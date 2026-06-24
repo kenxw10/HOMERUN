@@ -180,6 +180,47 @@ def test_generate_candidates_preserves_traded_candidate_snapshot(monkeypatch) ->
     assert all_candidates[1].decision == "candidate_only_existing_trade"
 
 
+def test_generate_candidates_avoids_duplicate_open_trade_across_days(monkeypatch) -> None:
+    current_time = {"now": datetime(2026, 7, 1, 16, 0, tzinfo=UTC)}
+    monkeypatch.setattr(candidates, "utc_now", lambda: current_time["now"])
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        game = MlbGame(
+            external_game_id="duplicate-1",
+            home_team="New York Yankees",
+            away_team="Boston Red Sox",
+            scheduled_start=datetime(2026, 7, 4, 0, 0, tzinfo=UTC),
+            status="scheduled",
+        )
+        market = KalshiMarket(
+            kalshi_market_id="KX-DUPLICATE",
+            ticker="KXMLB-DUPLICATE",
+            title="Will the New York Yankees win the game against the Boston Red Sox?",
+            status="open",
+            implied_yes_ask=Decimal("0.4000"),
+        )
+        session.add_all([game, market])
+        session.commit()
+
+        first_result = candidates.generate_candidates(session)
+        current_time["now"] = datetime(2026, 7, 2, 16, 0, tzinfo=UTC)
+        second_result = candidates.generate_candidates(session)
+
+        all_candidates = list(session.scalars(select(ModelCandidate).order_by(ModelCandidate.id.asc())))
+        all_trades = list(session.scalars(select(PaperTrade).order_by(PaperTrade.id.asc())))
+
+    assert first_result["paper_trades"] == 1
+    assert second_result["paper_trades"] == 0
+    assert len(all_candidates) == 2
+    assert len(all_trades) == 1
+    assert all_trades[0].market_ticker == "KXMLB-DUPLICATE"
+    assert all_candidates[0].decision == "paper_trade"
+    assert all_candidates[1].decision == "candidate_only_existing_trade"
+
+
 def test_mapping_confidence_and_rationale() -> None:
     game = MlbGame(
         external_game_id="1",
