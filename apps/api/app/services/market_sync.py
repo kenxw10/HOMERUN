@@ -12,6 +12,7 @@ from app.services.kalshi import KalshiClient, derive_orderbook_prices
 from app.time_utils import parse_datetime, utc_now
 
 BASEBALL_KEYWORDS = ("mlb", "baseball", "world series", "american league", "national league")
+DISCOVERABLE_MARKET_STATUSES = {"open", "unopened"}
 
 
 def _decimal(value: object) -> Decimal | None:
@@ -38,19 +39,33 @@ def looks_like_baseball_market(market: dict[str, Any]) -> bool:
     return any(keyword in text for keyword in BASEBALL_KEYWORDS)
 
 
+def _market_status(market: dict[str, Any]) -> str:
+    return str(market.get("status") or "").strip().lower()
+
+
+def _clear_orderbook_prices(row: KalshiMarket) -> None:
+    row.best_yes_bid = None
+    row.best_no_bid = None
+    row.implied_yes_ask = None
+    row.implied_no_ask = None
+
+
 def sync_kalshi_markets(session: Session, max_pages: int = 3, fetch_orderbooks: bool = True) -> int:
     client = KalshiClient.from_settings()
     close_start = utc_now() - timedelta(days=2)
     close_end = utc_now() + timedelta(days=21)
     params = {
         "limit": 200,
-        "status": "open,unopened",
         "min_close_ts": int(close_start.timestamp()),
         "max_close_ts": int(close_end.timestamp()),
     }
 
     count = 0
     for market in client.iter_markets(params=params, max_pages=max_pages):
+        status = _market_status(market)
+        if status not in DISCOVERABLE_MARKET_STATUSES:
+            continue
+
         if not looks_like_baseball_market(market):
             continue
 
@@ -67,7 +82,7 @@ def sync_kalshi_markets(session: Session, max_pages: int = 3, fetch_orderbooks: 
         row.rules = market.get("rules_primary") or market.get("rules")
         row.yes_subtitle = market.get("yes_sub_title") or market.get("yes_subtitle")
         row.no_subtitle = market.get("no_sub_title") or market.get("no_subtitle")
-        row.status = market.get("status") or "untracked"
+        row.status = status
         row.open_time = parse_datetime(market.get("open_time"))
         row.close_time = parse_datetime(market.get("close_time"))
         row.occurrence_datetime = parse_datetime(market.get("expected_expiration_time") or market.get("occurrence_datetime"))
@@ -94,6 +109,7 @@ def sync_kalshi_markets(session: Session, max_pages: int = 3, fetch_orderbooks: 
                 row.implied_no_ask = derived["implied_no_ask"]
                 row.orderbook_raw = orderbook_payload
             except Exception as exc:
+                _clear_orderbook_prices(row)
                 row.orderbook_raw = {"error": str(exc)}
 
         session.add(row)

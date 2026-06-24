@@ -1,10 +1,16 @@
-from fastapi.testclient import TestClient
+from decimal import Decimal
 
+from fastapi.testclient import TestClient
+from sqlalchemy import create_engine, select
+from sqlalchemy.orm import Session
+
+from app.database import Base
 from app.config import get_settings
 from app.database import database_status
 from app.main import app
 from app.models import KalshiMarket, MlbGame
 from app.services.kalshi import derive_orderbook_prices
+from app.services import market_sync
 from app.services.mapping import infer_market_type, score_mapping
 from app.time_utils import classify_time_bucket
 
@@ -125,3 +131,73 @@ def test_internal_sync_endpoints_require_api_key_when_configured(monkeypatch) ->
         get_settings.cache_clear()
 
     assert response.status_code == 401
+
+
+def test_market_sync_uses_valid_filters_and_clears_stale_orderbook(monkeypatch) -> None:
+    class FakeKalshiClient:
+        def __init__(self) -> None:
+            self.params: dict[str, object] | None = None
+
+        def iter_markets(self, params: dict[str, object], max_pages: int):
+            self.params = params
+            assert max_pages == 1
+            yield {
+                "id": "market-open",
+                "ticker": "KXMLB-OPEN",
+                "title": "MLB Yankees baseball market",
+                "status": "open",
+                "yes_ask": 46,
+                "close_time": "2026-07-01T23:00:00Z",
+            }
+            yield {
+                "id": "market-closed",
+                "ticker": "KXMLB-CLOSED",
+                "title": "MLB closed baseball market",
+                "status": "closed",
+                "yes_ask": 48,
+                "close_time": "2026-07-01T23:00:00Z",
+            }
+
+        def get_orderbook(self, ticker: str):
+            raise RuntimeError(f"orderbook unavailable for {ticker}")
+
+    fake_client = FakeKalshiClient()
+    monkeypatch.setattr(market_sync.KalshiClient, "from_settings", staticmethod(lambda: fake_client))
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        session.add(
+            KalshiMarket(
+                kalshi_market_id="market-open",
+                ticker="KXMLB-OPEN",
+                title="Old MLB market",
+                status="open",
+                best_yes_bid=Decimal("0.4200"),
+                best_no_bid=Decimal("0.5700"),
+                implied_yes_ask=Decimal("0.4300"),
+                implied_no_ask=Decimal("0.5800"),
+            )
+        )
+        session.commit()
+
+        count = market_sync.sync_kalshi_markets(session, max_pages=1)
+
+        assert count == 1
+        assert fake_client.params is not None
+        assert "status" not in fake_client.params
+        assert "min_close_ts" in fake_client.params
+        assert "max_close_ts" in fake_client.params
+
+        open_market = session.scalar(select(KalshiMarket).where(KalshiMarket.ticker == "KXMLB-OPEN"))
+        closed_market = session.scalar(select(KalshiMarket).where(KalshiMarket.ticker == "KXMLB-CLOSED"))
+
+        assert closed_market is None
+        assert open_market is not None
+        assert open_market.best_yes_bid is None
+        assert open_market.best_no_bid is None
+        assert open_market.implied_yes_ask is None
+        assert open_market.implied_no_ask is None
+        assert open_market.yes_ask == Decimal("0.4600")
+        assert open_market.orderbook_raw == {"error": "orderbook unavailable for KXMLB-OPEN"}
