@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 from app.config import get_settings
 from app.database import Base, database_status
 from app.main import app
-from app.models import BalanceSnapshot, KalshiMarket, MlbGame, PaperTrade, Position
+from app.models import BalanceSnapshot, KalshiMarket, MlbGame, ModelCandidate, PaperTrade, Position
 from app.services import candidates, dashboard, market_sync
 from app.services.kalshi import derive_orderbook_prices
 from app.services.mapping import infer_market_type, score_mapping
@@ -110,6 +110,56 @@ def test_candidate_day_bounds_use_dashboard_timezone(monkeypatch) -> None:
     assert day.isoformat() == "2026-07-01"
     assert start == datetime(2026, 7, 1, 4, 0, tzinfo=UTC)
     assert end == datetime(2026, 7, 2, 4, 0, tzinfo=UTC)
+
+
+def test_generate_candidates_preserves_traded_candidate_snapshot(monkeypatch) -> None:
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+    monkeypatch.setattr(candidates, "utc_now", lambda: now)
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        game = MlbGame(
+            external_game_id="preserve-1",
+            home_team="New York Yankees",
+            away_team="Boston Red Sox",
+            scheduled_start=now + timedelta(hours=25),
+            status="scheduled",
+        )
+        market = KalshiMarket(
+            kalshi_market_id="KX-PRESERVE",
+            ticker="KXMLB-PRESERVE",
+            title="Will the New York Yankees win the game against the Boston Red Sox?",
+            status="open",
+            implied_yes_ask=Decimal("0.4000"),
+        )
+        session.add_all([game, market])
+        session.commit()
+
+        first_result = candidates.generate_candidates(session)
+        trade = session.scalar(select(PaperTrade).where(PaperTrade.market_ticker == "KXMLB-PRESERVE"))
+        assert trade is not None
+        traded_candidate = session.get(ModelCandidate, trade.candidate_id)
+        assert traded_candidate is not None
+        assert first_result["paper_trades"] == 1
+        assert traded_candidate.executable_price == Decimal("0.4000")
+
+        market.implied_yes_ask = Decimal("0.3500")
+        session.add(market)
+        session.commit()
+
+        second_result = candidates.generate_candidates(session)
+        all_candidates = list(session.scalars(select(ModelCandidate).order_by(ModelCandidate.id.asc())))
+        all_trades = list(session.scalars(select(PaperTrade)))
+
+    assert second_result["paper_trades"] == 0
+    assert len(all_trades) == 1
+    assert len(all_candidates) == 2
+    assert all_candidates[0].id == traded_candidate.id
+    assert all_candidates[0].executable_price == Decimal("0.4000")
+    assert all_candidates[1].executable_price == Decimal("0.3500")
+    assert all_candidates[1].decision == "candidate_only_existing_trade"
 
 
 def test_mapping_confidence_and_rationale() -> None:
@@ -215,6 +265,94 @@ def test_market_sync_uses_valid_filters_and_clears_stale_orderbook(monkeypatch) 
         assert open_market.implied_no_ask is None
         assert open_market.yes_ask == Decimal("0.4600")
         assert open_market.orderbook_raw == {"error": "orderbook unavailable for KXMLB-OPEN"}
+
+
+def test_market_sync_updates_existing_closed_market(monkeypatch) -> None:
+    class FakeKalshiClient:
+        def iter_markets(self, params: dict[str, object], max_pages: int):
+            yield {
+                "id": "market-closing",
+                "ticker": "KXMLB-CLOSING",
+                "title": "MLB Yankees baseball market",
+                "status": "closed",
+                "yes_ask": 12,
+                "close_time": "2026-07-01T23:00:00Z",
+            }
+
+        def get_orderbook(self, ticker: str):
+            raise AssertionError("closed markets should not fetch orderbooks")
+
+    monkeypatch.setattr(market_sync.KalshiClient, "from_settings", staticmethod(lambda: FakeKalshiClient()))
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        session.add(
+            KalshiMarket(
+                kalshi_market_id="market-closing",
+                ticker="KXMLB-CLOSING",
+                title="Old MLB market",
+                status="open",
+                yes_ask=Decimal("0.4400"),
+                yes_mid=Decimal("0.4300"),
+                best_yes_bid=Decimal("0.4200"),
+                best_no_bid=Decimal("0.5700"),
+                implied_yes_ask=Decimal("0.4300"),
+                implied_no_ask=Decimal("0.5800"),
+            )
+        )
+        session.commit()
+
+        count = market_sync.sync_kalshi_markets(session, max_pages=1)
+        row = session.scalar(select(KalshiMarket).where(KalshiMarket.ticker == "KXMLB-CLOSING"))
+
+        assert count == 1
+        assert row is not None
+        assert row.status == "closed"
+        assert row.yes_ask == Decimal("0.1200")
+        assert row.yes_mid is None
+        assert row.best_yes_bid is None
+        assert row.best_no_bid is None
+        assert row.implied_yes_ask is None
+        assert row.implied_no_ask is None
+        assert row.orderbook_raw == {"skipped": "market status closed"}
+
+
+def test_market_sync_reads_fixed_point_orderbook_wrapper(monkeypatch) -> None:
+    class FakeKalshiClient:
+        def iter_markets(self, params: dict[str, object], max_pages: int):
+            yield {
+                "id": "market-fp",
+                "ticker": "KXMLB-FP",
+                "title": "MLB Yankees baseball market",
+                "status": "open",
+                "close_time": "2026-07-01T23:00:00Z",
+            }
+
+        def get_orderbook(self, ticker: str):
+            return {
+                "orderbook_fp": {
+                    "yes_dollars": [["0.0100", "200.00"], ["0.4200", "13.00"]],
+                    "no_dollars": [["0.2500", "50.00"], ["0.5600", "17.00"]],
+                }
+            }
+
+    monkeypatch.setattr(market_sync.KalshiClient, "from_settings", staticmethod(lambda: FakeKalshiClient()))
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        count = market_sync.sync_kalshi_markets(session, max_pages=1)
+        row = session.scalar(select(KalshiMarket).where(KalshiMarket.ticker == "KXMLB-FP"))
+
+        assert count == 1
+        assert row is not None
+        assert row.best_yes_bid == Decimal("0.4200")
+        assert row.best_no_bid == Decimal("0.5600")
+        assert row.implied_yes_ask == Decimal("0.4400")
+        assert row.implied_no_ask == Decimal("0.5800")
 
 
 def test_dashboard_uses_newest_portfolio_snapshots() -> None:

@@ -35,6 +35,18 @@ def _market_yes_price(market: KalshiMarket) -> Decimal | None:
     )
 
 
+def _candidate_ids_with_trades(session: Session, candidate_ids: list[int]) -> set[int]:
+    if not candidate_ids:
+        return set()
+    return {
+        candidate_id
+        for candidate_id in session.scalars(
+            select(PaperTrade.candidate_id).where(PaperTrade.candidate_id.in_(candidate_ids))
+        )
+        if candidate_id is not None
+    }
+
+
 def _decision(mapping: MarketMapping, market: KalshiMarket, price: Decimal | None, net_ev: Decimal | None) -> str:
     settings = get_settings()
     if mapping.mapping_status == "needs_review" or (mapping.confidence or Decimal("0")) < Decimal("0.55"):
@@ -79,12 +91,22 @@ def generate_candidates(session: Session) -> dict[str, int]:
         net_ev = (gross_ev - fee).quantize(Decimal("0.000001")) if gross_ev is not None else None
         decision = _decision(mapping, market, price, net_ev)
 
-        existing = session.scalar(
-            select(ModelCandidate)
-            .where(ModelCandidate.mapping_id == mapping.id)
-            .where(ModelCandidate.time_bucket == bucket)
-            .where(ModelCandidate.evaluated_at >= day_start)
-            .where(ModelCandidate.evaluated_at < day_end)
+        existing_candidates = list(
+            session.scalars(
+                select(ModelCandidate)
+                .where(ModelCandidate.mapping_id == mapping.id)
+                .where(ModelCandidate.time_bucket == bucket)
+                .where(ModelCandidate.evaluated_at >= day_start)
+                .where(ModelCandidate.evaluated_at < day_end)
+                .order_by(ModelCandidate.evaluated_at.desc(), ModelCandidate.id.desc())
+            )
+        )
+        traded_candidate_ids = _candidate_ids_with_trades(
+            session, [candidate.id for candidate in existing_candidates if candidate.id is not None]
+        )
+        existing = next(
+            (candidate for candidate in existing_candidates if candidate.id not in traded_candidate_ids),
+            None,
         )
         candidate = existing or ModelCandidate(
             mapping_id=mapping.id,
@@ -92,6 +114,8 @@ def generate_candidates(session: Session) -> dict[str, int]:
             kalshi_market_id=market.id,
             evaluated_at=now,
         )
+        if traded_candidate_ids and decision == "paper_trade":
+            decision = "candidate_only_existing_trade"
         candidate.model_version_id = None
         candidate.evaluated_at = now
         candidate.features = {

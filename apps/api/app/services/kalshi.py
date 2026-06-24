@@ -37,9 +37,28 @@ def _best_bid(levels: object) -> Decimal | None:
     return max(prices) if prices else None
 
 
+def _unwrap_orderbook(orderbook: dict[str, Any]) -> dict[str, Any]:
+    for key in ("orderbook", "orderbook_fp"):
+        nested = orderbook.get(key)
+        if isinstance(nested, dict):
+            return nested
+    return orderbook
+
+
 def derive_orderbook_prices(orderbook: dict[str, Any]) -> dict[str, Decimal | None]:
-    yes_levels = orderbook.get("yes") or orderbook.get("yes_bids") or orderbook.get("yesBid")
-    no_levels = orderbook.get("no") or orderbook.get("no_bids") or orderbook.get("noBid")
+    unwrapped = _unwrap_orderbook(orderbook)
+    yes_levels = (
+        unwrapped.get("yes")
+        or unwrapped.get("yes_bids")
+        or unwrapped.get("yesBid")
+        or unwrapped.get("yes_dollars")
+    )
+    no_levels = (
+        unwrapped.get("no")
+        or unwrapped.get("no_bids")
+        or unwrapped.get("noBid")
+        or unwrapped.get("no_dollars")
+    )
     best_yes_bid = _best_bid(yes_levels)
     best_no_bid = _best_bid(no_levels)
 

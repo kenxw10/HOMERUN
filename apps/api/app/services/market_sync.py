@@ -50,6 +50,37 @@ def _clear_orderbook_prices(row: KalshiMarket) -> None:
     row.implied_no_ask = None
 
 
+def _update_market_fields(row: KalshiMarket, market: dict[str, Any], ticker: str, status: str) -> None:
+    row.kalshi_market_id = str(market.get("id") or market.get("market_id") or ticker)
+    row.event_ticker = market.get("event_ticker")
+    row.title = market.get("title") or ticker
+    row.subtitle = market.get("subtitle")
+    row.rules = market.get("rules_primary") or market.get("rules")
+    row.yes_subtitle = market.get("yes_sub_title") or market.get("yes_subtitle")
+    row.no_subtitle = market.get("no_sub_title") or market.get("no_subtitle")
+    row.status = status or "untracked"
+    row.open_time = parse_datetime(market.get("open_time"))
+    row.close_time = parse_datetime(market.get("close_time"))
+    row.occurrence_datetime = parse_datetime(market.get("expected_expiration_time") or market.get("occurrence_datetime"))
+    row.resolve_time = parse_datetime(market.get("expiration_time") or market.get("resolve_time"))
+    row.yes_bid = _decimal(market.get("yes_bid"))
+    row.yes_ask = _decimal(market.get("yes_ask"))
+    row.no_bid = _decimal(market.get("no_bid"))
+    row.no_ask = _decimal(market.get("no_ask"))
+    row.last_price = _decimal(market.get("last_price"))
+    row.yes_mid = (
+        ((row.yes_bid + row.yes_ask) / Decimal("2")).quantize(Decimal("0.0001"))
+        if row.yes_bid is not None and row.yes_ask is not None
+        else None
+    )
+    row.no_mid = (
+        ((row.no_bid + row.no_ask) / Decimal("2")).quantize(Decimal("0.0001"))
+        if row.no_bid is not None and row.no_ask is not None
+        else None
+    )
+    row.raw_payload = market
+
+
 def sync_kalshi_markets(session: Session, max_pages: int = 3, fetch_orderbooks: bool = True) -> int:
     client = KalshiClient.from_settings()
     close_start = utc_now() - timedelta(days=2)
@@ -62,41 +93,25 @@ def sync_kalshi_markets(session: Session, max_pages: int = 3, fetch_orderbooks: 
 
     count = 0
     for market in client.iter_markets(params=params, max_pages=max_pages):
-        status = _market_status(market)
-        if status not in DISCOVERABLE_MARKET_STATUSES:
-            continue
-
-        if not looks_like_baseball_market(market):
-            continue
-
         ticker = str(market.get("ticker") or "").strip()
         if not ticker:
             continue
 
+        status = _market_status(market)
         existing = session.scalar(select(KalshiMarket).where(KalshiMarket.ticker == ticker))
+        should_track_new_market = status in DISCOVERABLE_MARKET_STATUSES and looks_like_baseball_market(market)
+        if existing is None and not should_track_new_market:
+            continue
+
         row = existing or KalshiMarket(ticker=ticker, kalshi_market_id=str(market.get("id") or ticker))
-        row.kalshi_market_id = str(market.get("id") or market.get("market_id") or ticker)
-        row.event_ticker = market.get("event_ticker")
-        row.title = market.get("title") or ticker
-        row.subtitle = market.get("subtitle")
-        row.rules = market.get("rules_primary") or market.get("rules")
-        row.yes_subtitle = market.get("yes_sub_title") or market.get("yes_subtitle")
-        row.no_subtitle = market.get("no_sub_title") or market.get("no_subtitle")
-        row.status = status
-        row.open_time = parse_datetime(market.get("open_time"))
-        row.close_time = parse_datetime(market.get("close_time"))
-        row.occurrence_datetime = parse_datetime(market.get("expected_expiration_time") or market.get("occurrence_datetime"))
-        row.resolve_time = parse_datetime(market.get("expiration_time") or market.get("resolve_time"))
-        row.yes_bid = _decimal(market.get("yes_bid"))
-        row.yes_ask = _decimal(market.get("yes_ask"))
-        row.no_bid = _decimal(market.get("no_bid"))
-        row.no_ask = _decimal(market.get("no_ask"))
-        row.last_price = _decimal(market.get("last_price"))
-        if row.yes_bid is not None and row.yes_ask is not None:
-            row.yes_mid = ((row.yes_bid + row.yes_ask) / Decimal("2")).quantize(Decimal("0.0001"))
-        if row.no_bid is not None and row.no_ask is not None:
-            row.no_mid = ((row.no_bid + row.no_ask) / Decimal("2")).quantize(Decimal("0.0001"))
-        row.raw_payload = market
+        _update_market_fields(row, market, ticker, status)
+
+        if status not in DISCOVERABLE_MARKET_STATUSES:
+            _clear_orderbook_prices(row)
+            row.orderbook_raw = {"skipped": f"market status {row.status}"}
+            session.add(row)
+            count += 1
+            continue
 
         if fetch_orderbooks:
             try:
