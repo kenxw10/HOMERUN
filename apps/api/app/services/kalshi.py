@@ -100,15 +100,19 @@ class KalshiClient:
             timeout=self.timeout_seconds,
         )
 
-    def iter_markets(self, params: dict[str, object] | None = None, max_pages: int = 3):
+    def iter_markets(self, params: dict[str, object] | None = None, max_pages: int | None = None):
         query = dict(params or {})
-        for _ in range(max_pages):
+        pages_seen = 0
+        cursors_seen: set[str] = set()
+        while max_pages is None or pages_seen < max_pages:
             payload = self.get_markets(query)
+            pages_seen += 1
             for market in payload.get("markets") or payload.get("data") or []:
                 yield market
             cursor = payload.get("cursor") or payload.get("next_cursor")
-            if not cursor:
+            if not cursor or cursor in cursors_seen:
                 break
+            cursors_seen.add(cursor)
             query["cursor"] = cursor
 
     def get_orderbook(self, ticker: str) -> dict[str, Any]:

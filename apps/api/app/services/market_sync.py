@@ -27,6 +27,11 @@ def _decimal(value: object) -> Decimal | None:
     return parsed.quantize(Decimal("0.0001"))
 
 
+def _market_decimal(market: dict[str, Any], dollars_key: str, legacy_key: str) -> Decimal | None:
+    value = _decimal(market.get(dollars_key))
+    return value if value is not None else _decimal(market.get(legacy_key))
+
+
 def _market_text(market: dict[str, Any]) -> str:
     return " ".join(
         str(market.get(key) or "")
@@ -63,11 +68,11 @@ def _update_market_fields(row: KalshiMarket, market: dict[str, Any], ticker: str
     row.close_time = parse_datetime(market.get("close_time"))
     row.occurrence_datetime = parse_datetime(market.get("expected_expiration_time") or market.get("occurrence_datetime"))
     row.resolve_time = parse_datetime(market.get("expiration_time") or market.get("resolve_time"))
-    row.yes_bid = _decimal(market.get("yes_bid"))
-    row.yes_ask = _decimal(market.get("yes_ask"))
-    row.no_bid = _decimal(market.get("no_bid"))
-    row.no_ask = _decimal(market.get("no_ask"))
-    row.last_price = _decimal(market.get("last_price"))
+    row.yes_bid = _market_decimal(market, "yes_bid_dollars", "yes_bid")
+    row.yes_ask = _market_decimal(market, "yes_ask_dollars", "yes_ask")
+    row.no_bid = _market_decimal(market, "no_bid_dollars", "no_bid")
+    row.no_ask = _market_decimal(market, "no_ask_dollars", "no_ask")
+    row.last_price = _market_decimal(market, "last_price_dollars", "last_price")
     row.yes_mid = (
         ((row.yes_bid + row.yes_ask) / Decimal("2")).quantize(Decimal("0.0001"))
         if row.yes_bid is not None and row.yes_ask is not None
@@ -81,7 +86,7 @@ def _update_market_fields(row: KalshiMarket, market: dict[str, Any], ticker: str
     row.raw_payload = market
 
 
-def sync_kalshi_markets(session: Session, max_pages: int = 3, fetch_orderbooks: bool = True) -> int:
+def sync_kalshi_markets(session: Session, max_pages: int | None = None, fetch_orderbooks: bool = True) -> int:
     client = KalshiClient.from_settings()
     close_start = utc_now() - timedelta(days=2)
     close_end = utc_now() + timedelta(days=21)

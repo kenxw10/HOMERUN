@@ -10,7 +10,7 @@ from app.database import Base, database_status
 from app.main import app
 from app.models import BalanceSnapshot, KalshiMarket, MlbGame, ModelCandidate, PaperTrade, Position
 from app.services import candidates, dashboard, market_sync
-from app.services.kalshi import derive_orderbook_prices
+from app.services.kalshi import KalshiClient, derive_orderbook_prices
 from app.services.mapping import infer_market_type, score_mapping
 from app.time_utils import classify_time_bucket
 
@@ -88,6 +88,24 @@ def test_kalshi_orderbook_derives_asks_from_yes_and_no_bids() -> None:
     assert str(derived["best_no_bid"]) == "0.3900"
     assert str(derived["implied_yes_ask"]) == "0.6100"
     assert str(derived["implied_no_ask"]) == "0.3900"
+
+
+def test_kalshi_client_iter_markets_follows_cursor_until_exhausted(monkeypatch) -> None:
+    client_instance = KalshiClient(base_url="https://example.test")
+    calls: list[dict[str, object]] = []
+
+    def fake_get_markets(params: dict[str, object]):
+        calls.append(dict(params))
+        if len(calls) == 1:
+            return {"markets": [{"ticker": "PAGE-1"}], "cursor": "next-page"}
+        return {"markets": [{"ticker": "PAGE-2"}], "cursor": ""}
+
+    monkeypatch.setattr(client_instance, "get_markets", fake_get_markets)
+
+    markets = list(client_instance.iter_markets(params={"limit": 200}))
+
+    assert [market["ticker"] for market in markets] == ["PAGE-1", "PAGE-2"]
+    assert calls == [{"limit": 200}, {"limit": 200, "cursor": "next-page"}]
 
 
 def test_time_bucket_classification() -> None:
@@ -265,6 +283,51 @@ def test_market_sync_uses_valid_filters_and_clears_stale_orderbook(monkeypatch) 
         assert open_market.implied_no_ask is None
         assert open_market.yes_ask == Decimal("0.4600")
         assert open_market.orderbook_raw == {"error": "orderbook unavailable for KXMLB-OPEN"}
+
+
+def test_market_sync_reads_kalshi_dollar_price_fields(monkeypatch) -> None:
+    class FakeKalshiClient:
+        def __init__(self) -> None:
+            self.max_pages: int | None | object = object()
+
+        def iter_markets(self, params: dict[str, object], max_pages: int | None):
+            self.max_pages = max_pages
+            yield {
+                "id": "market-dollar-fields",
+                "ticker": "KXMLB-DOLLARS",
+                "title": "MLB Yankees baseball market",
+                "status": "open",
+                "yes_bid_dollars": "0.1200",
+                "yes_ask_dollars": "0.3400",
+                "no_bid_dollars": "0.6500",
+                "no_ask_dollars": "0.8700",
+                "last_price_dollars": "0.2500",
+                "close_time": "2026-07-01T23:00:00Z",
+            }
+
+        def get_orderbook(self, ticker: str):
+            raise AssertionError("orderbook fetch is disabled in this test")
+
+    fake_client = FakeKalshiClient()
+    monkeypatch.setattr(market_sync.KalshiClient, "from_settings", staticmethod(lambda: fake_client))
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        count = market_sync.sync_kalshi_markets(session, fetch_orderbooks=False)
+        row = session.scalar(select(KalshiMarket).where(KalshiMarket.ticker == "KXMLB-DOLLARS"))
+
+        assert count == 1
+        assert fake_client.max_pages is None
+        assert row is not None
+        assert row.yes_bid == Decimal("0.1200")
+        assert row.yes_ask == Decimal("0.3400")
+        assert row.yes_mid == Decimal("0.2300")
+        assert row.no_bid == Decimal("0.6500")
+        assert row.no_ask == Decimal("0.8700")
+        assert row.no_mid == Decimal("0.7600")
+        assert row.last_price == Decimal("0.2500")
 
 
 def test_market_sync_updates_existing_closed_market(monkeypatch) -> None:
