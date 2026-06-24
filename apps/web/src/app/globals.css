@@ -191,18 +191,28 @@ select {
   min-height: 388px;
 }
 
-.chart-empty {
+.chart-empty,
+.chart-live {
   position: relative;
   display: grid;
   min-height: 302px;
-  place-items: center;
   overflow: hidden;
   border: 1px solid #e1e6ee;
   border-radius: 8px;
   background: #fbfcfe;
 }
 
-.chart-empty svg {
+.chart-empty {
+  place-items: center;
+}
+
+.chart-live {
+  align-items: end;
+  padding: 18px;
+}
+
+.chart-empty svg,
+.chart-live svg {
   position: absolute;
   inset: 0;
   width: 100%;
@@ -214,7 +224,13 @@ select {
   stroke-width: 2;
 }
 
-.chart-empty .grid-line {
+.chart-live line {
+  stroke: #c3ccd8;
+  stroke-width: 2;
+}
+
+.chart-empty .grid-line,
+.chart-live .grid-line {
   stroke: #e2e7ef;
   stroke-width: 1;
 }
@@ -224,6 +240,57 @@ select {
   stroke: #98a5b5;
   stroke-dasharray: 8 8;
   stroke-width: 3;
+}
+
+.chart-live path {
+  fill: none;
+  stroke: #1f6f5b;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 4;
+}
+
+.chart-live circle {
+  fill: #ffffff;
+  stroke: #1f6f5b;
+  stroke-width: 3;
+}
+
+.chart-summary {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  gap: 4px;
+  width: min(220px, 100%);
+  border: 1px solid #d9dee7;
+  border-radius: 8px;
+  padding: 12px;
+  background: rgb(255 255 255 / 92%);
+}
+
+.chart-summary span,
+.chart-summary small,
+.chart-scale {
+  color: #667386;
+  font-size: 0.82rem;
+}
+
+.chart-summary strong {
+  color: #17202a;
+  font-size: 1.25rem;
+  line-height: 1.1;
+}
+
+.chart-scale {
+  position: absolute;
+  top: 18px;
+  right: 18px;
+  bottom: 18px;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  text-align: right;
 }
 
 .empty-copy {

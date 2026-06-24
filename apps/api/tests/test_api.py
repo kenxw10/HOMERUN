@@ -1,5 +1,7 @@
 from fastapi.testclient import TestClient
 
+from app.config import get_settings
+from app.database import database_status
 from app.main import app
 
 client = TestClient(app)
@@ -47,3 +49,18 @@ def test_system_status_redacts_secrets_and_allows_missing_database() -> None:
     assert payload["config"]["ready"] is True
     assert payload["config"]["kalshi_credentials"] == "not_set"
     assert "KALSHI_API_KEY" not in str(payload)
+
+
+def test_database_status_does_not_mark_unreachable_database_ready(monkeypatch) -> None:
+    monkeypatch.setenv("DATABASE_URL", "postgresql+psycopg://bad:bad@127.0.0.1:1/bad")
+    get_settings.cache_clear()
+
+    try:
+        status = database_status()
+    finally:
+        get_settings.cache_clear()
+
+    assert status["configured"] is True
+    assert status["ready"] is False
+    assert status["dialect"] == "postgresql+psycopg"
+    assert status["message"] == "Database connection failed; check DATABASE_URL and network access."

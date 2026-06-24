@@ -115,6 +115,19 @@ function formatCurrency(value: number): string {
   }).format(value);
 }
 
+function formatShortDate(value: string): string {
+  const date = new Date(value);
+
+  if (Number.isNaN(date.getTime())) {
+    return value;
+  }
+
+  return new Intl.DateTimeFormat("en-US", {
+    month: "short",
+    day: "numeric",
+  }).format(date);
+}
+
 function getApiBaseUrl(): string {
   return (process.env.NEXT_PUBLIC_API_BASE_URL || "http://127.0.0.1:8000").replace(/\/$/, "");
 }
@@ -181,6 +194,74 @@ function StatCard({ label, value, detail }: { label: string; value: string; deta
   );
 }
 
+function getPortfolioChart(series: PortfolioPoint[]) {
+  const width = 640;
+  const height = 220;
+  const left = 48;
+  const right = 32;
+  const top = 24;
+  const bottom = 44;
+  const values = series.map((point) => point.value);
+  const minValue = Math.min(...values);
+  const maxValue = Math.max(...values);
+  const valueRange = maxValue - minValue || 1;
+  const xRange = width - left - right;
+  const yRange = height - top - bottom;
+
+  const points = series.map((point, index) => {
+    const x = series.length === 1 ? left + xRange / 2 : left + (index / (series.length - 1)) * xRange;
+    const y = top + ((maxValue - point.value) / valueRange) * yRange;
+
+    return { ...point, x, y };
+  });
+
+  const path = points
+    .map((point, index) => `${index === 0 ? "M" : "L"} ${point.x.toFixed(2)} ${point.y.toFixed(2)}`)
+    .join(" ");
+
+  return {
+    width,
+    height,
+    minValue,
+    maxValue,
+    path,
+    points,
+    latestPoint: points[points.length - 1],
+  };
+}
+
+function PortfolioChart({ series }: { series: PortfolioPoint[] }) {
+  const chart = getPortfolioChart(series);
+
+  return (
+    <div
+      className="chart-live"
+      role="img"
+      aria-label={`Portfolio value chart with ${series.length} snapshot${series.length === 1 ? "" : "s"}`}
+    >
+      <svg viewBox={`0 0 ${chart.width} ${chart.height}`} preserveAspectRatio="none" aria-hidden="true">
+        <line x1="48" y1="24" x2="48" y2="176" />
+        <line x1="48" y1="176" x2="608" y2="176" />
+        <line x1="48" y1="128" x2="608" y2="128" className="grid-line" />
+        <line x1="48" y1="80" x2="608" y2="80" className="grid-line" />
+        <path d={chart.path} />
+        {chart.points.map((point) => (
+          <circle key={`${point.timestamp}-${point.value}`} cx={point.x} cy={point.y} r="4" />
+        ))}
+      </svg>
+      <div className="chart-summary">
+        <span>Latest value</span>
+        <strong>{formatCurrency(chart.latestPoint.value)}</strong>
+        <small>{formatShortDate(chart.latestPoint.timestamp)}</small>
+      </div>
+      <div className="chart-scale">
+        <span>{formatCurrency(chart.maxValue)}</span>
+        <span>{formatCurrency(chart.minValue)}</span>
+      </div>
+    </div>
+  );
+}
+
 function PortfolioPanel({ series }: { series: PortfolioPoint[] }) {
   return (
     <section className="panel portfolio-panel">
@@ -206,7 +287,9 @@ function PortfolioPanel({ series }: { series: PortfolioPoint[] }) {
             <span>Paper trading has not recorded balance history.</span>
           </div>
         </div>
-      ) : null}
+      ) : (
+        <PortfolioChart series={series} />
+      )}
     </section>
   );
 }
