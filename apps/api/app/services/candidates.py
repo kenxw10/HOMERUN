@@ -1,0 +1,136 @@
+from __future__ import annotations
+
+from datetime import timedelta
+from decimal import Decimal
+
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from app.config import get_settings
+from app.models import KalshiMarket, MarketMapping, MlbGame, ModelCandidate, PaperTrade
+from app.services.mapping import infer_market_type, sync_market_mappings
+from app.time_utils import classify_time_bucket, ensure_aware_utc, today_eastern, utc_now
+
+TEMPORARY_EDGE_THRESHOLD = Decimal("0.0500")
+
+
+def _price(value) -> Decimal | None:
+    return value if value is not None else None
+
+
+def _market_yes_price(market: KalshiMarket) -> Decimal | None:
+    return (
+        _price(market.implied_yes_ask)
+        or _price(market.yes_ask)
+        or _price(market.yes_mid)
+        or _price(market.last_price)
+        or _price(market.best_yes_bid)
+    )
+
+
+def _decision(mapping: MarketMapping, market: KalshiMarket, price: Decimal | None, net_ev: Decimal | None) -> str:
+    settings = get_settings()
+    if mapping.mapping_status == "needs_review" or (mapping.confidence or Decimal("0")) < Decimal("0.55"):
+        return "no_trade_mapping_uncertain"
+    if price is None:
+        return "no_trade_missing_price"
+    if market.status.lower() in {"closed", "settled", "finalized", "expired"}:
+        return "no_trade_market_closed"
+    if net_ev is None or net_ev < TEMPORARY_EDGE_THRESHOLD:
+        return "no_trade_edge_too_low"
+    if not settings.paper_candidate_engine_enabled:
+        return "candidate_only"
+    if settings.safe_execution_posture:
+        return "paper_trade"
+    return "candidate_only"
+
+
+def generate_candidates(session: Session) -> dict[str, int]:
+    sync_market_mappings(session)
+    settings = get_settings()
+    now = utc_now()
+    day = today_eastern()
+    day_start = ensure_aware_utc(now.astimezone().replace(hour=0, minute=0, second=0, microsecond=0))
+    day_end = day_start + timedelta(days=1)
+    created_or_updated = 0
+    paper_trades = 0
+
+    mappings = session.execute(
+        select(MarketMapping, MlbGame, KalshiMarket)
+        .join(MlbGame, MarketMapping.mlb_game_id == MlbGame.id)
+        .join(KalshiMarket, MarketMapping.kalshi_market_id == KalshiMarket.id)
+        .where(MarketMapping.mapping_status.in_(["candidate", "confirmed", "needs_review"]))
+    ).all()
+
+    for mapping, game, market in mappings:
+        minutes_to_start = int((ensure_aware_utc(game.scheduled_start) - now).total_seconds() / 60)
+        bucket = classify_time_bucket(minutes_to_start)
+        text = " ".join(value or "" for value in (market.title, market.subtitle, market.rules))
+        market_type = infer_market_type(text)
+        probability = Decimal("0.500000")
+        price = _market_yes_price(market)
+        gross_ev = (probability - price).quantize(Decimal("0.000001")) if price is not None else None
+        fee = Decimal("0.000000")
+        net_ev = (gross_ev - fee).quantize(Decimal("0.000001")) if gross_ev is not None else None
+        decision = _decision(mapping, market, price, net_ev)
+
+        existing = session.scalar(
+            select(ModelCandidate)
+            .where(ModelCandidate.mapping_id == mapping.id)
+            .where(ModelCandidate.time_bucket == bucket)
+            .where(ModelCandidate.evaluated_at >= day_start)
+            .where(ModelCandidate.evaluated_at < day_end)
+        )
+        candidate = existing or ModelCandidate(
+            mapping_id=mapping.id,
+            mlb_game_id=game.id,
+            kalshi_market_id=market.id,
+            evaluated_at=now,
+        )
+        candidate.model_version_id = None
+        candidate.evaluated_at = now
+        candidate.features = {
+            "home_team": game.home_team,
+            "away_team": game.away_team,
+            "scheduled_start": game.scheduled_start.isoformat(),
+            "mapping_confidence": float(mapping.confidence or 0),
+            "market_status": market.status,
+            "best_yes_bid": float(market.best_yes_bid) if market.best_yes_bid is not None else None,
+            "implied_yes_ask": float(market.implied_yes_ask) if market.implied_yes_ask is not None else None,
+        }
+        candidate.probability = probability
+        candidate.model_probability = probability
+        candidate.fair_value = Decimal("0.5000")
+        candidate.market_price = price
+        candidate.executable_price = price
+        candidate.expected_value = gross_ev
+        candidate.fee_estimate = fee
+        candidate.net_expected_value = net_ev
+        candidate.market_type = market_type
+        candidate.time_bucket = bucket
+        candidate.time_to_start_minutes = minutes_to_start
+        candidate.contract_side = "yes"
+        candidate.decision = decision
+        session.add(candidate)
+        session.flush()
+        created_or_updated += 1
+
+        if decision == "paper_trade":
+            existing_trade = session.scalar(select(PaperTrade).where(PaperTrade.candidate_id == candidate.id))
+            if existing_trade is None and price is not None:
+                trade = PaperTrade(
+                    candidate_id=candidate.id,
+                    market_ticker=market.ticker,
+                    contract_side="yes",
+                    entry_price=price,
+                    current_price=price,
+                    quantity=settings.default_paper_contracts,
+                    entry_time=now,
+                    status="open",
+                    expected_value=net_ev,
+                )
+                session.add(trade)
+                paper_trades += 1
+
+    session.commit()
+    return {"date": int(day.strftime("%Y%m%d")), "candidates": created_or_updated, "paper_trades": paper_trades}

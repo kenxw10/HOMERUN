@@ -1,6 +1,6 @@
 # HOMERUN
 
-HOMERUN is a Kalshi-native MLB paper-trading system and dashboard. The first version is a deployable foundation only: FastAPI backend, Next.js frontend, PostgreSQL-ready schema, setup docs, and safety defaults that keep live execution disabled.
+HOMERUN is a Kalshi-native MLB paper-trading system and dashboard. The current version includes the deployable PR 1 foundation plus the PR 2 data layer: MLB slate ingestion, Kalshi market discovery, auditable game-to-market mapping, conservative paper candidates, and a light trading-terminal dashboard.
 
 This is not a sportsbook app. It does not use DraftKings, FanDuel, Odds API, or sportsbook odds behavior. Future trading logic should use Kalshi yes/no contract math, account for fees, and assume hold-to-settlement unless a later PR changes that context deliberately.
 
@@ -15,7 +15,8 @@ This is not a sportsbook app. It does not use DraftKings, FanDuel, Odds API, or 
 - `LIVE_TRADING_ENABLED=false`
 - `EXECUTION_KILL_SWITCH=true`
 - `KALSHI_ENV=demo`
-- Kalshi credentials are not required for PR 1.
+- Kalshi credentials are optional for PR 2 discovery and must not be production credentials unless a later PR explicitly changes the safety plan.
+- `BACKEND_API_KEY` is optional locally. If it is set, internal POST run endpoints require `X-API-Key`.
 
 ## Local Backend
 
@@ -39,6 +40,32 @@ pytest
 ruff check .
 ```
 
+## Local Data Jobs
+
+PR 2 adds safe one-shot worker commands. They write MLB games, candidate Kalshi markets, mappings, model candidates, and paper trades to the configured database. They do not place live orders.
+
+From `apps/api` after installing backend dependencies:
+
+```powershell
+.\.venv\Scripts\python.exe -m app.jobs.mlb_schedule_sync
+.\.venv\Scripts\python.exe -m app.jobs.kalshi_market_sync
+.\.venv\Scripts\python.exe -m app.jobs.paper_candidate_engine
+```
+
+You can pass a specific date to the MLB schedule job:
+
+```powershell
+.\.venv\Scripts\python.exe -m app.jobs.mlb_schedule_sync 2026-06-24
+```
+
+PR 2 also exposes internal API run endpoints:
+
+- `POST /v1/sync/mlb-schedule`
+- `POST /v1/sync/kalshi-markets`
+- `POST /v1/run/paper-candidate-engine`
+
+If `BACKEND_API_KEY` is set, call those endpoints with an `X-API-Key` header.
+
 ## Local Frontend
 
 From the repo root:
@@ -61,13 +88,15 @@ npm --workspace apps/web run build
 
 ## Database Migrations
 
-The backend can boot without `DATABASE_URL` in PR 1. To run migrations against PostgreSQL later:
+The backend can boot without `DATABASE_URL` for local UI work. To use the PR 2 data jobs and database-backed dashboard responses, configure PostgreSQL and run migrations:
 
 ```powershell
 cd apps/api
 $env:DATABASE_URL="postgresql+psycopg://USER:PASSWORD@HOST:PORT/DATABASE"
 alembic upgrade head
 ```
+
+PR 2 adds migration `0002_pr2_data_layer.py` for raw MLB payloads, Kalshi orderbook fields, mapping rationale, paper candidate fields, and paper trade mark-to-market fields.
 
 ## Deployment
 
