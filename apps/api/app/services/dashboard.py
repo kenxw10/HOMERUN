@@ -60,7 +60,7 @@ def _float(value: Decimal | None) -> float | None:
 
 
 def _position_from_trade(trade: PaperTrade) -> PositionSummary:
-    current = trade.current_price or trade.entry_price
+    current = trade.current_price if trade.current_price is not None else trade.entry_price
     pnl = ((current - trade.entry_price) * trade.quantity).quantize(Decimal("0.01"))
     pnl_percent = ((current - trade.entry_price) / trade.entry_price).quantize(Decimal("0.0001")) if trade.entry_price else None
     return PositionSummary(
@@ -79,7 +79,7 @@ def _position_from_trade(trade: PaperTrade) -> PositionSummary:
 
 
 def _position_from_position(position: Position) -> PositionSummary:
-    current = position.current_price or position.entry_price
+    current = position.current_price if position.current_price is not None else position.entry_price
     pnl = ((current - position.entry_price) * position.quantity).quantize(Decimal("0.01"))
     pnl_percent = ((current - position.entry_price) / position.entry_price).quantize(Decimal("0.0001")) if position.entry_price else None
     return PositionSummary(
@@ -99,9 +99,10 @@ def _position_from_position(position: Position) -> PositionSummary:
 
 def dashboard_summary_from_db(session: Session) -> DashboardSummary:
     summary = empty_dashboard_summary()
-    snapshots = list(
-        session.scalars(select(BalanceSnapshot).order_by(BalanceSnapshot.captured_at.asc()).limit(500))
+    newest_snapshots = list(
+        session.scalars(select(BalanceSnapshot).order_by(BalanceSnapshot.captured_at.desc()).limit(500))
     )
+    snapshots = list(reversed(newest_snapshots))
     summary.portfolio_series = [
         PortfolioPoint(timestamp=snapshot.captured_at, value=float(snapshot.portfolio_value)) for snapshot in snapshots
     ]

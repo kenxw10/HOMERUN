@@ -1,16 +1,16 @@
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
-from app.database import Base
 from app.config import get_settings
-from app.database import database_status
+from app.database import Base, database_status
 from app.main import app
-from app.models import KalshiMarket, MlbGame
+from app.models import BalanceSnapshot, KalshiMarket, MlbGame, PaperTrade, Position
+from app.services import candidates, dashboard, market_sync
 from app.services.kalshi import derive_orderbook_prices
-from app.services import market_sync
 from app.services.mapping import infer_market_type, score_mapping
 from app.time_utils import classify_time_bucket
 
@@ -96,6 +96,20 @@ def test_time_bucket_classification() -> None:
     assert classify_time_bucket(95) == "90M"
     assert classify_time_bucket(20) == "15M"
     assert classify_time_bucket(1) == "5M"
+
+
+def test_candidate_day_bounds_use_dashboard_timezone(monkeypatch) -> None:
+    monkeypatch.setenv("DASHBOARD_TIMEZONE", "America/New_York")
+    get_settings.cache_clear()
+
+    try:
+        day, start, end = candidates._candidate_day_bounds(datetime(2026, 7, 2, 1, 0, tzinfo=UTC))
+    finally:
+        get_settings.cache_clear()
+
+    assert day.isoformat() == "2026-07-01"
+    assert start == datetime(2026, 7, 1, 4, 0, tzinfo=UTC)
+    assert end == datetime(2026, 7, 2, 4, 0, tzinfo=UTC)
 
 
 def test_mapping_confidence_and_rationale() -> None:
@@ -201,3 +215,62 @@ def test_market_sync_uses_valid_filters_and_clears_stale_orderbook(monkeypatch) 
         assert open_market.implied_no_ask is None
         assert open_market.yes_ask == Decimal("0.4600")
         assert open_market.orderbook_raw == {"error": "orderbook unavailable for KXMLB-OPEN"}
+
+
+def test_dashboard_uses_newest_portfolio_snapshots() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    captured_at = datetime(2026, 7, 1, 12, 0, tzinfo=UTC)
+
+    with Session(engine) as session:
+        for index in range(501):
+            value = Decimal(index)
+            session.add(
+                BalanceSnapshot(
+                    captured_at=captured_at + timedelta(minutes=index),
+                    cash_balance=value,
+                    portfolio_value=value,
+                    source="paper",
+                )
+            )
+        session.commit()
+
+        summary = dashboard.dashboard_summary_from_db(session)
+
+    assert len(summary.portfolio_series) == 500
+    assert summary.portfolio_series[0].value == 1.0
+    assert summary.portfolio_series[-1].value == 500.0
+    assert summary.cash_balance == 500.0
+    assert summary.portfolio_value == 500.0
+
+
+def test_dashboard_preserves_zero_current_prices() -> None:
+    opened_at = datetime(2026, 7, 1, 12, 0, tzinfo=UTC)
+    trade = PaperTrade(
+        market_ticker="KXMLB-ZERO",
+        contract_side="yes",
+        entry_price=Decimal("0.5000"),
+        current_price=Decimal("0.0000"),
+        quantity=2,
+        entry_time=opened_at,
+        status="open",
+    )
+    position = Position(
+        market_ticker="KXMLB-ZERO",
+        contract_side="yes",
+        entry_price=Decimal("0.5000"),
+        current_price=Decimal("0.0000"),
+        quantity=2,
+        opened_at=opened_at,
+        status="open",
+    )
+
+    trade_summary = dashboard._position_from_trade(trade)
+    position_summary = dashboard._position_from_position(position)
+
+    assert trade_summary.current_price == 0.0
+    assert trade_summary.profit_loss == -1.0
+    assert trade_summary.profit_loss_percent == -1.0
+    assert position_summary.current_price == 0.0
+    assert position_summary.profit_loss == -1.0
+    assert position_summary.profit_loss_percent == -1.0

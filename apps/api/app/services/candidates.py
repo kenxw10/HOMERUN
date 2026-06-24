@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 
 from sqlalchemy import select
@@ -9,9 +9,16 @@ from sqlalchemy.orm import Session
 from app.config import get_settings
 from app.models import KalshiMarket, MarketMapping, MlbGame, ModelCandidate, PaperTrade
 from app.services.mapping import infer_market_type, sync_market_mappings
-from app.time_utils import classify_time_bucket, ensure_aware_utc, today_eastern, utc_now
+from app.time_utils import classify_time_bucket, ensure_aware_utc, get_dashboard_zone, utc_now
 
 TEMPORARY_EDGE_THRESHOLD = Decimal("0.0500")
+
+
+def _candidate_day_bounds(now: datetime) -> tuple[date, datetime, datetime]:
+    dashboard_zone = get_dashboard_zone()
+    day = now.astimezone(dashboard_zone).date()
+    day_start = ensure_aware_utc(datetime.combine(day, time.min, tzinfo=dashboard_zone))
+    return day, day_start, day_start + timedelta(days=1)
 
 
 def _price(value) -> Decimal | None:
@@ -49,9 +56,7 @@ def generate_candidates(session: Session) -> dict[str, int]:
     sync_market_mappings(session)
     settings = get_settings()
     now = utc_now()
-    day = today_eastern()
-    day_start = ensure_aware_utc(now.astimezone().replace(hour=0, minute=0, second=0, microsecond=0))
-    day_end = day_start + timedelta(days=1)
+    day, day_start, day_end = _candidate_day_bounds(now)
     created_or_updated = 0
     paper_trades = 0
 
