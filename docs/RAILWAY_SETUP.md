@@ -24,7 +24,10 @@ PAPER_TRADING=true
 LIVE_TRADING_ENABLED=false
 EXECUTION_KILL_SWITCH=true
 KALSHI_ENV=demo
+CORS_ORIGINS=https://YOUR-VERCEL-DASHBOARD-URL
 ```
+
+Use the exact Vercel dashboard origin for `CORS_ORIGINS`, without a trailing slash. Example: `https://homerun.vercel.app`.
 
 9. Do not add production Kalshi credentials in PR 1.
 10. Deploy the service.

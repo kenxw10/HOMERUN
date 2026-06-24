@@ -87,6 +87,12 @@ select {
   background: #dbf8e7;
 }
 
+.badge-danger {
+  border-color: #bd3b20;
+  color: #7a2311;
+  background: #ffe7de;
+}
+
 .api-error,
 .api-loading {
   display: grid;

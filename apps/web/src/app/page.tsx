@@ -129,8 +129,46 @@ async function fetchJson<T>(url: string): Promise<T> {
   return response.json() as Promise<T>;
 }
 
-function Badge({ children, tone }: { children: React.ReactNode; tone: "paper" | "safe" }) {
+type SafetyBadge = {
+  label: string;
+  tone: "paper" | "safe" | "danger";
+};
+
+function Badge({ children, tone }: { children: React.ReactNode; tone: SafetyBadge["tone"] }) {
   return <span className={`badge badge-${tone}`}>{children}</span>;
+}
+
+function getSafetyBadges(state: DashboardState): SafetyBadge[] {
+  if (state.status === "loading") {
+    return [
+      { label: "Loading Mode", tone: "paper" },
+      { label: "Safety Unknown", tone: "danger" },
+    ];
+  }
+
+  if (state.status === "error") {
+    return [
+      { label: "API Unavailable", tone: "danger" },
+      { label: "Safety Unknown", tone: "danger" },
+    ];
+  }
+
+  const config = state.system.config;
+
+  return [
+    {
+      label: config.paper_trading ? "Paper Mode" : "Paper Mode Off",
+      tone: config.paper_trading ? "paper" : "danger",
+    },
+    {
+      label: config.live_trading_enabled ? "Live Trading Enabled" : "Live Trading Disabled",
+      tone: config.live_trading_enabled ? "danger" : "safe",
+    },
+    {
+      label: config.execution_kill_switch ? "Kill Switch On" : "Kill Switch Off",
+      tone: config.execution_kill_switch ? "safe" : "danger",
+    },
+  ];
 }
 
 function StatCard({ label, value, detail }: { label: string; value: string; detail: string }) {
@@ -333,6 +371,7 @@ export default function DashboardPage() {
   const summary = state.status === "ready" ? state.summary : emptySummary;
   const system = state.status === "ready" ? state.system : null;
   const isLoading = state.status === "loading";
+  const safetyBadges = getSafetyBadges(state);
 
   return (
     <main className="dashboard-shell">
@@ -342,8 +381,11 @@ export default function DashboardPage() {
           <h1>HOMERUN</h1>
         </div>
         <div className="badge-row" aria-label="Trading safety mode">
-          <Badge tone="paper">Paper Mode</Badge>
-          <Badge tone="safe">Live Trading Disabled</Badge>
+          {safetyBadges.map((badge) => (
+            <Badge key={badge.label} tone={badge.tone}>
+              {badge.label}
+            </Badge>
+          ))}
         </div>
       </header>
 
