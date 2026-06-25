@@ -288,6 +288,11 @@ def validate_market_for_game(
         mapping_status = "candidate"
         validation_status = "plausible"
         confidence = Decimal("0.7500")
+    elif strategy == "series_window_fallback":
+        notes.append("REJECTED_UNRELATED_FALLBACK_MARKET")
+        mapping_status = "rejected_unrelated"
+        validation_status = "rejected_unrelated"
+        confidence = Decimal("0.0000")
     else:
         notes.append("TARGETED_MATCH_UNCERTAIN")
         mapping_status = "needs_review"
@@ -405,12 +410,13 @@ def _add_validated_markets(
         if not ticker or ticker in seen_tickers:
             continue
         seen_tickers.add(ticker)
-        resolution.matches.append(
-            validate_market_for_game(
-                game,
-                market,
-                resolution.attempted_event_tickers,
-                resolution.attempted_market_tickers,
-                strategy,
-            )
+        match = validate_market_for_game(
+            game,
+            market,
+            resolution.attempted_event_tickers,
+            resolution.attempted_market_tickers,
+            strategy,
         )
+        if match.mapping_status == "rejected_unrelated":
+            continue
+        resolution.matches.append(match)

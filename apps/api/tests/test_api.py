@@ -1194,6 +1194,78 @@ def test_resolver_series_fallback_close_window_covers_mlb_expiration() -> None:
     assert max_pages == 2
 
 
+def test_market_sync_drops_unrelated_series_fallback_markets(monkeypatch) -> None:
+    class FakeKalshiClient:
+        def __init__(self) -> None:
+            self.orderbook_calls: list[str] = []
+
+        def get_markets_by_tickers(self, tickers: list[str]):
+            return {"markets": []}
+
+        def get_event(self, event_ticker: str):
+            return {"event": {"markets": []}}
+
+        def get_markets_by_event_ticker(self, event_ticker: str, limit: int = 100):
+            return {"markets": []}
+
+        def get_markets_by_series_window(
+            self,
+            series_ticker: str,
+            min_close_ts: int,
+            max_close_ts: int,
+            *,
+            limit: int = 100,
+            max_pages: int = 2,
+        ):
+            return [
+                {
+                    "id": "unrelated-fallback-market",
+                    "ticker": "KXMLBGAME-26JUN261940KCCWS-KC",
+                    "event_ticker": "KXMLBGAME-26JUN261940KCCWS",
+                    "title": "Kansas City Royals vs Chicago White Sox",
+                    "status": "open",
+                    "occurrence_datetime": "2026-06-26T23:40:00Z",
+                    "yes_ask_dollars": "0.4400",
+                }
+            ]
+
+        def get_orderbook(self, ticker: str):
+            self.orderbook_calls.append(ticker)
+            raise AssertionError("unrelated fallback markets should not fetch orderbooks")
+
+    fake_client = FakeKalshiClient()
+    monkeypatch.setattr(market_sync.KalshiClient, "from_settings", staticmethod(lambda: fake_client))
+    monkeypatch.setattr(market_sync, "utc_now", lambda: datetime(2026, 6, 25, 12, 0, tzinfo=UTC))
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        session.add(
+            MlbGame(
+                external_game_id="fallback-unrelated-1",
+                home_team="Detroit Tigers",
+                away_team="Houston Astros",
+                home_abbreviation="DET",
+                away_abbreviation="HOU",
+                scheduled_start=datetime(2026, 6, 26, 22, 40, tzinfo=UTC),
+                status="scheduled",
+            )
+        )
+        session.commit()
+
+        summary = market_sync.sync_kalshi_markets(session)
+        markets = list(session.scalars(select(KalshiMarket)))
+        mappings = list(session.scalars(select(MarketMapping)))
+
+    assert summary["games_considered"] == 1
+    assert summary["markets_upserted"] == 0
+    assert summary["mappings_created_or_updated"] == 0
+    assert markets == []
+    assert mappings == []
+    assert fake_client.orderbook_calls == []
+
+
 def test_market_sync_rejects_multivariate_markets(monkeypatch) -> None:
     class FakeKalshiClient:
         def get_markets_by_tickers(self, tickers: list[str]):
