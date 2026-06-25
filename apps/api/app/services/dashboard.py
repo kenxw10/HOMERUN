@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, time, timedelta
 from decimal import Decimal
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
@@ -168,9 +168,14 @@ def list_today_markets(session: Session):
         session.execute(
             select(KalshiMarket, MarketMapping)
             .outerjoin(MarketMapping, KalshiMarket.id == MarketMapping.kalshi_market_id)
-            .where(KalshiMarket.close_time >= start)
-            .where(KalshiMarket.close_time < end)
-            .order_by(KalshiMarket.close_time.asc().nullslast())
+            .outerjoin(MlbGame, MarketMapping.mlb_game_id == MlbGame.id)
+            .where(
+                or_(
+                    (KalshiMarket.occurrence_datetime >= start) & (KalshiMarket.occurrence_datetime < end),
+                    (MlbGame.scheduled_start >= start) & (MlbGame.scheduled_start < end),
+                )
+            )
+            .order_by(KalshiMarket.occurrence_datetime.asc().nullslast(), MlbGame.scheduled_start.asc().nullslast())
             .limit(500)
         )
     )

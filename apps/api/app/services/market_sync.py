@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -13,6 +13,8 @@ from app.time_utils import parse_datetime, utc_now
 
 BASEBALL_KEYWORDS = ("mlb", "baseball", "world series", "american league", "national league")
 DISCOVERABLE_MARKET_STATUSES = {"open", "unopened"}
+DISCOVERY_LOOKBACK = timedelta(days=2)
+DISCOVERY_LOOKAHEAD = timedelta(days=21)
 
 
 def _decimal(value: object) -> Decimal | None:
@@ -45,6 +47,15 @@ def _market_text(market: dict[str, Any]) -> str:
 def looks_like_baseball_market(market: dict[str, Any]) -> bool:
     text = _market_text(market)
     return any(keyword in text for keyword in BASEBALL_KEYWORDS)
+
+
+def _market_relevant_time(market: dict[str, Any]) -> datetime | None:
+    return parse_datetime(market.get("expected_expiration_time") or market.get("occurrence_datetime") or market.get("close_time"))
+
+
+def _market_in_discovery_window(market: dict[str, Any], start: datetime, end: datetime) -> bool:
+    relevant_time = _market_relevant_time(market)
+    return relevant_time is not None and start <= relevant_time < end
 
 
 def _market_status(market: dict[str, Any]) -> str:
@@ -91,12 +102,10 @@ def _update_market_fields(row: KalshiMarket, market: dict[str, Any], ticker: str
 
 def sync_kalshi_markets(session: Session, max_pages: int | None = None, fetch_orderbooks: bool = True) -> int:
     client = KalshiClient.from_settings()
-    close_start = utc_now() - timedelta(days=2)
-    close_end = utc_now() + timedelta(days=21)
+    discovery_start = utc_now() - DISCOVERY_LOOKBACK
+    discovery_end = utc_now() + DISCOVERY_LOOKAHEAD
     params = {
         "limit": 200,
-        "min_close_ts": int(close_start.timestamp()),
-        "max_close_ts": int(close_end.timestamp()),
     }
 
     count = 0
@@ -107,7 +116,11 @@ def sync_kalshi_markets(session: Session, max_pages: int | None = None, fetch_or
 
         status = _market_status(market)
         existing = session.scalar(select(KalshiMarket).where(KalshiMarket.ticker == ticker))
-        should_track_new_market = status in DISCOVERABLE_MARKET_STATUSES and looks_like_baseball_market(market)
+        should_track_new_market = (
+            status in DISCOVERABLE_MARKET_STATUSES
+            and looks_like_baseball_market(market)
+            and _market_in_discovery_window(market, discovery_start, discovery_end)
+        )
         if existing is None and not should_track_new_market:
             continue
 

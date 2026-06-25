@@ -688,7 +688,17 @@ def test_market_sync_uses_valid_filters_and_clears_stale_orderbook(monkeypatch) 
                 "title": "MLB Yankees baseball market",
                 "status": "open",
                 "yes_ask": 46,
-                "close_time": "2026-07-01T23:00:00Z",
+                "expected_expiration_time": "2026-07-01T23:00:00Z",
+                "close_time": "2026-09-01T23:00:00Z",
+            }
+            yield {
+                "id": "market-future",
+                "ticker": "KXMLB-FUTURE",
+                "title": "MLB future baseball market",
+                "status": "open",
+                "yes_ask": 45,
+                "expected_expiration_time": "2026-08-15T23:00:00Z",
+                "close_time": "2026-09-01T23:00:00Z",
             }
             yield {
                 "id": "market-closed",
@@ -704,6 +714,7 @@ def test_market_sync_uses_valid_filters_and_clears_stale_orderbook(monkeypatch) 
 
     fake_client = FakeKalshiClient()
     monkeypatch.setattr(market_sync.KalshiClient, "from_settings", staticmethod(lambda: fake_client))
+    monkeypatch.setattr(market_sync, "utc_now", lambda: datetime(2026, 6, 30, 12, 0, tzinfo=UTC))
 
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
@@ -728,14 +739,18 @@ def test_market_sync_uses_valid_filters_and_clears_stale_orderbook(monkeypatch) 
         assert count == 1
         assert fake_client.params is not None
         assert "status" not in fake_client.params
-        assert "min_close_ts" in fake_client.params
-        assert "max_close_ts" in fake_client.params
+        assert "min_close_ts" not in fake_client.params
+        assert "max_close_ts" not in fake_client.params
 
         open_market = session.scalar(select(KalshiMarket).where(KalshiMarket.ticker == "KXMLB-OPEN"))
+        future_market = session.scalar(select(KalshiMarket).where(KalshiMarket.ticker == "KXMLB-FUTURE"))
         closed_market = session.scalar(select(KalshiMarket).where(KalshiMarket.ticker == "KXMLB-CLOSED"))
 
+        assert future_market is None
         assert closed_market is None
         assert open_market is not None
+        assert open_market.occurrence_datetime == datetime(2026, 7, 1, 23, 0)
+        assert open_market.close_time == datetime(2026, 9, 1, 23, 0)
         assert open_market.best_yes_bid is None
         assert open_market.best_no_bid is None
         assert open_market.implied_yes_ask is None
@@ -916,40 +931,65 @@ def test_market_sync_reads_fixed_point_orderbook_wrapper(monkeypatch) -> None:
         assert row.implied_no_ask == Decimal("0.5800")
 
 
-def test_list_today_markets_only_returns_today_close_times(monkeypatch) -> None:
+def test_list_today_markets_uses_occurrence_or_mapped_game_time(monkeypatch) -> None:
     monkeypatch.setattr(dashboard, "today_eastern", lambda: datetime(2026, 7, 1, tzinfo=UTC).date())
 
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
 
     with Session(engine) as session:
-        today_market = KalshiMarket(
-            kalshi_market_id="KX-TODAY",
-            ticker="KXMLB-TODAY",
-            title="Today market",
+        occurrence_today_market = KalshiMarket(
+            kalshi_market_id="KX-OCCURRENCE-TODAY",
+            ticker="KXMLB-OCCURRENCE-TODAY",
+            title="Occurrence today market",
+            status="open",
+            occurrence_datetime=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+            close_time=datetime(2026, 8, 1, 23, 0, tzinfo=UTC),
+        )
+        mapped_game = MlbGame(
+            external_game_id="market-list-game",
+            home_team="New York Yankees",
+            away_team="Boston Red Sox",
+            scheduled_start=datetime(2026, 7, 1, 22, 0, tzinfo=UTC),
+            status="scheduled",
+        )
+        mapped_today_market = KalshiMarket(
+            kalshi_market_id="KX-MAPPED-TODAY",
+            ticker="KXMLB-MAPPED-TODAY",
+            title="Mapped today market",
+            status="open",
+            close_time=datetime(2026, 8, 1, 23, 0, tzinfo=UTC),
+        )
+        tomorrow_market = KalshiMarket(
+            kalshi_market_id="KX-OCCURRENCE-TOMORROW",
+            ticker="KXMLB-OCCURRENCE-TOMORROW",
+            title="Occurrence tomorrow market",
+            status="open",
+            occurrence_datetime=datetime(2026, 7, 2, 23, 0, tzinfo=UTC),
+            close_time=datetime(2026, 8, 1, 23, 0, tzinfo=UTC),
+        )
+        close_today_only_market = KalshiMarket(
+            kalshi_market_id="KX-CLOSE-TODAY",
+            ticker="KXMLB-CLOSE-TODAY",
+            title="Close today market",
             status="open",
             close_time=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
         )
-        tomorrow_market = KalshiMarket(
-            kalshi_market_id="KX-TOMORROW",
-            ticker="KXMLB-TOMORROW",
-            title="Tomorrow market",
-            status="open",
-            close_time=datetime(2026, 7, 2, 23, 0, tzinfo=UTC),
+        session.add_all([occurrence_today_market, mapped_game, mapped_today_market, tomorrow_market, close_today_only_market])
+        session.flush()
+        session.add(
+            MarketMapping(
+                mlb_game_id=mapped_game.id,
+                kalshi_market_id=mapped_today_market.id,
+                mapping_status="candidate",
+                confidence=Decimal("0.9500"),
+            )
         )
-        no_close_market = KalshiMarket(
-            kalshi_market_id="KX-NO-CLOSE",
-            ticker="KXMLB-NO-CLOSE",
-            title="No close market",
-            status="open",
-            close_time=None,
-        )
-        session.add_all([today_market, tomorrow_market, no_close_market])
         session.commit()
 
         rows = dashboard.list_today_markets(session)
 
-    assert [market.ticker for market, _ in rows] == ["KXMLB-TODAY"]
+    assert {market.ticker for market, _ in rows} == {"KXMLB-OCCURRENCE-TODAY", "KXMLB-MAPPED-TODAY"}
 
 
 def test_dashboard_uses_newest_portfolio_snapshots() -> None:
