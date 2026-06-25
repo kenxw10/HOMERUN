@@ -2473,6 +2473,7 @@ def test_market_family_discovery_parses_line_from_ticker_tail_not_date_prefix() 
     assert result["markets_found"] == 1
     assert item is not None
     assert item.line_value == Decimal("-1.5000")
+    assert item.selection_code == "PIT"
     assert item.line_value != Decimal("26.0000")
 
 
@@ -2697,6 +2698,16 @@ def test_open_position_price_refresh_updates_only_open_paper_trades() -> None:
             entry_time=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
             status="open",
         )
+        legacy_position = Position(
+            kalshi_market_id=market.id,
+            market_ticker=market.ticker,
+            contract_side="yes",
+            entry_price=Decimal("0.4000"),
+            current_price=Decimal("0.4000"),
+            quantity=1,
+            opened_at=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
+            status="open",
+        )
         settled_trade = PaperTrade(
             market_ticker="KXMLBGAME-SETTLED-PIT",
             contract_side="yes",
@@ -2706,18 +2717,22 @@ def test_open_position_price_refresh_updates_only_open_paper_trades() -> None:
             entry_time=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
             status="settled",
         )
-        session.add_all([open_trade, settled_trade])
+        session.add_all([open_trade, legacy_position, settled_trade])
         session.commit()
 
         result = position_refresh.refresh_open_position_prices(session, client=FakeOrderbookClient())
         session.refresh(open_trade)
+        session.refresh(legacy_position)
         session.refresh(settled_trade)
         snapshot = session.scalar(select(BalanceSnapshot))
+        summary = dashboard.dashboard_summary_from_db(session)
 
     assert result["checked"] == 1
     assert result["updated"] == 1
     assert open_trade.current_price == Decimal("0.4400")
     assert open_trade.current_price_updated_at is not None
+    assert legacy_position.current_price == Decimal("0.4400")
+    assert summary.positions[0].current_price == 0.44
     assert settled_trade.current_price == Decimal("1.0000")
     assert snapshot is not None
     assert snapshot.source == "paper"

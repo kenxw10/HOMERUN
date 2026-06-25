@@ -6,7 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
-from app.models import KalshiMarket, ModelCandidate, PaperTrade
+from app.models import KalshiMarket, ModelCandidate, PaperTrade, Position
 from app.services.kalshi import KalshiAPIError, KalshiClient, derive_orderbook_prices
 from app.services.portfolio import create_balance_snapshot
 from app.time_utils import utc_now
@@ -82,6 +82,17 @@ def refresh_open_position_prices(
         trade.current_price = mark
         trade.current_price_updated_at = now
         session.add(trade)
+        matching_positions = list(
+            session.scalars(
+                select(Position)
+                .where(Position.status == "open")
+                .where(Position.market_ticker == trade.market_ticker)
+                .where(Position.contract_side == trade.contract_side)
+            )
+        )
+        for position in matching_positions:
+            position.current_price = mark
+            session.add(position)
         if market is not None:
             session.add(market)
         updated += 1

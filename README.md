@@ -154,7 +154,7 @@ Add these PR 3a checks after the PR 3 flow:
 
 ```powershell
 Invoke-RestMethod -Method Post -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-RAILWAY-API/v1/run/market-family-discovery?target_date=2026-06-26"
-Invoke-RestMethod "https://YOUR-RAILWAY-API/v1/market-families/discovery?date=2026-06-26"
+Invoke-RestMethod -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-RAILWAY-API/v1/market-families/discovery?date=2026-06-26"
 Invoke-RestMethod -Method Post -Headers @{"X-API-Key"="YOUR_KEY"} https://YOUR-RAILWAY-API/v1/run/open-position-price-refresh
 ```
 

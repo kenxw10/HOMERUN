@@ -242,7 +242,15 @@ def _selection_code(market: dict[str, Any]) -> str | None:
     ticker = str(market.get("ticker") or "").upper()
     if "-" not in ticker:
         return None
-    selected = re.sub(r"[^A-Z0-9]", "", ticker.rsplit("-", 1)[-1])
+    ticker_parts = ticker.split("-")
+    selected_part = ticker_parts[-1]
+    if len(ticker_parts) >= 3 and _decimal(selected_part) is not None:
+        selected_part = ticker_parts[-2]
+    else:
+        compact_line = re.match(r"^([A-Z0-9]{2,5})[+-]\d+(?:\.\d+)?$", selected_part)
+        if compact_line:
+            selected_part = compact_line.group(1)
+    selected = re.sub(r"[^A-Z0-9]", "", selected_part)
     return selected or None
 
 
