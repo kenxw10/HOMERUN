@@ -92,15 +92,24 @@ def score_mapping(game: MlbGame, market: KalshiMarket) -> tuple[Decimal, str, di
             score += Decimal("0.30")
             reasons.append(f"TEAM_MATCH:{team}")
 
+    date_proximity_matched = False
+    minutes_from_start: int | None = None
     market_time = market.occurrence_datetime or market.close_time
     if market_time:
         minutes = abs((ensure_aware_utc(market_time) - ensure_aware_utc(game.scheduled_start)).total_seconds()) / 60
+        minutes_from_start = int(minutes)
         if minutes <= 360:
+            date_proximity_matched = True
             score += Decimal("0.25")
             reasons.append("START_TIME_PROXIMITY")
         elif minutes <= 24 * 60:
+            date_proximity_matched = True
             score += Decimal("0.10")
             reasons.append("SAME_DAY_PROXIMITY")
+        else:
+            reasons.append("DATE_PROXIMITY_MISMATCH")
+    else:
+        reasons.append("DATE_PROXIMITY_MISSING")
 
     market_type = infer_market_type(text)
     if market_type != "unknown":
@@ -109,7 +118,9 @@ def score_mapping(game: MlbGame, market: KalshiMarket) -> tuple[Decimal, str, di
 
     confidence = min(score, Decimal("0.9500")).quantize(Decimal("0.0001"))
     both_teams_matched = matched_teams == 2
-    if both_teams_matched and confidence >= Decimal("0.60"):
+    if both_teams_matched and not date_proximity_matched:
+        status = "rejected"
+    elif both_teams_matched and confidence >= Decimal("0.60"):
         status = "candidate"
     elif confidence >= Decimal("0.25"):
         status = "needs_review"
@@ -122,6 +133,8 @@ def score_mapping(game: MlbGame, market: KalshiMarket) -> tuple[Decimal, str, di
         "home_team": game.home_team,
         "away_team": game.away_team,
         "matched_team_count": matched_teams,
+        "date_proximity_matched": date_proximity_matched,
+        "minutes_from_start": minutes_from_start,
         "market_ticker": market.ticker,
     }
     return confidence, status, metadata

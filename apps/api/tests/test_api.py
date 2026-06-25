@@ -157,6 +157,7 @@ def test_generate_candidates_preserves_traded_candidate_snapshot(monkeypatch) ->
             ticker="KXMLB-PRESERVE",
             title="Will the New York Yankees win the game against the Boston Red Sox?",
             status="open",
+            occurrence_datetime=now + timedelta(hours=25),
             implied_yes_ask=Decimal("0.4000"),
         )
         session.add_all([game, market])
@@ -207,6 +208,7 @@ def test_generate_candidates_avoids_duplicate_open_trade_across_days(monkeypatch
             ticker="KXMLB-DUPLICATE",
             title="Will the New York Yankees win the game against the Boston Red Sox?",
             status="open",
+            occurrence_datetime=datetime(2026, 7, 4, 0, 0, tzinfo=UTC),
             implied_yes_ask=Decimal("0.4000"),
         )
         session.add_all([game, market])
@@ -248,6 +250,7 @@ def test_generate_candidates_refreshes_existing_open_trade_price(monkeypatch) ->
             ticker="KXMLB-REFRESH",
             title="Will the New York Yankees win the game against the Boston Red Sox?",
             status="open",
+            occurrence_datetime=datetime(2026, 7, 4, 0, 0, tzinfo=UTC),
             implied_yes_ask=Decimal("0.4000"),
         )
         session.add_all([game, market])
@@ -280,7 +283,7 @@ def test_mapping_confidence_and_rationale() -> None:
         external_game_id="1",
         home_team="New York Yankees",
         away_team="Boston Red Sox",
-        scheduled_start="2026-07-01T23:05:00+00:00",
+        scheduled_start=datetime(2026, 7, 1, 23, 5, tzinfo=UTC),
         status="scheduled",
     )
     market = KalshiMarket(
@@ -288,6 +291,7 @@ def test_mapping_confidence_and_rationale() -> None:
         ticker="KXMLB-YANKEES-RED-SOX",
         title="Will the New York Yankees win the game against the Boston Red Sox?",
         status="open",
+        occurrence_datetime=datetime(2026, 7, 1, 23, 10, tzinfo=UTC),
     )
 
     confidence, status, metadata = score_mapping(game, market)
@@ -296,7 +300,81 @@ def test_mapping_confidence_and_rationale() -> None:
     assert status == "candidate"
     assert metadata["market_type"] == "full_game_moneyline"
     assert metadata["matched_team_count"] == 2
+    assert metadata["date_proximity_matched"] is True
     assert infer_market_type("first five total runs") == "first_five_total"
+
+
+def test_mapping_requires_date_proximity_for_candidate_status() -> None:
+    game = MlbGame(
+        external_game_id="date-match-1",
+        home_team="New York Yankees",
+        away_team="Boston Red Sox",
+        scheduled_start=datetime(2026, 7, 1, 23, 5, tzinfo=UTC),
+        status="scheduled",
+    )
+    missing_date_market = KalshiMarket(
+        kalshi_market_id="KX-MISSING-DATE",
+        ticker="KXMLB-YANKEES-RED-SOX-MISSING-DATE",
+        title="Will the New York Yankees win the game against the Boston Red Sox?",
+        status="open",
+    )
+    far_date_market = KalshiMarket(
+        kalshi_market_id="KX-FAR-DATE",
+        ticker="KXMLB-YANKEES-RED-SOX-FAR-DATE",
+        title="Will the New York Yankees win the game against the Boston Red Sox?",
+        status="open",
+        occurrence_datetime=datetime(2026, 7, 8, 23, 5, tzinfo=UTC),
+    )
+
+    missing_confidence, missing_status, missing_metadata = score_mapping(game, missing_date_market)
+    far_confidence, far_status, far_metadata = score_mapping(game, far_date_market)
+
+    assert missing_confidence == Decimal("0.7500")
+    assert missing_status == "rejected"
+    assert missing_metadata["matched_team_count"] == 2
+    assert missing_metadata["date_proximity_matched"] is False
+    assert "DATE_PROXIMITY_MISSING" in missing_metadata["reasons"]
+    assert far_confidence == Decimal("0.7500")
+    assert far_status == "rejected"
+    assert far_metadata["matched_team_count"] == 2
+    assert far_metadata["date_proximity_matched"] is False
+    assert "DATE_PROXIMITY_MISMATCH" in far_metadata["reasons"]
+
+
+def test_sync_market_mappings_ignores_same_teams_on_wrong_date() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        old_game = MlbGame(
+            external_game_id="same-teams-old",
+            home_team="New York Yankees",
+            away_team="Boston Red Sox",
+            scheduled_start=datetime(2026, 7, 1, 23, 5, tzinfo=UTC),
+            status="final",
+        )
+        current_game = MlbGame(
+            external_game_id="same-teams-current",
+            home_team="New York Yankees",
+            away_team="Boston Red Sox",
+            scheduled_start=datetime(2026, 7, 8, 23, 5, tzinfo=UTC),
+            status="scheduled",
+        )
+        market = KalshiMarket(
+            kalshi_market_id="KX-SAME-TEAMS-CURRENT",
+            ticker="KXMLB-YANKEES-RED-SOX-CURRENT",
+            title="Will the New York Yankees win the game against the Boston Red Sox?",
+            status="open",
+            occurrence_datetime=datetime(2026, 7, 8, 23, 10, tzinfo=UTC),
+        )
+        session.add_all([old_game, current_game, market])
+        session.commit()
+
+        sync_market_mappings(session)
+        mappings = session.execute(select(MarketMapping, MlbGame).join(MlbGame)).all()
+
+    status_by_game = {game.external_game_id: mapping.mapping_status for mapping, game in mappings}
+    assert status_by_game == {"same-teams-current": "candidate"}
 
 
 def test_mapping_requires_unambiguous_team_matches() -> None:
@@ -340,6 +418,7 @@ def test_sync_market_mappings_updates_existing_rows_to_rejected() -> None:
             ticker="KXMLB-STALE-MAP",
             title="Will the New York Yankees win the game against the Boston Red Sox?",
             status="open",
+            occurrence_datetime=datetime(2026, 7, 1, 23, 5, tzinfo=UTC),
         )
         session.add_all([game, market])
         session.commit()
@@ -350,6 +429,7 @@ def test_sync_market_mappings_updates_existing_rows_to_rejected() -> None:
         assert mapping.mapping_status == "candidate"
 
         market.title = "Will the Los Angeles Dodgers win the game against the San Francisco Giants?"
+        market.occurrence_datetime = None
         session.add(market)
         session.commit()
 
