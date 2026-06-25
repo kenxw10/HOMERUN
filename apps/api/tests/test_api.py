@@ -973,6 +973,20 @@ def test_internal_sync_endpoints_require_api_key_when_configured(monkeypatch) ->
     assert response.status_code == 401
 
 
+def test_market_family_discovery_report_endpoints_require_api_key_when_configured(monkeypatch) -> None:
+    monkeypatch.setenv("BACKEND_API_KEY", "secret-test-key")
+    get_settings.cache_clear()
+
+    try:
+        report_response = client.get("/v1/market-families/discovery?date=2026-07-01")
+        preview_response = client.get("/v1/market-families/discovery-preview?date=2026-07-01")
+    finally:
+        get_settings.cache_clear()
+
+    assert report_response.status_code == 401
+    assert preview_response.status_code == 401
+
+
 def test_internal_sync_endpoints_fail_closed_in_production_without_api_key(monkeypatch) -> None:
     monkeypatch.setenv("APP_ENV", "production")
     monkeypatch.delenv("BACKEND_API_KEY", raising=False)
@@ -2407,6 +2421,88 @@ def test_market_family_discovery_persists_structured_by_family_and_excludes_mve(
     assert items[0].family_key == "full_game_spread"
     assert items[0].line_value == Decimal("-1.5000")
     assert all(params["mve_filter"] == "exclude" for params in fake_client.series_params)
+
+
+def test_market_family_discovery_series_window_filters_to_matching_game() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    class FakeSeriesClient:
+        def get_event(self, event_ticker: str):
+            return {"event": {"markets": []}}
+
+        def get_markets_by_event_ticker(self, event_ticker: str):
+            return {"markets": []}
+
+        def iter_markets(self, params: dict[str, object], max_pages: int | None = None):
+            if params["series_ticker"] != "KXMLBSPREAD":
+                return iter([])
+            return iter(
+                [
+                    {
+                        "ticker": "KXMLBSPREAD-26JUL011900SEAPIT-PIT-1.5",
+                        "event_ticker": "KXMLBSPREAD-26JUL011900SEAPIT",
+                        "title": "Pittsburgh Pirates spread -1.5 vs Seattle Mariners",
+                        "status": "open",
+                        "functional_strike": "-1.5",
+                    },
+                    {
+                        "ticker": "KXMLBSPREAD-26JUL011840HOUDET-HOU-1.5",
+                        "event_ticker": "KXMLBSPREAD-26JUL011840HOUDET",
+                        "title": "Houston Astros spread -1.5 vs Detroit Tigers",
+                        "status": "open",
+                        "functional_strike": "-1.5",
+                    },
+                    {
+                        "ticker": "KXMLBSPREAD-26JUL021900NYBOS-NY-1.5",
+                        "event_ticker": "KXMLBSPREAD-26JUL021900NYBOS",
+                        "title": "Unrelated next-day spread",
+                        "status": "open",
+                    },
+                ]
+            )
+
+    with Session(engine) as session:
+        session.add_all(
+            [
+                MlbGame(
+                    external_game_id="series-filter-pit-sea",
+                    home_team="Pittsburgh Pirates",
+                    away_team="Seattle Mariners",
+                    home_abbreviation="PIT",
+                    away_abbreviation="SEA",
+                    scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+                    status="scheduled",
+                ),
+                MlbGame(
+                    external_game_id="series-filter-hou-det",
+                    home_team="Detroit Tigers",
+                    away_team="Houston Astros",
+                    home_abbreviation="DET",
+                    away_abbreviation="HOU",
+                    scheduled_start=datetime(2026, 7, 1, 22, 40, tzinfo=UTC),
+                    status="scheduled",
+                ),
+            ]
+        )
+        session.commit()
+
+        result = market_family_discovery.run_market_family_discovery(
+            session,
+            date(2026, 7, 1),
+            client=FakeSeriesClient(),
+        )
+        items = list(session.scalars(select(MarketFamilyDiscoveryItem).order_by(MarketFamilyDiscoveryItem.returned_ticker)))
+
+    assert result["markets_found"] == 2
+    assert result["by_family"]["full_game_spread"]["game_coverage_count"] == 2
+    assert {item.returned_ticker for item in items} == {
+        "KXMLBSPREAD-26JUL011840HOUDET-HOU-1.5",
+        "KXMLBSPREAD-26JUL011900SEAPIT-PIT-1.5",
+    }
+    assert len({item.mlb_game_id for item in items}) == 2
+    skipped = [warning for warning in result["warnings"] if warning["message"] == "SERIES_WINDOW_MARKET_SKIPPED_UNRELATED"]
+    assert skipped
 
 
 def test_new_market_families_remain_discovery_only_for_candidate_generation(monkeypatch) -> None:

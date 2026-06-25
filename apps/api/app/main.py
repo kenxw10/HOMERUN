@@ -330,7 +330,10 @@ def run_market_family_discovery_endpoint(
 
 
 @app.get("/v1/market-families/discovery", response_model=RunResponse)
-def market_family_discovery_report(target_date: date | None = Query(default=None, alias="date")) -> RunResponse:
+def market_family_discovery_report(
+    target_date: date | None = Query(default=None, alias="date"),
+    _: None = Depends(require_internal_api_key),
+) -> RunResponse:
     with _db_session_or_503() as session:
         result = latest_market_family_discovery(session, target_date)
     return RunResponse(ok=True, action="market_family_discovery_report", result=result)
@@ -339,6 +342,7 @@ def market_family_discovery_report(target_date: date | None = Query(default=None
 @app.get("/v1/market-families/discovery-preview", response_model=RunResponse)
 def market_family_discovery_preview_endpoint(
     target_date: date | None = Query(default=None, alias="date"),
+    _: None = Depends(require_internal_api_key),
 ) -> RunResponse:
     with _db_session_or_503() as session:
         result = market_family_discovery_preview(session, target_date)

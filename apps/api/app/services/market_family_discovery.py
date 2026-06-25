@@ -215,6 +215,15 @@ def _event_ticker_candidates(game: MlbGame, family_key: str) -> list[tuple[str, 
     return values
 
 
+def _matches_game_candidate_event(game: MlbGame, family_key: str, market: dict[str, Any]) -> bool:
+    event_tickers = {event_ticker for _series_ticker, event_ticker in _event_ticker_candidates(game, family_key)}
+    returned_event_ticker = str(market.get("event_ticker") or "").upper()
+    returned_ticker = str(market.get("ticker") or "").upper()
+    if returned_event_ticker in event_tickers:
+        return True
+    return any(returned_ticker.startswith(f"{event_ticker}-") for event_ticker in event_tickers)
+
+
 def _item_from_market(
     *,
     run_id: int,
@@ -419,7 +428,7 @@ def run_market_family_discovery(
         return result
 
     kalshi_client = client or KalshiClient.from_settings()
-    seen: set[tuple[int | None, str, str]] = set()
+    seen: set[tuple[object, ...]] = set()
 
     for game in games:
         for family_key in families:
@@ -436,7 +445,23 @@ def run_market_family_discovery(
                         }
                     )
                     continue
-                dedupe_key = (game.id, family_key, ticker)
+                if probe.source_strategy == "series_ticker_window" and not _matches_game_candidate_event(
+                    game, family_key, market
+                ):
+                    warnings.append(
+                        {
+                            "message": "SERIES_WINDOW_MARKET_SKIPPED_UNRELATED",
+                            "family_key": family_key,
+                            "ticker": ticker,
+                            "game_id": game.external_game_id,
+                        }
+                    )
+                    continue
+                dedupe_key = (
+                    (family_key, ticker)
+                    if probe.source_strategy == "series_ticker_window"
+                    else (game.id, family_key, ticker)
+                )
                 if dedupe_key in seen:
                     continue
                 seen.add(dedupe_key)
