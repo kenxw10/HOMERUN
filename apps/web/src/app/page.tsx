@@ -26,10 +26,14 @@ type PositionSummary = {
   side: "yes" | "no";
   entry_price: number;
   current_price: number | null;
+  current_price_updated_at: string | null;
+  current_price_updated_at_display: string | null;
   quantity: number;
   profit_loss: number | null;
   profit_loss_percent: number | null;
   status: string;
+  game_status: string | null;
+  game_status_display: string | null;
   resolution: string | null;
 };
 
@@ -39,6 +43,7 @@ type DashboardSummary = {
   positions: PositionSummary[];
   cash_balance: number | null;
   portfolio_value: number | null;
+  paper_starting_balance: number | null;
   last_update: string | null;
   last_update_display: string | null;
   bot: {
@@ -90,7 +95,19 @@ type StatusRow = {
   tone?: "green" | "amber" | "red";
 };
 
-const chartControls = ["LIVE", "30M", "1D", "1W", "1M", "ALL", "12H", "NORM", "P/L $", "P/L %"];
+type ChartRange = "LIVE" | "30M" | "1D" | "1W" | "1M" | "ALL" | "12H";
+type ChartMode = "NORM" | "P/L $" | "P/L %";
+
+const chartRanges: ChartRange[] = ["LIVE", "30M", "1D", "1W", "1M", "ALL", "12H"];
+const chartModes: ChartMode[] = ["NORM", "P/L $", "P/L %"];
+const rangeMs: Record<Exclude<ChartRange, "ALL">, number> = {
+  LIVE: 15 * 60 * 1000,
+  "30M": 30 * 60 * 1000,
+  "1D": 24 * 60 * 60 * 1000,
+  "1W": 7 * 24 * 60 * 60 * 1000,
+  "1M": 30 * 24 * 60 * 60 * 1000,
+  "12H": 12 * 60 * 60 * 1000,
+};
 
 const emptySummary: DashboardSummary = {
   portfolio_series: [],
@@ -103,6 +120,7 @@ const emptySummary: DashboardSummary = {
   positions: [],
   cash_balance: null,
   portfolio_value: null,
+  paper_starting_balance: 1000,
   last_update: null,
   last_update_display: null,
   bot: {
@@ -259,15 +277,57 @@ function Header({
   );
 }
 
-function buildChart(series: PortfolioPoint[]) {
+function filterPortfolioSeries(series: PortfolioPoint[], range: ChartRange): PortfolioPoint[] {
+  if (range === "ALL" || series.length <= 1) {
+    return series;
+  }
+
+  const latestTimestamp = new Date(series[series.length - 1]?.timestamp ?? "").getTime();
+  if (!Number.isFinite(latestTimestamp)) {
+    return series;
+  }
+
+  const cutoff = latestTimestamp - rangeMs[range];
+  const filtered = series.filter((point) => {
+    const timestamp = new Date(point.timestamp).getTime();
+    return Number.isFinite(timestamp) && timestamp >= cutoff;
+  });
+
+  return filtered.length > 0 ? filtered : series.slice(-1);
+}
+
+function transformPortfolioSeries(series: PortfolioPoint[], mode: ChartMode, startingBalance: number): PortfolioPoint[] {
+  return series.map((point) => {
+    if (mode === "P/L $") {
+      return { ...point, value: point.value - startingBalance };
+    }
+    if (mode === "P/L %") {
+      return { ...point, value: startingBalance > 0 ? (point.value - startingBalance) / startingBalance : 0 };
+    }
+    return point;
+  });
+}
+
+function formatChartValue(value: number | null | undefined, mode: ChartMode): string {
+  if (mode === "P/L $") {
+    return formatSignedCurrency(value);
+  }
+  if (mode === "P/L %") {
+    return formatPercent(value);
+  }
+  return formatCurrency(value);
+}
+
+function buildChart(series: PortfolioPoint[], mode: ChartMode) {
   const width = 1200;
   const height = 260;
   const padding = { top: 24, right: 28, bottom: 34, left: 54 };
   const values = series.map((point) => point.value);
-  const min = values.length ? Math.min(...values) : 24;
-  const max = values.length ? Math.max(...values) : 40;
-  const yMin = Math.floor((min - 2) / 2) * 2;
-  const yMax = Math.ceil((max + 2) / 2) * 2;
+  const min = values.length ? Math.min(...values) : mode === "NORM" ? 24 : -1;
+  const max = values.length ? Math.max(...values) : mode === "NORM" ? 40 : 1;
+  const paddingValue = mode === "P/L %" ? 0.005 : mode === "P/L $" ? 1 : 2;
+  const yMin = Math.floor((min - paddingValue) / paddingValue) * paddingValue;
+  const yMax = Math.ceil((max + paddingValue) / paddingValue) * paddingValue;
   const yRange = yMax - yMin || 1;
   const xRange = width - padding.left - padding.right;
   const yPixels = height - padding.top - padding.bottom;
@@ -290,28 +350,74 @@ function buildChart(series: PortfolioPoint[]) {
 }
 
 function PortfolioChart({ summary }: { summary: DashboardSummary }) {
-  const chart = buildChart(summary.portfolio_series);
-  const latest = summary.portfolio_value ?? chart.latest?.value ?? null;
-  const first = summary.portfolio_series[0]?.value ?? null;
-  const changePct = first && latest !== null ? (latest - first) / first : null;
+  const [activeRange, setActiveRange] = useState<ChartRange>("12H");
+  const [activeMode, setActiveMode] = useState<ChartMode>("NORM");
+  const startingBalance = summary.paper_starting_balance ?? summary.portfolio_series[0]?.value ?? 0;
+  const rangedSeries = useMemo(
+    () => filterPortfolioSeries(summary.portfolio_series, activeRange),
+    [activeRange, summary.portfolio_series],
+  );
+  const displaySeries = useMemo(
+    () => transformPortfolioSeries(rangedSeries, activeMode, startingBalance),
+    [activeMode, rangedSeries, startingBalance],
+  );
+  const chart = buildChart(displaySeries, activeMode);
+  const latestRaw = summary.portfolio_value ?? summary.portfolio_series[summary.portfolio_series.length - 1]?.value ?? null;
+  const latest =
+    activeMode === "NORM"
+      ? latestRaw
+      : latestRaw !== null && startingBalance > 0
+        ? activeMode === "P/L $"
+          ? latestRaw - startingBalance
+          : (latestRaw - startingBalance) / startingBalance
+        : null;
+  const changePct = latestRaw !== null && startingBalance > 0 ? (latestRaw - startingBalance) / startingBalance : null;
   const ticks = [chart.yMax, (chart.yMax + chart.yMin) / 2, chart.yMin];
+  const limitedData =
+    summary.portfolio_series.length > 0 && (rangedSeries.length < 2 || rangedSeries.length < summary.portfolio_series.length);
+  const title =
+    activeMode === "NORM"
+      ? "PORTFOLIO VALUE (PAPER TRADING)"
+      : activeMode === "P/L $"
+        ? "PORTFOLIO P/L $ (PAPER TRADING)"
+        : "PORTFOLIO P/L % (PAPER TRADING)";
 
   return (
     <section className="panel chart-panel">
       <div className="panel-heading chart-heading">
         <div>
-          <h2>PORTFOLIO VALUE (PAPER TRADING)</h2>
+          <h2>{title}</h2>
           <div className="chart-value-row">
-            <strong>{formatCurrency(latest)}</strong>
+            <strong>{formatChartValue(latest, activeMode)}</strong>
             <span className={pctClass(changePct)}>{formatPercent(changePct)}</span>
           </div>
         </div>
-        <div className="chart-controls" aria-label="Static chart controls">
-          {chartControls.map((control) => (
-            <button key={control} className={control === "12H" ? "active" : ""} type="button">
-              {control}
-            </button>
-          ))}
+        <div className="chart-control-stack">
+          <div className="chart-controls" aria-label="Portfolio chart range controls">
+            {chartRanges.map((control) => (
+              <button
+                key={control}
+                className={control === activeRange ? "active" : ""}
+                type="button"
+                onClick={() => setActiveRange(control)}
+              >
+                {control}
+              </button>
+            ))}
+          </div>
+          <div className="chart-controls" aria-label="Portfolio chart display mode controls">
+            {chartModes.map((control) => (
+              <button
+                key={control}
+                className={control === activeMode ? "active" : ""}
+                type="button"
+                onClick={() => setActiveMode(control)}
+              >
+                {control}
+              </button>
+            ))}
+          </div>
+          {limitedData ? <span className="chart-limited-state">LIMITED DATA FOR {activeRange}</span> : null}
         </div>
       </div>
 
@@ -325,7 +431,7 @@ function PortfolioChart({ summary }: { summary: DashboardSummary }) {
             const x = 54 + index * 186;
             return <line key={`v-${index}`} x1={x} y1="24" x2={x} y2="226" className="chart-grid" />;
           })}
-          {summary.portfolio_series.length > 0 ? (
+          {displaySeries.length > 0 ? (
             <>
               <polyline points={chart.polyline} />
               {chart.latest ? (
@@ -333,7 +439,7 @@ function PortfolioChart({ summary }: { summary: DashboardSummary }) {
                   <line x1={chart.latest.x} y1={chart.latest.y} x2="1172" y2={chart.latest.y} className="last-guide" />
                   <rect x="1130" y={chart.latest.y - 11} width="56" height="22" className="last-tag-bg" />
                   <text x="1138" y={chart.latest.y + 5} className="last-tag-text">
-                    {formatCurrency(chart.latest.value)}
+                    {formatChartValue(chart.latest.value, activeMode)}
                   </text>
                 </g>
               ) : null}
@@ -349,7 +455,7 @@ function PortfolioChart({ summary }: { summary: DashboardSummary }) {
         </svg>
         <div className="chart-y-axis">
           {ticks.map((tick) => (
-            <span key={tick}>{formatCurrency(tick)}</span>
+            <span key={tick}>{formatChartValue(tick, activeMode)}</span>
           ))}
         </div>
         <div className="chart-x-axis">
@@ -392,9 +498,11 @@ function PositionsTable({ positions }: { positions: PositionSummary[] }) {
               <th>SIDE</th>
               <th>ENTRY PRICE</th>
               <th>CURRENT PRICE</th>
+              <th>LAST MARK TIME</th>
               <th>QTY</th>
               <th>P/L ($)</th>
               <th>P/L (%)</th>
+              <th>GAME STATUS</th>
               <th>STATUS</th>
               <th>RESOLUTION</th>
             </tr>
@@ -402,7 +510,7 @@ function PositionsTable({ positions }: { positions: PositionSummary[] }) {
           <tbody>
             {positions.length === 0 ? (
               <tr>
-                <td colSpan={10} className="table-empty">
+                <td colSpan={12} className="table-empty">
                   <b>NO OPEN POSITIONS</b>
                   <span>PAPER TRADING HAS NOT TAKEN ANY POSITIONS YET.</span>
                 </td>
@@ -420,9 +528,11 @@ function PositionsTable({ positions }: { positions: PositionSummary[] }) {
                   <td>{position.side.toUpperCase()}</td>
                   <td>{formatPrice(position.entry_price)}</td>
                   <td>{formatPrice(position.current_price)}</td>
+                  <td>{position.current_price_updated_at_display ?? formatEastern(position.current_price_updated_at)}</td>
                   <td>{position.quantity}</td>
                   <td className={pctClass(position.profit_loss)}>{formatSignedCurrency(position.profit_loss)}</td>
                   <td className={pctClass(position.profit_loss_percent)}>{formatPercent(position.profit_loss_percent)}</td>
+                  <td>{position.game_status_display ?? position.game_status ?? "UNKNOWN"}</td>
                   <td>{position.status}</td>
                   <td>{position.resolution ?? "PENDING"}</td>
                 </tr>

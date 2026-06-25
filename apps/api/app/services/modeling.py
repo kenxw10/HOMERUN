@@ -4,11 +4,12 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
-from app.models import CalibrationRun, ModelCandidate, ModelVersion, TrainingRun
+from app.models import CalibrationRun, KalshiMarket, ModelCandidate, ModelVersion, TrainingRun
+from app.services.contracts import market_type_from_ticker
 from app.services.features import FEATURE_VERSION
 from app.time_utils import utc_now
 
@@ -119,21 +120,40 @@ def score_candidate_probability(features: dict[str, object], contract_side: str 
     )
 
 
-def _resolved_sample_count(session: Session) -> int:
-    return int(
-        session.scalar(
-            select(func.count(ModelCandidate.id))
-            .where(ModelCandidate.outcome.in_(["win", "loss"]))
-            .where(ModelCandidate.market_type == MODEL_FAMILY)
-        )
-        or 0
+def _resolved_supported_candidates(session: Session) -> list[ModelCandidate]:
+    rows = session.execute(
+        select(ModelCandidate, KalshiMarket)
+        .outerjoin(KalshiMarket, ModelCandidate.kalshi_market_id == KalshiMarket.id)
+        .where(ModelCandidate.outcome.in_(["win", "loss"]))
     )
+    return [
+        candidate
+        for candidate, market in rows
+        if market_type_from_ticker(market.ticker if market else None, candidate.market_type) == MODEL_FAMILY
+    ]
+
+
+def _repair_resolved_candidate_market_families(session: Session) -> int:
+    repaired = 0
+    for candidate in _resolved_supported_candidates(session):
+        if candidate.market_type != MODEL_FAMILY:
+            candidate.market_type = MODEL_FAMILY
+            session.add(candidate)
+            repaired += 1
+    if repaired:
+        session.flush()
+    return repaired
+
+
+def _resolved_sample_count(session: Session) -> int:
+    return len(_resolved_supported_candidates(session))
 
 
 def run_model_governance(session: Session, now: datetime | None = None) -> dict[str, object]:
     settings = get_settings()
     started = now or utc_now()
     active = get_or_create_heuristic_model_version(session)
+    repaired_candidates = _repair_resolved_candidate_market_families(session)
     sample_count = _resolved_sample_count(session)
     minimum = settings.model_training_min_samples
 
@@ -146,6 +166,7 @@ def run_model_governance(session: Session, now: datetime | None = None) -> dict[
             "model_family": MODEL_FAMILY,
             "minimum_samples": minimum,
             "sample_count": sample_count,
+            "repaired_candidate_market_types": repaired_candidates,
             "validation_policy": "chronological_holdout_required",
             "promotion_policy": "promote only after challenger beats active on out-of-sample log loss and brier",
         },
@@ -159,6 +180,7 @@ def run_model_governance(session: Session, now: datetime | None = None) -> dict[
             "model_family": MODEL_FAMILY,
             "minimum_samples": minimum,
             "sample_count": sample_count,
+            "repaired_candidate_market_types": repaired_candidates,
             "calibration_policy": "skip tiny samples to avoid overfit",
         },
     )
@@ -185,6 +207,7 @@ def run_model_governance(session: Session, now: datetime | None = None) -> dict[
         "status": training.status,
         "reason": reason,
         "resolved_samples": sample_count,
+        "repaired_candidate_market_types": repaired_candidates,
         "minimum_samples": minimum,
         "active_model_version": active.version_tag,
         "training_run_id": training.id,

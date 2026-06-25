@@ -28,9 +28,15 @@ from app.services.dashboard import (
     list_today_games,
     list_today_markets,
 )
+from app.services.market_family_discovery import (
+    latest_market_family_discovery,
+    market_family_discovery_preview,
+    run_market_family_discovery,
+)
 from app.services.modeling import run_model_governance
 from app.services.market_sync import resolve_preview_for_date, sync_kalshi_markets
 from app.services.mlb import sync_results, sync_schedule
+from app.services.position_refresh import refresh_open_position_prices
 from app.services.portfolio import create_balance_snapshot
 from app.services.settlement import settle_paper_trades
 from app.time_utils import eastern_display, to_eastern_iso
@@ -299,8 +305,41 @@ def run_balance_snapshot(_: None = Depends(require_internal_api_key)) -> RunResp
     return RunResponse(ok=True, action="balance_snapshot", result=result)
 
 
+@app.post("/v1/run/open-position-price-refresh", response_model=RunResponse)
+def run_open_position_price_refresh(_: None = Depends(require_internal_api_key)) -> RunResponse:
+    with _db_session_or_503() as session:
+        result = refresh_open_position_prices(session)
+    return RunResponse(ok=True, action="open_position_price_refresh", result=result)
+
+
 @app.post("/v1/run/model-governance", response_model=RunResponse)
 def run_model_governance_endpoint(_: None = Depends(require_internal_api_key)) -> RunResponse:
     with _db_session_or_503() as session:
         result = run_model_governance(session)
     return RunResponse(ok=True, action="model_governance", result=result)
+
+
+@app.post("/v1/run/market-family-discovery", response_model=RunResponse)
+def run_market_family_discovery_endpoint(
+    target_date: date | None = Query(default=None),
+    _: None = Depends(require_internal_api_key),
+) -> RunResponse:
+    with _db_session_or_503() as session:
+        result = run_market_family_discovery(session, target_date)
+    return RunResponse(ok=True, action="market_family_discovery", result=result)
+
+
+@app.get("/v1/market-families/discovery", response_model=RunResponse)
+def market_family_discovery_report(target_date: date | None = Query(default=None, alias="date")) -> RunResponse:
+    with _db_session_or_503() as session:
+        result = latest_market_family_discovery(session, target_date)
+    return RunResponse(ok=True, action="market_family_discovery_report", result=result)
+
+
+@app.get("/v1/market-families/discovery-preview", response_model=RunResponse)
+def market_family_discovery_preview_endpoint(
+    target_date: date | None = Query(default=None, alias="date"),
+) -> RunResponse:
+    with _db_session_or_503() as session:
+        result = market_family_discovery_preview(session, target_date)
+    return RunResponse(ok=True, action="market_family_discovery_preview", result=result)

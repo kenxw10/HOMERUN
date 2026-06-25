@@ -210,6 +210,12 @@ button {
   background: #f7f9fb;
 }
 
+.chart-control-stack {
+  display: grid;
+  justify-items: end;
+  gap: 6px;
+}
+
 .chart-controls button {
   min-width: 58px;
   height: 30px;
@@ -222,6 +228,12 @@ button {
 .chart-controls .active {
   background: #111827;
   color: #ffffff;
+}
+
+.chart-limited-state {
+  color: #687386;
+  font-size: 10px;
+  font-weight: 800;
 }
 
 .chart-stage {
@@ -361,7 +373,7 @@ button {
 
 .terminal-table {
   width: 100%;
-  min-width: 1180px;
+  min-width: 1320px;
   border-collapse: collapse;
   font-size: 12px;
 }

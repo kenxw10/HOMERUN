@@ -16,6 +16,8 @@ from app.models import (
     CalibrationRun,
     FeatureSnapshot,
     KalshiMarket,
+    MarketFamilyDiscoveryItem,
+    MarketFamilyDiscoveryRun,
     MarketMapping,
     MlbGame,
     ModelCandidate,
@@ -26,7 +28,7 @@ from app.models import (
     TrainingRun,
 )
 from app.security import require_internal_api_key
-from app.services import candidates, dashboard, market_sync
+from app.services import candidates, dashboard, market_family_discovery, market_sync, position_refresh
 from app.services.contracts import selected_team_from_ticker
 from app.services.http_json import HttpJsonError
 from app.services.kalshi import KalshiAPIError, KalshiClient, derive_orderbook_prices
@@ -1827,7 +1829,7 @@ def test_paper_settlement_sync_settles_wins_losses_and_is_idempotent() -> None:
             evaluated_at=datetime(2026, 7, 1, 16, 5, tzinfo=UTC),
             features={},
             decision="no_trade_edge_too_low",
-            market_type="full_game_winner",
+            market_type="full_game_moneyline",
             contract_side="yes",
         )
         session.add_all([win_candidate, loss_candidate, no_trade_candidate])
@@ -1879,6 +1881,7 @@ def test_paper_settlement_sync_settles_wins_losses_and_is_idempotent() -> None:
     assert no_trade is not None
     assert no_trade.outcome == "win"
     assert no_trade.outcome_source == "mlb_results_sync"
+    assert no_trade.market_type == "full_game_winner"
 
 
 def test_paper_settlement_leaves_untrusted_ticker_selection_unresolved() -> None:
@@ -2072,6 +2075,7 @@ def test_dashboard_summary_uses_labels_snapshots_and_settled_performance() -> No
                     contract_side="yes",
                     entry_price=Decimal("0.4000"),
                     current_price=Decimal("0.5500"),
+                    current_price_updated_at=opened_at + timedelta(minutes=10),
                     quantity=1,
                     entry_time=opened_at,
                     status="open",
@@ -2109,8 +2113,11 @@ def test_dashboard_summary_uses_labels_snapshots_and_settled_performance() -> No
     assert summary.portfolio_value == 1000.15
     assert summary.performance.record == "1-0-0"
     assert summary.performance.profit_loss == 0.6
+    assert summary.paper_starting_balance == 1000.0
     assert summary.positions[0].market == "FULL GAME WINNER · SEA @ PIT · PIT"
     assert summary.positions[0].market_ticker == "KXMLBGAME-26JUL011900SEAPIT-PIT"
+    assert summary.positions[0].game_status == "NOT STARTED"
+    assert summary.positions[0].current_price_updated_at_display is not None
     assert summary.positions[0].time_entered_display is not None
     assert "EDT" in summary.positions[0].time_entered_display
 
@@ -2198,6 +2205,321 @@ def test_model_governance_keeps_only_one_active_champion() -> None:
     assert result["active_model_version"] == "heuristic_full_game_winner_v1"
     assert [version.version_tag for version in active_versions] == ["heuristic_full_game_winner_v1"]
     assert next(version for version in versions if version.version_tag == "legacy_champion").role == "inactive"
+
+
+def test_model_governance_counts_old_kxmlb_market_type_as_full_game_winner() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        market = KalshiMarket(
+            kalshi_market_id="KX-OLD-MONEYLINE",
+            ticker="KXMLBGAME-26JUL011900SEAPIT-PIT",
+            title="Will Pittsburgh win?",
+            status="closed",
+        )
+        session.add(market)
+        session.flush()
+        candidate = ModelCandidate(
+            kalshi_market_id=market.id,
+            evaluated_at=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
+            features={},
+            decision="no_trade_edge_too_low",
+            market_type="full_game_moneyline",
+            outcome="win",
+            outcome_source="mlb_results_sync",
+            resolved_at=datetime(2026, 7, 2, 4, 0, tzinfo=UTC),
+        )
+        session.add(candidate)
+        session.commit()
+
+        result = run_model_governance(session, now=datetime(2026, 7, 2, 12, 0, tzinfo=UTC))
+        session.refresh(candidate)
+        training = session.scalar(select(TrainingRun))
+
+    assert result["resolved_samples"] == 1
+    assert result["repaired_candidate_market_types"] == 1
+    assert candidate.market_type == "full_game_winner"
+    assert training is not None
+    assert training.candidate_count == 1
+
+
+def test_model_governance_counts_samples_after_settlement_labels_candidates() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        game = MlbGame(
+            external_game_id="governance-after-settlement-1",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+            status="Final",
+            home_score=5,
+            away_score=3,
+        )
+        market = KalshiMarket(
+            kalshi_market_id="KX-GOV-SETTLE",
+            ticker="KXMLBGAME-26JUL011900SEAPIT-PIT",
+            title="Will Pittsburgh win?",
+            status="closed",
+        )
+        session.add_all([game, market])
+        session.flush()
+        mapping = MarketMapping(
+            mlb_game_id=game.id,
+            kalshi_market_id=market.id,
+            mapping_status="confirmed",
+            confidence=Decimal("0.9700"),
+        )
+        session.add(mapping)
+        session.flush()
+        candidate = ModelCandidate(
+            mlb_game_id=game.id,
+            kalshi_market_id=market.id,
+            mapping_id=mapping.id,
+            evaluated_at=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
+            features={},
+            decision="candidate_only",
+            market_type="full_game_moneyline",
+            contract_side="yes",
+        )
+        session.add(candidate)
+        session.commit()
+
+        settlement_result = settle_paper_trades(session, date(2026, 7, 1), now=datetime(2026, 7, 2, 4, 0, tzinfo=UTC))
+        governance_result = run_model_governance(session, now=datetime(2026, 7, 2, 12, 0, tzinfo=UTC))
+        session.refresh(candidate)
+
+    assert settlement_result["candidate_labels_created"] == 1
+    assert candidate.outcome == "win"
+    assert candidate.market_type == "full_game_winner"
+    assert governance_result["resolved_samples"] == 1
+
+
+def test_resolve_game_markets_exact_kxmlb_match_stays_confirmed_for_paper() -> None:
+    game = MlbGame(
+        external_game_id="exact-resolver-lock-1",
+        home_team="Detroit Tigers",
+        away_team="Houston Astros",
+        home_abbreviation="DET",
+        away_abbreviation="HOU",
+        scheduled_start=datetime(2026, 6, 26, 22, 40, tzinfo=UTC),
+        status="scheduled",
+    )
+
+    class FakeExactClient:
+        def get_markets_by_tickers(self, tickers):
+            assert "KXMLBGAME-26JUN261840HOUDET-HOU" in tickers
+            return {
+                "markets": [
+                    {
+                        "ticker": "KXMLBGAME-26JUN261840HOUDET-HOU",
+                        "event_ticker": "KXMLBGAME-26JUN261840HOUDET",
+                        "title": "Houston vs Detroit",
+                        "status": "open",
+                    }
+                ]
+            }
+
+    resolution = resolve_game_markets(FakeExactClient(), game)
+
+    assert len(resolution.matches) == 1
+    match = resolution.matches[0]
+    assert match.mapping_status == "confirmed"
+    assert match.validation_status == "confirmed_for_paper"
+    assert match.metadata["time_delta_minutes"] == 0
+    assert match.metadata["team_match_score"] == 1.0
+
+
+def test_market_family_discovery_persists_structured_by_family_and_excludes_mve() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    class FakeDiscoveryClient:
+        def __init__(self) -> None:
+            self.series_params: list[dict[str, object]] = []
+
+        def get_event(self, event_ticker: str):
+            return {"event": {"markets": []}}
+
+        def get_markets_by_event_ticker(self, event_ticker: str):
+            if not event_ticker.startswith("KXMLBSPREAD-"):
+                return {"markets": []}
+            return {
+                "markets": [
+                    {
+                        "ticker": "KXMLBSPREAD-26JUL011900SEAPIT-PIT-1.5",
+                        "event_ticker": event_ticker,
+                        "title": "Pittsburgh Pirates spread -1.5 vs Seattle Mariners",
+                        "yes_sub_title": "Pittsburgh -1.5",
+                        "no_sub_title": "Seattle +1.5",
+                        "rules_primary": "If Pittsburgh wins by 2 or more runs, Yes wins.",
+                        "status": "open",
+                        "functional_strike": "-1.5",
+                    },
+                    {
+                        "ticker": "KXMV-MLB-COMBO",
+                        "event_ticker": "KXMVE-MLB-COMBO",
+                        "title": "Multivariate combo",
+                        "mve_selected_legs": [{"ticker": "LEG"}],
+                    },
+                ]
+            }
+
+        def iter_markets(self, params: dict[str, object], max_pages: int | None = None):
+            self.series_params.append(dict(params))
+            return iter([])
+
+    fake_client = FakeDiscoveryClient()
+    with Session(engine) as session:
+        session.add(
+            MlbGame(
+                external_game_id="discovery-game-1",
+                home_team="Pittsburgh Pirates",
+                away_team="Seattle Mariners",
+                home_abbreviation="PIT",
+                away_abbreviation="SEA",
+                scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+                status="scheduled",
+            )
+        )
+        session.commit()
+
+        result = market_family_discovery.run_market_family_discovery(
+            session,
+            date(2026, 7, 1),
+            client=fake_client,
+        )
+        run = session.scalar(select(MarketFamilyDiscoveryRun))
+        items = list(session.scalars(select(MarketFamilyDiscoveryItem)))
+
+    assert result["markets_found"] == 1
+    assert result["by_family"]["full_game_spread"]["status"] == "discovered_unverified"
+    assert result["by_family"]["full_game_spread"]["market_count"] == 1
+    assert result["by_family"]["full_game_spread"]["line_or_strike_parsing_status"] == "parsed_unverified"
+    assert result["warnings"][0]["message"] == "MULTIVARIATE_MARKET_EXCLUDED"
+    assert run is not None
+    assert run.raw_summary["markets_found"] == 1
+    assert len(items) == 1
+    assert items[0].family_key == "full_game_spread"
+    assert items[0].line_value == Decimal("-1.5000")
+    assert all(params["mve_filter"] == "exclude" for params in fake_client.series_params)
+
+
+def test_new_market_families_remain_discovery_only_for_candidate_generation(monkeypatch) -> None:
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+    monkeypatch.setattr(candidates, "utc_now", lambda: now)
+    monkeypatch.setattr(candidates, "sync_market_mappings", lambda session: 0)
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        game = MlbGame(
+            external_game_id="spread-no-trade-1",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+            status="scheduled",
+        )
+        market = KalshiMarket(
+            kalshi_market_id="KX-SPREAD-NO-TRADE",
+            ticker="KXMLBSPREAD-26JUL011900SEAPIT-PIT-1.5",
+            title="Pittsburgh Pirates spread -1.5 vs Seattle Mariners",
+            status="open",
+            occurrence_datetime=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+            implied_yes_ask=Decimal("0.4000"),
+        )
+        session.add_all([game, market])
+        session.flush()
+        session.add(
+            MarketMapping(
+                mlb_game_id=game.id,
+                kalshi_market_id=market.id,
+                mapping_status="candidate",
+                confidence=Decimal("0.9500"),
+            )
+        )
+        session.commit()
+
+        result = candidates.generate_candidates(session)
+        candidate = session.scalar(select(ModelCandidate))
+        trade = session.scalar(select(PaperTrade))
+
+    assert result["candidates"] == 1
+    assert result["paper_trades"] == 0
+    assert candidate is not None
+    assert candidate.market_type == "full_game_spread"
+    assert candidate.decision == "no_trade_unsupported_market_type"
+    assert trade is None
+
+
+def test_open_position_price_refresh_updates_only_open_paper_trades() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    class FakeOrderbookClient:
+        def get_orderbook(self, ticker: str):
+            return {"orderbook": {"yes": [[44, 10]], "no": [[55, 20]]}}
+
+    with Session(engine) as session:
+        market = KalshiMarket(
+            kalshi_market_id="KX-REFRESH-OPEN",
+            ticker="KXMLBGAME-26JUL011900SEAPIT-PIT",
+            title="Will Pittsburgh win?",
+            status="open",
+        )
+        session.add(market)
+        session.flush()
+        candidate = ModelCandidate(
+            kalshi_market_id=market.id,
+            evaluated_at=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
+            features={},
+            decision="paper_trade",
+            market_type="full_game_winner",
+        )
+        session.add(candidate)
+        session.flush()
+        open_trade = PaperTrade(
+            candidate_id=candidate.id,
+            market_ticker=market.ticker,
+            contract_side="yes",
+            entry_price=Decimal("0.4000"),
+            current_price=Decimal("0.4000"),
+            quantity=1,
+            entry_time=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
+            status="open",
+        )
+        settled_trade = PaperTrade(
+            market_ticker="KXMLBGAME-SETTLED-PIT",
+            contract_side="yes",
+            entry_price=Decimal("0.4000"),
+            current_price=Decimal("1.0000"),
+            quantity=1,
+            entry_time=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
+            status="settled",
+        )
+        session.add_all([open_trade, settled_trade])
+        session.commit()
+
+        result = position_refresh.refresh_open_position_prices(session, client=FakeOrderbookClient())
+        session.refresh(open_trade)
+        session.refresh(settled_trade)
+        snapshot = session.scalar(select(BalanceSnapshot))
+
+    assert result["checked"] == 1
+    assert result["updated"] == 1
+    assert open_trade.current_price == Decimal("0.4400")
+    assert open_trade.current_price_updated_at is not None
+    assert settled_trade.current_price == Decimal("1.0000")
+    assert snapshot is not None
+    assert snapshot.source == "paper"
+    assert snapshot.snapshot_type == "open_position_price_refresh"
 
 
 def test_resolve_preview_endpoint_returns_ok_with_partial_warnings(monkeypatch) -> None:

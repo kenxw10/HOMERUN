@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, JSON, Numeric, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Integer, JSON, Numeric, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.sql import func
 
@@ -165,6 +165,7 @@ class PaperTrade(TimestampMixin, Base):
     entry_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     exit_price: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
     exit_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    current_price_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     status: Mapped[str] = mapped_column(String(40), default="open", nullable=False)
     expected_value: Mapped[Decimal | None] = mapped_column(Numeric(10, 6))
     realized_pnl: Mapped[Decimal | None] = mapped_column(Numeric(14, 2))
@@ -275,3 +276,49 @@ class RiskEvent(TimestampMixin, Base):
     severity: Mapped[str] = mapped_column(String(40), nullable=False)
     message: Mapped[str] = mapped_column(Text, nullable=False)
     event_metadata: Mapped[dict[str, object] | None] = mapped_column("metadata", JSON)
+
+
+class MarketFamilyDiscoveryRun(TimestampMixin, Base):
+    __tablename__ = "market_family_discovery_runs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    target_date: Mapped[date] = mapped_column(Date, nullable=False)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    status: Mapped[str] = mapped_column(String(40), default="running", nullable=False)
+    games_considered: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    families_considered: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    markets_found: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    errors: Mapped[list[object] | None] = mapped_column(JSON)
+    warnings: Mapped[list[object] | None] = mapped_column(JSON)
+    raw_summary: Mapped[dict[str, object] | None] = mapped_column(JSON)
+
+
+class MarketFamilyDiscoveryItem(TimestampMixin, Base):
+    __tablename__ = "market_family_discovery_items"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    run_id: Mapped[int] = mapped_column(ForeignKey("market_family_discovery_runs.id"), nullable=False)
+    mlb_game_id: Mapped[int | None] = mapped_column(ForeignKey("mlb_games.id"))
+    family_key: Mapped[str] = mapped_column(String(80), nullable=False)
+    candidate_series_ticker: Mapped[str | None] = mapped_column(String(120))
+    candidate_event_ticker: Mapped[str | None] = mapped_column(String(120))
+    candidate_market_ticker: Mapped[str | None] = mapped_column(String(120))
+    returned_ticker: Mapped[str | None] = mapped_column(String(120))
+    returned_event_ticker: Mapped[str | None] = mapped_column(String(120))
+    title: Mapped[str | None] = mapped_column(Text)
+    subtitle: Mapped[str | None] = mapped_column(Text)
+    yes_sub_title: Mapped[str | None] = mapped_column(Text)
+    no_sub_title: Mapped[str | None] = mapped_column(Text)
+    rules_primary: Mapped[str | None] = mapped_column(Text)
+    rules_secondary: Mapped[str | None] = mapped_column(Text)
+    custom_strike: Mapped[dict[str, object] | None] = mapped_column(JSON)
+    functional_strike: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str | None] = mapped_column(String(40))
+    raw_status: Mapped[str | None] = mapped_column(String(40))
+    validation_status: Mapped[str | None] = mapped_column(String(80))
+    confidence: Mapped[Decimal | None] = mapped_column(Numeric(6, 4))
+    line_value: Mapped[Decimal | None] = mapped_column(Numeric(10, 4))
+    selection_code: Mapped[str | None] = mapped_column(String(40))
+    source_strategy: Mapped[str | None] = mapped_column(String(80))
+    raw_payload: Mapped[dict[str, object] | None] = mapped_column(JSON)

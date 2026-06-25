@@ -204,6 +204,8 @@ def settle_paper_trades(
             continue
 
         outcome_value, _resolution = outcome
+        if market_type == SUPPORTED_MARKET_FAMILY:
+            candidate.market_type = SUPPORTED_MARKET_FAMILY
         candidate.outcome = outcome_value
         candidate.outcome_source = "mlb_results_sync"
         candidate.resolved_at = settled_at
@@ -245,6 +247,8 @@ def settle_paper_trades(
         session.add(trade)
 
         candidate.outcome = outcome_value
+        if market_type == SUPPORTED_MARKET_FAMILY:
+            candidate.market_type = SUPPORTED_MARKET_FAMILY
         candidate.outcome_source = "mlb_results_sync"
         candidate.resolved_at = settled_at
         session.add(candidate)

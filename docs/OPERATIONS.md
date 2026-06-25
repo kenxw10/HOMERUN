@@ -16,6 +16,8 @@ Before treating a deployment as valid:
 10. Confirm the dashboard shows API connected, paper mode, live trading disabled, kill switch on, and database ready.
 11. Confirm `BACKEND_API_KEY` is set in every public/deployed backend environment, and confirm internal POST endpoints reject requests without `X-API-Key`.
 12. Confirm `KALSHI_ENABLE_BROAD_DISCOVERY=false` unless you are deliberately running bounded diagnostics.
+13. Confirm PR 3a discovery-only families are not trade-enabled.
+14. Confirm open-position current price is treated as a REST last mark, not WebSocket live price.
 
 ## No-Live-Trading Safety Checklist
 
@@ -31,7 +33,7 @@ Do not proceed if any of these are false:
 
 Future live execution must include hard environment guards, a kill switch, tests for disabled execution, and explicit documentation in `PROJECT_CONTEXT.md`.
 
-## PR 3 Worker Commands
+## PR 3/PR 3a Worker Commands
 
 PR 3 worker commands are explicit one-shot commands. They should be run from the backend service context and should not be hidden inside the web dashboard.
 
@@ -45,6 +47,8 @@ From `apps/api`:
 .\.venv\Scripts\python.exe -m app.jobs.paper_settlement_sync
 .\.venv\Scripts\python.exe -m app.jobs.balance_snapshot
 .\.venv\Scripts\python.exe -m app.jobs.model_governance
+.\.venv\Scripts\python.exe -m app.jobs.market_family_discovery
+.\.venv\Scripts\python.exe -m app.jobs.open_position_price_refresh
 ```
 
 Optional dated MLB schedule sync:
@@ -53,6 +57,7 @@ Optional dated MLB schedule sync:
 .\.venv\Scripts\python.exe -m app.jobs.mlb_schedule_sync 2026-06-24
 .\.venv\Scripts\python.exe -m app.jobs.mlb_results_sync 2026-06-24
 .\.venv\Scripts\python.exe -m app.jobs.paper_settlement_sync 2026-06-24
+.\.venv\Scripts\python.exe -m app.jobs.market_family_discovery 2026-06-24
 ```
 
 The jobs currently cover:
@@ -68,6 +73,8 @@ The jobs currently cover:
 - Paper balance snapshots.
 - Feature snapshots and conservative heuristic model scoring.
 - Model governance records that skip training/promotion until sample thresholds are met.
+- Discovery-only market-family audit reports for spread, total, and first-five families.
+- REST last-mark refresh for open paper positions.
 
 They do not cover scheduled automation or live execution.
 They also do not fake spread, total, or first-five market tickers.
@@ -85,17 +92,21 @@ The backend also exposes these POST endpoints for controlled operational runs:
 - `POST /v1/run/paper-settlement-sync?target_date=YYYY-MM-DD`
 - `POST /v1/run/balance-snapshot`
 - `POST /v1/run/model-governance`
+- `POST /v1/run/open-position-price-refresh`
+- `POST /v1/run/market-family-discovery?target_date=YYYY-MM-DD`
+- `GET /v1/market-families/discovery?date=YYYY-MM-DD`
+- `GET /v1/market-families/discovery-preview?date=YYYY-MM-DD`
 - `GET /v1/kalshi/resolve-preview?date=YYYY-MM-DD`
 
 For public or deployed backends, `BACKEND_API_KEY` is required and must be sent as `X-API-Key`. The unauthenticated bypass is only for explicit local development environments. Do not expose these endpoints as public dashboard buttons in PR 3.
 
-## PR 3 Production Validation
+## PR 3a Production Validation
 
 After deploying PR 3 and running `alembic upgrade head`, validate in this order:
 
 1. `GET /health` returns `status: "ok"`.
 2. `GET /v1/system/status` reports `database.ready: true` and does not expose secrets.
-3. Alembic reports head revision `0004_pr3_results_model`.
+3. Alembic reports head revision `0005_pr3a_discovery`.
 4. `POST /v1/sync/mlb-schedule` returns a games count.
 5. `GET /v1/kalshi/resolve-preview?date=YYYY-MM-DD` returns attempted `KXMLBGAME` event and market tickers for each MLB game, with `ok=true` even when individual games have no match warnings.
 6. `POST /v1/sync/kalshi-markets` returns a structured summary with `games_considered`, attempted ticker counts, mapping counts, and `errors` when upstream calls fail.
@@ -104,9 +115,14 @@ After deploying PR 3 and running `alembic upgrade head`, validate in this order:
 9. `POST /v1/sync/mlb-results` updates completed games with scores/final status.
 10. `POST /v1/run/paper-settlement-sync` settles completed supported full-game winner paper trades.
 11. `POST /v1/run/balance-snapshot` creates a snapshot and `/v1/dashboard/summary` uses it for the portfolio chart.
-12. `POST /v1/run/model-governance` records a training/calibration run and either promotes under governance or skips with a clear insufficient-sample reason.
-13. The Vercel dashboard shows readable contract labels with the raw Kalshi ticker as secondary text.
-14. Confirm no live execution path exists and live trading remains disabled.
+12. `POST /v1/run/model-governance` records a training/calibration run and counts resolved `KXMLBGAME` candidates even when older rows used `full_game_moneyline`.
+13. `POST /v1/run/market-family-discovery?target_date=YYYY-MM-DD` returns structured `by_family` output and persists audit rows.
+14. `GET /v1/market-families/discovery?date=YYYY-MM-DD` returns the latest persisted report.
+15. Confirm discovered spread, total, or first-five families do not create paper candidates/trades.
+16. `POST /v1/run/open-position-price-refresh` updates current marks and last mark timestamps for open paper positions only.
+17. The Vercel dashboard shows readable contract labels with the raw Kalshi ticker as secondary text.
+18. The dashboard shows `GAME STATUS`, `LAST MARK TIME`, working chart ranges, and `NORM` / `P/L $` / `P/L %` chart modes.
+19. Confirm no live execution path exists and live trading remains disabled.
 
 Broad market discovery is diagnostic-only:
 
