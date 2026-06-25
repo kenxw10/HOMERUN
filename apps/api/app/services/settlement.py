@@ -12,7 +12,7 @@ from app.services.portfolio import create_balance_snapshot
 from app.time_utils import ensure_aware_utc, get_dashboard_zone, utc_now
 
 FINAL_STATUS_TOKENS = ("final", "game over", "completed")
-VOID_STATUS_TOKENS = ("cancel", "postpon", "suspend")
+VOID_STATUS_TOKENS = ("cancel", "void")
 
 
 def _target_bounds(target_date: date | None) -> tuple[datetime, datetime] | None:

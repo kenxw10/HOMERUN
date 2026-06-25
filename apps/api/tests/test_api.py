@@ -1937,6 +1937,77 @@ def test_paper_settlement_leaves_untrusted_ticker_selection_unresolved() -> None
     assert settlement is None
 
 
+def test_paper_settlement_keeps_suspended_games_open() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        game = MlbGame(
+            external_game_id="settle-suspended-1",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+            status="Suspended",
+            home_score=2,
+            away_score=2,
+        )
+        market = KalshiMarket(
+            kalshi_market_id="KX-SUSPENDED",
+            ticker="KXMLBGAME-26JUL011900SEAPIT-PIT",
+            title="Will Pittsburgh win?",
+            status="open",
+        )
+        session.add_all([game, market])
+        session.flush()
+        mapping = MarketMapping(
+            mlb_game_id=game.id,
+            kalshi_market_id=market.id,
+            mapping_status="confirmed",
+            confidence=Decimal("0.9700"),
+        )
+        session.add(mapping)
+        session.flush()
+        candidate = ModelCandidate(
+            mlb_game_id=game.id,
+            kalshi_market_id=market.id,
+            mapping_id=mapping.id,
+            evaluated_at=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
+            features={},
+            decision="paper_trade",
+            market_type="full_game_winner",
+            contract_side="yes",
+        )
+        session.add(candidate)
+        session.flush()
+        trade = PaperTrade(
+            candidate_id=candidate.id,
+            market_ticker=market.ticker,
+            contract_side="yes",
+            entry_price=Decimal("0.4000"),
+            current_price=Decimal("0.4000"),
+            quantity=1,
+            entry_time=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
+            status="open",
+        )
+        session.add(trade)
+        session.commit()
+
+        result = settle_paper_trades(session, date(2026, 7, 1), now=datetime(2026, 7, 2, 4, 0, tzinfo=UTC))
+        session.refresh(candidate)
+        session.refresh(trade)
+        settlement = session.scalar(select(Settlement))
+
+    assert result["candidate_labels_skipped_not_final"] == 1
+    assert result["skipped_not_final"] == 1
+    assert result["voided"] == 0
+    assert candidate.outcome is None
+    assert trade.status == "open"
+    assert trade.outcome is None
+    assert settlement is None
+
+
 def test_dashboard_summary_uses_labels_snapshots_and_settled_performance() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
