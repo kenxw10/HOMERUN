@@ -1,20 +1,36 @@
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_settings
-from app.database import database_status
+from app.database import database_status, get_session_factory
+from app.models import KalshiMarket, MarketMapping, MlbGame, ModelCandidate
 from app.schemas import (
     BackendStatus,
-    BotMode,
+    CandidateSummary,
     ConfigStatus,
     DashboardSummary,
+    GameSummary,
     HealthResponse,
-    ModelStatus,
-    PerformanceMetrics,
+    ListResponse,
+    MarketMappingSummary,
+    MarketSummary,
+    RunResponse,
     SystemStatus,
 )
+from app.security import require_internal_api_key
+from app.services.candidates import generate_candidates
+from app.services.dashboard import (
+    dashboard_summary_from_db,
+    empty_dashboard_summary,
+    list_today_candidates,
+    list_today_games,
+    list_today_markets,
+)
+from app.services.market_sync import sync_kalshi_markets
+from app.services.mlb import sync_schedule
+from app.time_utils import eastern_display, to_eastern_iso
 
 settings = get_settings()
 
@@ -28,7 +44,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origin_list,
     allow_credentials=False,
-    allow_methods=["GET"],
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 
@@ -51,30 +67,15 @@ def health() -> HealthResponse:
 
 @app.get("/v1/dashboard/summary", response_model=DashboardSummary)
 def dashboard_summary() -> DashboardSummary:
-    return DashboardSummary(
-        portfolio_series=[],
-        performance=PerformanceMetrics(
-            win_rate=None,
-            roi=None,
-            profit_loss=0.0,
-            record="0-0-0",
-        ),
-        positions=[],
-        bot=BotMode(
-            mode="paper",
-            paper_trading=settings.paper_trading,
-            live_trading_enabled=settings.live_trading_enabled,
-            execution_kill_switch=settings.execution_kill_switch,
-            kalshi_env=settings.kalshi_env,
-        ),
-        model_status=ModelStatus(
-            active_model_version=None,
-            last_training_run=None,
-            last_calibration_run=None,
-            candidate_count=0,
-            notes="No model has been trained yet. PR 1 only provides the foundation.",
-        ),
-    )
+    if not database_status()["ready"]:
+        return empty_dashboard_summary()
+
+    try:
+        session_factory = get_session_factory()
+        with session_factory() as session:
+            return dashboard_summary_from_db(session)
+    except Exception:
+        return empty_dashboard_summary()
 
 
 @app.get("/v1/system/status", response_model=SystemStatus)
@@ -98,3 +99,138 @@ def system_status() -> SystemStatus:
             kalshi_credentials=credentials_state,
         ),
     )
+
+
+def _db_session_or_503():
+    if not database_status()["ready"]:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database is not ready. Configure a reachable DATABASE_URL first.",
+        )
+    try:
+        session_factory = get_session_factory()
+        return session_factory()
+    except Exception as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
+
+
+def _decimal_float(value) -> float | None:
+    return float(value) if value is not None else None
+
+
+def _prefer_not_none(primary, fallback):
+    return primary if primary is not None else fallback
+
+
+def _game_summary(game: MlbGame) -> GameSummary:
+    return GameSummary(
+        external_game_id=game.external_game_id,
+        home_team=game.home_team,
+        away_team=game.away_team,
+        scheduled_start=to_eastern_iso(game.scheduled_start),
+        scheduled_start_display=eastern_display(game.scheduled_start),
+        status=game.status,
+        home_score=game.home_score,
+        away_score=game.away_score,
+    )
+
+
+def _market_summary(market: KalshiMarket, mapping: MarketMapping | None) -> MarketSummary:
+    mapping_summary = None
+    if mapping is not None:
+        mapping_summary = MarketMappingSummary(
+            mapping_status=mapping.mapping_status,
+            confidence=_decimal_float(mapping.confidence),
+            rationale=mapping.rationale,
+            metadata=mapping.mapping_metadata,
+        )
+    return MarketSummary(
+        ticker=market.ticker,
+        event_ticker=market.event_ticker,
+        title=market.title,
+        subtitle=market.subtitle,
+        status=market.status,
+        close_time=to_eastern_iso(market.close_time),
+        close_time_display=eastern_display(market.close_time),
+        best_yes_bid=_decimal_float(market.best_yes_bid),
+        implied_yes_ask=_decimal_float(market.implied_yes_ask),
+        best_no_bid=_decimal_float(market.best_no_bid),
+        implied_no_ask=_decimal_float(market.implied_no_ask),
+        mapping=mapping_summary,
+    )
+
+
+def _candidate_summary(candidate: ModelCandidate, game: MlbGame | None, market: KalshiMarket | None) -> CandidateSummary:
+    game_label = f"{game.away_team} @ {game.home_team}" if game else None
+    return CandidateSummary(
+        evaluated_at=to_eastern_iso(candidate.evaluated_at),
+        evaluated_at_display=eastern_display(candidate.evaluated_at),
+        game=game_label,
+        market_ticker=market.ticker if market else None,
+        market_type=candidate.market_type,
+        time_bucket=candidate.time_bucket,
+        time_to_start_minutes=candidate.time_to_start_minutes,
+        model_probability=_decimal_float(_prefer_not_none(candidate.model_probability, candidate.probability)),
+        executable_price=_decimal_float(_prefer_not_none(candidate.executable_price, candidate.market_price)),
+        net_expected_value=_decimal_float(candidate.net_expected_value),
+        decision=candidate.decision,
+    )
+
+
+@app.get("/v1/games/today", response_model=ListResponse)
+def games_today() -> ListResponse:
+    ready = bool(database_status()["ready"])
+    if not ready:
+        return ListResponse(items=[], count=0, database_ready=False)
+    with _db_session_or_503() as session:
+        items = [_game_summary(game).model_dump() for game in list_today_games(session)]
+        return ListResponse(items=items, count=len(items), database_ready=True)
+
+
+@app.get("/v1/markets/today", response_model=ListResponse)
+def markets_today() -> ListResponse:
+    ready = bool(database_status()["ready"])
+    if not ready:
+        return ListResponse(items=[], count=0, database_ready=False)
+    with _db_session_or_503() as session:
+        items = [_market_summary(market, mapping).model_dump() for market, mapping in list_today_markets(session)]
+        return ListResponse(items=items, count=len(items), database_ready=True)
+
+
+@app.get("/v1/candidates/today", response_model=ListResponse)
+def candidates_today() -> ListResponse:
+    ready = bool(database_status()["ready"])
+    if not ready:
+        return ListResponse(items=[], count=0, database_ready=False)
+    with _db_session_or_503() as session:
+        items = [
+            _candidate_summary(candidate, game, market).model_dump()
+            for candidate, game, market in list_today_candidates(session)
+        ]
+        return ListResponse(items=items, count=len(items), database_ready=True)
+
+
+@app.post("/v1/sync/mlb-schedule", response_model=RunResponse)
+def run_mlb_schedule_sync(
+    target_date: date | None = Query(default=None),
+    _: None = Depends(require_internal_api_key),
+) -> RunResponse:
+    with _db_session_or_503() as session:
+        count = sync_schedule(session, target_date)
+    return RunResponse(ok=True, action="mlb_schedule_sync", result={"games": count})
+
+
+@app.post("/v1/sync/kalshi-markets", response_model=RunResponse)
+def run_kalshi_market_sync(_: None = Depends(require_internal_api_key)) -> RunResponse:
+    if not settings.market_discovery_enabled:
+        return RunResponse(ok=True, action="kalshi_market_sync", result={"skipped": True})
+    with _db_session_or_503() as session:
+        count = sync_kalshi_markets(session)
+    return RunResponse(ok=True, action="kalshi_market_sync", result={"markets": count})
+
+
+@app.post("/v1/run/paper-candidate-engine", response_model=RunResponse)
+def run_paper_candidate_engine(_: None = Depends(require_internal_api_key)) -> RunResponse:
+    with _db_session_or_503() as session:
+        result = generate_candidates(session)
+    return RunResponse(ok=True, action="paper_candidate_engine", result=result)

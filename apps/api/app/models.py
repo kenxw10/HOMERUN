@@ -49,6 +49,7 @@ class MlbGame(TimestampMixin, Base):
     status: Mapped[str] = mapped_column(String(40), default="scheduled", nullable=False)
     home_score: Mapped[int | None] = mapped_column(Integer)
     away_score: Mapped[int | None] = mapped_column(Integer)
+    raw_payload: Mapped[dict[str, object] | None] = mapped_column(JSON)
 
 
 class KalshiMarket(TimestampMixin, Base):
@@ -59,12 +60,28 @@ class KalshiMarket(TimestampMixin, Base):
     ticker: Mapped[str] = mapped_column(String(120), unique=True, nullable=False)
     event_ticker: Mapped[str | None] = mapped_column(String(120))
     title: Mapped[str] = mapped_column(Text, nullable=False)
+    subtitle: Mapped[str | None] = mapped_column(Text)
+    rules: Mapped[str | None] = mapped_column(Text)
+    yes_subtitle: Mapped[str | None] = mapped_column(Text)
+    no_subtitle: Mapped[str | None] = mapped_column(Text)
     yes_bid: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
     yes_ask: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
     yes_mid: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
+    no_bid: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
+    no_ask: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
+    no_mid: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
+    last_price: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
+    best_yes_bid: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
+    best_no_bid: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
+    implied_yes_ask: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
+    implied_no_ask: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
     status: Mapped[str] = mapped_column(String(40), default="untracked", nullable=False)
+    open_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     close_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    occurrence_datetime: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     resolve_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    raw_payload: Mapped[dict[str, object] | None] = mapped_column(JSON)
+    orderbook_raw: Mapped[dict[str, object] | None] = mapped_column(JSON)
 
 
 class MarketMapping(TimestampMixin, Base):
@@ -76,6 +93,8 @@ class MarketMapping(TimestampMixin, Base):
     kalshi_market_id: Mapped[int] = mapped_column(ForeignKey("kalshi_markets.id"), nullable=False)
     mapping_status: Mapped[str] = mapped_column(String(40), default="candidate", nullable=False)
     confidence: Mapped[Decimal | None] = mapped_column(Numeric(6, 4))
+    rationale: Mapped[str | None] = mapped_column(Text)
+    mapping_metadata: Mapped[dict[str, object] | None] = mapped_column(JSON)
 
 
 class ModelVersion(TimestampMixin, Base):
@@ -95,13 +114,22 @@ class ModelCandidate(TimestampMixin, Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     mlb_game_id: Mapped[int | None] = mapped_column(ForeignKey("mlb_games.id"))
     kalshi_market_id: Mapped[int | None] = mapped_column(ForeignKey("kalshi_markets.id"))
+    mapping_id: Mapped[int | None] = mapped_column(ForeignKey("market_mappings.id"))
     model_version_id: Mapped[int | None] = mapped_column(ForeignKey("model_versions.id"))
     evaluated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     features: Mapped[dict[str, object]] = mapped_column(JSON, default=dict, nullable=False)
     probability: Mapped[Decimal | None] = mapped_column(Numeric(8, 6))
+    model_probability: Mapped[Decimal | None] = mapped_column(Numeric(8, 6))
     fair_value: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
     market_price: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
+    executable_price: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
     expected_value: Mapped[Decimal | None] = mapped_column(Numeric(10, 6))
+    fee_estimate: Mapped[Decimal | None] = mapped_column(Numeric(10, 6))
+    net_expected_value: Mapped[Decimal | None] = mapped_column(Numeric(10, 6))
+    market_type: Mapped[str | None] = mapped_column(String(80))
+    time_bucket: Mapped[str | None] = mapped_column(String(40))
+    time_to_start_minutes: Mapped[int | None] = mapped_column(Integer)
+    contract_side: Mapped[str | None] = mapped_column(String(10))
     decision: Mapped[str] = mapped_column(String(40), default="no_trade", nullable=False)
     outcome: Mapped[str | None] = mapped_column(String(40))
 
@@ -114,11 +142,13 @@ class PaperTrade(TimestampMixin, Base):
     market_ticker: Mapped[str] = mapped_column(String(120), nullable=False)
     contract_side: Mapped[str] = mapped_column(String(10), nullable=False)
     entry_price: Mapped[Decimal] = mapped_column(Numeric(8, 4), nullable=False)
+    current_price: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
     quantity: Mapped[int] = mapped_column(Integer, nullable=False)
     entry_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     exit_price: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
     exit_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     status: Mapped[str] = mapped_column(String(40), default="open", nullable=False)
+    expected_value: Mapped[Decimal | None] = mapped_column(Numeric(10, 6))
     realized_pnl: Mapped[Decimal | None] = mapped_column(Numeric(14, 2))
 
 

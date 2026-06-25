@@ -10,33 +10,37 @@ The user wants the system to become as hands-off as possible. Calibration, thres
 
 ## 2. Current Scope
 
-PR 1 creates the deployable foundation:
+PR 2 builds on the merged PR 1 foundation:
 
 - FastAPI backend in `apps/api`.
 - Next.js TypeScript frontend in `apps/web`.
-- PostgreSQL-ready database models and initial Alembic migration.
-- Empty but correctly shaped dashboard API responses.
-- Light-theme trading dashboard shell with empty states.
+- PostgreSQL-ready database models and Alembic migrations.
+- MLB schedule ingestion from the public MLB Stats API.
+- Kalshi market discovery with yes/no orderbook parsing and raw payload storage.
+- Auditable MLB game to Kalshi market mapping with confidence and rationale.
+- Conservative paper candidate and paper-trade generation.
+- Database-backed dashboard API responses when data exists.
+- Light-theme trading-terminal dashboard that renders portfolio snapshots, paper metrics, open positions, model status, and system status.
 - Railway backend and PostgreSQL setup documentation.
 - Vercel frontend setup documentation.
 - CI scaffolding for backend tests and frontend checks.
 
-The system starts with no real Kalshi market discovery, no model scoring, no workers, and no live trading.
+The system still has no live trading, no production credentials requirement, no trained predictive model, no settlement collection, and no scheduled automation.
 
 ## 3. Non-Goals
 
 This project is not a sportsbook betting app. Do not add sportsbook assumptions, sportsbook APIs, sportsbook odds conversion, DraftKings, FanDuel, or Odds API behavior.
 
-PR 1 also intentionally excludes:
+PR 2 still intentionally excludes:
 
 - Live order placement.
-- Real Kalshi market discovery.
-- Real MLB data ingestion.
+- Production Kalshi credentials.
+- A trained predictive model.
+- Settlement and outcome collection.
 - Admin password pages.
 - Monthly calendars.
-- Production secrets.
 - Automated retraining jobs.
-- Cron workers.
+- Hidden dashboard-triggered worker automation.
 
 ## 4. Architecture Decisions
 
@@ -47,13 +51,23 @@ The repo is a small monorepo:
 - Railway is the intended backend and PostgreSQL host.
 - Vercel is the intended frontend host.
 
-The backend exposes read-only foundation endpoints in PR 1:
+The backend exposes these read endpoints in PR 2:
 
 - `GET /health`
 - `GET /v1/dashboard/summary`
 - `GET /v1/system/status`
+- `GET /v1/games/today`
+- `GET /v1/markets/today`
+- `GET /v1/candidates/today`
 
-The database layer is PostgreSQL-ready but the API can boot locally without a database so the first PR remains easy to run.
+It also exposes controlled internal run endpoints:
+
+- `POST /v1/sync/mlb-schedule`
+- `POST /v1/sync/kalshi-markets`
+- `POST /v1/run/paper-candidate-engine`
+
+The database layer is PostgreSQL-ready but the API can still boot locally without a database for frontend and health-check work.
+If `BACKEND_API_KEY` is configured, internal POST endpoints require `X-API-Key`.
 
 ## 5. Paper Trading First
 
@@ -79,6 +93,7 @@ Do not model this as a sportsbook odds product. Do not add sportsbook concepts u
 The starting assumption is hold-to-settlement. Candidate scoring, expected value, paper-trading performance, and future position accounting should assume the system holds contracts through resolution unless a later PR adds a documented exit strategy.
 
 Current price is still useful for dashboard visibility, but realized performance should be based on settlement.
+PR 2 stores `fee_estimate` as `0` for candidate and paper-trade rows until a later PR implements Kalshi fee modeling.
 
 ## 8. Candidate Dataset Philosophy
 
@@ -123,7 +138,8 @@ Required operator views:
 - Model status panel.
 - System status panel.
 
-The dashboard should clearly show paper mode and live trading disabled. It should also show a clear light-theme error state when the API is unavailable.
+The dashboard should clearly show paper mode, live trading disabled, and kill switch on based on backend API state. It should also show a clear light-theme error state when the API is unavailable.
+Frontend user-facing dashboard labels should stay uppercase.
 
 There should be no separate password-protected admin page and no monthly calendar.
 
@@ -140,8 +156,9 @@ Frontend target:
 
 - Vercel project rooted at `apps/web`.
 - `NEXT_PUBLIC_API_BASE_URL` points to the Railway backend URL.
+- `NEXT_PUBLIC_REFRESH_MS` controls dashboard polling and defaults to `30000`.
 
-Production Kalshi credentials should not be added during PR 1.
+Production Kalshi credentials should not be added during PR 2.
 
 ## 12. PR Change Log
 
@@ -157,3 +174,11 @@ Every future PR must update this section with:
 - Created the initial FastAPI backend, Next.js dashboard shell, PostgreSQL-ready schema, setup docs, and CI scaffolding.
 - Kept the system paper-trading only with live trading disabled and the execution kill switch enabled by default.
 - Added empty dashboard responses and light-theme empty states without implementing Kalshi discovery, model scoring, or live execution.
+
+### PR 2 - Data Layer And Dashboard
+
+- Added MLB schedule sync, Kalshi market sync, auditable mapping, conservative paper candidate generation, and protected internal run endpoints.
+- Added migration `0002_pr2_data_layer.py` for raw MLB payloads, Kalshi orderbook fields, mapping rationale, candidate scoring fields, and paper trade mark-to-market fields.
+- Replaced the PR 1 dashboard shell with a light terminal-style dashboard that reads backend portfolio snapshots, positions, model status, and system status.
+- Kept the safety posture paper-first: live trading disabled, execution kill switch enabled, no live order placement, and no production credential requirement.
+- Validation performed: backend Ruff, backend pytest, frontend lint, frontend typecheck, and frontend production build.
