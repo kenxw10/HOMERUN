@@ -27,6 +27,8 @@ from app.schemas import (
     PortfolioPoint,
     PositionSummary,
 )
+from app.services.contracts import contract_labels, market_type_from_ticker
+from app.services.portfolio import calculate_paper_portfolio
 from app.time_utils import eastern_display, ensure_aware_utc, get_dashboard_zone, to_eastern_iso, today_eastern, utc_now
 
 MAPPING_STATUS_PRIORITY = {"confirmed": 0, "candidate": 1, "needs_review": 2}
@@ -61,14 +63,30 @@ def _float(value: Decimal | None) -> float | None:
     return float(value) if value is not None else None
 
 
-def _position_from_trade(trade: PaperTrade) -> PositionSummary:
+def _position_from_trade(
+    trade: PaperTrade,
+    game: MlbGame | None = None,
+    market: KalshiMarket | None = None,
+) -> PositionSummary:
     current = trade.current_price if trade.current_price is not None else trade.entry_price
     pnl = ((current - trade.entry_price) * trade.quantity).quantize(Decimal("0.01"))
     pnl_percent = ((current - trade.entry_price) / trade.entry_price).quantize(Decimal("0.0001")) if trade.entry_price else None
+    fallback_labels = contract_labels(
+        game=game,
+        market=market,
+        market_ticker=trade.market_ticker,
+        market_type=market_type_from_ticker(trade.market_ticker),
+    )
+    display = trade.contract_display or trade.market_display or fallback_labels.contract_display
     return PositionSummary(
         time_entered=to_eastern_iso(trade.entry_time),
         time_entered_display=eastern_display(trade.entry_time),
-        market=trade.market_ticker,
+        market=display,
+        market_ticker=trade.market_ticker,
+        market_display=trade.market_display or fallback_labels.market_display,
+        selection_display=trade.selection_display or fallback_labels.selection_display,
+        matchup_display=trade.matchup_display or fallback_labels.matchup_display,
+        contract_display=display,
         side=trade.contract_side,
         entry_price=float(trade.entry_price),
         current_price=float(current),
@@ -76,7 +94,7 @@ def _position_from_trade(trade: PaperTrade) -> PositionSummary:
         profit_loss=float(pnl),
         profit_loss_percent=_float(pnl_percent),
         status=trade.status,
-        resolution=None,
+        resolution=trade.resolution,
     )
 
 
@@ -84,10 +102,21 @@ def _position_from_position(position: Position) -> PositionSummary:
     current = position.current_price if position.current_price is not None else position.entry_price
     pnl = ((current - position.entry_price) * position.quantity).quantize(Decimal("0.01"))
     pnl_percent = ((current - position.entry_price) / position.entry_price).quantize(Decimal("0.0001")) if position.entry_price else None
+    fallback_labels = contract_labels(
+        game=None,
+        market=None,
+        market_ticker=position.market_ticker,
+        market_type=market_type_from_ticker(position.market_ticker),
+    )
     return PositionSummary(
         time_entered=to_eastern_iso(position.opened_at),
         time_entered_display=eastern_display(position.opened_at),
-        market=position.market_ticker,
+        market=fallback_labels.contract_display,
+        market_ticker=position.market_ticker,
+        market_display=fallback_labels.market_display,
+        selection_display=fallback_labels.selection_display,
+        matchup_display=fallback_labels.matchup_display,
+        contract_display=fallback_labels.contract_display,
         side=position.contract_side,
         entry_price=float(position.entry_price),
         current_price=float(current),
@@ -119,11 +148,15 @@ def dashboard_summary_from_db(session: Session) -> DashboardSummary:
         latest_snapshot = snapshots[-1]
         summary.cash_balance = float(latest_snapshot.cash_balance)
         summary.portfolio_value = float(latest_snapshot.portfolio_value)
+    else:
+        totals = calculate_paper_portfolio(session)
+        summary.cash_balance = float(totals.cash_balance)
+        summary.portfolio_value = float(totals.portfolio_value)
 
-    settled = list(session.scalars(select(PaperTrade).where(PaperTrade.status.in_(["settled", "closed"]))))
-    wins = sum(1 for trade in settled if (trade.realized_pnl or Decimal("0")) > 0)
-    losses = sum(1 for trade in settled if (trade.realized_pnl or Decimal("0")) < 0)
-    pushes = max(len(settled) - wins - losses, 0)
+    settled = list(session.scalars(select(PaperTrade).where(PaperTrade.status.in_(["settled", "closed", "void"]))))
+    wins = sum(1 for trade in settled if trade.outcome == "win" or (trade.realized_pnl or Decimal("0")) > 0)
+    losses = sum(1 for trade in settled if trade.outcome == "loss" or (trade.realized_pnl or Decimal("0")) < 0)
+    pushes = sum(1 for trade in settled if trade.outcome in {"push", "void"})
     realized = sum((trade.realized_pnl or Decimal("0")) for trade in settled)
     stake = sum((trade.entry_price * trade.quantity) for trade in settled)
     summary.performance = PerformanceMetrics(
@@ -134,12 +167,21 @@ def dashboard_summary_from_db(session: Session) -> DashboardSummary:
     )
 
     open_positions = list(session.scalars(select(Position).where(Position.status == "open").limit(100)))
-    open_trades = list(session.scalars(select(PaperTrade).where(PaperTrade.status == "open").limit(100)))
+    open_trade_rows = list(
+        session.execute(
+            select(PaperTrade, MlbGame, KalshiMarket)
+            .outerjoin(ModelCandidate, PaperTrade.candidate_id == ModelCandidate.id)
+            .outerjoin(MlbGame, ModelCandidate.mlb_game_id == MlbGame.id)
+            .outerjoin(KalshiMarket, ModelCandidate.kalshi_market_id == KalshiMarket.id)
+            .where(PaperTrade.status == "open")
+            .limit(100)
+        )
+    )
     summary.positions = [_position_from_position(position) for position in open_positions]
     position_keys = {(position.market_ticker, position.contract_side) for position in open_positions}
     summary.positions.extend(
-        _position_from_trade(trade)
-        for trade in open_trades
+        _position_from_trade(trade, game, market)
+        for trade, game, market in open_trade_rows
         if (trade.market_ticker, trade.contract_side) not in position_keys
     )
 
@@ -152,7 +194,7 @@ def dashboard_summary_from_db(session: Session) -> DashboardSummary:
         last_training_run=last_training.started_at if last_training else None,
         last_calibration_run=last_calibration.started_at if last_calibration else None,
         candidate_count=int(candidate_count),
-        notes="PR 2 uses placeholder 0.50 probabilities until model training is added.",
+        notes="PR3 uses a paper-only heuristic model and skips trained promotion until sample thresholds are met.",
     )
     summary.last_update = to_eastern_iso(utc_now())
     summary.last_update_display = eastern_display(utc_now())

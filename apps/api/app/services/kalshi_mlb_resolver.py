@@ -19,6 +19,7 @@ EVENT_OFFSETS_MINUTES = (0, -5, 5, -10, 10, -1, 1)
 SERIES_FALLBACK_CLOSE_LOOKBACK = timedelta(days=1)
 SERIES_FALLBACK_CLOSE_LOOKAHEAD = timedelta(days=21)
 MONTH_CODES = ("JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC")
+MONTH_CODE_TO_NUMBER = {code: index + 1 for index, code in enumerate(MONTH_CODES)}
 KALSHI_EVENT_TIME_ZONE = ZoneInfo("America/New_York")
 
 MARKET_FAMILY_REGISTRY: dict[str, dict[str, str]] = {
@@ -230,7 +231,54 @@ def _market_relevant_time(market: dict[str, Any]) -> datetime | None:
     return parse_datetime(market.get("occurrence_datetime") or market.get("expected_expiration_time") or market.get("close_time"))
 
 
+def _event_ticker_from_market(market: dict[str, Any]) -> str:
+    event_ticker = str(market.get("event_ticker") or "").upper()
+    if event_ticker:
+        return event_ticker
+    ticker = str(market.get("ticker") or "").upper()
+    return ticker.rsplit("-", 1)[0] if ticker.count("-") >= 2 else ""
+
+
+def _event_ticker_details_for_game(game: MlbGame, event_ticker: str) -> dict[str, object] | None:
+    match = re.match(
+        r"^KXMLBGAME-(?P<year>\d{2})(?P<month>[A-Z]{3})(?P<day>\d{2})"
+        r"(?P<hour>\d{2})(?P<minute>\d{2})(?P<teams>[A-Z0-9]+)$",
+        event_ticker.upper(),
+    )
+    if not match:
+        return None
+    month = MONTH_CODE_TO_NUMBER.get(match.group("month"))
+    if month is None:
+        return None
+
+    local = datetime(
+        2000 + int(match.group("year")),
+        month,
+        int(match.group("day")),
+        int(match.group("hour")),
+        int(match.group("minute")),
+        tzinfo=KALSHI_EVENT_TIME_ZONE,
+    )
+    away_code, home_code = game_team_codes(game)
+    ticker_codes = str(match.group("teams"))
+    return {
+        "timestamp": ensure_aware_utc(local),
+        "ticker_team_codes": ticker_codes,
+        "expected_team_codes": f"{away_code}{home_code}",
+        "team_codes_match": ticker_codes == f"{away_code}{home_code}",
+    }
+
+
 def _time_delta_minutes(game: MlbGame, market: dict[str, Any], attempted_event_tickers: list[str]) -> int | None:
+    event_details = _event_ticker_details_for_game(game, _event_ticker_from_market(market))
+    if event_details is not None:
+        return int(
+            abs(
+                (event_details["timestamp"] - ensure_aware_utc(game.scheduled_start)).total_seconds()
+            )
+            / 60
+        )
+
     market_time = _market_relevant_time(market)
     if market_time is None:
         event_ticker = str(market.get("event_ticker") or "").upper()
@@ -245,6 +293,14 @@ def _team_match_score(game: MlbGame, market: dict[str, Any]) -> Decimal:
     text = _market_text(market)
     ticker = str(market.get("ticker") or "").upper()
     away_code, home_code = game_team_codes(game)
+    event_details = _event_ticker_details_for_game(game, _event_ticker_from_market(market))
+    selected = ticker.rsplit("-", 1)[-1] if "-" in ticker else ""
+    if event_details and event_details.get("team_codes_match"):
+        score = Decimal("0.75")
+        if selected in {away_code, home_code}:
+            score += Decimal("0.25")
+        return min(score, Decimal("1.00"))
+
     score = Decimal("0")
     for team_name, code in ((game.away_team, away_code), (game.home_team, home_code)):
         normalized_team = _normalize_name(team_name)
@@ -269,6 +325,7 @@ def validate_market_for_game(
 ) -> ResolvedMarket:
     ticker = str(market.get("ticker") or "").upper()
     event_ticker = str(market.get("event_ticker") or "").upper()
+    event_details = _event_ticker_details_for_game(game, _event_ticker_from_market(market))
     notes: list[str] = []
     time_delta = _time_delta_minutes(game, market, attempted_event_tickers)
     team_score = _team_match_score(game, market)
@@ -283,15 +340,15 @@ def validate_market_for_game(
         validation_status = "rejected_multivariate"
         confidence = Decimal("0.0000")
     elif market_ticker_match and event_ticker_match and (time_delta is None or time_delta <= 10) and team_score >= Decimal("0.50"):
-        notes.extend(["MARKET_TICKER_MATCH", "EVENT_TICKER_MATCH", "TEAM_MATCH"])
+        notes.extend(["MARKET_TICKER_MATCH", "EVENT_TICKER_MATCH", "TICKER_TEAM_CODE_MATCH"])
         mapping_status = "confirmed"
-        validation_status = "strong"
-        confidence = Decimal("0.9500")
+        validation_status = "confirmed_for_paper"
+        confidence = Decimal("0.9700")
     elif event_ticker_match and (time_delta is None or time_delta <= 360) and team_score >= Decimal("0.25"):
         notes.append("EVENT_TICKER_MATCH")
         mapping_status = "candidate"
-        validation_status = "plausible"
-        confidence = Decimal("0.7500")
+        validation_status = "strong_candidate"
+        confidence = Decimal("0.8500")
     elif strategy == "series_window_fallback":
         notes.append("REJECTED_UNRELATED_FALLBACK_MARKET")
         mapping_status = "rejected_unrelated"
@@ -315,6 +372,14 @@ def validate_market_for_game(
         "returned_market_tickers": [ticker] if ticker else [],
         "time_delta_minutes": time_delta,
         "team_match_score": float(team_score),
+        "ticker_event_time": (
+            event_details["timestamp"].isoformat()
+            if event_details and isinstance(event_details.get("timestamp"), datetime)
+            else None
+        ),
+        "ticker_team_codes": event_details.get("ticker_team_codes") if event_details else None,
+        "expected_team_codes": event_details.get("expected_team_codes") if event_details else None,
+        "ticker_team_codes_match": bool(event_details and event_details.get("team_codes_match")),
         "validation_notes": notes,
         "mve_filter": "exclude",
     }

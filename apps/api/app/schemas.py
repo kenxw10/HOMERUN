@@ -29,6 +29,11 @@ class PositionSummary(BaseModel):
     time_entered: str | None = None
     time_entered_display: str | None = None
     market: str
+    market_ticker: str | None = None
+    market_display: str | None = None
+    selection_display: str | None = None
+    matchup_display: str | None = None
+    contract_display: str | None = None
     side: Literal["yes", "no"]
     entry_price: float
     current_price: float | None
