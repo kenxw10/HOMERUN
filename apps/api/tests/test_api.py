@@ -28,6 +28,7 @@ from app.models import (
     Settlement,
     TrainingRun,
 )
+from app.jobs import market_family_discovery as market_family_discovery_job
 from app.security import require_internal_api_key
 from app.services import candidates, dashboard, market_family_discovery, market_sync, position_refresh
 from app.services.contracts import selected_team_from_ticker
@@ -2644,6 +2645,25 @@ def test_market_family_discovery_preserves_series_markets_before_pagination_erro
     assert run.status == "partial_error"
     assert item is not None
     assert item.returned_ticker == "KXMLBSPREAD-26JUL011900SEAPIT-PIT-1.5"
+
+
+def test_market_family_discovery_job_returns_nonzero_for_failed_status(monkeypatch) -> None:
+    class DummySession:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+    monkeypatch.setattr(market_family_discovery_job, "get_session_factory", lambda: DummySession)
+    monkeypatch.setattr(market_family_discovery_job, "_target_date_from_args", lambda: date(2026, 7, 1))
+    monkeypatch.setattr(
+        market_family_discovery_job,
+        "run_market_family_discovery",
+        lambda session, target_date: {"status": "failed", "errors": [{"message": "persisted failure"}]},
+    )
+
+    assert market_family_discovery_job.main() == 1
 
 
 def test_market_family_discovery_parses_line_from_ticker_tail_not_date_prefix() -> None:
