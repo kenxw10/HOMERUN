@@ -135,14 +135,14 @@ def sync_market_mappings(session: Session) -> int:
     for game in games:
         for market in markets:
             confidence, status, metadata = score_mapping(game, market)
-            if status == "rejected":
-                continue
             existing = session.scalar(
                 select(MarketMapping).where(
                     MarketMapping.mlb_game_id == game.id,
                     MarketMapping.kalshi_market_id == market.id,
                 )
             )
+            if status == "rejected" and existing is None:
+                continue
             row = existing or MarketMapping(mlb_game_id=game.id, kalshi_market_id=market.id)
             row.confidence = confidence
             row.mapping_status = status

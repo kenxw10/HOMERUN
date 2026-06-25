@@ -47,19 +47,16 @@ def _candidate_ids_with_trades(session: Session, candidate_ids: list[int]) -> se
     }
 
 
-def _has_open_trade_for_mapping(session: Session, mapping_id: int | None, market_ticker: str) -> bool:
+def _open_trade_for_mapping(session: Session, mapping_id: int | None, market_ticker: str) -> PaperTrade | None:
     if mapping_id is None:
-        return False
-    return (
-        session.scalar(
-            select(PaperTrade.id)
+        return None
+    return session.scalar(
+        select(PaperTrade)
             .join(ModelCandidate, PaperTrade.candidate_id == ModelCandidate.id)
             .where(ModelCandidate.mapping_id == mapping_id)
             .where(PaperTrade.market_ticker == market_ticker)
             .where(PaperTrade.status == "open")
             .limit(1)
-        )
-        is not None
     )
 
 
@@ -124,14 +121,17 @@ def generate_candidates(session: Session) -> dict[str, int]:
             (candidate for candidate in existing_candidates if candidate.id not in traded_candidate_ids),
             None,
         )
-        has_open_trade_for_mapping = _has_open_trade_for_mapping(session, mapping.id, market.ticker)
+        open_trade_for_mapping = _open_trade_for_mapping(session, mapping.id, market.ticker)
         candidate = existing or ModelCandidate(
             mapping_id=mapping.id,
             mlb_game_id=game.id,
             kalshi_market_id=market.id,
             evaluated_at=now,
         )
-        if (traded_candidate_ids or has_open_trade_for_mapping) and decision == "paper_trade":
+        if open_trade_for_mapping is not None and price is not None:
+            open_trade_for_mapping.current_price = price
+            session.add(open_trade_for_mapping)
+        if (traded_candidate_ids or open_trade_for_mapping is not None) and decision == "paper_trade":
             decision = "candidate_only_existing_trade"
         candidate.model_version_id = None
         candidate.evaluated_at = now

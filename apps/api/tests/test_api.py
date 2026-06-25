@@ -8,10 +8,10 @@ from sqlalchemy.orm import Session
 from app.config import get_settings
 from app.database import Base, database_status
 from app.main import app
-from app.models import BalanceSnapshot, KalshiMarket, MlbGame, ModelCandidate, PaperTrade, Position
+from app.models import BalanceSnapshot, KalshiMarket, MarketMapping, MlbGame, ModelCandidate, PaperTrade, Position
 from app.services import candidates, dashboard, market_sync
 from app.services.kalshi import KalshiClient, derive_orderbook_prices
-from app.services.mapping import infer_market_type, score_mapping
+from app.services.mapping import infer_market_type, score_mapping, sync_market_mappings
 from app.time_utils import classify_time_bucket
 
 client = TestClient(app)
@@ -228,6 +228,53 @@ def test_generate_candidates_avoids_duplicate_open_trade_across_days(monkeypatch
     assert all_candidates[1].decision == "candidate_only_existing_trade"
 
 
+def test_generate_candidates_refreshes_existing_open_trade_price(monkeypatch) -> None:
+    current_time = {"now": datetime(2026, 7, 1, 16, 0, tzinfo=UTC)}
+    monkeypatch.setattr(candidates, "utc_now", lambda: current_time["now"])
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        game = MlbGame(
+            external_game_id="refresh-1",
+            home_team="New York Yankees",
+            away_team="Boston Red Sox",
+            scheduled_start=datetime(2026, 7, 4, 0, 0, tzinfo=UTC),
+            status="scheduled",
+        )
+        market = KalshiMarket(
+            kalshi_market_id="KX-REFRESH",
+            ticker="KXMLB-REFRESH",
+            title="Will the New York Yankees win the game against the Boston Red Sox?",
+            status="open",
+            implied_yes_ask=Decimal("0.4000"),
+        )
+        session.add_all([game, market])
+        session.commit()
+
+        first_result = candidates.generate_candidates(session)
+        trade = session.scalar(select(PaperTrade).where(PaperTrade.market_ticker == "KXMLB-REFRESH"))
+        assert trade is not None
+        assert trade.current_price == Decimal("0.4000")
+
+        market.implied_yes_ask = Decimal("0.3200")
+        session.add(market)
+        session.commit()
+        current_time["now"] = datetime(2026, 7, 2, 16, 0, tzinfo=UTC)
+        second_result = candidates.generate_candidates(session)
+
+        refreshed_trade = session.get(PaperTrade, trade.id)
+        all_trades = list(session.scalars(select(PaperTrade)))
+
+    assert first_result["paper_trades"] == 1
+    assert second_result["paper_trades"] == 0
+    assert len(all_trades) == 1
+    assert refreshed_trade is not None
+    assert refreshed_trade.entry_price == Decimal("0.4000")
+    assert refreshed_trade.current_price == Decimal("0.3200")
+
+
 def test_mapping_confidence_and_rationale() -> None:
     game = MlbGame(
         external_game_id="1",
@@ -274,6 +321,45 @@ def test_mapping_requires_unambiguous_team_matches() -> None:
     assert status == "needs_review"
     assert metadata["matched_team_count"] == 0
     assert not any(str(reason).startswith("TEAM_MATCH") for reason in metadata["reasons"])
+
+
+def test_sync_market_mappings_updates_existing_rows_to_rejected() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        game = MlbGame(
+            external_game_id="stale-map-1",
+            home_team="New York Yankees",
+            away_team="Boston Red Sox",
+            scheduled_start=datetime(2026, 7, 1, 23, 5, tzinfo=UTC),
+            status="scheduled",
+        )
+        market = KalshiMarket(
+            kalshi_market_id="KX-STALE-MAP",
+            ticker="KXMLB-STALE-MAP",
+            title="Will the New York Yankees win the game against the Boston Red Sox?",
+            status="open",
+        )
+        session.add_all([game, market])
+        session.commit()
+
+        sync_market_mappings(session)
+        mapping = session.scalar(select(MarketMapping))
+        assert mapping is not None
+        assert mapping.mapping_status == "candidate"
+
+        market.title = "Will the Los Angeles Dodgers win the game against the San Francisco Giants?"
+        session.add(market)
+        session.commit()
+
+        sync_market_mappings(session)
+        updated_mapping = session.get(MarketMapping, mapping.id)
+
+    assert updated_mapping is not None
+    assert updated_mapping.mapping_status == "rejected"
+    assert updated_mapping.confidence == Decimal("0.1500")
+    assert updated_mapping.mapping_metadata["matched_team_count"] == 0
 
 
 def test_internal_sync_endpoints_require_api_key_when_configured(monkeypatch) -> None:
