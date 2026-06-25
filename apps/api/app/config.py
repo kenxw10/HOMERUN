@@ -1,3 +1,4 @@
+from decimal import Decimal
 from functools import lru_cache
 from typing import Literal
 
@@ -33,6 +34,8 @@ class Settings(BaseSettings):
     kalshi_market_sync_limit: int = Field(default=100, alias="KALSHI_MARKET_SYNC_LIMIT")
     paper_candidate_engine_enabled: bool = Field(default=True, alias="PAPER_CANDIDATE_ENGINE_ENABLED")
     default_paper_contracts: int = Field(default=1, alias="DEFAULT_PAPER_CONTRACTS")
+    paper_starting_balance: Decimal = Field(default=Decimal("1000.00"), alias="PAPER_STARTING_BALANCE")
+    model_training_min_samples: int = Field(default=100, alias="MODEL_TRAINING_MIN_SAMPLES")
     dashboard_timezone: str = Field(default="America/New_York", alias="DASHBOARD_TIMEZONE")
     backend_api_key: SecretStr | None = Field(default=None, alias="BACKEND_API_KEY")
 
@@ -49,6 +52,16 @@ class Settings(BaseSettings):
     @field_validator("default_paper_contracts")
     @classmethod
     def validate_default_paper_contracts(cls, value: int) -> int:
+        return max(value, 1)
+
+    @field_validator("paper_starting_balance")
+    @classmethod
+    def validate_paper_starting_balance(cls, value: Decimal) -> Decimal:
+        return max(value, Decimal("0.00"))
+
+    @field_validator("model_training_min_samples")
+    @classmethod
+    def validate_model_training_min_samples(cls, value: int) -> int:
         return max(value, 1)
 
     @property

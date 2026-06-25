@@ -308,9 +308,26 @@ def resolve_preview_for_date(session: Session, target_date: date, *, query_kalsh
     client = KalshiClient.from_settings()
     games = games_for_eastern_date(session, target_date)
     previews = [resolve_game_markets(client, game, query_kalshi=query_kalshi).to_preview_dict() for game in games]
+    partial_errors = [
+        {"game_id": preview.get("game_id"), **error}
+        for preview in previews
+        for error in preview.get("errors", [])
+        if isinstance(error, dict)
+    ]
+    warnings = [
+        {
+            "game_id": preview.get("game_id"),
+            "game_label": preview.get("game_label"),
+            "message": "NO_MATCHING_KALSHI_MARKET",
+        }
+        for preview in previews
+        if preview.get("validation_status") == "no_match"
+    ]
     return {
         "date": target_date.isoformat(),
         "games_considered": len(games),
         "games": previews,
-        "errors": [error for preview in previews for error in preview.get("errors", []) if isinstance(error, dict)],
+        "partial_errors": partial_errors,
+        "warnings": warnings,
+        "errors": partial_errors,
     }

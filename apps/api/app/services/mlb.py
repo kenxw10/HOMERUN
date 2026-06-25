@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 from typing import Any
 
 from sqlalchemy import select
@@ -57,3 +57,43 @@ def sync_schedule(session: Session, target_date: date | None = None) -> int:
 
     session.commit()
     return count
+
+
+def sync_results(session: Session, target_date: date | None = None) -> dict[str, object]:
+    target_dates = [target_date] if target_date else [today_eastern() - timedelta(days=1), today_eastern()]
+    updated = 0
+    missing = 0
+    final = 0
+
+    for day in target_dates:
+        payload = fetch_schedule(day)
+        for schedule_date in payload.get("dates", []):
+            for game in schedule_date.get("games", []):
+                game_pk = str(game.get("gamePk"))
+                if not game_pk:
+                    continue
+                row = session.scalar(select(MlbGame).where(MlbGame.external_game_id == game_pk))
+                if row is None:
+                    missing += 1
+                    continue
+
+                teams = game.get("teams", {})
+                home = teams.get("home", {})
+                away = teams.get("away", {})
+                status = game.get("status", {})
+                row.status = status.get("detailedState") or status.get("abstractGameState") or row.status
+                row.home_score = home.get("score")
+                row.away_score = away.get("score")
+                row.raw_payload = game
+                session.add(row)
+                updated += 1
+                if str(status.get("abstractGameState") or row.status).lower() == "final":
+                    final += 1
+
+    session.commit()
+    return {
+        "target_dates": [day.isoformat() for day in target_dates],
+        "games_updated": updated,
+        "missing_games": missing,
+        "final_games": final,
+    }

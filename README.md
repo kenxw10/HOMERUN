@@ -1,6 +1,6 @@
 # HOMERUN
 
-HOMERUN is a Kalshi-native MLB paper-trading system and dashboard. The current version includes the deployable PR 1 foundation, the PR 2 data layer, and the PR 2.5 targeted Kalshi MLB resolver: MLB slate ingestion, targeted Kalshi `KXMLBGAME` market resolution, auditable game-to-market mapping, conservative paper candidates, and a light trading-terminal dashboard.
+HOMERUN is a Kalshi-native MLB paper-trading system and dashboard. The current version includes the deployable PR 1 foundation, PR 2 data layer, PR 2.5 targeted Kalshi MLB resolver, and PR 3 paper results/model infrastructure: MLB slate/results ingestion, targeted Kalshi `KXMLBGAME` market resolution, auditable game-to-market mapping, conservative paper candidates, full-game winner paper settlement, portfolio snapshots, and a light trading-terminal dashboard.
 
 This is not a sportsbook app. It does not use DraftKings, FanDuel, Odds API, or sportsbook odds behavior. Future trading logic should use Kalshi yes/no contract math, account for fees, and assume hold-to-settlement unless a later PR changes that context deliberately.
 
@@ -15,9 +15,11 @@ This is not a sportsbook app. It does not use DraftKings, FanDuel, Odds API, or 
 - `LIVE_TRADING_ENABLED=false`
 - `EXECUTION_KILL_SWITCH=true`
 - `KALSHI_ENV=demo`
-- Kalshi credentials are optional for PR 2.5 targeted discovery and must not be production credentials unless a later PR explicitly changes the safety plan.
+- Kalshi credentials are optional for PR 3 paper-mode discovery and must not be production credentials unless a later PR explicitly changes the safety plan.
 - `BACKEND_API_KEY` is optional only for local development. Public or deployed backends must set it, and internal POST run endpoints require `X-API-Key`.
 - Broad Kalshi discovery is diagnostic-only and disabled by default with `KALSHI_ENABLE_BROAD_DISCOVERY=false`.
+- `PAPER_STARTING_BALANCE=1000.00` by default.
+- `MODEL_TRAINING_MIN_SAMPLES=100` prevents trained-model promotion on tiny samples.
 
 ## Local Backend
 
@@ -43,7 +45,7 @@ ruff check .
 
 ## Local Data Jobs
 
-PR 2.5 keeps the safe one-shot worker commands. They write MLB games, targeted Kalshi markets, mappings, model candidates, and paper trades to the configured database. They do not place live orders.
+PR 3 keeps safe one-shot worker commands. They write MLB games/results, targeted Kalshi markets, mappings, model candidates, paper trades, settlements, balance snapshots, and model governance records to the configured database. They do not place live orders.
 
 From `apps/api` after installing backend dependencies:
 
@@ -51,24 +53,38 @@ From `apps/api` after installing backend dependencies:
 .\.venv\Scripts\python.exe -m app.jobs.mlb_schedule_sync
 .\.venv\Scripts\python.exe -m app.jobs.kalshi_market_sync
 .\.venv\Scripts\python.exe -m app.jobs.paper_candidate_engine
+.\.venv\Scripts\python.exe -m app.jobs.mlb_results_sync
+.\.venv\Scripts\python.exe -m app.jobs.paper_settlement_sync
+.\.venv\Scripts\python.exe -m app.jobs.balance_snapshot
+.\.venv\Scripts\python.exe -m app.jobs.model_governance
 ```
 
 You can pass a specific date to the MLB schedule job:
 
 ```powershell
 .\.venv\Scripts\python.exe -m app.jobs.mlb_schedule_sync 2026-06-24
+.\.venv\Scripts\python.exe -m app.jobs.mlb_results_sync 2026-06-24
+.\.venv\Scripts\python.exe -m app.jobs.paper_settlement_sync 2026-06-24
 ```
 
-PR 2 also exposes internal API run endpoints:
+PR 3 exposes these internal API run endpoints:
 
 - `POST /v1/sync/mlb-schedule`
+- `POST /v1/sync/mlb-results?target_date=YYYY-MM-DD`
 - `POST /v1/sync/kalshi-markets`
 - `POST /v1/run/paper-candidate-engine`
+- `POST /v1/run/paper-settlement-sync?target_date=YYYY-MM-DD`
+- `POST /v1/run/balance-snapshot`
+- `POST /v1/run/model-governance`
 - `GET /v1/kalshi/resolve-preview?date=YYYY-MM-DD`
 
 For local development, these endpoints can run without a key when `APP_ENV=local` and `BACKEND_API_KEY` is empty. For any public or deployed backend, set `BACKEND_API_KEY` and call these endpoints with an `X-API-Key` header.
 
 `/v1/sync/kalshi-markets` now uses MLB games as its primary input and resolves the empirically observed `KXMLBGAME` full-game winner family first. Spread, total, and first-five families are still pending discovery and are not faked.
+
+Paper settlement currently supports only `full_game_winner`. It determines the selected team from the Kalshi ticker suffix, settles YES/NO contracts from final MLB scores, and uses hold-to-settlement P/L. Fees remain structured but zero until the exact Kalshi fee formula is implemented.
+
+The PR 3 model pipeline uses `heuristic_full_game_winner_v1`, a deterministic paper-only model with explicit feature JSON and missing-source markers. Model governance records skipped training/calibration runs until enough clean resolved candidates exist for chronological validation.
 
 ## Local Frontend
 
@@ -104,7 +120,9 @@ PR 2 adds migration `0002_pr2_data_layer.py` for raw MLB payloads, Kalshi orderb
 
 PR 2.5 adds migration `0003_pr2_5_targeted_kalshi_resolver.py` for MLB team abbreviations, raw Kalshi status, resolver strategy, and validation status.
 
-## PR 2.5 Production Validation
+PR 3 adds migration `0004_pr3_results_model.py` for paper settlement fields, readable contract labels, feature/model metadata, snapshot type, and settlement-to-paper-trade linkage.
+
+## PR 3 Production Validation
 
 After deploy and migration:
 
@@ -115,9 +133,13 @@ Invoke-RestMethod -Method Post -Headers @{"X-API-Key"="YOUR_KEY"} https://YOUR-R
 Invoke-RestMethod -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-RAILWAY-API/v1/kalshi/resolve-preview?date=2026-06-26"
 Invoke-RestMethod -Method Post -Headers @{"X-API-Key"="YOUR_KEY"} https://YOUR-RAILWAY-API/v1/sync/kalshi-markets
 Invoke-RestMethod -Method Post -Headers @{"X-API-Key"="YOUR_KEY"} https://YOUR-RAILWAY-API/v1/run/paper-candidate-engine
+Invoke-RestMethod -Method Post -Headers @{"X-API-Key"="YOUR_KEY"} https://YOUR-RAILWAY-API/v1/sync/mlb-results
+Invoke-RestMethod -Method Post -Headers @{"X-API-Key"="YOUR_KEY"} https://YOUR-RAILWAY-API/v1/run/paper-settlement-sync
+Invoke-RestMethod -Method Post -Headers @{"X-API-Key"="YOUR_KEY"} https://YOUR-RAILWAY-API/v1/run/balance-snapshot
+Invoke-RestMethod -Method Post -Headers @{"X-API-Key"="YOUR_KEY"} https://YOUR-RAILWAY-API/v1/run/model-governance
 ```
 
-Expected result: health and system status remain safe, resolve preview shows attempted `KXMLBGAME` tickers per MLB game, Kalshi sync returns a structured summary instead of a blank upstream error, and missing Kalshi matches exit cleanly.
+Expected result: health and system status remain safe, Alembic is at `0004_pr3_results_model`, resolve preview returns structured per-game results with `ok=true`, Kalshi sync returns a structured summary, the candidate engine creates candidates with non-placeholder probabilities, results sync updates completed games, settlement settles completed full-game winner paper trades, balance snapshots populate the portfolio chart, and model governance records either a trained/promoted model or a clear skipped reason due to insufficient samples.
 
 ## Deployment
 

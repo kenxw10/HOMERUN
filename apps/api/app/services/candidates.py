@@ -7,8 +7,12 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
-from app.models import KalshiMarket, MarketMapping, MlbGame, ModelCandidate, PaperTrade
+from app.models import FeatureSnapshot, KalshiMarket, MarketMapping, MlbGame, ModelCandidate, PaperTrade
+from app.services.contracts import SUPPORTED_MARKET_FAMILY, contract_labels, has_trusted_selection, market_type_from_ticker
+from app.services.features import FEATURE_VERSION, build_feature_snapshot
 from app.services.mapping import infer_market_type, sync_market_mappings
+from app.services.modeling import get_or_create_heuristic_model_version, score_candidate_probability
+from app.services.portfolio import create_balance_snapshot
 from app.time_utils import classify_time_bucket, ensure_aware_utc, get_dashboard_zone, utc_now
 
 TEMPORARY_EDGE_THRESHOLD = Decimal("0.0500")
@@ -74,6 +78,7 @@ def _open_trade_for_market(session: Session, market_ticker: str, contract_side: 
 
 def _decision(
     mapping: MarketMapping,
+    game: MlbGame,
     market: KalshiMarket,
     market_type: str,
     minutes_to_start: int,
@@ -83,7 +88,7 @@ def _decision(
     settings = get_settings()
     if mapping.mapping_status == "needs_review" or (mapping.confidence or Decimal("0")) < Decimal("0.55"):
         return "no_trade_mapping_uncertain"
-    if market_type == "unknown":
+    if market_type != SUPPORTED_MARKET_FAMILY:
         return "no_trade_unsupported_market_type"
     if minutes_to_start <= 0:
         return "no_trade_game_started"
@@ -95,6 +100,8 @@ def _decision(
         return "no_trade_edge_too_low"
     if not settings.paper_candidate_engine_enabled:
         return "candidate_only"
+    if settings.safe_execution_posture and not has_trusted_selection(game, market.ticker):
+        return "no_trade_untrusted_selection"
     if settings.safe_execution_posture:
         return "paper_trade"
     return "candidate_only"
@@ -107,6 +114,7 @@ def generate_candidates(session: Session) -> dict[str, int]:
     day, day_start, day_end = _candidate_day_bounds(now)
     created_or_updated = 0
     paper_trades = 0
+    model_version = get_or_create_heuristic_model_version(session)
 
     mappings = session.execute(
         select(MarketMapping, MlbGame, KalshiMarket)
@@ -121,13 +129,29 @@ def generate_candidates(session: Session) -> dict[str, int]:
     for mapping, game, market in mappings:
         minutes_to_start = int((ensure_aware_utc(game.scheduled_start) - now).total_seconds() / 60)
         bucket = classify_time_bucket(minutes_to_start)
-        market_type = infer_market_type(_market_classification_text(market))
-        probability = Decimal("0.500000")
+        market_type = market_type_from_ticker(market.ticker, infer_market_type(_market_classification_text(market)))
         price = _market_yes_price(market)
+        contract_side = "yes"
+        features = build_feature_snapshot(game, market, mapping)
+        labels = contract_labels(game=game, market=market, market_ticker=market.ticker, market_type=market_type)
+        if market_type == SUPPORTED_MARKET_FAMILY:
+            model_score = score_candidate_probability(features, contract_side)
+            probability = model_score.probability
+            fair_value = model_score.fair_value
+            scoring_rationale = model_score.rationale
+        else:
+            probability = Decimal("0.500000")
+            fair_value = Decimal("0.5000")
+            scoring_rationale = {
+                "model_version": model_version.version_tag,
+                "feature_version": FEATURE_VERSION,
+                "reason": "unsupported_market_family",
+                "uses_market_price": False,
+            }
         gross_ev = (probability - price).quantize(Decimal("0.000001")) if price is not None else None
         fee = Decimal("0.000000")
         net_ev = (gross_ev - fee).quantize(Decimal("0.000001")) if gross_ev is not None else None
-        decision = _decision(mapping, market, market_type, minutes_to_start, price, net_ev)
+        decision = _decision(mapping, game, market, market_type, minutes_to_start, price, net_ev)
 
         existing_candidates = list(
             session.scalars(
@@ -146,7 +170,6 @@ def generate_candidates(session: Session) -> dict[str, int]:
             (candidate for candidate in existing_candidates if candidate.id not in traded_candidate_ids),
             None,
         )
-        contract_side = "yes"
         open_trade_for_market = _open_trade_for_market(session, market.ticker, contract_side)
         candidate = existing or ModelCandidate(
             mapping_id=mapping.id,
@@ -156,23 +179,19 @@ def generate_candidates(session: Session) -> dict[str, int]:
         )
         if open_trade_for_market is not None and price is not None:
             open_trade_for_market.current_price = price
+            open_trade_for_market.market_display = open_trade_for_market.market_display or labels.market_display
+            open_trade_for_market.selection_display = open_trade_for_market.selection_display or labels.selection_display
+            open_trade_for_market.matchup_display = open_trade_for_market.matchup_display or labels.matchup_display
+            open_trade_for_market.contract_display = open_trade_for_market.contract_display or labels.contract_display
             session.add(open_trade_for_market)
         if (traded_candidate_ids or open_trade_for_market is not None) and decision == "paper_trade":
             decision = "candidate_only_existing_trade"
-        candidate.model_version_id = None
+        candidate.model_version_id = model_version.id
         candidate.evaluated_at = now
-        candidate.features = {
-            "home_team": game.home_team,
-            "away_team": game.away_team,
-            "scheduled_start": game.scheduled_start.isoformat(),
-            "mapping_confidence": float(mapping.confidence or 0),
-            "market_status": market.status,
-            "best_yes_bid": float(market.best_yes_bid) if market.best_yes_bid is not None else None,
-            "implied_yes_ask": float(market.implied_yes_ask) if market.implied_yes_ask is not None else None,
-        }
+        candidate.features = features
         candidate.probability = probability
         candidate.model_probability = probability
-        candidate.fair_value = Decimal("0.5000")
+        candidate.fair_value = fair_value
         candidate.market_price = price
         candidate.executable_price = price
         candidate.expected_value = gross_ev
@@ -183,8 +202,22 @@ def generate_candidates(session: Session) -> dict[str, int]:
         candidate.time_to_start_minutes = minutes_to_start
         candidate.contract_side = contract_side
         candidate.decision = decision
+        candidate.model_version_tag = model_version.version_tag
+        candidate.scoring_rationale = scoring_rationale
+        candidate.market_display = labels.market_display
+        candidate.selection_display = labels.selection_display
+        candidate.matchup_display = labels.matchup_display
+        candidate.contract_display = labels.contract_display
         session.add(candidate)
         session.flush()
+        session.add(
+            FeatureSnapshot(
+                candidate_id=candidate.id,
+                captured_at=now,
+                features=features,
+                source=FEATURE_VERSION,
+            )
+        )
         created_or_updated += 1
 
         if decision == "paper_trade":
@@ -200,10 +233,21 @@ def generate_candidates(session: Session) -> dict[str, int]:
                     entry_time=now,
                     status="open",
                     expected_value=net_ev,
+                    market_display=labels.market_display,
+                    selection_display=labels.selection_display,
+                    matchup_display=labels.matchup_display,
+                    contract_display=labels.contract_display,
                 )
                 session.add(trade)
                 session.flush()
                 paper_trades += 1
 
+    snapshot = create_balance_snapshot(session, source="candidate_engine")
     session.commit()
-    return {"date": int(day.strftime("%Y%m%d")), "candidates": created_or_updated, "paper_trades": paper_trades}
+    return {
+        "date": int(day.strftime("%Y%m%d")),
+        "candidates": created_or_updated,
+        "paper_trades": paper_trades,
+        "model_version": model_version.version_tag,
+        "snapshot_id": snapshot.id,
+    }

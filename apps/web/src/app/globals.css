@@ -384,6 +384,22 @@ button {
   border-bottom: 0;
 }
 
+.market-primary,
+.market-secondary {
+  display: block;
+}
+
+.market-primary {
+  color: #111827;
+  font-weight: 900;
+}
+
+.market-secondary {
+  margin-top: 4px;
+  color: #687386;
+  font-size: 10px;
+}
+
 .table-empty {
   height: 90px;
   color: #687386;

@@ -10,7 +10,7 @@ The user wants the system to become as hands-off as possible. Calibration, thres
 
 ## 2. Current Scope
 
-PR 2.5 builds on the merged PR 2 data layer:
+PR 3 builds on the merged PR 2.5 targeted resolver:
 
 - FastAPI backend in `apps/api`.
 - Next.js TypeScript frontend in `apps/web`.
@@ -19,30 +19,33 @@ PR 2.5 builds on the merged PR 2 data layer:
 - Targeted Kalshi MLB market resolution from MLB game rows using the empirically observed `KXMLBGAME` full-game winner family.
 - Kalshi yes/no orderbook parsing and raw payload storage for targeted markets only.
 - Auditable MLB game to Kalshi market mapping with confidence and rationale.
-- Conservative paper candidate and paper-trade generation.
+- Conservative paper candidate and paper-trade generation using a transparent heuristic probability model.
+- MLB results sync for completed games.
+- Paper full-game winner settlement and realized P/L tracking.
+- Paper balance snapshots from starting balance, open cost, realized P/L, and open mark value.
+- Feature snapshot storage for model candidates with explicit missing-source markers.
+- Automated model governance runs that skip training/promotion until sample thresholds are met.
 - Database-backed dashboard API responses when data exists.
 - Light-theme trading-terminal dashboard that renders portfolio snapshots, paper metrics, open positions, model status, and system status.
 - Railway backend and PostgreSQL setup documentation.
 - Vercel frontend setup documentation.
 - CI scaffolding for backend tests and frontend checks.
 
-The system still has no live trading, no production credentials requirement, no trained predictive model, no settlement collection, and no scheduled automation.
+The system still has no live trading, no production credentials requirement, no sportsbook logic, and no support for spreads, totals, or first-five markets.
 
 ## 3. Non-Goals
 
 This project is not a sportsbook betting app. Do not add sportsbook assumptions, sportsbook APIs, sportsbook odds conversion, DraftKings, FanDuel, or Odds API behavior.
 
-PR 2.5 still intentionally excludes:
+PR 3 still intentionally excludes:
 
 - Live order placement.
 - Production Kalshi credentials.
 - A trained predictive model.
-- Settlement and outcome collection.
 - Admin password pages.
 - Monthly calendars.
-- Automated retraining jobs.
 - Hidden dashboard-triggered worker automation.
-- Model training or calibration.
+- Automatic trained-model promotion on tiny samples.
 - Fake spread, total, or first-five market tickers.
 
 ## 4. Architecture Decisions
@@ -66,8 +69,12 @@ The backend exposes these read endpoints in PR 2:
 It also exposes controlled internal run endpoints:
 
 - `POST /v1/sync/mlb-schedule`
+- `POST /v1/sync/mlb-results?target_date=YYYY-MM-DD`
 - `POST /v1/sync/kalshi-markets`
 - `POST /v1/run/paper-candidate-engine`
+- `POST /v1/run/paper-settlement-sync?target_date=YYYY-MM-DD`
+- `POST /v1/run/balance-snapshot`
+- `POST /v1/run/model-governance`
 - `GET /v1/kalshi/resolve-preview?date=YYYY-MM-DD`
 
 The database layer is PostgreSQL-ready but the API can still boot locally without a database for frontend and health-check work.
@@ -162,7 +169,7 @@ Frontend target:
 - `NEXT_PUBLIC_API_BASE_URL` points to the Railway backend URL.
 - `NEXT_PUBLIC_REFRESH_MS` controls dashboard polling and defaults to `30000`.
 
-Production Kalshi credentials should not be added during PR 2.5.
+Production Kalshi credentials should not be added during PR 3.
 
 ## 12. PR2.5 Kalshi Market Resolution
 
@@ -185,7 +192,46 @@ New PR 2.5 migration:
 - Adds Kalshi raw status.
 - Adds mapping resolver strategy and validation status.
 
-## 13. PR Change Log
+## 13. PR3 Paper Results And Model Workflow
+
+PR 3 adds the first closed-loop paper-results workflow:
+
+- `app.jobs.mlb_results_sync` updates `mlb_games` with final statuses, scores, and raw MLB payloads.
+- `app.jobs.paper_settlement_sync` settles only supported `full_game_winner` paper trades.
+- Settlement determines the selected team from the Kalshi ticker suffix and computes hold-to-settlement P/L.
+- Fees remain structured as `fee_estimate` / `fee_paid` with a zero value until a later PR implements the exact Kalshi fee formula.
+- `app.jobs.balance_snapshot` creates portfolio snapshots from `PAPER_STARTING_BALANCE`, open trade cost, realized P/L, and current marks.
+- `/v1/dashboard/summary` reads snapshots, settled paper trades, and open positions/trades for cash, portfolio value, P/L, ROI, record, and readable contract labels.
+
+PR 3 also adds the first model-feature and governance infrastructure:
+
+- Candidate generation builds `mlb_features_v1` snapshots from available MLB/Kalshi data.
+- Missing starters, lineup, weather, injury, splits, and richer team metrics are explicit in JSON with `source_status: missing`.
+- The active model is `heuristic_full_game_winner_v1`, a conservative deterministic model that does not blend toward Kalshi market price.
+- Model governance writes training and calibration run records and skips automatic training/promotion until the resolved-sample threshold is met.
+- Future trained models must use clean resolved candidates, chronological validation, calibration metrics, and documented champion/challenger promotion rules.
+
+Frontend PR 3 display changes:
+
+- Open positions show readable labels such as `FULL GAME WINNER · SEA @ PIT · PIT`.
+- Raw Kalshi tickers remain visible as secondary text under the market label.
+- The dashboard keeps the light terminal style, uppercase text, full-width chart, metrics, contracts table, model panel, and system panel.
+
+Remaining PR 3 limitations:
+
+- Only full-game winner markets are supported.
+- Spread, total, and first-five market families remain pending discovery and must not be faked.
+- The heuristic model is intentionally conservative and should be replaced only after governance has enough clean resolved samples.
+- Live execution remains disabled and no live order path exists.
+
+Expected next PR scope:
+
+- Schedule the hands-off jobs in deployment infrastructure.
+- Expand MLB feature coverage from reliable Stats API sources.
+- Add fee-aware settlement once exact fee terms are verified.
+- Begin trained challenger evaluation when enough resolved candidates exist.
+
+## 14. PR Change Log
 
 Every future PR must update this section with:
 
@@ -217,3 +263,16 @@ Every future PR must update this section with:
 - Rejected multivariate Kalshi markets from normal MLB game mapping.
 - Kept paper-first safety posture unchanged: no live orders, live trading disabled, kill switch enabled.
 - Validation performed: backend Ruff and backend pytest.
+
+### PR 3 - Paper Results, Portfolio, And Model Governance
+
+- Added migration `0004_pr3_results_model.py` for paper settlement fields, readable contract labels, feature/model metadata, snapshot type, and settlement-to-paper-trade linkage.
+- Added MLB results sync, paper settlement sync, balance snapshot, and model governance jobs/endpoints.
+- Added hold-to-settlement P/L for supported `full_game_winner` paper trades and idempotent settlement records.
+- Added paper portfolio accounting from `PAPER_STARTING_BALANCE`, realized P/L, open trade cost, and open mark value.
+- Replaced placeholder `0.50` candidate probabilities with `heuristic_full_game_winner_v1`.
+- Added feature snapshots with explicit missing-source markers and automated governance skips for insufficient samples.
+- Updated dashboard summaries and frontend positions to show readable market labels while preserving raw Kalshi tickers.
+- Changed resolve-preview semantics so structured partial no-match/error results return `ok=true` with warnings/partial errors.
+- Kept paper-first safety posture unchanged: no live orders, live trading disabled, kill switch enabled.
+- Validation performed: backend Ruff, backend pytest, Alembic head check, frontend lint, frontend typecheck, and frontend build.

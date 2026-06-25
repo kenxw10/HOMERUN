@@ -9,7 +9,7 @@ Before treating a deployment as valid:
 3. Confirm `PAPER_TRADING=true`.
 4. Confirm `LIVE_TRADING_ENABLED=false`.
 5. Confirm `EXECUTION_KILL_SWITCH=true`.
-6. Confirm `KALSHI_ENV=demo` for PR 2.5 unless a later PR explicitly approves production credentials.
+6. Confirm `KALSHI_ENV=demo` for PR 3 unless a later PR explicitly approves production credentials.
 7. Confirm Vercel has `NEXT_PUBLIC_API_BASE_URL` pointed at the Railway backend.
 8. Confirm Railway `/v1/system/status` reports `database.ready: true` after opening a real database connection.
 9. Confirm the Vercel dashboard loads the light terminal UI without a dark theme, admin page, calendar, or sportsbook concepts.
@@ -25,15 +25,15 @@ Do not proceed if any of these are false:
 
 1. `LIVE_TRADING_ENABLED=false`.
 2. `EXECUTION_KILL_SWITCH=true`.
-3. No production Kalshi credentials are configured for PR 2.5.
+3. No production Kalshi credentials are configured for PR 3.
 4. No code path places live Kalshi orders.
 5. Dashboard labels are derived from `/v1/system/status` and show paper mode, live trading disabled, and kill switch on.
 
 Future live execution must include hard environment guards, a kill switch, tests for disabled execution, and explicit documentation in `PROJECT_CONTEXT.md`.
 
-## PR 2.5 Worker Commands
+## PR 3 Worker Commands
 
-PR 2.5 worker commands are explicit one-shot commands. They should be run from the backend service context and should not be hidden inside the web dashboard.
+PR 3 worker commands are explicit one-shot commands. They should be run from the backend service context and should not be hidden inside the web dashboard.
 
 From `apps/api`:
 
@@ -41,12 +41,18 @@ From `apps/api`:
 .\.venv\Scripts\python.exe -m app.jobs.mlb_schedule_sync
 .\.venv\Scripts\python.exe -m app.jobs.kalshi_market_sync
 .\.venv\Scripts\python.exe -m app.jobs.paper_candidate_engine
+.\.venv\Scripts\python.exe -m app.jobs.mlb_results_sync
+.\.venv\Scripts\python.exe -m app.jobs.paper_settlement_sync
+.\.venv\Scripts\python.exe -m app.jobs.balance_snapshot
+.\.venv\Scripts\python.exe -m app.jobs.model_governance
 ```
 
 Optional dated MLB schedule sync:
 
 ```powershell
 .\.venv\Scripts\python.exe -m app.jobs.mlb_schedule_sync 2026-06-24
+.\.venv\Scripts\python.exe -m app.jobs.mlb_results_sync 2026-06-24
+.\.venv\Scripts\python.exe -m app.jobs.paper_settlement_sync 2026-06-24
 ```
 
 The jobs currently cover:
@@ -55,10 +61,15 @@ The jobs currently cover:
 - Targeted Kalshi MLB market resolution for the empirically observed `KXMLBGAME` full-game winner family.
 - Orderbook snapshots for targeted relevant markets only.
 - Auditable MLB game to Kalshi market mapping.
-- Candidate scoring with a placeholder probability model.
+- Candidate scoring with the `heuristic_full_game_winner_v1` paper model.
 - Conservative paper-trade simulation.
+- MLB results updates for completed games.
+- Full-game winner paper settlement and hold-to-settlement P/L.
+- Paper balance snapshots.
+- Feature snapshots and conservative heuristic model scoring.
+- Model governance records that skip training/promotion until sample thresholds are met.
 
-They do not cover settlement collection, model training, calibration, scheduled automation, or live execution.
+They do not cover scheduled automation or live execution.
 They also do not fake spread, total, or first-five market tickers.
 
 Each worker should be idempotent where possible, log risk events, and avoid live order execution unless future safety gates are in place.
@@ -68,23 +79,34 @@ Each worker should be idempotent where possible, log risk events, and avoid live
 The backend also exposes these POST endpoints for controlled operational runs:
 
 - `POST /v1/sync/mlb-schedule`
+- `POST /v1/sync/mlb-results?target_date=YYYY-MM-DD`
 - `POST /v1/sync/kalshi-markets`
 - `POST /v1/run/paper-candidate-engine`
+- `POST /v1/run/paper-settlement-sync?target_date=YYYY-MM-DD`
+- `POST /v1/run/balance-snapshot`
+- `POST /v1/run/model-governance`
 - `GET /v1/kalshi/resolve-preview?date=YYYY-MM-DD`
 
-For public or deployed backends, `BACKEND_API_KEY` is required and must be sent as `X-API-Key`. The unauthenticated bypass is only for explicit local development environments. Do not expose these endpoints as public dashboard buttons in PR 2.5.
+For public or deployed backends, `BACKEND_API_KEY` is required and must be sent as `X-API-Key`. The unauthenticated bypass is only for explicit local development environments. Do not expose these endpoints as public dashboard buttons in PR 3.
 
-## PR 2.5 Kalshi Resolver Validation
+## PR 3 Production Validation
 
-After deploying PR 2.5 and running `alembic upgrade head`, validate in this order:
+After deploying PR 3 and running `alembic upgrade head`, validate in this order:
 
 1. `GET /health` returns `status: "ok"`.
 2. `GET /v1/system/status` reports `database.ready: true` and does not expose secrets.
-3. `POST /v1/sync/mlb-schedule` returns a games count.
-4. `GET /v1/kalshi/resolve-preview?date=YYYY-MM-DD` returns attempted `KXMLBGAME` event and market tickers for each MLB game.
-5. `POST /v1/sync/kalshi-markets` returns a structured summary with `games_considered`, attempted ticker counts, mapping counts, and `errors` when upstream calls fail.
-6. `GET /v1/markets/today` shows mapped markets if matching Kalshi markets exist.
-7. `POST /v1/run/paper-candidate-engine` exits cleanly and creates candidates only when confirmed or candidate mappings exist.
+3. Alembic reports head revision `0004_pr3_results_model`.
+4. `POST /v1/sync/mlb-schedule` returns a games count.
+5. `GET /v1/kalshi/resolve-preview?date=YYYY-MM-DD` returns attempted `KXMLBGAME` event and market tickers for each MLB game, with `ok=true` even when individual games have no match warnings.
+6. `POST /v1/sync/kalshi-markets` returns a structured summary with `games_considered`, attempted ticker counts, mapping counts, and `errors` when upstream calls fail.
+7. `GET /v1/markets/today` shows mapped markets if matching Kalshi markets exist.
+8. `POST /v1/run/paper-candidate-engine` exits cleanly and creates candidates with `heuristic_full_game_winner_v1` probabilities.
+9. `POST /v1/sync/mlb-results` updates completed games with scores/final status.
+10. `POST /v1/run/paper-settlement-sync` settles completed supported full-game winner paper trades.
+11. `POST /v1/run/balance-snapshot` creates a snapshot and `/v1/dashboard/summary` uses it for the portfolio chart.
+12. `POST /v1/run/model-governance` records a training/calibration run and either promotes under governance or skips with a clear insufficient-sample reason.
+13. The Vercel dashboard shows readable contract labels with the raw Kalshi ticker as secondary text.
+14. Confirm no live execution path exists and live trading remains disabled.
 
 Broad market discovery is diagnostic-only:
 

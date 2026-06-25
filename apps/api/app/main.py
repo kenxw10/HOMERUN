@@ -28,8 +28,11 @@ from app.services.dashboard import (
     list_today_games,
     list_today_markets,
 )
+from app.services.modeling import run_model_governance
 from app.services.market_sync import resolve_preview_for_date, sync_kalshi_markets
-from app.services.mlb import sync_schedule
+from app.services.mlb import sync_results, sync_schedule
+from app.services.portfolio import create_balance_snapshot
+from app.services.settlement import settle_paper_trades
 from app.time_utils import eastern_display, to_eastern_iso
 
 settings = get_settings()
@@ -252,7 +255,7 @@ def kalshi_resolve_preview(
                 action="kalshi_resolve_preview",
                 result={"error": {"message": str(exc), "type": exc.__class__.__name__}},
             )
-    return RunResponse(ok=not result.get("errors"), action="kalshi_resolve_preview", result=result)
+    return RunResponse(ok=True, action="kalshi_resolve_preview", result=result)
 
 
 @app.post("/v1/run/paper-candidate-engine", response_model=RunResponse)
@@ -260,3 +263,44 @@ def run_paper_candidate_engine(_: None = Depends(require_internal_api_key)) -> R
     with _db_session_or_503() as session:
         result = generate_candidates(session)
     return RunResponse(ok=True, action="paper_candidate_engine", result=result)
+
+
+@app.post("/v1/sync/mlb-results", response_model=RunResponse)
+def run_mlb_results_sync(
+    target_date: date | None = Query(default=None),
+    _: None = Depends(require_internal_api_key),
+) -> RunResponse:
+    with _db_session_or_503() as session:
+        result = sync_results(session, target_date)
+    return RunResponse(ok=True, action="mlb_results_sync", result=result)
+
+
+@app.post("/v1/run/paper-settlement-sync", response_model=RunResponse)
+def run_paper_settlement_sync(
+    target_date: date | None = Query(default=None),
+    _: None = Depends(require_internal_api_key),
+) -> RunResponse:
+    with _db_session_or_503() as session:
+        result = settle_paper_trades(session, target_date)
+    return RunResponse(ok=True, action="paper_settlement_sync", result=result)
+
+
+@app.post("/v1/run/balance-snapshot", response_model=RunResponse)
+def run_balance_snapshot(_: None = Depends(require_internal_api_key)) -> RunResponse:
+    with _db_session_or_503() as session:
+        snapshot = create_balance_snapshot(session, source="manual_endpoint")
+        session.commit()
+        result = {
+            "snapshot_id": snapshot.id,
+            "cash_balance": float(snapshot.cash_balance),
+            "portfolio_value": float(snapshot.portfolio_value),
+            "captured_at": snapshot.captured_at.isoformat(),
+        }
+    return RunResponse(ok=True, action="balance_snapshot", result=result)
+
+
+@app.post("/v1/run/model-governance", response_model=RunResponse)
+def run_model_governance_endpoint(_: None = Depends(require_internal_api_key)) -> RunResponse:
+    with _db_session_or_503() as session:
+        result = run_model_governance(session)
+    return RunResponse(ok=True, action="model_governance", result=result)

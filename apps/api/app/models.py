@@ -36,6 +36,7 @@ class BalanceSnapshot(TimestampMixin, Base):
     cash_balance: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False)
     portfolio_value: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False)
     source: Mapped[str] = mapped_column(String(40), default="paper", nullable=False)
+    snapshot_type: Mapped[str | None] = mapped_column(String(40))
 
 
 class MlbGame(TimestampMixin, Base):
@@ -111,6 +112,10 @@ class ModelVersion(TimestampMixin, Base):
     trained_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     metrics: Mapped[dict[str, object] | None] = mapped_column(JSON)
     is_active: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    model_family: Mapped[str | None] = mapped_column(String(80))
+    feature_version: Mapped[str | None] = mapped_column(String(80))
+    role: Mapped[str | None] = mapped_column(String(40))
+    promoted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class ModelCandidate(TimestampMixin, Base):
@@ -137,6 +142,14 @@ class ModelCandidate(TimestampMixin, Base):
     contract_side: Mapped[str | None] = mapped_column(String(10))
     decision: Mapped[str] = mapped_column(String(40), default="no_trade", nullable=False)
     outcome: Mapped[str | None] = mapped_column(String(40))
+    outcome_source: Mapped[str | None] = mapped_column(String(80))
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    model_version_tag: Mapped[str | None] = mapped_column(String(120))
+    scoring_rationale: Mapped[dict[str, object] | None] = mapped_column(JSON)
+    market_display: Mapped[str | None] = mapped_column(Text)
+    selection_display: Mapped[str | None] = mapped_column(String(40))
+    matchup_display: Mapped[str | None] = mapped_column(String(80))
+    contract_display: Mapped[str | None] = mapped_column(Text)
 
 
 class PaperTrade(TimestampMixin, Base):
@@ -155,6 +168,14 @@ class PaperTrade(TimestampMixin, Base):
     status: Mapped[str] = mapped_column(String(40), default="open", nullable=False)
     expected_value: Mapped[Decimal | None] = mapped_column(Numeric(10, 6))
     realized_pnl: Mapped[Decimal | None] = mapped_column(Numeric(14, 2))
+    resolution: Mapped[str | None] = mapped_column(String(40))
+    fee_paid: Mapped[Decimal | None] = mapped_column(Numeric(14, 2))
+    settled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    outcome: Mapped[str | None] = mapped_column(String(40))
+    market_display: Mapped[str | None] = mapped_column(Text)
+    selection_display: Mapped[str | None] = mapped_column(String(40))
+    matchup_display: Mapped[str | None] = mapped_column(String(80))
+    contract_display: Mapped[str | None] = mapped_column(Text)
 
 
 class Order(TimestampMixin, Base):
@@ -199,12 +220,16 @@ class Position(TimestampMixin, Base):
 
 class Settlement(TimestampMixin, Base):
     __tablename__ = "settlements"
+    __table_args__ = (UniqueConstraint("paper_trade_id", name="uq_settlement_paper_trade"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    position_id: Mapped[int] = mapped_column(ForeignKey("positions.id"), nullable=False)
+    position_id: Mapped[int | None] = mapped_column(ForeignKey("positions.id"))
+    paper_trade_id: Mapped[int | None] = mapped_column(ForeignKey("paper_trades.id"))
     settled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     resolution: Mapped[str] = mapped_column(String(40), nullable=False)
+    outcome: Mapped[str | None] = mapped_column(String(40))
     payout: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False)
+    fee_paid: Mapped[Decimal | None] = mapped_column(Numeric(14, 2))
     realized_pnl: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False)
 
 

@@ -18,6 +18,11 @@ type PositionSummary = {
   time_entered: string | null;
   time_entered_display: string | null;
   market: string;
+  market_ticker: string | null;
+  market_display: string | null;
+  selection_display: string | null;
+  matchup_display: string | null;
+  contract_display: string | null;
   side: "yes" | "no";
   entry_price: number;
   current_price: number | null;
@@ -406,8 +411,13 @@ function PositionsTable({ positions }: { positions: PositionSummary[] }) {
               positions.map((position) => (
                 <tr key={`${position.market}-${position.side}-${position.time_entered}-${position.entry_price}`}>
                   <td>{position.time_entered_display ?? formatEastern(position.time_entered)}</td>
-                  <td>{position.market}</td>
-                  <td>{position.side}</td>
+                  <td>
+                    <span className="market-primary">{position.contract_display ?? position.market}</span>
+                    <span className="market-secondary" title={position.market_ticker ?? position.market}>
+                      {position.market_ticker ?? position.market}
+                    </span>
+                  </td>
+                  <td>{position.side.toUpperCase()}</td>
                   <td>{formatPrice(position.entry_price)}</td>
                   <td>{formatPrice(position.current_price)}</td>
                   <td>{position.quantity}</td>
@@ -523,7 +533,7 @@ export default function DashboardPage() {
       <PortfolioChart summary={summary} />
 
       <section className="metrics-grid" aria-label="Performance metrics">
-        <MetricCard label="WIN RATE" value={formatPercent(summary.performance.win_rate)} detail="NO SETTLED PAPER TRADES" />
+        <MetricCard label="WIN RATE" value={formatPercent(summary.performance.win_rate)} detail="SETTLED PAPER TRADES" />
         <MetricCard label="ROI" value={formatPercent(summary.performance.roi)} detail="HOLD-TO-SETTLEMENT BASIS" />
         <MetricCard label="P/L" value={formatSignedCurrency(summary.performance.profit_loss)} detail="PAPER TRADING ONLY" />
         <MetricCard label="RECORD" value={summary.performance.record} detail="WINS-LOSSES-PUSHES" />
@@ -538,7 +548,7 @@ export default function DashboardPage() {
 
       <footer className="terminal-footer">
         <span>ALL TIMES DISPLAYED IN EDT/EST</span>
-        <span>HOMERUN V0.2.0 | PR2 DATA LAYER</span>
+        <span>HOMERUN V0.3.0 | PR3 PAPER RESULTS</span>
       </footer>
     </main>
   );
