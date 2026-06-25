@@ -140,14 +140,56 @@ def score_mapping(game: MlbGame, market: KalshiMarket) -> tuple[Decimal, str, di
     return confidence, status, metadata
 
 
+def _disambiguate_market_scores(scored: list[dict[str, object]]) -> None:
+    candidate_indexes: list[tuple[int, int]] = []
+    for index, item in enumerate(scored):
+        metadata = item["metadata"]
+        if (
+            item["status"] == "candidate"
+            and isinstance(metadata, dict)
+            and metadata.get("matched_team_count") == 2
+            and metadata.get("date_proximity_matched") is True
+            and isinstance(metadata.get("minutes_from_start"), int)
+        ):
+            candidate_indexes.append((index, metadata["minutes_from_start"]))
+
+    if len(candidate_indexes) <= 1:
+        return
+
+    nearest_minutes = min(minutes for _, minutes in candidate_indexes)
+    nearest_indexes = [index for index, minutes in candidate_indexes if minutes == nearest_minutes]
+    unique_nearest_index = nearest_indexes[0] if len(nearest_indexes) == 1 else None
+
+    for index, _ in candidate_indexes:
+        if index == unique_nearest_index:
+            continue
+
+        metadata = dict(scored[index]["metadata"])
+        reasons = list(metadata.get("reasons") or [])
+        reasons.append("AMBIGUOUS_SAME_TEAM_GAME" if unique_nearest_index is None else "NON_NEAREST_SAME_TEAM_GAME")
+        metadata["reasons"] = reasons
+        scored[index]["metadata"] = metadata
+        scored[index]["status"] = "needs_review"
+
+
 def sync_market_mappings(session: Session) -> int:
     games = list(session.scalars(select(MlbGame)))
     markets = list(session.scalars(select(KalshiMarket)))
     count = 0
 
-    for game in games:
-        for market in markets:
+    for market in markets:
+        scored: list[dict[str, object]] = []
+        for game in games:
             confidence, status, metadata = score_mapping(game, market)
+            scored.append({"game": game, "confidence": confidence, "status": status, "metadata": metadata})
+
+        _disambiguate_market_scores(scored)
+
+        for item in scored:
+            game = item["game"]
+            confidence = item["confidence"]
+            status = item["status"]
+            metadata = item["metadata"]
             existing = session.scalar(
                 select(MarketMapping).where(
                     MarketMapping.mlb_game_id == game.id,

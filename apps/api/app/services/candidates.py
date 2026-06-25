@@ -12,6 +12,7 @@ from app.services.mapping import infer_market_type, sync_market_mappings
 from app.time_utils import classify_time_bucket, ensure_aware_utc, get_dashboard_zone, utc_now
 
 TEMPORARY_EDGE_THRESHOLD = Decimal("0.0500")
+ACTIVE_SLATE_LOOKAHEAD = timedelta(days=21)
 
 
 def _candidate_day_bounds(now: datetime) -> tuple[date, datetime, datetime]:
@@ -95,6 +96,8 @@ def generate_candidates(session: Session) -> dict[str, int]:
         .join(MlbGame, MarketMapping.mlb_game_id == MlbGame.id)
         .join(KalshiMarket, MarketMapping.kalshi_market_id == KalshiMarket.id)
         .where(MarketMapping.mapping_status.in_(["candidate", "confirmed", "needs_review"]))
+        .where(MlbGame.scheduled_start > now)
+        .where(MlbGame.scheduled_start < now + ACTIVE_SLATE_LOOKAHEAD)
     ).all()
 
     for mapping, game, market in mappings:

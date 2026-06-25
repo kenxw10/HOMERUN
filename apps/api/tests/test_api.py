@@ -238,6 +238,7 @@ def test_generate_candidates_avoids_duplicate_open_trade_across_days(monkeypatch
 def test_generate_candidates_avoids_duplicate_open_trade_across_mappings(monkeypatch) -> None:
     now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
     monkeypatch.setattr(candidates, "utc_now", lambda: now)
+    monkeypatch.setattr(candidates, "sync_market_mappings", lambda session: 0)
 
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
@@ -266,6 +267,23 @@ def test_generate_candidates_avoids_duplicate_open_trade_across_mappings(monkeyp
             implied_yes_ask=Decimal("0.4000"),
         )
         session.add_all([first_game, second_game, market])
+        session.flush()
+        session.add_all(
+            [
+                MarketMapping(
+                    mlb_game_id=first_game.id,
+                    kalshi_market_id=market.id,
+                    mapping_status="candidate",
+                    confidence=Decimal("0.9500"),
+                ),
+                MarketMapping(
+                    mlb_game_id=second_game.id,
+                    kalshi_market_id=market.id,
+                    mapping_status="candidate",
+                    confidence=Decimal("0.9500"),
+                ),
+            ]
+        )
         session.commit()
 
         result = candidates.generate_candidates(session)
@@ -478,12 +496,9 @@ def test_generate_candidates_blocks_paper_trades_after_game_start(monkeypatch) -
         candidate = session.scalar(select(ModelCandidate))
         all_trades = list(session.scalars(select(PaperTrade)))
 
-    assert result["candidates"] == 1
+    assert result["candidates"] == 0
     assert result["paper_trades"] == 0
-    assert candidate is not None
-    assert candidate.time_bucket == "POST_START"
-    assert candidate.time_to_start_minutes == -10
-    assert candidate.decision == "no_trade_game_started"
+    assert candidate is None
     assert all_trades == []
 
 
@@ -600,6 +615,44 @@ def test_sync_market_mappings_ignores_same_teams_on_wrong_date() -> None:
 
     status_by_game = {game.external_game_id: mapping.mapping_status for mapping, game in mappings}
     assert status_by_game == {"same-teams-current": "candidate"}
+
+
+def test_sync_market_mappings_marks_non_nearest_doubleheader_for_review() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        early_game = MlbGame(
+            external_game_id="doubleheader-early",
+            home_team="New York Yankees",
+            away_team="Boston Red Sox",
+            scheduled_start=datetime(2026, 7, 1, 18, 0, tzinfo=UTC),
+            status="scheduled",
+        )
+        late_game = MlbGame(
+            external_game_id="doubleheader-late",
+            home_team="New York Yankees",
+            away_team="Boston Red Sox",
+            scheduled_start=datetime(2026, 7, 1, 20, 0, tzinfo=UTC),
+            status="scheduled",
+        )
+        market = KalshiMarket(
+            kalshi_market_id="KX-DOUBLEHEADER-LATE",
+            ticker="KXMLB-DOUBLEHEADER-LATE",
+            title="Will the New York Yankees win the game against the Boston Red Sox?",
+            status="open",
+            occurrence_datetime=datetime(2026, 7, 1, 20, 5, tzinfo=UTC),
+        )
+        session.add_all([early_game, late_game, market])
+        session.commit()
+
+        sync_market_mappings(session)
+        mappings = session.execute(select(MarketMapping, MlbGame).join(MlbGame)).all()
+
+    status_by_game = {game.external_game_id: mapping.mapping_status for mapping, game in mappings}
+    metadata_by_game = {game.external_game_id: mapping.mapping_metadata for mapping, game in mappings}
+    assert status_by_game == {"doubleheader-early": "needs_review", "doubleheader-late": "candidate"}
+    assert "NON_NEAREST_SAME_TEAM_GAME" in metadata_by_game["doubleheader-early"]["reasons"]
 
 
 def test_mapping_requires_unambiguous_team_matches() -> None:
