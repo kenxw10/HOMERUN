@@ -469,8 +469,8 @@ export default function DashboardPage() {
       setState((previous) => ({
         status: "error",
         message: `API UNAVAILABLE AT ${apiBaseUrl}: ${detail}`,
-        summary: previous.status === "ready" ? previous.summary : null,
-        system: previous.status === "ready" ? previous.system : null,
+        summary: previous.status === "loading" ? null : previous.summary,
+        system: previous.status === "loading" ? null : previous.system,
       }));
     }
   }, [apiBaseUrl]);

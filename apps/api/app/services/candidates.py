@@ -13,6 +13,7 @@ from app.time_utils import classify_time_bucket, ensure_aware_utc, get_dashboard
 
 TEMPORARY_EDGE_THRESHOLD = Decimal("0.0500")
 ACTIVE_SLATE_LOOKAHEAD = timedelta(days=21)
+TRADABLE_MARKET_STATUSES = {"active", "open"}
 
 
 def _candidate_day_bounds(now: datetime) -> tuple[date, datetime, datetime]:
@@ -72,7 +73,7 @@ def _decision(
         return "no_trade_game_started"
     if price is None:
         return "no_trade_missing_price"
-    if market.status.lower() in {"closed", "settled", "finalized", "expired"}:
+    if market.status.strip().lower() not in TRADABLE_MARKET_STATUSES:
         return "no_trade_market_closed"
     if net_ev is None or net_ev < TEMPORARY_EDGE_THRESHOLD:
         return "no_trade_edge_too_low"

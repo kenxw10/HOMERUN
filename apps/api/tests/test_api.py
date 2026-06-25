@@ -466,6 +466,43 @@ def test_generate_candidates_requires_executable_yes_ask(monkeypatch) -> None:
     assert all_trades == []
 
 
+def test_generate_candidates_blocks_paused_markets(monkeypatch) -> None:
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+    monkeypatch.setattr(candidates, "utc_now", lambda: now)
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        game = MlbGame(
+            external_game_id="paused-market-1",
+            home_team="New York Yankees",
+            away_team="Boston Red Sox",
+            scheduled_start=datetime(2026, 7, 1, 23, 5, tzinfo=UTC),
+            status="scheduled",
+        )
+        market = KalshiMarket(
+            kalshi_market_id="KX-PAUSED",
+            ticker="KXMLB-PAUSED",
+            title="Will the New York Yankees win the game against the Boston Red Sox?",
+            status="paused",
+            occurrence_datetime=datetime(2026, 7, 1, 23, 5, tzinfo=UTC),
+            implied_yes_ask=Decimal("0.4000"),
+        )
+        session.add_all([game, market])
+        session.commit()
+
+        result = candidates.generate_candidates(session)
+        candidate = session.scalar(select(ModelCandidate))
+        all_trades = list(session.scalars(select(PaperTrade)))
+
+    assert result["candidates"] == 1
+    assert result["paper_trades"] == 0
+    assert candidate is not None
+    assert candidate.decision == "no_trade_market_closed"
+    assert all_trades == []
+
+
 def test_generate_candidates_blocks_paper_trades_after_game_start(monkeypatch) -> None:
     now = datetime(2026, 7, 1, 23, 15, tzinfo=UTC)
     monkeypatch.setattr(candidates, "utc_now", lambda: now)
