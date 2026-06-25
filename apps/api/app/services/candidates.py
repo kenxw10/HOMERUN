@@ -21,18 +21,17 @@ def _candidate_day_bounds(now: datetime) -> tuple[date, datetime, datetime]:
     return day, day_start, day_start + timedelta(days=1)
 
 
-def _price(value) -> Decimal | None:
-    return value if value is not None else None
-
-
 def _market_yes_price(market: KalshiMarket) -> Decimal | None:
-    return (
-        _price(market.implied_yes_ask)
-        or _price(market.yes_ask)
-        or _price(market.yes_mid)
-        or _price(market.last_price)
-        or _price(market.best_yes_bid)
-    )
+    for value in (
+        market.implied_yes_ask,
+        market.yes_ask,
+        market.yes_mid,
+        market.last_price,
+        market.best_yes_bid,
+    ):
+        if value is not None:
+            return value
+    return None
 
 
 def _candidate_ids_with_trades(session: Session, candidate_ids: list[int]) -> set[int]:
@@ -60,10 +59,18 @@ def _open_trade_for_mapping(session: Session, mapping_id: int | None, market_tic
     )
 
 
-def _decision(mapping: MarketMapping, market: KalshiMarket, price: Decimal | None, net_ev: Decimal | None) -> str:
+def _decision(
+    mapping: MarketMapping,
+    market: KalshiMarket,
+    market_type: str,
+    price: Decimal | None,
+    net_ev: Decimal | None,
+) -> str:
     settings = get_settings()
     if mapping.mapping_status == "needs_review" or (mapping.confidence or Decimal("0")) < Decimal("0.55"):
         return "no_trade_mapping_uncertain"
+    if market_type == "unknown":
+        return "no_trade_unsupported_market_type"
     if price is None:
         return "no_trade_missing_price"
     if market.status.lower() in {"closed", "settled", "finalized", "expired"}:
@@ -102,7 +109,7 @@ def generate_candidates(session: Session) -> dict[str, int]:
         gross_ev = (probability - price).quantize(Decimal("0.000001")) if price is not None else None
         fee = Decimal("0.000000")
         net_ev = (gross_ev - fee).quantize(Decimal("0.000001")) if gross_ev is not None else None
-        decision = _decision(mapping, market, price, net_ev)
+        decision = _decision(mapping, market, market_type, price, net_ev)
 
         existing_candidates = list(
             session.scalars(

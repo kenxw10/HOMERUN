@@ -278,6 +278,85 @@ def test_generate_candidates_refreshes_existing_open_trade_price(monkeypatch) ->
     assert refreshed_trade.current_price == Decimal("0.3200")
 
 
+def test_generate_candidates_blocks_unknown_market_type_from_paper_trading(monkeypatch) -> None:
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+    monkeypatch.setattr(candidates, "utc_now", lambda: now)
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        game = MlbGame(
+            external_game_id="unsupported-1",
+            home_team="New York Yankees",
+            away_team="Boston Red Sox",
+            scheduled_start=datetime(2026, 7, 1, 23, 5, tzinfo=UTC),
+            status="scheduled",
+        )
+        market = KalshiMarket(
+            kalshi_market_id="KX-UNSUPPORTED",
+            ticker="KXMLB-UNSUPPORTED",
+            title="Aaron Judge special when the New York Yankees play the Boston Red Sox",
+            status="open",
+            occurrence_datetime=datetime(2026, 7, 1, 23, 10, tzinfo=UTC),
+            implied_yes_ask=Decimal("0.4000"),
+        )
+        session.add_all([game, market])
+        session.commit()
+
+        result = candidates.generate_candidates(session)
+        candidate = session.scalar(select(ModelCandidate))
+        all_trades = list(session.scalars(select(PaperTrade)))
+
+    assert result["candidates"] == 1
+    assert result["paper_trades"] == 0
+    assert candidate is not None
+    assert candidate.market_type == "unknown"
+    assert candidate.decision == "no_trade_unsupported_market_type"
+    assert all_trades == []
+
+
+def test_generate_candidates_preserves_zero_market_price(monkeypatch) -> None:
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+    monkeypatch.setattr(candidates, "utc_now", lambda: now)
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        game = MlbGame(
+            external_game_id="zero-price-1",
+            home_team="New York Yankees",
+            away_team="Boston Red Sox",
+            scheduled_start=datetime(2026, 7, 1, 23, 5, tzinfo=UTC),
+            status="scheduled",
+        )
+        market = KalshiMarket(
+            kalshi_market_id="KX-ZERO-PRICE",
+            ticker="KXMLB-ZERO-PRICE",
+            title="Will the New York Yankees win the game against the Boston Red Sox?",
+            status="open",
+            occurrence_datetime=datetime(2026, 7, 1, 23, 10, tzinfo=UTC),
+            implied_yes_ask=Decimal("0.0000"),
+            yes_ask=Decimal("0.4000"),
+        )
+        session.add_all([game, market])
+        session.commit()
+
+        result = candidates.generate_candidates(session)
+        candidate = session.scalar(select(ModelCandidate))
+        trade = session.scalar(select(PaperTrade))
+
+    assert result["paper_trades"] == 1
+    assert candidate is not None
+    assert candidate.executable_price == Decimal("0.0000")
+    assert candidate.expected_value == Decimal("0.500000")
+    assert candidate.decision == "paper_trade"
+    assert trade is not None
+    assert trade.entry_price == Decimal("0.0000")
+    assert trade.current_price == Decimal("0.0000")
+
+
 def test_mapping_confidence_and_rationale() -> None:
     game = MlbGame(
         external_game_id="1",
