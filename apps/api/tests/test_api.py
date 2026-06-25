@@ -6,6 +6,7 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import StaticPool
 
 from app import main as main_module
 from app.config import get_settings
@@ -2421,6 +2422,166 @@ def test_market_family_discovery_persists_structured_by_family_and_excludes_mve(
     assert items[0].family_key == "full_game_spread"
     assert items[0].line_value == Decimal("-1.5000")
     assert all(params["mve_filter"] == "exclude" for params in fake_client.series_params)
+
+
+def _kalshi_probe_error(status_code: int, endpoint: str = "https://kalshi.test/probe") -> KalshiAPIError:
+    return KalshiAPIError(
+        f"Kalshi probe failed with {status_code}",
+        source=HttpJsonError(
+            f"GET {endpoint} failed with HTTP {status_code}.",
+            endpoint=endpoint,
+            params={},
+            status_code=status_code,
+            body_preview="not found" if status_code == 404 else "upstream unavailable",
+        ),
+    )
+
+
+def test_market_family_discovery_persists_zero_market_run_when_all_probes_404(monkeypatch) -> None:
+    engine = create_engine(
+        "sqlite+pysqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    SessionLocal = sessionmaker(bind=engine)
+
+    class FakeNoMatchClient:
+        def get_event(self, event_ticker: str):
+            raise _kalshi_probe_error(404, f"https://kalshi.test/events/{event_ticker}")
+
+        def get_markets_by_event_ticker(self, event_ticker: str):
+            raise _kalshi_probe_error(404, "https://kalshi.test/markets")
+
+        def iter_markets(self, params: dict[str, object], max_pages: int | None = None):
+            raise _kalshi_probe_error(404, "https://kalshi.test/markets")
+
+    monkeypatch.setattr(
+        main_module,
+        "database_status",
+        lambda: {"ready": True, "configured": True, "dialect": "sqlite", "message": "ok"},
+    )
+    monkeypatch.setattr(main_module, "get_session_factory", lambda: SessionLocal)
+    monkeypatch.setattr(
+        market_family_discovery.KalshiClient,
+        "from_settings",
+        staticmethod(lambda: FakeNoMatchClient()),
+    )
+    app.dependency_overrides[require_internal_api_key] = lambda: None
+
+    with SessionLocal() as session:
+        session.add(
+            MlbGame(
+                external_game_id="zero-market-404",
+                home_team="Pittsburgh Pirates",
+                away_team="Seattle Mariners",
+                home_abbreviation="PIT",
+                away_abbreviation="SEA",
+                scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+                status="scheduled",
+            )
+        )
+        session.commit()
+
+    try:
+        post_response = client.post("/v1/run/market-family-discovery?target_date=2026-07-01")
+        get_response = client.get("/v1/market-families/discovery?date=2026-07-01")
+    finally:
+        app.dependency_overrides.clear()
+
+    post_payload = post_response.json()
+    get_payload = get_response.json()
+    assert post_response.status_code == 200
+    assert post_payload["ok"] is True
+    assert post_payload["result"]["status"] == "completed"
+    assert post_payload["result"]["markets_found"] == 0
+    assert post_payload["result"]["errors"] == []
+    assert post_payload["result"]["warnings"]
+    assert post_payload["result"]["warnings"][0]["message"] == "MARKET_FAMILY_PROBE_NO_MATCH"
+    assert post_payload["result"]["attempted_probe_count"] > 0
+    assert post_payload["result"]["probe_attempts"][0]["outcome"] == "no_match"
+
+    assert get_response.status_code == 200
+    assert get_payload["result"]["run"] is not None
+    assert get_payload["result"]["run"]["status"] == "completed"
+    assert get_payload["result"]["run"]["markets_found"] == 0
+    assert get_payload["result"]["attempted_probe_count"] == post_payload["result"]["attempted_probe_count"]
+
+    with SessionLocal() as session:
+        run = session.scalar(select(MarketFamilyDiscoveryRun))
+        items = list(session.scalars(select(MarketFamilyDiscoveryItem)))
+
+    assert run is not None
+    assert run.status == "completed"
+    assert run.markets_found == 0
+    assert run.raw_summary["attempted_probe_count"] > 0
+    assert run.raw_summary["probe_attempts"][0]["outcome"] == "no_match"
+    assert items == []
+
+
+def test_market_family_discovery_records_non_404_errors_and_continues() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    class FakePartialErrorClient:
+        def __init__(self) -> None:
+            self.failed_once = False
+
+        def get_event(self, event_ticker: str):
+            if not self.failed_once:
+                self.failed_once = True
+                raise _kalshi_probe_error(500, f"https://kalshi.test/events/{event_ticker}")
+            return {"event": {"markets": []}}
+
+        def get_markets_by_event_ticker(self, event_ticker: str):
+            if event_ticker == "KXMLBSPREAD-26JUL011900SEAPIT":
+                return {
+                    "markets": [
+                        {
+                            "ticker": "KXMLBSPREAD-26JUL011900SEAPIT-PIT-1.5",
+                            "event_ticker": event_ticker,
+                            "title": "Pittsburgh Pirates spread -1.5 vs Seattle Mariners",
+                            "status": "open",
+                            "functional_strike": "-1.5",
+                        }
+                    ]
+                }
+            return {"markets": []}
+
+        def iter_markets(self, params: dict[str, object], max_pages: int | None = None):
+            return iter([])
+
+    with Session(engine) as session:
+        session.add(
+            MlbGame(
+                external_game_id="partial-error-market",
+                home_team="Pittsburgh Pirates",
+                away_team="Seattle Mariners",
+                home_abbreviation="PIT",
+                away_abbreviation="SEA",
+                scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+                status="scheduled",
+            )
+        )
+        session.commit()
+
+        result = market_family_discovery.run_market_family_discovery(
+            session,
+            date(2026, 7, 1),
+            client=FakePartialErrorClient(),
+        )
+        run = session.scalar(select(MarketFamilyDiscoveryRun))
+        item = session.scalar(select(MarketFamilyDiscoveryItem))
+
+    assert result["status"] == "partial_error"
+    assert result["markets_found"] == 1
+    assert result["errors"][0]["message"] == "MARKET_FAMILY_PROBE_ERROR"
+    assert result["errors"][0]["error"]["upstream_status_code"] == 500
+    assert run is not None
+    assert run.status == "partial_error"
+    assert run.raw_summary["errors"][0]["message"] == "MARKET_FAMILY_PROBE_ERROR"
+    assert item is not None
+    assert item.returned_ticker == "KXMLBSPREAD-26JUL011900SEAPIT-PIT-1.5"
 
 
 def test_market_family_discovery_parses_line_from_ticker_tail_not_date_prefix() -> None:
