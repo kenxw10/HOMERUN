@@ -25,9 +25,6 @@ def _market_yes_price(market: KalshiMarket) -> Decimal | None:
     for value in (
         market.implied_yes_ask,
         market.yes_ask,
-        market.yes_mid,
-        market.last_price,
-        market.best_yes_bid,
     ):
         if value is not None:
             return value

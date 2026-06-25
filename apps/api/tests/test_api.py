@@ -357,6 +357,46 @@ def test_generate_candidates_preserves_zero_market_price(monkeypatch) -> None:
     assert trade.current_price == Decimal("0.0000")
 
 
+def test_generate_candidates_requires_executable_yes_ask(monkeypatch) -> None:
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+    monkeypatch.setattr(candidates, "utc_now", lambda: now)
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        game = MlbGame(
+            external_game_id="no-ask-1",
+            home_team="New York Yankees",
+            away_team="Boston Red Sox",
+            scheduled_start=datetime(2026, 7, 1, 23, 5, tzinfo=UTC),
+            status="scheduled",
+        )
+        market = KalshiMarket(
+            kalshi_market_id="KX-NO-ASK",
+            ticker="KXMLB-NO-ASK",
+            title="Will the New York Yankees win the game against the Boston Red Sox?",
+            status="open",
+            occurrence_datetime=datetime(2026, 7, 1, 23, 10, tzinfo=UTC),
+            yes_mid=Decimal("0.3000"),
+            last_price=Decimal("0.2800"),
+            best_yes_bid=Decimal("0.2500"),
+        )
+        session.add_all([game, market])
+        session.commit()
+
+        result = candidates.generate_candidates(session)
+        candidate = session.scalar(select(ModelCandidate))
+        all_trades = list(session.scalars(select(PaperTrade)))
+
+    assert result["paper_trades"] == 0
+    assert candidate is not None
+    assert candidate.market_price is None
+    assert candidate.executable_price is None
+    assert candidate.decision == "no_trade_missing_price"
+    assert all_trades == []
+
+
 def test_mapping_confidence_and_rationale() -> None:
     game = MlbGame(
         external_game_id="1",
