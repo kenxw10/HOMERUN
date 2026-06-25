@@ -232,6 +232,52 @@ def test_generate_candidates_avoids_duplicate_open_trade_across_days(monkeypatch
     assert all_candidates[1].decision == "candidate_only_existing_trade"
 
 
+def test_generate_candidates_avoids_duplicate_open_trade_across_mappings(monkeypatch) -> None:
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+    monkeypatch.setattr(candidates, "utc_now", lambda: now)
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        first_game = MlbGame(
+            external_game_id="doubleheader-1",
+            home_team="New York Yankees",
+            away_team="Boston Red Sox",
+            scheduled_start=datetime(2026, 7, 2, 18, 0, tzinfo=UTC),
+            status="scheduled",
+        )
+        second_game = MlbGame(
+            external_game_id="doubleheader-2",
+            home_team="New York Yankees",
+            away_team="Boston Red Sox",
+            scheduled_start=datetime(2026, 7, 2, 20, 0, tzinfo=UTC),
+            status="scheduled",
+        )
+        market = KalshiMarket(
+            kalshi_market_id="KX-DOUBLEHEADER",
+            ticker="KXMLB-DOUBLEHEADER",
+            title="Will the New York Yankees win the game against the Boston Red Sox?",
+            status="open",
+            occurrence_datetime=datetime(2026, 7, 2, 18, 5, tzinfo=UTC),
+            implied_yes_ask=Decimal("0.4000"),
+        )
+        session.add_all([first_game, second_game, market])
+        session.commit()
+
+        result = candidates.generate_candidates(session)
+        all_candidates = list(session.scalars(select(ModelCandidate).order_by(ModelCandidate.id.asc())))
+        all_trades = list(session.scalars(select(PaperTrade).order_by(PaperTrade.id.asc())))
+
+    assert result["candidates"] == 2
+    assert result["paper_trades"] == 1
+    assert len(all_candidates) == 2
+    assert len(all_trades) == 1
+    assert {candidate.decision for candidate in all_candidates} == {"paper_trade", "candidate_only_existing_trade"}
+    assert all_trades[0].market_ticker == "KXMLB-DOUBLEHEADER"
+    assert all_trades[0].contract_side == "yes"
+
+
 def test_generate_candidates_refreshes_existing_open_trade_price(monkeypatch) -> None:
     current_time = {"now": datetime(2026, 7, 1, 16, 0, tzinfo=UTC)}
     monkeypatch.setattr(candidates, "utc_now", lambda: current_time["now"])
@@ -868,6 +914,42 @@ def test_market_sync_reads_fixed_point_orderbook_wrapper(monkeypatch) -> None:
         assert row.best_no_bid == Decimal("0.5600")
         assert row.implied_yes_ask == Decimal("0.4400")
         assert row.implied_no_ask == Decimal("0.5800")
+
+
+def test_list_today_markets_only_returns_today_close_times(monkeypatch) -> None:
+    monkeypatch.setattr(dashboard, "today_eastern", lambda: datetime(2026, 7, 1, tzinfo=UTC).date())
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        today_market = KalshiMarket(
+            kalshi_market_id="KX-TODAY",
+            ticker="KXMLB-TODAY",
+            title="Today market",
+            status="open",
+            close_time=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+        )
+        tomorrow_market = KalshiMarket(
+            kalshi_market_id="KX-TOMORROW",
+            ticker="KXMLB-TOMORROW",
+            title="Tomorrow market",
+            status="open",
+            close_time=datetime(2026, 7, 2, 23, 0, tzinfo=UTC),
+        )
+        no_close_market = KalshiMarket(
+            kalshi_market_id="KX-NO-CLOSE",
+            ticker="KXMLB-NO-CLOSE",
+            title="No close market",
+            status="open",
+            close_time=None,
+        )
+        session.add_all([today_market, tomorrow_market, no_close_market])
+        session.commit()
+
+        rows = dashboard.list_today_markets(session)
+
+    assert [market.ticker for market, _ in rows] == ["KXMLB-TODAY"]
 
 
 def test_dashboard_uses_newest_portfolio_snapshots() -> None:

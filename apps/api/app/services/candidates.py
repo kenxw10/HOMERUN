@@ -43,15 +43,13 @@ def _candidate_ids_with_trades(session: Session, candidate_ids: list[int]) -> se
     }
 
 
-def _open_trade_for_mapping(session: Session, mapping_id: int | None, market_ticker: str) -> PaperTrade | None:
-    if mapping_id is None:
-        return None
+def _open_trade_for_market(session: Session, market_ticker: str, contract_side: str) -> PaperTrade | None:
     return session.scalar(
         select(PaperTrade)
-            .join(ModelCandidate, PaperTrade.candidate_id == ModelCandidate.id)
-            .where(ModelCandidate.mapping_id == mapping_id)
             .where(PaperTrade.market_ticker == market_ticker)
+            .where(PaperTrade.contract_side == contract_side)
             .where(PaperTrade.status == "open")
+            .order_by(PaperTrade.entry_time.desc(), PaperTrade.id.desc())
             .limit(1)
     )
 
@@ -128,17 +126,18 @@ def generate_candidates(session: Session) -> dict[str, int]:
             (candidate for candidate in existing_candidates if candidate.id not in traded_candidate_ids),
             None,
         )
-        open_trade_for_mapping = _open_trade_for_mapping(session, mapping.id, market.ticker)
+        contract_side = "yes"
+        open_trade_for_market = _open_trade_for_market(session, market.ticker, contract_side)
         candidate = existing or ModelCandidate(
             mapping_id=mapping.id,
             mlb_game_id=game.id,
             kalshi_market_id=market.id,
             evaluated_at=now,
         )
-        if open_trade_for_mapping is not None and price is not None:
-            open_trade_for_mapping.current_price = price
-            session.add(open_trade_for_mapping)
-        if (traded_candidate_ids or open_trade_for_mapping is not None) and decision == "paper_trade":
+        if open_trade_for_market is not None and price is not None:
+            open_trade_for_market.current_price = price
+            session.add(open_trade_for_market)
+        if (traded_candidate_ids or open_trade_for_market is not None) and decision == "paper_trade":
             decision = "candidate_only_existing_trade"
         candidate.model_version_id = None
         candidate.evaluated_at = now
@@ -162,7 +161,7 @@ def generate_candidates(session: Session) -> dict[str, int]:
         candidate.market_type = market_type
         candidate.time_bucket = bucket
         candidate.time_to_start_minutes = minutes_to_start
-        candidate.contract_side = "yes"
+        candidate.contract_side = contract_side
         candidate.decision = decision
         session.add(candidate)
         session.flush()

@@ -168,7 +168,8 @@ def list_today_markets(session: Session):
         session.execute(
             select(KalshiMarket, MarketMapping)
             .outerjoin(MarketMapping, KalshiMarket.id == MarketMapping.kalshi_market_id)
-            .where((KalshiMarket.close_time.is_(None)) | ((KalshiMarket.close_time >= start) & (KalshiMarket.close_time < end + timedelta(days=21))))
+            .where(KalshiMarket.close_time >= start)
+            .where(KalshiMarket.close_time < end)
             .order_by(KalshiMarket.close_time.asc().nullslast())
             .limit(500)
         )
