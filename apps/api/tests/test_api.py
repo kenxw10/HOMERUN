@@ -503,6 +503,42 @@ def test_generate_candidates_blocks_paused_markets(monkeypatch) -> None:
     assert all_trades == []
 
 
+def test_generate_candidates_skips_non_playable_future_games(monkeypatch) -> None:
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+    monkeypatch.setattr(candidates, "utc_now", lambda: now)
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        game = MlbGame(
+            external_game_id="postponed-game-1",
+            home_team="New York Yankees",
+            away_team="Boston Red Sox",
+            scheduled_start=datetime(2026, 7, 1, 23, 5, tzinfo=UTC),
+            status="postponed",
+        )
+        market = KalshiMarket(
+            kalshi_market_id="KX-POSTPONED",
+            ticker="KXMLB-POSTPONED",
+            title="Will the New York Yankees win the game against the Boston Red Sox?",
+            status="open",
+            occurrence_datetime=datetime(2026, 7, 1, 23, 5, tzinfo=UTC),
+            implied_yes_ask=Decimal("0.4000"),
+        )
+        session.add_all([game, market])
+        session.commit()
+
+        result = candidates.generate_candidates(session)
+        candidate = session.scalar(select(ModelCandidate))
+        all_trades = list(session.scalars(select(PaperTrade)))
+
+    assert result["candidates"] == 0
+    assert result["paper_trades"] == 0
+    assert candidate is None
+    assert all_trades == []
+
+
 def test_generate_candidates_blocks_paper_trades_after_game_start(monkeypatch) -> None:
     now = datetime(2026, 7, 1, 23, 15, tzinfo=UTC)
     monkeypatch.setattr(candidates, "utc_now", lambda: now)
@@ -1185,3 +1221,50 @@ def test_dashboard_preserves_zero_current_prices() -> None:
     assert position_summary.current_price == 0.0
     assert position_summary.profit_loss == -1.0
     assert position_summary.profit_loss_percent == -1.0
+
+
+def test_dashboard_includes_paper_trades_alongside_positions() -> None:
+    opened_at = datetime(2026, 7, 1, 12, 0, tzinfo=UTC)
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        session.add(
+            Position(
+                market_ticker="KXMLB-POSITION",
+                contract_side="yes",
+                entry_price=Decimal("0.5000"),
+                current_price=Decimal("0.6000"),
+                quantity=1,
+                opened_at=opened_at,
+                status="open",
+            )
+        )
+        session.add(
+            PaperTrade(
+                market_ticker="KXMLB-TRADE",
+                contract_side="yes",
+                entry_price=Decimal("0.4000"),
+                current_price=Decimal("0.5000"),
+                quantity=1,
+                entry_time=opened_at,
+                status="open",
+            )
+        )
+        session.add(
+            PaperTrade(
+                market_ticker="KXMLB-POSITION",
+                contract_side="yes",
+                entry_price=Decimal("0.5000"),
+                current_price=Decimal("0.7000"),
+                quantity=1,
+                entry_time=opened_at,
+                status="open",
+            )
+        )
+        session.commit()
+
+        summary = dashboard.dashboard_summary_from_db(session)
+
+    markets = [position.market for position in summary.positions]
+    assert markets == ["KXMLB-POSITION", "KXMLB-TRADE"]

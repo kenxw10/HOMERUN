@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
@@ -14,6 +14,7 @@ from app.time_utils import classify_time_bucket, ensure_aware_utc, get_dashboard
 TEMPORARY_EDGE_THRESHOLD = Decimal("0.0500")
 ACTIVE_SLATE_LOOKAHEAD = timedelta(days=21)
 TRADABLE_MARKET_STATUSES = {"active", "open"}
+PLAYABLE_GAME_STATUSES = {"pre-game", "preview", "scheduled", "warmup"}
 
 
 def _candidate_day_bounds(now: datetime) -> tuple[date, datetime, datetime]:
@@ -97,6 +98,7 @@ def generate_candidates(session: Session) -> dict[str, int]:
         .join(MlbGame, MarketMapping.mlb_game_id == MlbGame.id)
         .join(KalshiMarket, MarketMapping.kalshi_market_id == KalshiMarket.id)
         .where(MarketMapping.mapping_status.in_(["candidate", "confirmed", "needs_review"]))
+        .where(func.lower(MlbGame.status).in_(PLAYABLE_GAME_STATUSES))
         .where(MlbGame.scheduled_start > now)
         .where(MlbGame.scheduled_start < now + ACTIVE_SLATE_LOOKAHEAD)
     ).all()

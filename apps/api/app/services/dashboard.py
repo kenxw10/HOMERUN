@@ -127,8 +127,12 @@ def dashboard_summary_from_db(session: Session) -> DashboardSummary:
     open_positions = list(session.scalars(select(Position).where(Position.status == "open").limit(100)))
     open_trades = list(session.scalars(select(PaperTrade).where(PaperTrade.status == "open").limit(100)))
     summary.positions = [_position_from_position(position) for position in open_positions]
-    if not summary.positions:
-        summary.positions = [_position_from_trade(trade) for trade in open_trades]
+    position_keys = {(position.market_ticker, position.contract_side) for position in open_positions}
+    summary.positions.extend(
+        _position_from_trade(trade)
+        for trade in open_trades
+        if (trade.market_ticker, trade.contract_side) not in position_keys
+    )
 
     active_version = session.scalar(select(ModelVersion).where(ModelVersion.is_active.is_(True)))
     last_training = session.scalar(select(TrainingRun).order_by(TrainingRun.started_at.desc()))
