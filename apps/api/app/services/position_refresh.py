@@ -12,20 +12,24 @@ from app.services.portfolio import create_balance_snapshot
 from app.time_utils import utc_now
 
 
-def _fallback_mark(market: KalshiMarket | None, trade: PaperTrade) -> Decimal | None:
-    if market is None:
-        return trade.current_price
-
-    side = trade.contract_side.lower()
-    values = (
-        (market.best_yes_bid, market.yes_bid, market.last_price, trade.current_price)
-        if side == "yes"
-        else (market.best_no_bid, market.no_bid, market.last_price, trade.current_price)
-    )
+def _first_present(values: tuple[Decimal | None, ...]) -> Decimal | None:
     for value in values:
         if value is not None:
             return value
     return None
+
+
+def _fallback_mark(market: KalshiMarket | None, contract_side: str) -> Decimal | None:
+    if market is None:
+        return None
+
+    side = contract_side.lower()
+    values = (
+        (market.best_yes_bid, market.yes_bid, market.last_price)
+        if side == "yes"
+        else (market.best_no_bid, market.no_bid, market.last_price)
+    )
+    return _first_present(values)
 
 
 def _mark_from_orderbook(orderbook: dict[str, object], market: KalshiMarket | None, trade: PaperTrade) -> Decimal | None:
@@ -38,8 +42,8 @@ def _mark_from_orderbook(orderbook: dict[str, object], market: KalshiMarket | No
         market.orderbook_raw = orderbook
 
     if trade.contract_side.lower() == "yes":
-        return derived["best_yes_bid"] or _fallback_mark(market, trade)
-    return derived["best_no_bid"] or _fallback_mark(market, trade)
+        return _first_present((derived["best_yes_bid"], _fallback_mark(market, trade.contract_side)))
+    return _first_present((derived["best_no_bid"], _fallback_mark(market, trade.contract_side)))
 
 
 def refresh_open_position_prices(
@@ -83,7 +87,7 @@ def refresh_open_position_prices(
             mark = _mark_from_orderbook(orderbook, market, trade)
         except KalshiAPIError as exc:
             errors.append({"market_ticker": trade.market_ticker, "error": exc.to_detail()})
-            mark = _fallback_mark(market, trade)
+            mark = _fallback_mark(market, trade.contract_side)
         except Exception as exc:
             errors.append(
                 {
@@ -91,7 +95,7 @@ def refresh_open_position_prices(
                     "error": {"message": str(exc), "type": exc.__class__.__name__},
                 }
             )
-            mark = _fallback_mark(market, trade)
+            mark = _fallback_mark(market, trade.contract_side)
 
         if mark is None:
             skipped += 1

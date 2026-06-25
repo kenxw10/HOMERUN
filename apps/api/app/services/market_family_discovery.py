@@ -138,6 +138,23 @@ def _market_text(market: dict[str, Any]) -> str:
     ).lower()
 
 
+def _market_line_text(market: dict[str, Any]) -> str:
+    return " ".join(
+        str(market.get(key) or "")
+        for key in (
+            "title",
+            "subtitle",
+            "rules_primary",
+            "rules_secondary",
+            "rules",
+            "yes_sub_title",
+            "no_sub_title",
+            "yes_subtitle",
+            "no_subtitle",
+        )
+    ).lower()
+
+
 def _classify_candidate_family(market: dict[str, Any], fallback: str) -> str:
     text = _market_text(market)
     first_five = bool(re.search(r"\b(first five|first 5|f5|5 innings?)\b", text))
@@ -169,6 +186,38 @@ def _decimal(value: object) -> Decimal | None:
         return None
 
 
+def _parse_explicit_line_text(market: dict[str, Any]) -> Decimal | None:
+    text = _market_line_text(market)
+    patterns = (
+        r"\b(?:spread|run line|runline|handicap|line|total|over/under|over|under)\s*(?:of|is|at|:)?\s*([+-]?\d+(?:\.\d+)?)\b",
+        r"(?<![A-Z0-9])([+-]\d+(?:\.\d+)?)(?![A-Z0-9])",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            parsed = _decimal(match.group(1))
+            if parsed is not None:
+                return parsed
+    return None
+
+
+def _parse_ticker_tail_line(market: dict[str, Any]) -> Decimal | None:
+    ticker = str(market.get("ticker") or "").upper()
+    if not ticker:
+        return None
+
+    selected_team_line = re.search(r"-[A-Z0-9]{2,5}([+-]\d+(?:\.\d+)?)$", ticker)
+    if selected_team_line:
+        parsed = _decimal(selected_team_line.group(1))
+        if parsed is not None:
+            return parsed
+
+    tail = ticker.rsplit("-", 1)[-1]
+    if re.fullmatch(r"\+?\d+(?:\.\d+)?", tail):
+        return _decimal(tail.lstrip("+"))
+    return None
+
+
 def _parse_line_value(market: dict[str, Any]) -> Decimal | None:
     for key in ("line", "strike", "functional_strike"):
         parsed = _decimal(market.get(key))
@@ -182,9 +231,11 @@ def _parse_line_value(market: dict[str, Any]) -> Decimal | None:
             if parsed is not None:
                 return parsed
 
-    text = _market_text(market)
-    match = re.search(r"(?<![A-Z0-9])([+-]?\d+(?:\.\d+)?)(?![A-Z0-9])", text, flags=re.IGNORECASE)
-    return _decimal(match.group(1)) if match else None
+    explicit_line = _parse_explicit_line_text(market)
+    if explicit_line is not None:
+        return explicit_line
+
+    return _parse_ticker_tail_line(market)
 
 
 def _selection_code(market: dict[str, Any]) -> str | None:

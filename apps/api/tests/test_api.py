@@ -2423,6 +2423,59 @@ def test_market_family_discovery_persists_structured_by_family_and_excludes_mve(
     assert all(params["mve_filter"] == "exclude" for params in fake_client.series_params)
 
 
+def test_market_family_discovery_parses_line_from_ticker_tail_not_date_prefix() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    class FakeTickerTailClient:
+        def get_event(self, event_ticker: str):
+            return {"event": {"markets": []}}
+
+        def get_markets_by_event_ticker(self, event_ticker: str):
+            if event_ticker != "KXMLBSPREAD-26JUL011900SEAPIT":
+                return {"markets": []}
+            return {
+                "markets": [
+                    {
+                        "ticker": "KXMLBSPREAD-26JUL011900SEAPIT-PIT-1.5",
+                        "event_ticker": event_ticker,
+                        "title": "Pittsburgh Pirates spread market vs Seattle Mariners",
+                        "rules_primary": "If Pittsburgh covers the spread, Yes wins.",
+                        "status": "open",
+                    }
+                ]
+            }
+
+        def iter_markets(self, params: dict[str, object], max_pages: int | None = None):
+            return iter([])
+
+    with Session(engine) as session:
+        session.add(
+            MlbGame(
+                external_game_id="discovery-ticker-tail-line",
+                home_team="Pittsburgh Pirates",
+                away_team="Seattle Mariners",
+                home_abbreviation="PIT",
+                away_abbreviation="SEA",
+                scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+                status="scheduled",
+            )
+        )
+        session.commit()
+
+        result = market_family_discovery.run_market_family_discovery(
+            session,
+            date(2026, 7, 1),
+            client=FakeTickerTailClient(),
+        )
+        item = session.scalar(select(MarketFamilyDiscoveryItem))
+
+    assert result["markets_found"] == 1
+    assert item is not None
+    assert item.line_value == Decimal("-1.5000")
+    assert item.line_value != Decimal("26.0000")
+
+
 def test_market_family_discovery_series_window_filters_to_matching_game() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
@@ -2616,6 +2669,58 @@ def test_open_position_price_refresh_updates_only_open_paper_trades() -> None:
     assert snapshot is not None
     assert snapshot.source == "paper"
     assert snapshot.snapshot_type == "open_position_price_refresh"
+
+
+def test_open_position_price_refresh_does_not_stamp_stale_trade_price_on_orderbook_error() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    class BrokenOrderbookClient:
+        def get_orderbook(self, ticker: str):
+            raise RuntimeError("kalshi unavailable")
+
+    old_mark_time = datetime(2026, 7, 1, 15, 0, tzinfo=UTC)
+    with Session(engine) as session:
+        market = KalshiMarket(
+            kalshi_market_id="KX-REFRESH-STALE",
+            ticker="KXMLBGAME-26JUL011900SEAPIT-PIT",
+            title="Will Pittsburgh win?",
+            status="open",
+        )
+        session.add(market)
+        session.flush()
+        candidate = ModelCandidate(
+            kalshi_market_id=market.id,
+            evaluated_at=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
+            features={},
+            decision="paper_trade",
+            market_type="full_game_winner",
+        )
+        session.add(candidate)
+        session.flush()
+        open_trade = PaperTrade(
+            candidate_id=candidate.id,
+            market_ticker=market.ticker,
+            contract_side="yes",
+            entry_price=Decimal("0.4000"),
+            current_price=Decimal("0.4000"),
+            current_price_updated_at=old_mark_time,
+            quantity=1,
+            entry_time=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
+            status="open",
+        )
+        session.add(open_trade)
+        session.commit()
+
+        result = position_refresh.refresh_open_position_prices(session, client=BrokenOrderbookClient())
+        session.refresh(open_trade)
+
+    assert result["checked"] == 1
+    assert result["updated"] == 0
+    assert result["skipped"] == 1
+    assert result["errors"][0]["error"]["type"] == "RuntimeError"
+    assert open_trade.current_price == Decimal("0.4000")
+    assert open_trade.current_price_updated_at == old_mark_time.replace(tzinfo=None)
 
 
 def test_resolve_preview_endpoint_returns_ok_with_partial_warnings(monkeypatch) -> None:
