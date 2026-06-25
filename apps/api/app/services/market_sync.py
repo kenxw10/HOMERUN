@@ -22,14 +22,17 @@ def _decimal(value: object) -> Decimal | None:
         parsed = Decimal(str(value))
     except Exception:
         return None
-    if parsed > 1:
-        parsed = parsed / Decimal("100")
     return parsed.quantize(Decimal("0.0001"))
+
+
+def _cent_decimal(value: object) -> Decimal | None:
+    parsed = _decimal(value)
+    return (parsed / Decimal("100")).quantize(Decimal("0.0001")) if parsed is not None else None
 
 
 def _market_decimal(market: dict[str, Any], dollars_key: str, legacy_key: str) -> Decimal | None:
     value = _decimal(market.get(dollars_key))
-    return value if value is not None else _decimal(market.get(legacy_key))
+    return value if value is not None else _cent_decimal(market.get(legacy_key))
 
 
 def _market_text(market: dict[str, Any]) -> str:

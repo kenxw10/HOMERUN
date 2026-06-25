@@ -15,25 +15,30 @@ def _as_decimal(value: object) -> Decimal | None:
         parsed = Decimal(str(value))
     except Exception:
         return None
-    if parsed > 1:
-        parsed = parsed / Decimal("100")
     return parsed.quantize(Decimal("0.0001"))
 
 
-def _bid_price(level: object) -> Decimal | None:
+def _as_cent_decimal(value: object) -> Decimal | None:
+    parsed = _as_decimal(value)
+    return (parsed / Decimal("100")).quantize(Decimal("0.0001")) if parsed is not None else None
+
+
+def _bid_price(level: object, *, dollars: bool) -> Decimal | None:
+    parse = _as_decimal if dollars else _as_cent_decimal
     if isinstance(level, dict):
-        for key in ("price", "yes_bid", "no_bid"):
+        keys = ("price_dollars", "yes_bid_dollars", "no_bid_dollars", "price") if dollars else ("price", "yes_bid", "no_bid")
+        for key in keys:
             if key in level:
-                return _as_decimal(level[key])
+                return parse(level[key])
     if isinstance(level, (list, tuple)) and level:
-        return _as_decimal(level[0])
-    return _as_decimal(level)
+        return parse(level[0])
+    return parse(level)
 
 
-def _best_bid(levels: object) -> Decimal | None:
+def _best_bid(levels: object, *, dollars: bool) -> Decimal | None:
     if not isinstance(levels, list):
         return None
-    prices = [price for price in (_bid_price(level) for level in levels) if price is not None]
+    prices = [price for price in (_bid_price(level, dollars=dollars) for level in levels) if price is not None]
     return max(prices) if prices else None
 
 
@@ -47,20 +52,12 @@ def _unwrap_orderbook(orderbook: dict[str, Any]) -> dict[str, Any]:
 
 def derive_orderbook_prices(orderbook: dict[str, Any]) -> dict[str, Decimal | None]:
     unwrapped = _unwrap_orderbook(orderbook)
-    yes_levels = (
-        unwrapped.get("yes")
-        or unwrapped.get("yes_bids")
-        or unwrapped.get("yesBid")
-        or unwrapped.get("yes_dollars")
-    )
-    no_levels = (
-        unwrapped.get("no")
-        or unwrapped.get("no_bids")
-        or unwrapped.get("noBid")
-        or unwrapped.get("no_dollars")
-    )
-    best_yes_bid = _best_bid(yes_levels)
-    best_no_bid = _best_bid(no_levels)
+    yes_dollars = "yes_dollars" in unwrapped
+    no_dollars = "no_dollars" in unwrapped
+    yes_levels = unwrapped.get("yes_dollars") if yes_dollars else (unwrapped.get("yes") or unwrapped.get("yes_bids") or unwrapped.get("yesBid"))
+    no_levels = unwrapped.get("no_dollars") if no_dollars else (unwrapped.get("no") or unwrapped.get("no_bids") or unwrapped.get("noBid"))
+    best_yes_bid = _best_bid(yes_levels, dollars=yes_dollars)
+    best_no_bid = _best_bid(no_levels, dollars=no_dollars)
 
     return {
         "best_yes_bid": best_yes_bid,

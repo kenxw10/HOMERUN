@@ -89,6 +89,13 @@ def test_kalshi_orderbook_derives_asks_from_yes_and_no_bids() -> None:
     assert str(derived["implied_yes_ask"]) == "0.6100"
     assert str(derived["implied_no_ask"]) == "0.3900"
 
+    low_price = derive_orderbook_prices({"yes": [[1, 100]], "no": [[99, 100]]})
+
+    assert str(low_price["best_yes_bid"]) == "0.0100"
+    assert str(low_price["best_no_bid"]) == "0.9900"
+    assert str(low_price["implied_yes_ask"]) == "0.0100"
+    assert str(low_price["implied_no_ask"]) == "0.9900"
+
 
 def test_kalshi_client_iter_markets_follows_cursor_until_exhausted(monkeypatch) -> None:
     client_instance = KalshiClient(base_url="https://example.test")
@@ -239,9 +246,34 @@ def test_mapping_confidence_and_rationale() -> None:
     confidence, status, metadata = score_mapping(game, market)
 
     assert confidence >= 0
-    assert status in {"candidate", "needs_review"}
+    assert status == "candidate"
     assert metadata["market_type"] == "full_game_moneyline"
+    assert metadata["matched_team_count"] == 2
     assert infer_market_type("first five total runs") == "first_five_total"
+
+
+def test_mapping_requires_unambiguous_team_matches() -> None:
+    game = MlbGame(
+        external_game_id="2",
+        home_team="New York Yankees",
+        away_team="Boston Red Sox",
+        scheduled_start=datetime(2026, 7, 1, 23, 5, tzinfo=UTC),
+        status="scheduled",
+    )
+    market = KalshiMarket(
+        kalshi_market_id="KX-2",
+        ticker="KXMLB-METS-REDS",
+        title="Will the New York Mets win the game against the Cincinnati Reds?",
+        status="open",
+        occurrence_datetime=datetime(2026, 7, 1, 23, 10, tzinfo=UTC),
+    )
+
+    confidence, status, metadata = score_mapping(game, market)
+
+    assert confidence == Decimal("0.4000")
+    assert status == "needs_review"
+    assert metadata["matched_team_count"] == 0
+    assert not any(str(reason).startswith("TEAM_MATCH") for reason in metadata["reasons"])
 
 
 def test_internal_sync_endpoints_require_api_key_when_configured(monkeypatch) -> None:
@@ -369,6 +401,45 @@ def test_market_sync_reads_kalshi_dollar_price_fields(monkeypatch) -> None:
         assert row.no_ask == Decimal("0.8700")
         assert row.no_mid == Decimal("0.7600")
         assert row.last_price == Decimal("0.2500")
+
+
+def test_market_sync_reads_legacy_cent_price_fields(monkeypatch) -> None:
+    class FakeKalshiClient:
+        def iter_markets(self, params: dict[str, object], max_pages: int | None):
+            yield {
+                "id": "market-legacy-cents",
+                "ticker": "KXMLB-CENTS",
+                "title": "MLB Yankees baseball market",
+                "status": "open",
+                "yes_bid": 1,
+                "yes_ask": 2,
+                "no_bid": 99,
+                "no_ask": 98,
+                "last_price": 1,
+                "close_time": "2026-07-01T23:00:00Z",
+            }
+
+        def get_orderbook(self, ticker: str):
+            raise AssertionError("orderbook fetch is disabled in this test")
+
+    monkeypatch.setattr(market_sync.KalshiClient, "from_settings", staticmethod(lambda: FakeKalshiClient()))
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        count = market_sync.sync_kalshi_markets(session, fetch_orderbooks=False)
+        row = session.scalar(select(KalshiMarket).where(KalshiMarket.ticker == "KXMLB-CENTS"))
+
+        assert count == 1
+        assert row is not None
+        assert row.yes_bid == Decimal("0.0100")
+        assert row.yes_ask == Decimal("0.0200")
+        assert row.yes_mid == Decimal("0.0150")
+        assert row.no_bid == Decimal("0.9900")
+        assert row.no_ask == Decimal("0.9800")
+        assert row.no_mid == Decimal("0.9850")
+        assert row.last_price == Decimal("0.0100")
 
 
 def test_market_sync_updates_existing_closed_market(monkeypatch) -> None:

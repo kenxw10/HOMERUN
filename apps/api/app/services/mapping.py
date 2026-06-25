@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from decimal import Decimal
+import re
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -17,6 +18,46 @@ MARKET_HINTS = {
     "full_game_spread": ("spread", "run line"),
     "full_game_total": ("total", "over/under", "runs"),
 }
+
+
+TEAM_ALIAS_OVERRIDES = {
+    "arizona diamondbacks": ("diamondbacks", "d-backs", "dbacks"),
+    "athletics": ("athletics", "a's"),
+    "boston red sox": ("red sox",),
+    "chicago white sox": ("white sox",),
+    "toronto blue jays": ("blue jays",),
+}
+
+
+def _tokens(value: str) -> list[str]:
+    return re.findall(r"[a-z0-9]+", value.lower())
+
+
+def _contains_phrase(haystack: list[str], phrase: str) -> bool:
+    phrase_tokens = _tokens(phrase)
+    if not phrase_tokens:
+        return False
+    phrase_len = len(phrase_tokens)
+    return any(haystack[index : index + phrase_len] == phrase_tokens for index in range(len(haystack) - phrase_len + 1))
+
+
+def _team_aliases(team: str) -> tuple[str, ...]:
+    normalized = " ".join(_tokens(team))
+    if not normalized:
+        return ()
+
+    aliases = [normalized]
+    aliases.extend(TEAM_ALIAS_OVERRIDES.get(normalized, ()))
+
+    team_tokens = normalized.split()
+    if normalized not in TEAM_ALIAS_OVERRIDES and len(team_tokens) >= 2:
+        aliases.append(team_tokens[-1])
+
+    return tuple(dict.fromkeys(alias for alias in aliases if alias))
+
+
+def _matches_team(team: str, market_tokens: list[str]) -> bool:
+    return any(_contains_phrase(market_tokens, alias) for alias in _team_aliases(team))
 
 
 def infer_market_type(text: str) -> str:
@@ -40,13 +81,14 @@ def score_mapping(game: MlbGame, market: KalshiMarket) -> tuple[Decimal, str, di
             market.event_ticker,
         )
     )
-    lowered = text.lower()
+    market_tokens = _tokens(text)
     score = Decimal("0")
     reasons: list[str] = []
+    matched_teams = 0
 
     for team in (game.home_team, game.away_team):
-        tokens = [part for part in team.lower().replace(".", "").split(" ") if len(part) >= 3]
-        if team.lower() in lowered or any(token in lowered for token in tokens[-2:]):
+        if _matches_team(team, market_tokens):
+            matched_teams += 1
             score += Decimal("0.30")
             reasons.append(f"TEAM_MATCH:{team}")
 
@@ -66,7 +108,8 @@ def score_mapping(game: MlbGame, market: KalshiMarket) -> tuple[Decimal, str, di
         reasons.append(f"MARKET_TYPE:{market_type}")
 
     confidence = min(score, Decimal("0.9500")).quantize(Decimal("0.0001"))
-    if confidence >= Decimal("0.60"):
+    both_teams_matched = matched_teams == 2
+    if both_teams_matched and confidence >= Decimal("0.60"):
         status = "candidate"
     elif confidence >= Decimal("0.25"):
         status = "needs_review"
@@ -78,6 +121,7 @@ def score_mapping(game: MlbGame, market: KalshiMarket) -> tuple[Decimal, str, di
         "reasons": reasons,
         "home_team": game.home_team,
         "away_team": game.away_team,
+        "matched_team_count": matched_teams,
         "market_ticker": market.ticker,
     }
     return confidence, status, metadata
