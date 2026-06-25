@@ -19,6 +19,7 @@ from app.models import (
     MarketMapping,
     MlbGame,
     ModelCandidate,
+    ModelVersion,
     PaperTrade,
     Position,
     Settlement,
@@ -1866,6 +1867,76 @@ def test_paper_settlement_sync_settles_wins_losses_and_is_idempotent() -> None:
     assert no_trade.outcome_source == "mlb_results_sync"
 
 
+def test_paper_settlement_leaves_untrusted_ticker_selection_unresolved() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        game = MlbGame(
+            external_game_id="settle-invalid-selection-1",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+            status="Final",
+            home_score=5,
+            away_score=3,
+        )
+        market = KalshiMarket(
+            kalshi_market_id="KX-INVALID-SELECTION",
+            ticker="KXMLB-SUBTITLE-TYPE",
+            title="Will Pittsburgh win?",
+            status="closed",
+        )
+        session.add_all([game, market])
+        session.flush()
+        mapping = MarketMapping(
+            mlb_game_id=game.id,
+            kalshi_market_id=market.id,
+            mapping_status="confirmed",
+            confidence=Decimal("0.9700"),
+        )
+        session.add(mapping)
+        session.flush()
+        candidate = ModelCandidate(
+            mlb_game_id=game.id,
+            kalshi_market_id=market.id,
+            mapping_id=mapping.id,
+            evaluated_at=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
+            features={},
+            decision="paper_trade",
+            market_type="full_game_winner",
+            contract_side="yes",
+        )
+        session.add(candidate)
+        session.flush()
+        trade = PaperTrade(
+            candidate_id=candidate.id,
+            market_ticker=market.ticker,
+            contract_side="yes",
+            entry_price=Decimal("0.4000"),
+            current_price=Decimal("0.4000"),
+            quantity=1,
+            entry_time=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
+            status="open",
+        )
+        session.add(trade)
+        session.commit()
+
+        result = settle_paper_trades(session, date(2026, 7, 1), now=datetime(2026, 7, 2, 4, 0, tzinfo=UTC))
+        session.refresh(candidate)
+        session.refresh(trade)
+        settlement = session.scalar(select(Settlement))
+
+    assert result["candidate_labels_skipped_invalid_selection"] == 1
+    assert result["skipped_invalid_selection"] == 1
+    assert candidate.outcome is None
+    assert trade.status == "open"
+    assert trade.outcome is None
+    assert settlement is None
+
+
 def test_dashboard_summary_uses_labels_snapshots_and_settled_performance() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
@@ -2018,6 +2089,30 @@ def test_model_governance_skips_training_and_records_runs_when_samples_are_too_s
     assert training.status == "skipped"
     assert calibration.status == "skipped"
     assert "INSUFFICIENT_RESOLVED_SAMPLES" in training.metrics["reason"]
+
+
+def test_model_governance_keeps_only_one_active_champion() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        old_version = ModelVersion(
+            version_tag="legacy_champion",
+            description="Legacy active model",
+            is_active=True,
+            role="champion",
+            model_family="full_game_winner",
+        )
+        session.add(old_version)
+        session.commit()
+
+        result = run_model_governance(session, now=datetime(2026, 7, 1, 12, 0, tzinfo=UTC))
+        versions = list(session.scalars(select(ModelVersion).order_by(ModelVersion.version_tag)))
+
+    active_versions = [version for version in versions if version.is_active]
+    assert result["active_model_version"] == "heuristic_full_game_winner_v1"
+    assert [version.version_tag for version in active_versions] == ["heuristic_full_game_winner_v1"]
+    assert next(version for version in versions if version.version_tag == "legacy_champion").role == "inactive"
 
 
 def test_resolve_preview_endpoint_returns_ok_with_partial_warnings(monkeypatch) -> None:

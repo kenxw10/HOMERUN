@@ -42,6 +42,26 @@ def _winner_code(game: MlbGame) -> str | None:
     return (game.away_abbreviation or "").upper()
 
 
+def _game_team_codes(game: MlbGame) -> set[str]:
+    return {code for code in ((game.home_abbreviation or "").upper(), (game.away_abbreviation or "").upper()) if code}
+
+
+def _has_trusted_selection(game: MlbGame, market_ticker: str) -> bool:
+    selected = selected_team_from_ticker(market_ticker)
+    team_codes = _game_team_codes(game)
+    return selected is not None and bool(team_codes) and selected in team_codes
+
+
+def _skip_reason(game: MlbGame, market_ticker: str, market_type: str) -> str:
+    if market_type != SUPPORTED_MARKET_FAMILY:
+        return "unsupported"
+    if _status_kind(game.status) == "open":
+        return "not_final"
+    if not _has_trusted_selection(game, market_ticker):
+        return "invalid_selection"
+    return "not_final"
+
+
 def _contract_outcome(
     game: MlbGame,
     *,
@@ -59,9 +79,9 @@ def _contract_outcome(
         return "void", "VOID"
 
     winner = _winner_code(game)
-    selected = selected_team_from_ticker(market_ticker)
-    if winner is None or selected is None:
+    if winner is None or not _has_trusted_selection(game, market_ticker):
         return None
+    selected = selected_team_from_ticker(market_ticker)
     if winner == "PUSH":
         return "push", "PUSH"
 
@@ -158,12 +178,14 @@ def settle_paper_trades(
         "voided": 0,
         "skipped_not_final": 0,
         "skipped_unsupported": 0,
+        "skipped_invalid_selection": 0,
         "already_settled": 0,
         "candidate_labels_checked": len(candidate_rows),
         "candidate_labels_created": 0,
         "candidate_labels_already_set": 0,
         "candidate_labels_skipped_not_final": 0,
         "candidate_labels_skipped_unsupported": 0,
+        "candidate_labels_skipped_invalid_selection": 0,
         "snapshot_id": None,
     }
 
@@ -175,8 +197,13 @@ def settle_paper_trades(
         market_type = market_type_from_ticker(market.ticker, candidate.market_type)
         outcome = _candidate_outcome(game, candidate, market)
         if outcome is None:
-            if market_type != SUPPORTED_MARKET_FAMILY:
+            reason = _skip_reason(game, market.ticker, market_type)
+            if reason == "unsupported":
                 result["candidate_labels_skipped_unsupported"] = int(result["candidate_labels_skipped_unsupported"]) + 1
+            elif reason == "invalid_selection":
+                result["candidate_labels_skipped_invalid_selection"] = (
+                    int(result["candidate_labels_skipped_invalid_selection"]) + 1
+                )
             else:
                 result["candidate_labels_skipped_not_final"] = int(result["candidate_labels_skipped_not_final"]) + 1
             continue
@@ -197,8 +224,11 @@ def settle_paper_trades(
         market_type = market_type_from_ticker(market.ticker, candidate.market_type)
         outcome = _trade_outcome(game, trade, market_type)
         if outcome is None:
-            if market_type != SUPPORTED_MARKET_FAMILY:
+            reason = _skip_reason(game, trade.market_ticker, market_type)
+            if reason == "unsupported":
                 result["skipped_unsupported"] = int(result["skipped_unsupported"]) + 1
+            elif reason == "invalid_selection":
+                result["skipped_invalid_selection"] = int(result["skipped_invalid_selection"]) + 1
             else:
                 result["skipped_not_final"] = int(result["skipped_not_final"]) + 1
             continue

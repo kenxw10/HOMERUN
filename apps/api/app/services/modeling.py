@@ -36,7 +36,7 @@ def get_or_create_heuristic_model_version(session: Session) -> ModelVersion:
                 "uses_market_price": False,
                 "promotion_policy": "active baseline until trained challenger clears governance",
             },
-            is_active=True,
+            is_active=False,
             model_family=MODEL_FAMILY,
             feature_version=FEATURE_VERSION,
             role="champion",
@@ -44,16 +44,33 @@ def get_or_create_heuristic_model_version(session: Session) -> ModelVersion:
         )
         session.add(version)
         session.flush()
+        _activate_model_version(session, version, now)
         return version
 
     if not version.is_active:
-        active = session.scalar(select(ModelVersion).where(ModelVersion.is_active.is_(True)))
-        if active is None:
-            version.is_active = True
-            version.role = version.role or "champion"
-            version.promoted_at = version.promoted_at or utc_now()
-            session.add(version)
+        _activate_model_version(session, version, utc_now())
+    else:
+        _deactivate_other_active_versions(session, version.id)
     return version
+
+
+def _deactivate_other_active_versions(session: Session, active_id: int | None) -> None:
+    active_versions = list(session.scalars(select(ModelVersion).where(ModelVersion.is_active.is_(True))))
+    for active_version in active_versions:
+        if active_version.id == active_id:
+            continue
+        active_version.is_active = False
+        if active_version.role == "champion":
+            active_version.role = "inactive"
+        session.add(active_version)
+
+
+def _activate_model_version(session: Session, version: ModelVersion, now: datetime) -> None:
+    _deactivate_other_active_versions(session, version.id)
+    version.is_active = True
+    version.role = "champion"
+    version.promoted_at = version.promoted_at or now
+    session.add(version)
 
 
 def score_candidate_probability(features: dict[str, object], contract_side: str = "yes") -> ModelScore:
