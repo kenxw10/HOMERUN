@@ -182,6 +182,7 @@ def generate_candidates(session: Session) -> dict[str, int]:
                     expected_value=net_ev,
                 )
                 session.add(trade)
+                session.flush()
                 paper_trades += 1
 
     session.commit()

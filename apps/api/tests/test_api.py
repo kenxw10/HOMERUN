@@ -1,14 +1,17 @@
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
+import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.database import Base, database_status
-from app.main import app
+from app.main import _candidate_summary, app
 from app.models import BalanceSnapshot, KalshiMarket, MarketMapping, MlbGame, ModelCandidate, PaperTrade, Position
+from app.security import require_internal_api_key
 from app.services import candidates, dashboard, market_sync
 from app.services.kalshi import KalshiClient, derive_orderbook_prices
 from app.services.mapping import infer_market_type, score_mapping, sync_market_mappings
@@ -239,7 +242,7 @@ def test_generate_candidates_avoids_duplicate_open_trade_across_mappings(monkeyp
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
 
-    with Session(engine) as session:
+    with Session(engine, autoflush=False) as session:
         first_game = MlbGame(
             external_game_id="doubleheader-1",
             home_team="New York Yankees",
@@ -484,6 +487,22 @@ def test_generate_candidates_blocks_paper_trades_after_game_start(monkeypatch) -
     assert all_trades == []
 
 
+def test_candidate_summary_preserves_zero_values() -> None:
+    candidate = ModelCandidate(
+        evaluated_at=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
+        model_probability=Decimal("0.000000"),
+        probability=Decimal("0.500000"),
+        executable_price=Decimal("0.0000"),
+        market_price=Decimal("0.4000"),
+        decision="paper_trade",
+    )
+
+    summary = _candidate_summary(candidate, None, None)
+
+    assert summary.model_probability == 0.0
+    assert summary.executable_price == 0.0
+
+
 def test_mapping_confidence_and_rationale() -> None:
     game = MlbGame(
         external_game_id="1",
@@ -672,6 +691,32 @@ def test_internal_sync_endpoints_fail_closed_in_production_without_api_key(monke
 
     assert response.status_code == 401
     assert "BACKEND_API_KEY" in response.json()["detail"]
+
+
+def test_internal_api_key_fails_closed_without_explicit_local_env(monkeypatch) -> None:
+    monkeypatch.delenv("APP_ENV", raising=False)
+    monkeypatch.delenv("BACKEND_API_KEY", raising=False)
+    get_settings.cache_clear()
+
+    try:
+        with pytest.raises(HTTPException) as exc_info:
+            require_internal_api_key(x_api_key=None)
+    finally:
+        get_settings.cache_clear()
+
+    assert exc_info.value.status_code == 401
+    assert "APP_ENV explicitly enables local development" in exc_info.value.detail
+
+
+def test_internal_api_key_allows_explicit_local_without_api_key(monkeypatch) -> None:
+    monkeypatch.setenv("APP_ENV", "local")
+    monkeypatch.delenv("BACKEND_API_KEY", raising=False)
+    get_settings.cache_clear()
+
+    try:
+        assert require_internal_api_key(x_api_key=None) is None
+    finally:
+        get_settings.cache_clear()
 
 
 def test_market_sync_uses_valid_filters_and_clears_stale_orderbook(monkeypatch) -> None:

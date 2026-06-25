@@ -118,6 +118,10 @@ def _decimal_float(value) -> float | None:
     return float(value) if value is not None else None
 
 
+def _prefer_not_none(primary, fallback):
+    return primary if primary is not None else fallback
+
+
 def _game_summary(game: MlbGame) -> GameSummary:
     return GameSummary(
         external_game_id=game.external_game_id,
@@ -166,8 +170,8 @@ def _candidate_summary(candidate: ModelCandidate, game: MlbGame | None, market: 
         market_type=candidate.market_type,
         time_bucket=candidate.time_bucket,
         time_to_start_minutes=candidate.time_to_start_minutes,
-        model_probability=_decimal_float(candidate.model_probability or candidate.probability),
-        executable_price=_decimal_float(candidate.executable_price or candidate.market_price),
+        model_probability=_decimal_float(_prefer_not_none(candidate.model_probability, candidate.probability)),
+        executable_price=_decimal_float(_prefer_not_none(candidate.executable_price, candidate.market_price)),
         net_expected_value=_decimal_float(candidate.net_expected_value),
         decision=candidate.decision,
     )
