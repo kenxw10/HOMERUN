@@ -180,6 +180,18 @@ def _is_multivariate_market_row(market: KalshiMarket) -> bool:
     return is_multivariate_market(payload)
 
 
+def _has_targeted_resolver_mapping(session: Session, market: KalshiMarket) -> bool:
+    return (
+        session.scalar(
+            select(MarketMapping.id)
+            .where(MarketMapping.kalshi_market_id == market.id)
+            .where(MarketMapping.resolver_strategy.is_not(None))
+            .limit(1)
+        )
+        is not None
+    )
+
+
 def sync_market_mappings(session: Session) -> int:
     games = list(session.scalars(select(MlbGame)))
     markets = list(session.scalars(select(KalshiMarket)))
@@ -198,6 +210,9 @@ def sync_market_mappings(session: Session) -> int:
                 }
                 session.add(row)
                 count += 1
+            continue
+
+        if _has_targeted_resolver_mapping(session, market):
             continue
 
         scored: list[dict[str, object]] = []

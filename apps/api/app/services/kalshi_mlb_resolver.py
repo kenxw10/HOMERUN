@@ -16,7 +16,8 @@ logger = logging.getLogger(__name__)
 
 TARGETED_SERIES_TICKER = "KXMLBGAME"
 EVENT_OFFSETS_MINUTES = (0, -5, 5, -10, 10, -1, 1)
-SERIES_FALLBACK_WINDOW = timedelta(hours=12)
+SERIES_FALLBACK_CLOSE_LOOKBACK = timedelta(days=1)
+SERIES_FALLBACK_CLOSE_LOOKAHEAD = timedelta(days=21)
 MONTH_CODES = ("JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC")
 KALSHI_EVENT_TIME_ZONE = ZoneInfo("America/New_York")
 
@@ -375,8 +376,8 @@ def resolve_game_markets(client: KalshiClient, game: MlbGame, *, query_kalshi: b
             resolution.errors.append(_error_detail(exc, fallback_attempted=True))
 
     try:
-        start = int((ensure_aware_utc(game.scheduled_start) - SERIES_FALLBACK_WINDOW).timestamp())
-        end = int((ensure_aware_utc(game.scheduled_start) + SERIES_FALLBACK_WINDOW).timestamp())
+        start = int((ensure_aware_utc(game.scheduled_start) - SERIES_FALLBACK_CLOSE_LOOKBACK).timestamp())
+        end = int((ensure_aware_utc(game.scheduled_start) + SERIES_FALLBACK_CLOSE_LOOKAHEAD).timestamp())
         markets = client.get_markets_by_series_window(
             TARGETED_SERIES_TICKER,
             start,

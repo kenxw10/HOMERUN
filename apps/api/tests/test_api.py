@@ -19,6 +19,7 @@ from app.services.kalshi_mlb_resolver import (
     build_event_ticker_candidates,
     build_market_ticker_candidates,
     normalize_team_abbreviation,
+    resolve_game_markets,
 )
 from app.services.mapping import infer_market_type, score_mapping, sync_market_mappings
 from app.time_utils import classify_time_bucket
@@ -650,6 +651,64 @@ def test_generate_candidates_handles_no_mappings_cleanly(monkeypatch) -> None:
     assert all_trades == []
 
 
+def test_generate_candidates_preserves_confirmed_targeted_resolver_mapping(monkeypatch) -> None:
+    now = datetime(2026, 6, 25, 12, 0, tzinfo=UTC)
+    monkeypatch.setattr(candidates, "utc_now", lambda: now)
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        game = MlbGame(
+            external_game_id="resolver-confirmed-1",
+            home_team="San Diego Padres",
+            away_team="Los Angeles Dodgers",
+            home_abbreviation="SD",
+            away_abbreviation="LAD",
+            scheduled_start=datetime(2026, 6, 26, 22, 40, tzinfo=UTC),
+            status="scheduled",
+        )
+        market = KalshiMarket(
+            kalshi_market_id="KX-RESOLVER-CONFIRMED",
+            ticker="KXMLBGAME-26JUN261840LADSD-LAD",
+            event_ticker="KXMLBGAME-26JUN261840LADSD",
+            title="Los Angeles D vs San Diego",
+            yes_subtitle="Los Angeles D win the game",
+            status="open",
+            occurrence_datetime=datetime(2026, 6, 26, 22, 40, tzinfo=UTC),
+            implied_yes_ask=Decimal("0.4000"),
+        )
+        session.add_all([game, market])
+        session.flush()
+        session.add(
+            MarketMapping(
+                mlb_game_id=game.id,
+                kalshi_market_id=market.id,
+                mapping_status="confirmed",
+                confidence=Decimal("0.9500"),
+                rationale="MARKET_TICKER_MATCH",
+                resolver_strategy="exact_market_tickers",
+                validation_status="strong",
+                mapping_metadata={"resolver_strategy_used": "exact_market_tickers"},
+            )
+        )
+        session.commit()
+
+        result = candidates.generate_candidates(session)
+        mapping = session.scalar(select(MarketMapping))
+        candidate = session.scalar(select(ModelCandidate))
+        trade = session.scalar(select(PaperTrade))
+
+    assert result["paper_trades"] == 1
+    assert mapping is not None
+    assert mapping.mapping_status == "confirmed"
+    assert mapping.confidence == Decimal("0.9500")
+    assert mapping.resolver_strategy == "exact_market_tickers"
+    assert candidate is not None
+    assert candidate.decision == "paper_trade"
+    assert trade is not None
+
+
 def test_candidate_summary_preserves_zero_values() -> None:
     candidate = ModelCandidate(
         evaluated_at=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
@@ -1083,6 +1142,56 @@ def test_series_window_fallback_uses_mve_filter_exclude() -> None:
             2,
         )
     ]
+
+
+def test_resolver_series_fallback_close_window_covers_mlb_expiration() -> None:
+    class FakeKalshiClient:
+        def __init__(self) -> None:
+            self.series_call: tuple[str, int, int, int, int] | None = None
+
+        def get_markets_by_tickers(self, tickers: list[str]):
+            return {"markets": []}
+
+        def get_event(self, event_ticker: str):
+            return {"event": {"markets": []}}
+
+        def get_markets_by_event_ticker(self, event_ticker: str, limit: int = 100):
+            return {"markets": []}
+
+        def get_markets_by_series_window(
+            self,
+            series_ticker: str,
+            min_close_ts: int,
+            max_close_ts: int,
+            *,
+            limit: int = 100,
+            max_pages: int = 2,
+        ):
+            self.series_call = (series_ticker, min_close_ts, max_close_ts, limit, max_pages)
+            return []
+
+    client = FakeKalshiClient()
+    scheduled_start = datetime(2026, 6, 26, 22, 40, tzinfo=UTC)
+    game = MlbGame(
+        external_game_id="series-window-1",
+        home_team="Detroit Tigers",
+        away_team="Houston Astros",
+        home_abbreviation="DET",
+        away_abbreviation="HOU",
+        scheduled_start=scheduled_start,
+        status="scheduled",
+    )
+
+    resolve_game_markets(client, game)
+
+    assert client.series_call is not None
+    series_ticker, min_close_ts, max_close_ts, limit, max_pages = client.series_call
+    assert series_ticker == "KXMLBGAME"
+    assert min_close_ts == int((scheduled_start - timedelta(days=1)).timestamp())
+    assert max_close_ts == int((scheduled_start + timedelta(days=21)).timestamp())
+    assert max_close_ts - min_close_ts == 22 * 24 * 60 * 60
+    assert limit == 100
+    assert max_pages == 2
 
 
 def test_market_sync_rejects_multivariate_markets(monkeypatch) -> None:
