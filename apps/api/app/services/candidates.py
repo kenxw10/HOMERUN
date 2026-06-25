@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.models import FeatureSnapshot, KalshiMarket, MarketMapping, MlbGame, ModelCandidate, PaperTrade
-from app.services.contracts import SUPPORTED_MARKET_FAMILY, contract_labels, market_type_from_ticker
+from app.services.contracts import SUPPORTED_MARKET_FAMILY, contract_labels, has_trusted_selection, market_type_from_ticker
 from app.services.features import FEATURE_VERSION, build_feature_snapshot
 from app.services.mapping import infer_market_type, sync_market_mappings
 from app.services.modeling import get_or_create_heuristic_model_version, score_candidate_probability
@@ -78,6 +78,7 @@ def _open_trade_for_market(session: Session, market_ticker: str, contract_side: 
 
 def _decision(
     mapping: MarketMapping,
+    game: MlbGame,
     market: KalshiMarket,
     market_type: str,
     minutes_to_start: int,
@@ -99,6 +100,8 @@ def _decision(
         return "no_trade_edge_too_low"
     if not settings.paper_candidate_engine_enabled:
         return "candidate_only"
+    if settings.safe_execution_posture and not has_trusted_selection(game, market.ticker):
+        return "no_trade_untrusted_selection"
     if settings.safe_execution_posture:
         return "paper_trade"
     return "candidate_only"
@@ -148,7 +151,7 @@ def generate_candidates(session: Session) -> dict[str, int]:
         gross_ev = (probability - price).quantize(Decimal("0.000001")) if price is not None else None
         fee = Decimal("0.000000")
         net_ev = (gross_ev - fee).quantize(Decimal("0.000001")) if gross_ev is not None else None
-        decision = _decision(mapping, market, market_type, minutes_to_start, price, net_ev)
+        decision = _decision(mapping, game, market, market_type, minutes_to_start, price, net_ev)
 
         existing_candidates = list(
             session.scalars(

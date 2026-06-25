@@ -7,7 +7,12 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models import KalshiMarket, MarketMapping, MlbGame, ModelCandidate, PaperTrade, Position, Settlement
-from app.services.contracts import SUPPORTED_MARKET_FAMILY, market_type_from_ticker, selected_team_from_ticker
+from app.services.contracts import (
+    SUPPORTED_MARKET_FAMILY,
+    has_trusted_selection,
+    market_type_from_ticker,
+    selected_team_from_ticker,
+)
 from app.services.portfolio import create_balance_snapshot
 from app.time_utils import ensure_aware_utc, get_dashboard_zone, utc_now
 
@@ -42,22 +47,12 @@ def _winner_code(game: MlbGame) -> str | None:
     return (game.away_abbreviation or "").upper()
 
 
-def _game_team_codes(game: MlbGame) -> set[str]:
-    return {code for code in ((game.home_abbreviation or "").upper(), (game.away_abbreviation or "").upper()) if code}
-
-
-def _has_trusted_selection(game: MlbGame, market_ticker: str) -> bool:
-    selected = selected_team_from_ticker(market_ticker)
-    team_codes = _game_team_codes(game)
-    return selected is not None and bool(team_codes) and selected in team_codes
-
-
 def _skip_reason(game: MlbGame, market_ticker: str, market_type: str) -> str:
     if market_type != SUPPORTED_MARKET_FAMILY:
         return "unsupported"
     if _status_kind(game.status) == "open":
         return "not_final"
-    if not _has_trusted_selection(game, market_ticker):
+    if not has_trusted_selection(game, market_ticker):
         return "invalid_selection"
     return "not_final"
 
@@ -79,7 +74,7 @@ def _contract_outcome(
         return "void", "VOID"
 
     winner = _winner_code(game)
-    if winner is None or not _has_trusted_selection(game, market_ticker):
+    if winner is None or not has_trusted_selection(game, market_ticker):
         return None
     selected = selected_team_from_ticker(market_ticker)
     if winner == "PUSH":

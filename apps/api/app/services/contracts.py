@@ -24,6 +24,22 @@ def selected_team_from_ticker(ticker: str | None) -> str | None:
     return selected or None
 
 
+def game_team_codes(game: MlbGame | None) -> set[str]:
+    if game is None:
+        return set()
+    return {
+        code
+        for code in ((game.home_abbreviation or "").upper(), (game.away_abbreviation or "").upper())
+        if code
+    }
+
+
+def has_trusted_selection(game: MlbGame | None, market_ticker: str | None) -> bool:
+    selected = selected_team_from_ticker(market_ticker)
+    team_codes = game_team_codes(game)
+    return selected is not None and bool(team_codes) and selected in team_codes
+
+
 def matchup_display(game: MlbGame | None) -> str | None:
     if game is None:
         return None
