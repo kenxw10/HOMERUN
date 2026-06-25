@@ -1283,6 +1283,15 @@ def test_market_sync_rejects_multivariate_markets(monkeypatch) -> None:
                 ]
             }
 
+        def get_event(self, event_ticker: str):
+            return {"event": {"markets": []}}
+
+        def get_markets_by_event_ticker(self, event_ticker: str, limit: int = 100):
+            return {"markets": []}
+
+        def get_markets_by_series_window(self, *args, **kwargs):
+            return []
+
         def get_orderbook(self, ticker: str):
             raise AssertionError("multivariate markets should not fetch orderbooks")
 
@@ -1316,6 +1325,86 @@ def test_market_sync_rejects_multivariate_markets(monkeypatch) -> None:
     assert mapping.validation_status == "rejected_multivariate"
     assert row is not None
     assert row.orderbook_raw == {"skipped": "multivariate market"}
+
+
+def test_market_sync_continues_fallbacks_after_rejected_only_exact_result(monkeypatch) -> None:
+    class FakeKalshiClient:
+        def __init__(self) -> None:
+            self.event_calls: list[str] = []
+
+        def get_markets_by_tickers(self, tickers: list[str]):
+            return {
+                "markets": [
+                    {
+                        "id": "market-mve",
+                        "ticker": "KXMV-MLB-COMBO",
+                        "event_ticker": "KXMVE-26JUN261840HOUDET",
+                        "title": "Multivariate MLB combo",
+                        "status": "open",
+                        "mve_selected_legs": [{"ticker": "KXMLBGAME-26JUN261840HOUDET-HOU"}],
+                    }
+                ]
+            }
+
+        def get_event(self, event_ticker: str):
+            self.event_calls.append(event_ticker)
+            if event_ticker != "KXMLBGAME-26JUN261840HOUDET":
+                return {"event": {"markets": []}}
+            return {
+                "event": {
+                    "markets": [
+                        {
+                            "id": "market-targeted",
+                            "ticker": "KXMLBGAME-26JUN261840HOUDET-HOU",
+                            "event_ticker": "KXMLBGAME-26JUN261840HOUDET",
+                            "title": "Will the Houston Astros win the game against the Detroit Tigers?",
+                            "status": "open",
+                            "occurrence_datetime": "2026-06-26T22:40:00Z",
+                            "yes_ask_dollars": "0.3400",
+                        }
+                    ]
+                }
+            }
+
+        def get_markets_by_event_ticker(self, event_ticker: str, limit: int = 100):
+            raise AssertionError("event lookup should stop after usable fallback match")
+
+        def get_markets_by_series_window(self, *args, **kwargs):
+            raise AssertionError("series fallback should not run after usable fallback match")
+
+        def get_orderbook(self, ticker: str):
+            if ticker == "KXMV-MLB-COMBO":
+                raise AssertionError("multivariate markets should not fetch orderbooks")
+            return {"orderbook_fp": {"yes_dollars": [["0.3400", "10.00"]], "no_dollars": [["0.6500", "10.00"]]}}
+
+    fake_client = FakeKalshiClient()
+    monkeypatch.setattr(market_sync.KalshiClient, "from_settings", staticmethod(lambda: fake_client))
+    monkeypatch.setattr(market_sync, "utc_now", lambda: datetime(2026, 6, 25, 12, 0, tzinfo=UTC))
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        session.add(
+            MlbGame(
+                external_game_id="mve-fallback-1",
+                home_team="Detroit Tigers",
+                away_team="Houston Astros",
+                home_abbreviation="DET",
+                away_abbreviation="HOU",
+                scheduled_start=datetime(2026, 6, 26, 22, 40, tzinfo=UTC),
+                status="scheduled",
+            )
+        )
+        session.commit()
+
+        summary = market_sync.sync_kalshi_markets(session)
+        mappings = list(session.scalars(select(MarketMapping).order_by(MarketMapping.mapping_status)))
+
+    assert "KXMLBGAME-26JUN261840HOUDET" in fake_client.event_calls
+    assert summary["rejected_multivariate"] == 1
+    assert summary["confirmed_mappings"] == 1
+    assert {mapping.mapping_status for mapping in mappings} == {"confirmed", "rejected_multivariate"}
 
 
 def test_market_sync_returns_structured_upstream_errors(monkeypatch) -> None:

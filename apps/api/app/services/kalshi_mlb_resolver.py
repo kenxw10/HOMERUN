@@ -121,6 +121,10 @@ class GameResolution:
         }
 
 
+def _has_usable_match(resolution: GameResolution) -> bool:
+    return any(not match.mapping_status.startswith("rejected_") for match in resolution.matches)
+
+
 def _normalize_name(value: str) -> str:
     return " ".join(re.findall(r"[a-z0-9]+", value.lower()))
 
@@ -356,7 +360,7 @@ def resolve_game_markets(client: KalshiClient, game: MlbGame, *, query_kalshi: b
     try:
         payload = client.get_markets_by_tickers(resolution.attempted_market_tickers)
         _add_validated_markets(resolution, game, _markets_from_payload(payload), "exact_market_tickers", seen_tickers)
-        if resolution.matches:
+        if _has_usable_match(resolution):
             return resolution
     except KalshiAPIError as exc:
         logger.warning("Kalshi exact ticker resolver failed: %s", exc)
@@ -366,7 +370,7 @@ def resolve_game_markets(client: KalshiClient, game: MlbGame, *, query_kalshi: b
         try:
             payload = client.get_event(event_ticker)
             _add_validated_markets(resolution, game, _markets_from_payload(payload), "get_event", seen_tickers)
-            if resolution.matches:
+            if _has_usable_match(resolution):
                 return resolution
         except KalshiAPIError as exc:
             resolution.errors.append(_error_detail(exc, fallback_attempted=True))
@@ -375,7 +379,7 @@ def resolve_game_markets(client: KalshiClient, game: MlbGame, *, query_kalshi: b
         try:
             payload = client.get_markets_by_event_ticker(event_ticker)
             _add_validated_markets(resolution, game, _markets_from_payload(payload), "event_ticker_filter", seen_tickers)
-            if resolution.matches:
+            if _has_usable_match(resolution):
                 return resolution
         except KalshiAPIError as exc:
             resolution.errors.append(_error_detail(exc, fallback_attempted=True))

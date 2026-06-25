@@ -1,6 +1,6 @@
 """PR2.5 targeted Kalshi resolver audit fields.
 
-Revision ID: 0003_pr2_5_targeted_kalshi_resolver
+Revision ID: 0003_pr2_5_resolver
 Revises: 0002_pr2_data_layer
 Create Date: 2026-06-25
 """
@@ -10,7 +10,7 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0003_pr2_5_targeted_kalshi_resolver"
+revision: str = "0003_pr2_5_resolver"
 down_revision: str | None = "0002_pr2_data_layer"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
