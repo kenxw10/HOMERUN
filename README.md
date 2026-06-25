@@ -16,7 +16,7 @@ This is not a sportsbook app. It does not use DraftKings, FanDuel, Odds API, or 
 - `EXECUTION_KILL_SWITCH=true`
 - `KALSHI_ENV=demo`
 - Kalshi credentials are optional for PR 2 discovery and must not be production credentials unless a later PR explicitly changes the safety plan.
-- `BACKEND_API_KEY` is optional locally. If it is set, internal POST run endpoints require `X-API-Key`.
+- `BACKEND_API_KEY` is optional only for local development. Public or deployed backends must set it, and internal POST run endpoints require `X-API-Key`.
 
 ## Local Backend
 
@@ -64,7 +64,7 @@ PR 2 also exposes internal API run endpoints:
 - `POST /v1/sync/kalshi-markets`
 - `POST /v1/run/paper-candidate-engine`
 
-If `BACKEND_API_KEY` is set, call those endpoints with an `X-API-Key` header.
+For local development, these endpoints can run without a key when `APP_ENV=local` and `BACKEND_API_KEY` is empty. For any public or deployed backend, set `BACKEND_API_KEY` and call these endpoints with an `X-API-Key` header.
 
 ## Local Frontend
 

@@ -71,6 +71,9 @@ def classify_time_bucket(minutes_to_start: int | float | None) -> str:
     if minutes_to_start is None:
         return "MARKET_OPEN"
 
+    if minutes_to_start <= 0:
+        return "POST_START"
+
     if minutes_to_start <= 5:
         return "5M"
 

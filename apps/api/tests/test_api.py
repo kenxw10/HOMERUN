@@ -121,6 +121,8 @@ def test_time_bucket_classification() -> None:
     assert classify_time_bucket(95) == "90M"
     assert classify_time_bucket(20) == "15M"
     assert classify_time_bucket(1) == "5M"
+    assert classify_time_bucket(0) == "POST_START"
+    assert classify_time_bucket(-1) == "POST_START"
 
 
 def test_candidate_day_bounds_use_dashboard_timezone(monkeypatch) -> None:
@@ -397,6 +399,45 @@ def test_generate_candidates_requires_executable_yes_ask(monkeypatch) -> None:
     assert all_trades == []
 
 
+def test_generate_candidates_blocks_paper_trades_after_game_start(monkeypatch) -> None:
+    now = datetime(2026, 7, 1, 23, 15, tzinfo=UTC)
+    monkeypatch.setattr(candidates, "utc_now", lambda: now)
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        game = MlbGame(
+            external_game_id="started-1",
+            home_team="New York Yankees",
+            away_team="Boston Red Sox",
+            scheduled_start=datetime(2026, 7, 1, 23, 5, tzinfo=UTC),
+            status="in_progress",
+        )
+        market = KalshiMarket(
+            kalshi_market_id="KX-STARTED",
+            ticker="KXMLB-STARTED",
+            title="Will the New York Yankees win the game against the Boston Red Sox?",
+            status="open",
+            occurrence_datetime=datetime(2026, 7, 1, 23, 5, tzinfo=UTC),
+            implied_yes_ask=Decimal("0.4000"),
+        )
+        session.add_all([game, market])
+        session.commit()
+
+        result = candidates.generate_candidates(session)
+        candidate = session.scalar(select(ModelCandidate))
+        all_trades = list(session.scalars(select(PaperTrade)))
+
+    assert result["candidates"] == 1
+    assert result["paper_trades"] == 0
+    assert candidate is not None
+    assert candidate.time_bucket == "POST_START"
+    assert candidate.time_to_start_minutes == -10
+    assert candidate.decision == "no_trade_game_started"
+    assert all_trades == []
+
+
 def test_mapping_confidence_and_rationale() -> None:
     game = MlbGame(
         external_game_id="1",
@@ -571,6 +612,20 @@ def test_internal_sync_endpoints_require_api_key_when_configured(monkeypatch) ->
         get_settings.cache_clear()
 
     assert response.status_code == 401
+
+
+def test_internal_sync_endpoints_fail_closed_in_production_without_api_key(monkeypatch) -> None:
+    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.delenv("BACKEND_API_KEY", raising=False)
+    get_settings.cache_clear()
+
+    try:
+        response = client.post("/v1/run/paper-candidate-engine")
+    finally:
+        get_settings.cache_clear()
+
+    assert response.status_code == 401
+    assert "BACKEND_API_KEY" in response.json()["detail"]
 
 
 def test_market_sync_uses_valid_filters_and_clears_stale_orderbook(monkeypatch) -> None:

@@ -14,7 +14,7 @@ Before treating a deployment as valid:
 8. Confirm Railway `/v1/system/status` reports `database.ready: true` after opening a real database connection.
 9. Confirm the Vercel dashboard loads the light terminal UI without a dark theme, admin page, calendar, or sportsbook concepts.
 10. Confirm the dashboard shows API connected, paper mode, live trading disabled, kill switch on, and database ready.
-11. If `BACKEND_API_KEY` is set, confirm internal POST endpoints reject requests without `X-API-Key`.
+11. Confirm `BACKEND_API_KEY` is set in every public/deployed backend environment, and confirm internal POST endpoints reject requests without `X-API-Key`.
 
 ## No-Live-Trading Safety Checklist
 
@@ -68,7 +68,7 @@ The backend also exposes these POST endpoints for controlled operational runs:
 - `POST /v1/sync/kalshi-markets`
 - `POST /v1/run/paper-candidate-engine`
 
-If `BACKEND_API_KEY` is configured, include it as `X-API-Key`. Do not expose these endpoints as public dashboard buttons in PR 2.
+For public or deployed backends, `BACKEND_API_KEY` is required and must be sent as `X-API-Key`. The unauthenticated bypass is only for explicit local development environments. Do not expose these endpoints as public dashboard buttons in PR 2.
 
 ## Required Context Updates
 

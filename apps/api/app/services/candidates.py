@@ -60,6 +60,7 @@ def _decision(
     mapping: MarketMapping,
     market: KalshiMarket,
     market_type: str,
+    minutes_to_start: int,
     price: Decimal | None,
     net_ev: Decimal | None,
 ) -> str:
@@ -68,6 +69,8 @@ def _decision(
         return "no_trade_mapping_uncertain"
     if market_type == "unknown":
         return "no_trade_unsupported_market_type"
+    if minutes_to_start <= 0:
+        return "no_trade_game_started"
     if price is None:
         return "no_trade_missing_price"
     if market.status.lower() in {"closed", "settled", "finalized", "expired"}:
@@ -106,7 +109,7 @@ def generate_candidates(session: Session) -> dict[str, int]:
         gross_ev = (probability - price).quantize(Decimal("0.000001")) if price is not None else None
         fee = Decimal("0.000000")
         net_ev = (gross_ev - fee).quantize(Decimal("0.000001")) if gross_ev is not None else None
-        decision = _decision(mapping, market, market_type, price, net_ev)
+        decision = _decision(mapping, market, market_type, minutes_to_start, price, net_ev)
 
         existing_candidates = list(
             session.scalars(

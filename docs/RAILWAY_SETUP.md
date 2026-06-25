@@ -32,11 +32,12 @@ MARKET_DISCOVERY_ENABLED=true
 PAPER_CANDIDATE_ENGINE_ENABLED=true
 DEFAULT_PAPER_CONTRACTS=1
 DASHBOARD_TIMEZONE=America/New_York
+BACKEND_API_KEY=replace-with-a-long-random-secret
 ```
 
 Use the exact Vercel dashboard origin for `CORS_ORIGINS`, without a trailing slash. Example: `https://homerun.vercel.app`.
 
-9. Optional: set `BACKEND_API_KEY` to a long random value if you want the PR 2 internal POST run endpoints protected.
+9. Required for Railway: set `BACKEND_API_KEY` to a long random value. Internal POST run endpoints reject unauthenticated requests outside local development.
 10. Do not add production Kalshi credentials in PR 2.
 11. Deploy the service.
 12. Run database migrations.
