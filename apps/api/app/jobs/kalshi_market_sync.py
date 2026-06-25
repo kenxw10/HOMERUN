@@ -13,9 +13,15 @@ def main() -> None:
 
     session_factory = get_session_factory()
     with session_factory() as session:
-        count = sync_kalshi_markets(session)
+        result = sync_kalshi_markets(session)
 
-    print(f"Synced {count} Kalshi MLB candidate markets.")
+    print(
+        "Kalshi targeted sync complete: "
+        f"games={result['games_considered']} "
+        f"markets={result['markets_upserted']} "
+        f"mappings={result['mappings_created_or_updated']} "
+        f"errors={len(result['errors'])}"
+    )
 
 
 if __name__ == "__main__":

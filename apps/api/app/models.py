@@ -45,6 +45,8 @@ class MlbGame(TimestampMixin, Base):
     external_game_id: Mapped[str] = mapped_column(String(120), unique=True, nullable=False)
     home_team: Mapped[str] = mapped_column(String(120), nullable=False)
     away_team: Mapped[str] = mapped_column(String(120), nullable=False)
+    home_abbreviation: Mapped[str | None] = mapped_column(String(12))
+    away_abbreviation: Mapped[str | None] = mapped_column(String(12))
     scheduled_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     status: Mapped[str] = mapped_column(String(40), default="scheduled", nullable=False)
     home_score: Mapped[int | None] = mapped_column(Integer)
@@ -76,6 +78,7 @@ class KalshiMarket(TimestampMixin, Base):
     implied_yes_ask: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
     implied_no_ask: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
     status: Mapped[str] = mapped_column(String(40), default="untracked", nullable=False)
+    raw_status: Mapped[str | None] = mapped_column(String(40))
     open_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     close_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     occurrence_datetime: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -94,6 +97,8 @@ class MarketMapping(TimestampMixin, Base):
     mapping_status: Mapped[str] = mapped_column(String(40), default="candidate", nullable=False)
     confidence: Mapped[Decimal | None] = mapped_column(Numeric(6, 4))
     rationale: Mapped[str | None] = mapped_column(Text)
+    resolver_strategy: Mapped[str | None] = mapped_column(String(80))
+    validation_status: Mapped[str | None] = mapped_column(String(80))
     mapping_metadata: Mapped[dict[str, object] | None] = mapped_column(JSON)
 
 

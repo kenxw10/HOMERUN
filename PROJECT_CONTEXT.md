@@ -10,13 +10,14 @@ The user wants the system to become as hands-off as possible. Calibration, thres
 
 ## 2. Current Scope
 
-PR 2 builds on the merged PR 1 foundation:
+PR 2.5 builds on the merged PR 2 data layer:
 
 - FastAPI backend in `apps/api`.
 - Next.js TypeScript frontend in `apps/web`.
 - PostgreSQL-ready database models and Alembic migrations.
 - MLB schedule ingestion from the public MLB Stats API.
-- Kalshi market discovery with yes/no orderbook parsing and raw payload storage.
+- Targeted Kalshi MLB market resolution from MLB game rows using the empirically observed `KXMLBGAME` full-game winner family.
+- Kalshi yes/no orderbook parsing and raw payload storage for targeted markets only.
 - Auditable MLB game to Kalshi market mapping with confidence and rationale.
 - Conservative paper candidate and paper-trade generation.
 - Database-backed dashboard API responses when data exists.
@@ -31,7 +32,7 @@ The system still has no live trading, no production credentials requirement, no 
 
 This project is not a sportsbook betting app. Do not add sportsbook assumptions, sportsbook APIs, sportsbook odds conversion, DraftKings, FanDuel, or Odds API behavior.
 
-PR 2 still intentionally excludes:
+PR 2.5 still intentionally excludes:
 
 - Live order placement.
 - Production Kalshi credentials.
@@ -41,6 +42,8 @@ PR 2 still intentionally excludes:
 - Monthly calendars.
 - Automated retraining jobs.
 - Hidden dashboard-triggered worker automation.
+- Model training or calibration.
+- Fake spread, total, or first-five market tickers.
 
 ## 4. Architecture Decisions
 
@@ -65,6 +68,7 @@ It also exposes controlled internal run endpoints:
 - `POST /v1/sync/mlb-schedule`
 - `POST /v1/sync/kalshi-markets`
 - `POST /v1/run/paper-candidate-engine`
+- `GET /v1/kalshi/resolve-preview?date=YYYY-MM-DD`
 
 The database layer is PostgreSQL-ready but the API can still boot locally without a database for frontend and health-check work.
 If `BACKEND_API_KEY` is configured, internal POST endpoints require `X-API-Key`.
@@ -158,9 +162,30 @@ Frontend target:
 - `NEXT_PUBLIC_API_BASE_URL` points to the Railway backend URL.
 - `NEXT_PUBLIC_REFRESH_MS` controls dashboard polling and defaults to `30000`.
 
-Production Kalshi credentials should not be added during PR 2.
+Production Kalshi credentials should not be added during PR 2.5.
 
-## 12. PR Change Log
+## 12. PR2.5 Kalshi Market Resolution
+
+PR 2.5 switches the primary Kalshi market sync from broad universe crawling to targeted MLB resolution:
+
+- MLB schedule sync creates or updates `mlb_games`.
+- The Kalshi resolver builds candidate event tickers around each game's Eastern first pitch.
+- The initial supported family is `full_game_winner` with series ticker `KXMLBGAME`.
+- Observed event format: `KXMLBGAME-YYMMMDDHHMMAWAYHOME`, for example `KXMLBGAME-26JUN261840HOUDET`.
+- Observed market format: `{EVENT}-{TEAM}`, for example `KXMLBGAME-26JUN261840HOUDET-HOU`.
+- Spread, total, and first-five families remain `unknown_pending_discovery` and must not be faked.
+- `mve_filter=exclude` is used for narrow market queries where supported.
+- Multivariate markets are rejected for normal MLB mapping in PR 2.5.
+- Broad discovery is diagnostic-only, disabled by default, bounded by page/limit env vars, and must not block targeted resolver success.
+
+New PR 2.5 migration:
+
+- `0003_pr2_5_targeted_kalshi_resolver.py`
+- Adds MLB home/away abbreviations.
+- Adds Kalshi raw status.
+- Adds mapping resolver strategy and validation status.
+
+## 13. PR Change Log
 
 Every future PR must update this section with:
 
@@ -182,3 +207,13 @@ Every future PR must update this section with:
 - Replaced the PR 1 dashboard shell with a light terminal-style dashboard that reads backend portfolio snapshots, positions, model status, and system status.
 - Kept the safety posture paper-first: live trading disabled, execution kill switch enabled, no live order placement, and no production credential requirement.
 - Validation performed: backend Ruff, backend pytest, frontend lint, frontend typecheck, and frontend production build.
+
+### PR 2.5 - Targeted Kalshi MLB Resolver
+
+- Replaced broad Kalshi market discovery as the primary path with an MLB-game-driven targeted resolver for the empirically observed `KXMLBGAME` full-game winner family.
+- Added migration `0003_pr2_5_targeted_kalshi_resolver.py` for MLB abbreviations, raw Kalshi status, resolver strategy, and validation status.
+- Added protected `GET /v1/kalshi/resolve-preview?date=YYYY-MM-DD` for production validation without database writes.
+- Kept broad discovery as bounded diagnostics only via `KALSHI_ENABLE_BROAD_DISCOVERY=false` by default.
+- Rejected multivariate Kalshi markets from normal MLB game mapping.
+- Kept paper-first safety posture unchanged: no live orders, live trading disabled, kill switch enabled.
+- Validation performed: backend Ruff and backend pytest.

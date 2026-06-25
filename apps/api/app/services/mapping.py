@@ -7,6 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models import KalshiMarket, MarketMapping, MlbGame
+from app.services.kalshi_mlb_resolver import is_multivariate_market
 from app.time_utils import ensure_aware_utc
 
 
@@ -172,12 +173,33 @@ def _disambiguate_market_scores(scored: list[dict[str, object]]) -> None:
         scored[index]["status"] = "needs_review"
 
 
+def _is_multivariate_market_row(market: KalshiMarket) -> bool:
+    payload = dict(market.raw_payload or {})
+    payload.setdefault("ticker", market.ticker)
+    payload.setdefault("event_ticker", market.event_ticker)
+    return is_multivariate_market(payload)
+
+
 def sync_market_mappings(session: Session) -> int:
     games = list(session.scalars(select(MlbGame)))
     markets = list(session.scalars(select(KalshiMarket)))
     count = 0
 
     for market in markets:
+        if _is_multivariate_market_row(market):
+            existing_rows = list(session.scalars(select(MarketMapping).where(MarketMapping.kalshi_market_id == market.id)))
+            for row in existing_rows:
+                row.mapping_status = "rejected_multivariate"
+                row.validation_status = "rejected_multivariate"
+                row.rationale = "REJECTED_MULTIVARIATE"
+                row.mapping_metadata = {
+                    **(row.mapping_metadata or {}),
+                    "validation_notes": ["REJECTED_MULTIVARIATE"],
+                }
+                session.add(row)
+                count += 1
+            continue
+
         scored: list[dict[str, object]] = []
         for game in games:
             confidence, status, metadata = score_mapping(game, market)

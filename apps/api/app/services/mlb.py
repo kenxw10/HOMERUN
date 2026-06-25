@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from app.config import get_settings
 from app.models import MlbGame
 from app.services.http_json import get_json
+from app.services.kalshi_mlb_resolver import normalize_team_abbreviation
 from app.time_utils import parse_datetime, today_eastern
 
 
@@ -34,6 +35,8 @@ def sync_schedule(session: Session, target_date: date | None = None) -> int:
             away = teams.get("away", {})
             home_team = home.get("team", {}).get("name") or "UNKNOWN HOME"
             away_team = away.get("team", {}).get("name") or "UNKNOWN AWAY"
+            home_abbreviation = home.get("team", {}).get("abbreviation")
+            away_abbreviation = away.get("team", {}).get("abbreviation")
             scheduled_start = parse_datetime(game.get("gameDate"))
             if scheduled_start is None:
                 continue
@@ -42,6 +45,8 @@ def sync_schedule(session: Session, target_date: date | None = None) -> int:
             row = existing or MlbGame(external_game_id=game_pk)
             row.home_team = home_team
             row.away_team = away_team
+            row.home_abbreviation = normalize_team_abbreviation(home_team, home_abbreviation)
+            row.away_abbreviation = normalize_team_abbreviation(away_team, away_abbreviation)
             row.scheduled_start = scheduled_start
             row.status = game.get("status", {}).get("detailedState") or game.get("status", {}).get("abstractGameState") or "scheduled"
             row.home_score = home.get("score")
