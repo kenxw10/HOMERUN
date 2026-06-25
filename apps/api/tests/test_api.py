@@ -1805,7 +1805,17 @@ def test_paper_settlement_sync_settles_wins_losses_and_is_idempotent() -> None:
             decision="paper_trade",
             market_type="full_game_winner",
         )
-        session.add_all([win_candidate, loss_candidate])
+        no_trade_candidate = ModelCandidate(
+            mlb_game_id=game.id,
+            kalshi_market_id=win_market.id,
+            mapping_id=win_mapping.id,
+            evaluated_at=datetime(2026, 7, 1, 16, 5, tzinfo=UTC),
+            features={},
+            decision="no_trade_edge_too_low",
+            market_type="full_game_winner",
+            contract_side="yes",
+        )
+        session.add_all([win_candidate, loss_candidate, no_trade_candidate])
         session.flush()
         session.add_all(
             [
@@ -1836,16 +1846,24 @@ def test_paper_settlement_sync_settles_wins_losses_and_is_idempotent() -> None:
         result = settle_paper_trades(session, date(2026, 7, 1), now=settled_at)
         second_result = settle_paper_trades(session, date(2026, 7, 1), now=settled_at)
         trades = list(session.scalars(select(PaperTrade).order_by(PaperTrade.market_ticker)))
+        no_trade = session.scalar(select(ModelCandidate).where(ModelCandidate.decision == "no_trade_edge_too_low"))
         settlements = list(session.scalars(select(Settlement)))
         snapshots = list(session.scalars(select(BalanceSnapshot)))
 
     assert selected_team_from_ticker("KXMLBGAME-26JUL011900SEAPIT-PIT") == "PIT"
+    assert result["candidate_labels_checked"] == 3
+    assert result["candidate_labels_created"] == 3
+    assert second_result["candidate_labels_created"] == 0
+    assert second_result["candidate_labels_already_set"] == 3
     assert result["settled"] == 2
     assert second_result["settled"] == 0
     assert len(settlements) == 2
     assert len(snapshots) == 2
     assert [trade.outcome for trade in trades] == ["win", "loss"]
     assert [trade.realized_pnl for trade in trades] == [Decimal("1.20"), Decimal("-0.90")]
+    assert no_trade is not None
+    assert no_trade.outcome == "win"
+    assert no_trade.outcome_source == "mlb_results_sync"
 
 
 def test_dashboard_summary_uses_labels_snapshots_and_settled_performance() -> None:

@@ -42,7 +42,13 @@ def _winner_code(game: MlbGame) -> str | None:
     return (game.away_abbreviation or "").upper()
 
 
-def _trade_outcome(game: MlbGame, trade: PaperTrade, market_type: str) -> tuple[str, str] | None:
+def _contract_outcome(
+    game: MlbGame,
+    *,
+    market_ticker: str,
+    contract_side: str | None,
+    market_type: str,
+) -> tuple[str, str] | None:
     if market_type != SUPPORTED_MARKET_FAMILY:
         return None
 
@@ -53,16 +59,34 @@ def _trade_outcome(game: MlbGame, trade: PaperTrade, market_type: str) -> tuple[
         return "void", "VOID"
 
     winner = _winner_code(game)
-    selected = selected_team_from_ticker(trade.market_ticker)
+    selected = selected_team_from_ticker(market_ticker)
     if winner is None or selected is None:
         return None
     if winner == "PUSH":
         return "push", "PUSH"
 
     selected_won = selected == winner
-    side = trade.contract_side.lower()
+    side = (contract_side or "yes").lower()
     won = selected_won if side == "yes" else not selected_won
     return ("win", "WIN") if won else ("loss", "LOSS")
+
+
+def _trade_outcome(game: MlbGame, trade: PaperTrade, market_type: str) -> tuple[str, str] | None:
+    return _contract_outcome(
+        game,
+        market_ticker=trade.market_ticker,
+        contract_side=trade.contract_side,
+        market_type=market_type,
+    )
+
+
+def _candidate_outcome(game: MlbGame, candidate: ModelCandidate, market: KalshiMarket) -> tuple[str, str] | None:
+    return _contract_outcome(
+        game,
+        market_ticker=market.ticker,
+        contract_side=candidate.contract_side,
+        market_type=market_type_from_ticker(market.ticker, candidate.market_type),
+    )
 
 
 def _settlement_amounts(trade: PaperTrade, outcome: str) -> tuple[Decimal, Decimal, Decimal]:
@@ -103,6 +127,18 @@ def settle_paper_trades(
 ) -> dict[str, object]:
     settled_at = now or utc_now()
     bounds = _target_bounds(target_date)
+    candidate_query = (
+        select(ModelCandidate, MarketMapping, MlbGame, KalshiMarket)
+        .join(MarketMapping, ModelCandidate.mapping_id == MarketMapping.id)
+        .join(MlbGame, MarketMapping.mlb_game_id == MlbGame.id)
+        .join(KalshiMarket, MarketMapping.kalshi_market_id == KalshiMarket.id)
+    )
+    if bounds is not None:
+        start, end = bounds
+        candidate_query = candidate_query.where(MlbGame.scheduled_start >= start).where(MlbGame.scheduled_start < end)
+
+    candidate_rows = session.execute(candidate_query).all()
+
     query = (
         select(PaperTrade, ModelCandidate, MarketMapping, MlbGame, KalshiMarket)
         .join(ModelCandidate, PaperTrade.candidate_id == ModelCandidate.id)
@@ -123,8 +159,34 @@ def settle_paper_trades(
         "skipped_not_final": 0,
         "skipped_unsupported": 0,
         "already_settled": 0,
+        "candidate_labels_checked": len(candidate_rows),
+        "candidate_labels_created": 0,
+        "candidate_labels_already_set": 0,
+        "candidate_labels_skipped_not_final": 0,
+        "candidate_labels_skipped_unsupported": 0,
         "snapshot_id": None,
     }
+
+    for candidate, _mapping, game, market in candidate_rows:
+        if candidate.outcome is not None:
+            result["candidate_labels_already_set"] = int(result["candidate_labels_already_set"]) + 1
+            continue
+
+        market_type = market_type_from_ticker(market.ticker, candidate.market_type)
+        outcome = _candidate_outcome(game, candidate, market)
+        if outcome is None:
+            if market_type != SUPPORTED_MARKET_FAMILY:
+                result["candidate_labels_skipped_unsupported"] = int(result["candidate_labels_skipped_unsupported"]) + 1
+            else:
+                result["candidate_labels_skipped_not_final"] = int(result["candidate_labels_skipped_not_final"]) + 1
+            continue
+
+        outcome_value, _resolution = outcome
+        candidate.outcome = outcome_value
+        candidate.outcome_source = "mlb_results_sync"
+        candidate.resolved_at = settled_at
+        session.add(candidate)
+        result["candidate_labels_created"] = int(result["candidate_labels_created"]) + 1
 
     for trade, candidate, _mapping, game, market in rows:
         existing = session.scalar(select(Settlement).where(Settlement.paper_trade_id == trade.id))
