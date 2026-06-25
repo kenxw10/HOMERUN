@@ -366,14 +366,15 @@ def _record_probe_exception(
     warnings: list[object],
     errors: list[object],
     probe_attempts: list[dict[str, object]],
+    markets_found: int = 0,
 ) -> None:
     detail = _kalshi_error(exc)
     if _is_not_found_error(exc):
         record = _probe_attempt_record(
             game=game,
             probe=probe,
-            outcome="no_match",
-            markets_found=0,
+            outcome="partial_no_match" if markets_found else "no_match",
+            markets_found=markets_found,
             error=detail,
         )
         record["message"] = "MARKET_FAMILY_PROBE_NO_MATCH"
@@ -384,8 +385,8 @@ def _record_probe_exception(
     record = _probe_attempt_record(
         game=game,
         probe=probe,
-        outcome="error",
-        markets_found=0,
+        outcome="partial_error" if markets_found else "error",
+        markets_found=markets_found,
         error=detail,
     )
     record["message"] = "MARKET_FAMILY_PROBE_ERROR"
@@ -515,8 +516,9 @@ def _probe_markets(
     for series_ticker in FULL_REGISTRY[family_key]["candidate_series_tickers"]:
         assert isinstance(series_ticker, str)
         probe = DiscoveryProbe(family_key, series_ticker, None, "series_ticker_window")
+        markets: list[dict[str, Any]] = []
         try:
-            markets = client.iter_markets(
+            for market in client.iter_markets(
                 params={
                     "series_ticker": series_ticker,
                     "min_close_ts": start,
@@ -525,8 +527,21 @@ def _probe_markets(
                     "mve_filter": "exclude",
                 },
                 max_pages=settings.market_family_discovery_max_pages,
+            ):
+                if isinstance(market, dict):
+                    markets.append(market)
+        except Exception as exc:
+            found.extend((probe, market) for market in markets)
+            _record_probe_exception(
+                game=game,
+                probe=probe,
+                exc=exc,
+                warnings=warnings,
+                errors=errors,
+                probe_attempts=probe_attempts,
+                markets_found=len(markets),
             )
-            markets = list(markets)
+        else:
             probe_attempts.append(
                 _probe_attempt_record(
                     game=game,
@@ -536,15 +551,6 @@ def _probe_markets(
                 )
             )
             found.extend((probe, market) for market in markets)
-        except Exception as exc:
-            _record_probe_exception(
-                game=game,
-                probe=probe,
-                exc=exc,
-                warnings=warnings,
-                errors=errors,
-                probe_attempts=probe_attempts,
-            )
 
     return found
 

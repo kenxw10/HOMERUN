@@ -2584,6 +2584,68 @@ def test_market_family_discovery_records_non_404_errors_and_continues() -> None:
     assert item.returned_ticker == "KXMLBSPREAD-26JUL011900SEAPIT-PIT-1.5"
 
 
+def test_market_family_discovery_preserves_series_markets_before_pagination_error() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    class FakePaginationErrorClient:
+        def get_event(self, event_ticker: str):
+            return {"event": {"markets": []}}
+
+        def get_markets_by_event_ticker(self, event_ticker: str):
+            return {"markets": []}
+
+        def iter_markets(self, params: dict[str, object], max_pages: int | None = None):
+            if params["series_ticker"] != "KXMLBSPREAD":
+                return iter([])
+
+            def market_pages():
+                yield {
+                    "ticker": "KXMLBSPREAD-26JUL011900SEAPIT-PIT-1.5",
+                    "event_ticker": "KXMLBSPREAD-26JUL011900SEAPIT",
+                    "title": "Pittsburgh Pirates spread -1.5 vs Seattle Mariners",
+                    "status": "open",
+                    "functional_strike": "-1.5",
+                }
+                raise _kalshi_probe_error(500, "https://kalshi.test/markets")
+
+            return market_pages()
+
+    with Session(engine) as session:
+        session.add(
+            MlbGame(
+                external_game_id="pagination-error-market",
+                home_team="Pittsburgh Pirates",
+                away_team="Seattle Mariners",
+                home_abbreviation="PIT",
+                away_abbreviation="SEA",
+                scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+                status="scheduled",
+            )
+        )
+        session.commit()
+
+        result = market_family_discovery.run_market_family_discovery(
+            session,
+            date(2026, 7, 1),
+            client=FakePaginationErrorClient(),
+        )
+        run = session.scalar(select(MarketFamilyDiscoveryRun))
+        item = session.scalar(select(MarketFamilyDiscoveryItem))
+
+    assert result["status"] == "partial_error"
+    assert result["markets_found"] == 1
+    assert result["errors"][0]["message"] == "MARKET_FAMILY_PROBE_ERROR"
+    assert result["errors"][0]["source_strategy"] == "series_ticker_window"
+    assert result["errors"][0]["markets_found"] == 1
+    partial_attempts = [attempt for attempt in result["probe_attempts"] if attempt["outcome"] == "partial_error"]
+    assert partial_attempts[0]["markets_found"] == 1
+    assert run is not None
+    assert run.status == "partial_error"
+    assert item is not None
+    assert item.returned_ticker == "KXMLBSPREAD-26JUL011900SEAPIT-PIT-1.5"
+
+
 def test_market_family_discovery_parses_line_from_ticker_tail_not_date_prefix() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
