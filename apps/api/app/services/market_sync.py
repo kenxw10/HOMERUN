@@ -50,7 +50,7 @@ def looks_like_baseball_market(market: dict[str, Any]) -> bool:
 
 
 def _market_relevant_time(market: dict[str, Any]) -> datetime | None:
-    return parse_datetime(market.get("expected_expiration_time") or market.get("occurrence_datetime") or market.get("close_time"))
+    return parse_datetime(market.get("occurrence_datetime") or market.get("expected_expiration_time") or market.get("close_time"))
 
 
 def _market_in_discovery_window(market: dict[str, Any], start: datetime, end: datetime) -> bool:
@@ -80,7 +80,7 @@ def _update_market_fields(row: KalshiMarket, market: dict[str, Any], ticker: str
     row.status = status or "untracked"
     row.open_time = parse_datetime(market.get("open_time"))
     row.close_time = parse_datetime(market.get("close_time"))
-    row.occurrence_datetime = parse_datetime(market.get("expected_expiration_time") or market.get("occurrence_datetime"))
+    row.occurrence_datetime = parse_datetime(market.get("occurrence_datetime") or market.get("expected_expiration_time"))
     row.resolve_time = parse_datetime(market.get("expiration_time") or market.get("resolve_time"))
     row.yes_bid = _market_decimal(market, "yes_bid_dollars", "yes_bid")
     row.yes_ask = _market_decimal(market, "yes_ask_dollars", "yes_ask")

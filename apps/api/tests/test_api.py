@@ -688,7 +688,8 @@ def test_market_sync_uses_valid_filters_and_clears_stale_orderbook(monkeypatch) 
                 "title": "MLB Yankees baseball market",
                 "status": "open",
                 "yes_ask": 46,
-                "expected_expiration_time": "2026-07-01T23:00:00Z",
+                "occurrence_datetime": "2026-07-01T23:00:00Z",
+                "expected_expiration_time": "2026-08-15T23:00:00Z",
                 "close_time": "2026-09-01T23:00:00Z",
             }
             yield {
