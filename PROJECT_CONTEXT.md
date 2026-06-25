@@ -246,6 +246,7 @@ PR 3a adds production repairs and discovery-only market-family infrastructure:
 - The supported trading/settlement/model family remains `full_game_winner` only.
 - `full_game_spread`, `full_game_total`, `first_five_winner`, `first_five_spread`, and `first_five_total` remain discovery-only and are not wired into candidate generation, paper trading, settlement, or model scoring.
 - `app.jobs.market_family_discovery` and `POST /v1/run/market-family-discovery` produce a structured `by_family` report and persisted audit rows.
+- The PR3a hotfix makes discovery persist a completed or `partial_error` run even when candidate spread, total, or first-five probes return 404/no-match responses and no markets are found.
 - Discovery probes candidate MLB Kalshi family series/event tickers from the MLB slate and uses `mve_filter=exclude` where supported; multivariate markets are excluded from normal discovery items.
 - `app.jobs.open_position_price_refresh` and `POST /v1/run/open-position-price-refresh` refresh open paper-trade marks from REST orderbook snapshots only. No WebSocket/live streaming is added.
 - Dashboard summary position rows now include `game_status`, `game_status_display`, `current_price_updated_at`, and `current_price_updated_at_display`.
@@ -257,6 +258,7 @@ PR 3a adds production repairs and discovery-only market-family infrastructure:
 Known PR 3a limitations:
 
 - Discovery can prove that candidate series names return markets, but PR3a does not claim settlement or line parsing is reliable enough to trade spreads, totals, or first-five markets.
+- A valid discovery run may find zero spread, total, or first-five markets. In that case `market_family_discovery_runs.raw_summary` should still show attempted probes, warnings, and errors so production validation can audit the no-match result.
 - Current price remains a REST last mark, not a real-time WebSocket mark.
 - No cron jobs or dashboard admin controls are added.
 - No live execution path exists.
@@ -323,3 +325,12 @@ Every future PR must update this section with:
 - Added `GAME STATUS` and `LAST MARK TIME` columns to open positions.
 - Kept paper-first safety posture unchanged: no live orders, no live execution, no cron setup, and no new market families trade-enabled.
 - Validation performed: backend focused tests during implementation; full PR validation recorded in the pull request.
+
+### PR 3a Hotfix - Market-Family Discovery Failure Persistence
+
+- Production validation found that `POST /v1/run/market-family-discovery?target_date=YYYY-MM-DD` could fail with an upstream error when spread, total, or first-five candidate probes returned expected Kalshi 404/no-match responses.
+- The hotfix keeps PR3a discovery-only but treats 404 probe misses as structured `MARKET_FAMILY_PROBE_NO_MATCH` warnings, records non-404 upstream failures as run errors, and continues probing remaining families.
+- `market_family_discovery_runs` now persists a completed or `partial_error` row even when `markets_found=0`; `raw_summary` includes `attempted_probe_count` and `probe_attempts` for auditability.
+- `GET /v1/market-families/discovery?date=YYYY-MM-DD` should return the latest run instead of `run: null` after a zero-market discovery run.
+- No schema migration, safety posture change, live execution, or spread/total/F5 trade enablement was added.
+- Production validation steps: run the protected discovery POST, confirm structured JSON instead of a blank upstream error, confirm the protected report GET returns `run` not null, confirm the run row exists with probe attempts in `raw_summary`, confirm discovery item rows may be zero, and confirm `KXMLBGAME` full-game winner resolver behavior remains `confirmed_for_paper`.

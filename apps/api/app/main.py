@@ -325,8 +325,15 @@ def run_market_family_discovery_endpoint(
     _: None = Depends(require_internal_api_key),
 ) -> RunResponse:
     with _db_session_or_503() as session:
-        result = run_market_family_discovery(session, target_date)
-    return RunResponse(ok=True, action="market_family_discovery", result=result)
+        try:
+            result = run_market_family_discovery(session, target_date)
+        except Exception as exc:
+            return RunResponse(
+                ok=False,
+                action="market_family_discovery",
+                result={"status": "failed", "error": {"message": str(exc), "type": exc.__class__.__name__}},
+            )
+    return RunResponse(ok=result.get("status") != "failed", action="market_family_discovery", result=result)
 
 
 @app.get("/v1/market-families/discovery", response_model=RunResponse)

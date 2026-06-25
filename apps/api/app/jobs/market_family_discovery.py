@@ -13,13 +13,14 @@ def _target_date_from_args() -> date | None:
     return date.fromisoformat(sys.argv[1])
 
 
-def main() -> None:
+def main() -> int:
     session_factory = get_session_factory()
     with session_factory() as session:
         result = run_market_family_discovery(session, _target_date_from_args())
 
     print(f"Market family discovery result: {result}")
+    return 1 if result.get("status") == "failed" else 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

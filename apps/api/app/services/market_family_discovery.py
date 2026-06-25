@@ -331,6 +331,69 @@ def _kalshi_error(exc: Exception) -> dict[str, object]:
     return {"message": str(exc), "type": exc.__class__.__name__}
 
 
+def _is_not_found_error(exc: Exception) -> bool:
+    return isinstance(exc, KalshiAPIError) and exc.source.status_code == 404
+
+
+def _probe_attempt_record(
+    *,
+    game: MlbGame,
+    probe: DiscoveryProbe,
+    outcome: str,
+    markets_found: int,
+    error: dict[str, object] | None = None,
+) -> dict[str, object]:
+    record: dict[str, object] = {
+        "outcome": outcome,
+        "game_id": game.id,
+        "external_game_id": game.external_game_id,
+        "family_key": probe.family_key,
+        "candidate_series_ticker": probe.candidate_series_ticker,
+        "candidate_event_ticker": probe.candidate_event_ticker,
+        "source_strategy": probe.source_strategy,
+        "markets_found": markets_found,
+    }
+    if error is not None:
+        record["error"] = error
+    return record
+
+
+def _record_probe_exception(
+    *,
+    game: MlbGame,
+    probe: DiscoveryProbe,
+    exc: Exception,
+    warnings: list[object],
+    errors: list[object],
+    probe_attempts: list[dict[str, object]],
+    markets_found: int = 0,
+) -> None:
+    detail = _kalshi_error(exc)
+    if _is_not_found_error(exc):
+        record = _probe_attempt_record(
+            game=game,
+            probe=probe,
+            outcome="partial_no_match" if markets_found else "no_match",
+            markets_found=markets_found,
+            error=detail,
+        )
+        record["message"] = "MARKET_FAMILY_PROBE_NO_MATCH"
+        warnings.append(record)
+        probe_attempts.append(record)
+        return
+
+    record = _probe_attempt_record(
+        game=game,
+        probe=probe,
+        outcome="partial_error" if markets_found else "error",
+        markets_found=markets_found,
+        error=detail,
+    )
+    record["message"] = "MARKET_FAMILY_PROBE_ERROR"
+    errors.append(record)
+    probe_attempts.append(record)
+
+
 def _empty_family_summary(family_key: str) -> dict[str, object]:
     definition = FULL_REGISTRY[family_key]
     return {
@@ -394,7 +457,9 @@ def _probe_markets(
     client: KalshiClient,
     game: MlbGame,
     family_key: str,
+    warnings: list[object],
     errors: list[object],
+    probe_attempts: list[dict[str, object]],
 ) -> list[tuple[DiscoveryProbe, dict[str, Any]]]:
     settings = get_settings()
     found: list[tuple[DiscoveryProbe, dict[str, Any]]] = []
@@ -403,24 +468,57 @@ def _probe_markets(
         event_probe = DiscoveryProbe(family_key, series_ticker, event_ticker, "get_event")
         try:
             payload = client.get_event(event_ticker)
-            found.extend((event_probe, market) for market in _markets_from_payload(payload))
+            markets = _markets_from_payload(payload)
+            probe_attempts.append(
+                _probe_attempt_record(
+                    game=game,
+                    probe=event_probe,
+                    outcome="found" if markets else "no_match",
+                    markets_found=len(markets),
+                )
+            )
+            found.extend((event_probe, market) for market in markets)
         except Exception as exc:
-            errors.append({"family_key": family_key, "event_ticker": event_ticker, "error": _kalshi_error(exc)})
+            _record_probe_exception(
+                game=game,
+                probe=event_probe,
+                exc=exc,
+                warnings=warnings,
+                errors=errors,
+                probe_attempts=probe_attempts,
+            )
 
         filter_probe = DiscoveryProbe(family_key, series_ticker, event_ticker, "event_ticker_filter")
         try:
             payload = client.get_markets_by_event_ticker(event_ticker)
-            found.extend((filter_probe, market) for market in _markets_from_payload(payload))
+            markets = _markets_from_payload(payload)
+            probe_attempts.append(
+                _probe_attempt_record(
+                    game=game,
+                    probe=filter_probe,
+                    outcome="found" if markets else "no_match",
+                    markets_found=len(markets),
+                )
+            )
+            found.extend((filter_probe, market) for market in markets)
         except Exception as exc:
-            errors.append({"family_key": family_key, "event_ticker": event_ticker, "error": _kalshi_error(exc)})
+            _record_probe_exception(
+                game=game,
+                probe=filter_probe,
+                exc=exc,
+                warnings=warnings,
+                errors=errors,
+                probe_attempts=probe_attempts,
+            )
 
     start = int((ensure_aware_utc(game.scheduled_start) - timedelta(days=1)).timestamp())
     end = int((ensure_aware_utc(game.scheduled_start) + timedelta(days=21)).timestamp())
     for series_ticker in FULL_REGISTRY[family_key]["candidate_series_tickers"]:
         assert isinstance(series_ticker, str)
         probe = DiscoveryProbe(family_key, series_ticker, None, "series_ticker_window")
+        markets: list[dict[str, Any]] = []
         try:
-            markets = client.iter_markets(
+            for market in client.iter_markets(
                 params={
                     "series_ticker": series_ticker,
                     "min_close_ts": start,
@@ -429,10 +527,30 @@ def _probe_markets(
                     "mve_filter": "exclude",
                 },
                 max_pages=settings.market_family_discovery_max_pages,
+            ):
+                if isinstance(market, dict):
+                    markets.append(market)
+        except Exception as exc:
+            found.extend((probe, market) for market in markets)
+            _record_probe_exception(
+                game=game,
+                probe=probe,
+                exc=exc,
+                warnings=warnings,
+                errors=errors,
+                probe_attempts=probe_attempts,
+                markets_found=len(markets),
+            )
+        else:
+            probe_attempts.append(
+                _probe_attempt_record(
+                    game=game,
+                    probe=probe,
+                    outcome="found" if markets else "no_match",
+                    markets_found=len(markets),
+                )
             )
             found.extend((probe, market) for market in markets)
-        except Exception as exc:
-            errors.append({"family_key": family_key, "series_ticker": series_ticker, "error": _kalshi_error(exc)})
 
     return found
 
@@ -448,6 +566,10 @@ def run_market_family_discovery(
     started = utc_now()
     families = DISCOVERY_FAMILIES
     games = _games_for_date(session, day)
+    errors: list[object] = []
+    warnings: list[object] = []
+    probe_attempts: list[dict[str, object]] = []
+    persisted_items: list[MarketFamilyDiscoveryItem] = []
     run = MarketFamilyDiscoveryRun(
         target_date=day,
         started_at=started,
@@ -461,96 +583,141 @@ def run_market_family_discovery(
     )
     session.add(run)
     session.flush()
-
-    errors: list[object] = []
-    warnings: list[object] = []
-    persisted_items: list[MarketFamilyDiscoveryItem] = []
+    run_id = run.id
+    session.commit()
+    session.refresh(run)
 
     if not settings.market_family_discovery_enabled:
         completed = utc_now()
         result = {
             "run_id": run.id,
             "date": day.isoformat(),
+            "status": "skipped",
             "games_considered": len(games),
             "families_considered": len(families),
             "markets_found": 0,
             "by_family": _summarize_by_family(families, [], completed),
             "warnings": [{"message": "MARKET_FAMILY_DISCOVERY_DISABLED"}],
             "errors": [],
+            "attempted_probe_count": 0,
+            "probe_attempts": [],
         }
         run.status = "skipped"
         run.completed_at = completed
+        run.markets_found = 0
         run.warnings = result["warnings"]  # type: ignore[assignment]
+        run.errors = []
         run.raw_summary = result
         session.add(run)
         session.commit()
         return result
 
-    kalshi_client = client or KalshiClient.from_settings()
-    seen: set[tuple[object, ...]] = set()
+    try:
+        kalshi_client = client or KalshiClient.from_settings()
+        seen: set[tuple[object, ...]] = set()
 
-    for game in games:
-        for family_key in families:
-            for probe, market in _probe_markets(kalshi_client, game, family_key, errors):
-                ticker = str(market.get("ticker") or "").upper()
-                if not ticker:
-                    continue
-                if is_multivariate_market(market):
-                    warnings.append(
-                        {
-                            "message": "MULTIVARIATE_MARKET_EXCLUDED",
-                            "family_key": family_key,
-                            "ticker": ticker,
-                        }
-                    )
-                    continue
-                if probe.source_strategy == "series_ticker_window" and not _matches_game_candidate_event(
-                    game, family_key, market
+        for game in games:
+            for family_key in families:
+                for probe, market in _probe_markets(
+                    kalshi_client,
+                    game,
+                    family_key,
+                    warnings,
+                    errors,
+                    probe_attempts,
                 ):
-                    warnings.append(
-                        {
-                            "message": "SERIES_WINDOW_MARKET_SKIPPED_UNRELATED",
-                            "family_key": family_key,
-                            "ticker": ticker,
-                            "game_id": game.external_game_id,
-                        }
+                    ticker = str(market.get("ticker") or "").upper()
+                    if not ticker:
+                        continue
+                    if is_multivariate_market(market):
+                        warnings.append(
+                            {
+                                "message": "MULTIVARIATE_MARKET_EXCLUDED",
+                                "family_key": family_key,
+                                "ticker": ticker,
+                            }
+                        )
+                        continue
+                    if probe.source_strategy == "series_ticker_window" and not _matches_game_candidate_event(
+                        game, family_key, market
+                    ):
+                        warnings.append(
+                            {
+                                "message": "SERIES_WINDOW_MARKET_SKIPPED_UNRELATED",
+                                "family_key": family_key,
+                                "ticker": ticker,
+                                "game_id": game.external_game_id,
+                            }
+                        )
+                        continue
+                    dedupe_key = (family_key, ticker)
+                    if dedupe_key in seen:
+                        continue
+                    seen.add(dedupe_key)
+                    item = _item_from_market(
+                        run_id=run.id,
+                        game=game,
+                        family_key=family_key,
+                        probe=probe,
+                        market=market,
                     )
-                    continue
-                dedupe_key = (family_key, ticker)
-                if dedupe_key in seen:
-                    continue
-                seen.add(dedupe_key)
-                item = _item_from_market(
-                    run_id=run.id,
-                    game=game,
-                    family_key=family_key,
-                    probe=probe,
-                    market=market,
-                )
-                persisted_items.append(item)
-                session.add(item)
+                    persisted_items.append(item)
+                    session.add(item)
 
-    completed = utc_now()
-    by_family = _summarize_by_family(families, persisted_items, completed)
-    result = {
-        "run_id": run.id,
-        "date": day.isoformat(),
-        "games_considered": len(games),
-        "families_considered": len(families),
-        "markets_found": len(persisted_items),
-        "by_family": by_family,
-        "warnings": warnings,
-        "errors": errors,
-    }
-    run.completed_at = completed
-    run.status = "completed_with_errors" if errors else "completed"
-    run.markets_found = len(persisted_items)
-    run.errors = errors
-    run.warnings = warnings
-    run.raw_summary = result
-    session.add(run)
-    session.commit()
-    return result
+        completed = utc_now()
+        by_family = _summarize_by_family(families, persisted_items, completed)
+        status_value = "partial_error" if errors else "completed"
+        result = {
+            "run_id": run.id,
+            "date": day.isoformat(),
+            "status": status_value,
+            "games_considered": len(games),
+            "families_considered": len(families),
+            "markets_found": len(persisted_items),
+            "by_family": by_family,
+            "warnings": warnings,
+            "errors": errors,
+            "attempted_probe_count": len(probe_attempts),
+            "probe_attempts": probe_attempts,
+        }
+        run.completed_at = completed
+        run.status = status_value
+        run.markets_found = len(persisted_items)
+        run.errors = errors
+        run.warnings = warnings
+        run.raw_summary = result
+        session.add(run)
+        session.commit()
+        return result
+    except Exception as exc:
+        session.rollback()
+        completed = utc_now()
+        error = {"message": str(exc), "type": exc.__class__.__name__}
+        result = {
+            "run_id": run_id,
+            "date": day.isoformat(),
+            "status": "failed",
+            "games_considered": len(games),
+            "families_considered": len(families),
+            "markets_found": 0,
+            "by_family": _summarize_by_family(families, [], completed),
+            "warnings": warnings,
+            "errors": [*errors, error],
+            "attempted_probe_count": len(probe_attempts),
+            "probe_attempts": probe_attempts,
+        }
+        failed_run = session.get(MarketFamilyDiscoveryRun, run_id)
+        if failed_run is None:
+            raise
+        failed_run.completed_at = completed
+        failed_run.status = "failed"
+        failed_run.markets_found = 0
+        failed_run.errors = result["errors"]  # type: ignore[assignment]
+        failed_run.warnings = warnings
+        failed_run.raw_summary = result
+        session.add(failed_run)
+        session.commit()
+        return result
 
 
 def latest_market_family_discovery(session: Session, target_date: date | None = None) -> dict[str, object]:
@@ -593,6 +760,8 @@ def latest_market_family_discovery(session: Session, target_date: date | None = 
         },
         "by_family": (run.raw_summary or {}).get("by_family")
         or _summarize_by_family(DISCOVERY_FAMILIES, items, run.completed_at or utc_now()),
+        "attempted_probe_count": (run.raw_summary or {}).get("attempted_probe_count", 0),
+        "probe_attempts": (run.raw_summary or {}).get("probe_attempts", []),
         "items": [
             {
                 "family_key": item.family_key,
@@ -618,6 +787,7 @@ def market_family_discovery_preview(session: Session, target_date: date | None =
     games = _games_for_date(session, day)
     return {
         "date": day.isoformat(),
+        "mode": "planned_probes_only",
         "games_considered": len(games),
         "families_considered": len(DISCOVERY_FAMILIES),
         "by_family": {

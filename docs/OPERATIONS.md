@@ -116,8 +116,8 @@ After deploying PR 3 and running `alembic upgrade head`, validate in this order:
 10. `POST /v1/run/paper-settlement-sync` settles completed supported full-game winner paper trades.
 11. `POST /v1/run/balance-snapshot` creates a snapshot and `/v1/dashboard/summary` uses it for the portfolio chart.
 12. `POST /v1/run/model-governance` records a training/calibration run and counts resolved `KXMLBGAME` candidates even when older rows used `full_game_moneyline`.
-13. `POST /v1/run/market-family-discovery?target_date=YYYY-MM-DD` returns structured `by_family` output and persists audit rows.
-14. `GET /v1/market-families/discovery?date=YYYY-MM-DD` returns the latest persisted report.
+13. `POST /v1/run/market-family-discovery?target_date=YYYY-MM-DD` returns structured `by_family` output and persists a `market_family_discovery_runs` row even when no candidate spread, total, or first-five markets are found.
+14. `GET /v1/market-families/discovery?date=YYYY-MM-DD` returns the latest persisted report with `run` not null after the POST succeeds.
 15. Confirm discovered spread, total, or first-five families do not create paper candidates/trades.
 16. `POST /v1/run/open-position-price-refresh` updates current marks and last mark timestamps for open paper positions only.
 17. The Vercel dashboard shows readable contract labels with the raw Kalshi ticker as secondary text.
@@ -129,6 +129,21 @@ Broad market discovery is diagnostic-only:
 - Keep `KALSHI_ENABLE_BROAD_DISCOVERY=false` for normal operation.
 - If enabled for diagnostics, it must stay bounded by `KALSHI_MARKET_SYNC_MAX_PAGES` and `KALSHI_MARKET_SYNC_LIMIT`.
 - Broad diagnostic failures should not fail the targeted sync.
+
+## PR 3a Hotfix Validation
+
+The PR3a market-family discovery hotfix handles expected Kalshi no-match responses without aborting the job.
+
+Validate the hotfix after deploy:
+
+1. Run `POST /v1/run/market-family-discovery?target_date=YYYY-MM-DD` with `X-API-Key`.
+2. Confirm the response is structured JSON, not a blank upstream error.
+3. Confirm the response status is `completed` for 404/no-match-only runs or `partial_error` when non-404 upstream errors were recorded but the job completed.
+4. Run `GET /v1/market-families/discovery?date=YYYY-MM-DD` with `X-API-Key`.
+5. Confirm `run` is not null and `market_family_discovery_runs.raw_summary` includes `attempted_probe_count` and `probe_attempts`.
+6. Treat `markets_found=0` and zero `market_family_discovery_items` as valid when no markets are returned.
+7. Confirm spread, total, and first-five families remain discovery-only and do not create paper candidates or trades.
+8. Confirm known `KXMLBGAME` full-game winner resolver matches remain `confirmed_for_paper`.
 
 ## Required Context Updates
 

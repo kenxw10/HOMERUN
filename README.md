@@ -160,6 +160,8 @@ Invoke-RestMethod -Method Post -Headers @{"X-API-Key"="YOUR_KEY"} https://YOUR-R
 
 Expected result: health and system status remain safe, Alembic is at `0005_pr3a_discovery`, resolve preview keeps exact `KXMLBGAME` matches confirmed for paper, market-family discovery returns a structured `by_family` report without trade-enabling new families, open-position price refresh updates REST last marks for open paper positions only, the dashboard shows `GAME STATUS` and `LAST MARK TIME`, chart range/P&L controls work, and model governance reports resolved samples correctly after settled candidate outcomes exist.
 
+PR3a hotfix validation: if spread, total, or first-five candidate probes return 404/no-match responses, the discovery POST should still return structured JSON with status `completed` or `partial_error`. The report GET should return `run` not null. `markets_found=0` and zero `market_family_discovery_items` are valid when no markets are found, but `market_family_discovery_runs.raw_summary` must include attempted probe details and any warnings/errors.
+
 ## Deployment
 
 - Railway backend setup: see `docs/RAILWAY_SETUP.md`.
