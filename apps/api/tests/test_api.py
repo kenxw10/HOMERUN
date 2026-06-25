@@ -947,6 +947,28 @@ def test_candidate_event_ticker_generation_uses_observed_format() -> None:
     assert "KXMLBGAME-26JUN261840HOUDET-DET" in markets
 
 
+def test_candidate_event_ticker_generation_uses_fixed_eastern_timezone(monkeypatch) -> None:
+    monkeypatch.setenv("DASHBOARD_TIMEZONE", "UTC")
+    get_settings.cache_clear()
+
+    try:
+        game = MlbGame(
+            external_game_id="ticker-fixed-zone-1",
+            home_team="Detroit Tigers",
+            away_team="Houston Astros",
+            home_abbreviation="DET",
+            away_abbreviation="HOU",
+            scheduled_start=datetime(2026, 6, 26, 22, 40, tzinfo=UTC),
+            status="scheduled",
+        )
+
+        events = build_event_ticker_candidates(game)
+    finally:
+        get_settings.cache_clear()
+
+    assert events[0] == "KXMLBGAME-26JUN261840HOUDET"
+
+
 def test_market_sync_uses_targeted_resolver_and_skips_broad_by_default(monkeypatch) -> None:
     class FakeKalshiClient:
         def __init__(self) -> None:

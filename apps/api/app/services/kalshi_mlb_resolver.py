@@ -6,10 +6,11 @@ from decimal import Decimal
 import logging
 import re
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from app.models import MlbGame
 from app.services.kalshi import KalshiAPIError, KalshiClient
-from app.time_utils import eastern_display, ensure_aware_utc, get_dashboard_zone, to_eastern_iso
+from app.time_utils import eastern_display, ensure_aware_utc, to_eastern_iso
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +18,7 @@ TARGETED_SERIES_TICKER = "KXMLBGAME"
 EVENT_OFFSETS_MINUTES = (0, -5, 5, -10, 10, -1, 1)
 SERIES_FALLBACK_WINDOW = timedelta(hours=12)
 MONTH_CODES = ("JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC")
+KALSHI_EVENT_TIME_ZONE = ZoneInfo("America/New_York")
 
 MARKET_FAMILY_REGISTRY: dict[str, dict[str, str]] = {
     "full_game_winner": {"series_ticker": TARGETED_SERIES_TICKER, "status": "supported_targeted"},
@@ -153,7 +155,7 @@ def game_team_codes(game: MlbGame) -> tuple[str, str]:
 
 
 def _event_timestamp(value: datetime) -> str:
-    local = ensure_aware_utc(value).astimezone(get_dashboard_zone())
+    local = ensure_aware_utc(value).astimezone(KALSHI_EVENT_TIME_ZONE)
     return f"{local:%y}{MONTH_CODES[local.month - 1]}{local:%d%H%M}"
 
 
