@@ -54,6 +54,7 @@ def empty_dashboard_summary() -> DashboardSummary:
             candidate_count=0,
             notes="No model has been trained yet. PR 2 adds candidate plumbing.",
         ),
+        paper_starting_balance=float(settings.paper_starting_balance),
         last_update=to_eastern_iso(utc_now()),
         last_update_display=eastern_display(utc_now()),
     )
@@ -61,6 +62,23 @@ def empty_dashboard_summary() -> DashboardSummary:
 
 def _float(value: Decimal | None) -> float | None:
     return float(value) if value is not None else None
+
+
+def _game_status_display(game: MlbGame | None) -> str:
+    if game is None:
+        return "UNKNOWN"
+    status = game.status.strip().lower()
+    if any(token in status for token in ("final", "completed", "game over")):
+        return "FINAL"
+    if any(token in status for token in ("cancel", "canceled", "cancelled")):
+        return "CANCELED"
+    if "postpon" in status:
+        return "POSTPONED"
+    if any(token in status for token in ("in progress", "live", "warmup", "delayed", "suspended")):
+        return "LIVE"
+    if status in {"scheduled", "pre-game", "preview"}:
+        return "NOT STARTED"
+    return "UNKNOWN"
 
 
 def _position_from_trade(
@@ -90,10 +108,14 @@ def _position_from_trade(
         side=trade.contract_side,
         entry_price=float(trade.entry_price),
         current_price=float(current),
+        current_price_updated_at=to_eastern_iso(trade.current_price_updated_at),
+        current_price_updated_at_display=eastern_display(trade.current_price_updated_at),
         quantity=trade.quantity,
         profit_loss=float(pnl),
         profit_loss_percent=_float(pnl_percent),
         status=trade.status,
+        game_status=_game_status_display(game),
+        game_status_display=_game_status_display(game),
         resolution=trade.resolution,
     )
 
@@ -120,10 +142,14 @@ def _position_from_position(position: Position) -> PositionSummary:
         side=position.contract_side,
         entry_price=float(position.entry_price),
         current_price=float(current),
+        current_price_updated_at=None,
+        current_price_updated_at_display=None,
         quantity=position.quantity,
         profit_loss=float(pnl),
         profit_loss_percent=_float(pnl_percent),
         status=position.status,
+        game_status="UNKNOWN",
+        game_status_display="UNKNOWN",
         resolution=position.resolution,
     )
 

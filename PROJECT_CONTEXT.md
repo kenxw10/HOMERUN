@@ -10,7 +10,7 @@ The user wants the system to become as hands-off as possible. Calibration, thres
 
 ## 2. Current Scope
 
-PR 3 builds on the merged PR 2.5 targeted resolver:
+PR 3a builds on the merged PR 3 paper-results workflow:
 
 - FastAPI backend in `apps/api`.
 - Next.js TypeScript frontend in `apps/web`.
@@ -25,8 +25,11 @@ PR 3 builds on the merged PR 2.5 targeted resolver:
 - Paper balance snapshots from starting balance, open cost, realized P/L, and open mark value.
 - Feature snapshot storage for model candidates with explicit missing-source markers.
 - Automated model governance runs that skip training/promotion until sample thresholds are met.
+- PR3a governance repair that normalizes resolved `KXMLBGAME` candidates to `full_game_winner` before counting samples.
+- Discovery-only Kalshi MLB market-family audit runs for spread, total, and first-five families.
+- REST last-mark refresh for open paper positions.
 - Database-backed dashboard API responses when data exists.
-- Light-theme trading-terminal dashboard that renders portfolio snapshots, paper metrics, open positions, model status, and system status.
+- Light-theme trading-terminal dashboard that renders portfolio snapshots, chart range/P&L controls, paper metrics, open positions, game status, last mark time, model status, and system status.
 - Railway backend and PostgreSQL setup documentation.
 - Vercel frontend setup documentation.
 - CI scaffolding for backend tests and frontend checks.
@@ -75,6 +78,10 @@ It also exposes controlled internal run endpoints:
 - `POST /v1/run/paper-settlement-sync?target_date=YYYY-MM-DD`
 - `POST /v1/run/balance-snapshot`
 - `POST /v1/run/model-governance`
+- `POST /v1/run/open-position-price-refresh`
+- `POST /v1/run/market-family-discovery?target_date=YYYY-MM-DD`
+- `GET /v1/market-families/discovery?date=YYYY-MM-DD`
+- `GET /v1/market-families/discovery-preview?date=YYYY-MM-DD`
 - `GET /v1/kalshi/resolve-preview?date=YYYY-MM-DD`
 
 The database layer is PostgreSQL-ready but the API can still boot locally without a database for frontend and health-check work.
@@ -231,7 +238,35 @@ Expected next PR scope:
 - Add fee-aware settlement once exact fee terms are verified.
 - Begin trained challenger evaluation when enough resolved candidates exist.
 
-## 14. PR Change Log
+## 14. PR3a Market-Family Discovery And Dashboard Repair
+
+PR 3a adds production repairs and discovery-only market-family infrastructure:
+
+- Migration `0005_pr3a_discovery.py` adds market-family discovery run/item audit tables and `paper_trades.current_price_updated_at`.
+- The supported trading/settlement/model family remains `full_game_winner` only.
+- `full_game_spread`, `full_game_total`, `first_five_winner`, `first_five_spread`, and `first_five_total` remain discovery-only and are not wired into candidate generation, paper trading, settlement, or model scoring.
+- `app.jobs.market_family_discovery` and `POST /v1/run/market-family-discovery` produce a structured `by_family` report and persisted audit rows.
+- Discovery probes candidate MLB Kalshi family series/event tickers from the MLB slate and uses `mve_filter=exclude` where supported; multivariate markets are excluded from normal discovery items.
+- `app.jobs.open_position_price_refresh` and `POST /v1/run/open-position-price-refresh` refresh open paper-trade marks from REST orderbook snapshots only. No WebSocket/live streaming is added.
+- Dashboard summary position rows now include `game_status`, `game_status_display`, `current_price_updated_at`, and `current_price_updated_at_display`.
+- Dashboard summary includes `paper_starting_balance` for frontend chart P/L modes.
+- The frontend portfolio chart range controls and `NORM` / `P/L $` / `P/L %` controls now operate client-side on loaded snapshots.
+- Open positions now show `GAME STATUS` and `LAST MARK TIME`.
+- Model governance now counts clean resolved `KXMLBGAME` candidates using normalized family logic and repairs old `full_game_moneyline` rows to `full_game_winner` before counting.
+
+Known PR 3a limitations:
+
+- Discovery can prove that candidate series names return markets, but PR3a does not claim settlement or line parsing is reliable enough to trade spreads, totals, or first-five markets.
+- Current price remains a REST last mark, not a real-time WebSocket mark.
+- No cron jobs or dashboard admin controls are added.
+- No live execution path exists.
+
+Expected next PR scope:
+
+- PR3b should review PR3a discovery reports and wire only proven reliable market families into mapping/candidate/settlement/model logic.
+- A later operator PR can add scheduled runs after the one-shot jobs are validated in production.
+
+## 15. PR Change Log
 
 Every future PR must update this section with:
 
@@ -276,3 +311,15 @@ Every future PR must update this section with:
 - Changed resolve-preview semantics so structured partial no-match/error results return `ok=true` with warnings/partial errors.
 - Kept paper-first safety posture unchanged: no live orders, live trading disabled, kill switch enabled.
 - Validation performed: backend Ruff, backend pytest, Alembic head check, frontend lint, frontend typecheck, and frontend build.
+
+### PR 3a - Market-Family Discovery And Operator Repairs
+
+- Added migration `0005_pr3a_discovery.py` for discovery audit tables and paper-trade current mark timestamps.
+- Added discovery-only market-family registry/reporting for full-game spread, full-game total, first-five winner, first-five spread, and first-five total.
+- Added protected market-family discovery and open-position REST price-refresh run endpoints plus matching one-shot job modules.
+- Fixed model governance resolved-sample counting by normalizing resolved `KXMLBGAME` candidates, including older `full_game_moneyline` rows.
+- Added dashboard API fields for game status, last mark time, and paper starting balance.
+- Made frontend portfolio chart range controls and `NORM` / `P/L $` / `P/L %` controls functional.
+- Added `GAME STATUS` and `LAST MARK TIME` columns to open positions.
+- Kept paper-first safety posture unchanged: no live orders, no live execution, no cron setup, and no new market families trade-enabled.
+- Validation performed: backend focused tests during implementation; full PR validation recorded in the pull request.

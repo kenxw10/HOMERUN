@@ -32,6 +32,9 @@ class Settings(BaseSettings):
     kalshi_enable_broad_discovery: bool = Field(default=False, alias="KALSHI_ENABLE_BROAD_DISCOVERY")
     kalshi_market_sync_max_pages: int = Field(default=2, alias="KALSHI_MARKET_SYNC_MAX_PAGES")
     kalshi_market_sync_limit: int = Field(default=100, alias="KALSHI_MARKET_SYNC_LIMIT")
+    market_family_discovery_enabled: bool = Field(default=True, alias="MARKET_FAMILY_DISCOVERY_ENABLED")
+    market_family_discovery_max_pages: int = Field(default=2, alias="MARKET_FAMILY_DISCOVERY_MAX_PAGES")
+    open_position_price_refresh_enabled: bool = Field(default=True, alias="OPEN_POSITION_PRICE_REFRESH_ENABLED")
     paper_candidate_engine_enabled: bool = Field(default=True, alias="PAPER_CANDIDATE_ENGINE_ENABLED")
     default_paper_contracts: int = Field(default=1, alias="DEFAULT_PAPER_CONTRACTS")
     paper_starting_balance: Decimal = Field(default=Decimal("1000.00"), alias="PAPER_STARTING_BALANCE")
@@ -48,6 +51,11 @@ class Settings(BaseSettings):
     @classmethod
     def validate_kalshi_market_sync_limit(cls, value: int) -> int:
         return min(max(value, 1), 200)
+
+    @field_validator("market_family_discovery_max_pages")
+    @classmethod
+    def validate_market_family_discovery_max_pages(cls, value: int) -> int:
+        return max(value, 1)
 
     @field_validator("default_paper_contracts")
     @classmethod

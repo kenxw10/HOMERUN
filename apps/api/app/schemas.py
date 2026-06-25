@@ -37,10 +37,14 @@ class PositionSummary(BaseModel):
     side: Literal["yes", "no"]
     entry_price: float
     current_price: float | None
+    current_price_updated_at: str | None = None
+    current_price_updated_at_display: str | None = None
     quantity: int
     profit_loss: float | None = None
     profit_loss_percent: float | None = None
     status: str
+    game_status: str | None = None
+    game_status_display: str | None = None
     resolution: str | None
 
 
@@ -68,6 +72,7 @@ class DashboardSummary(BaseModel):
     model_status: ModelStatus
     cash_balance: float | None = None
     portfolio_value: float | None = None
+    paper_starting_balance: float | None = None
     last_update: str | None = None
     last_update_display: str | None = None
 
