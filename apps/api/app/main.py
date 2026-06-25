@@ -28,7 +28,7 @@ from app.services.dashboard import (
     list_today_games,
     list_today_markets,
 )
-from app.services.market_sync import sync_kalshi_markets
+from app.services.market_sync import resolve_preview_for_date, sync_kalshi_markets
 from app.services.mlb import sync_schedule
 from app.time_utils import eastern_display, to_eastern_iso
 
@@ -225,8 +225,34 @@ def run_kalshi_market_sync(_: None = Depends(require_internal_api_key)) -> RunRe
     if not settings.market_discovery_enabled:
         return RunResponse(ok=True, action="kalshi_market_sync", result={"skipped": True})
     with _db_session_or_503() as session:
-        count = sync_kalshi_markets(session)
-    return RunResponse(ok=True, action="kalshi_market_sync", result={"markets": count})
+        try:
+            result = sync_kalshi_markets(session)
+        except Exception as exc:
+            return RunResponse(
+                ok=False,
+                action="kalshi_market_sync",
+                result={"error": {"message": str(exc), "type": exc.__class__.__name__}},
+            )
+    errors = result.get("errors")
+    ok = not errors or int(result.get("markets_upserted") or 0) > 0
+    return RunResponse(ok=ok, action="kalshi_market_sync", result=result)
+
+
+@app.get("/v1/kalshi/resolve-preview", response_model=RunResponse)
+def kalshi_resolve_preview(
+    target_date: date = Query(..., alias="date"),
+    _: None = Depends(require_internal_api_key),
+) -> RunResponse:
+    with _db_session_or_503() as session:
+        try:
+            result = resolve_preview_for_date(session, target_date)
+        except Exception as exc:
+            return RunResponse(
+                ok=False,
+                action="kalshi_resolve_preview",
+                result={"error": {"message": str(exc), "type": exc.__class__.__name__}},
+            )
+    return RunResponse(ok=not result.get("errors"), action="kalshi_resolve_preview", result=result)
 
 
 @app.post("/v1/run/paper-candidate-engine", response_model=RunResponse)

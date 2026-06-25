@@ -13,7 +13,14 @@ from app.main import _candidate_summary, app
 from app.models import BalanceSnapshot, KalshiMarket, MarketMapping, MlbGame, ModelCandidate, PaperTrade, Position
 from app.security import require_internal_api_key
 from app.services import candidates, dashboard, market_sync
-from app.services.kalshi import KalshiClient, derive_orderbook_prices
+from app.services.http_json import HttpJsonError
+from app.services.kalshi import KalshiAPIError, KalshiClient, derive_orderbook_prices
+from app.services.kalshi_mlb_resolver import (
+    build_event_ticker_candidates,
+    build_market_ticker_candidates,
+    normalize_team_abbreviation,
+    resolve_game_markets,
+)
 from app.services.mapping import infer_market_type, score_mapping, sync_market_mappings
 from app.time_utils import classify_time_bucket
 
@@ -615,6 +622,93 @@ def test_generate_candidates_blocks_paper_trades_after_game_start(monkeypatch) -
     assert all_trades == []
 
 
+def test_generate_candidates_handles_no_mappings_cleanly(monkeypatch) -> None:
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+    monkeypatch.setattr(candidates, "utc_now", lambda: now)
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        session.add(
+            MlbGame(
+                external_game_id="no-mapping-1",
+                home_team="New York Yankees",
+                away_team="Boston Red Sox",
+                scheduled_start=datetime(2026, 7, 1, 23, 5, tzinfo=UTC),
+                status="scheduled",
+            )
+        )
+        session.commit()
+
+        result = candidates.generate_candidates(session)
+        all_candidates = list(session.scalars(select(ModelCandidate)))
+        all_trades = list(session.scalars(select(PaperTrade)))
+
+    assert result["candidates"] == 0
+    assert result["paper_trades"] == 0
+    assert all_candidates == []
+    assert all_trades == []
+
+
+def test_generate_candidates_preserves_confirmed_targeted_resolver_mapping(monkeypatch) -> None:
+    now = datetime(2026, 6, 25, 12, 0, tzinfo=UTC)
+    monkeypatch.setattr(candidates, "utc_now", lambda: now)
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        game = MlbGame(
+            external_game_id="resolver-confirmed-1",
+            home_team="San Diego Padres",
+            away_team="Los Angeles Dodgers",
+            home_abbreviation="SD",
+            away_abbreviation="LAD",
+            scheduled_start=datetime(2026, 6, 26, 22, 40, tzinfo=UTC),
+            status="scheduled",
+        )
+        market = KalshiMarket(
+            kalshi_market_id="KX-RESOLVER-CONFIRMED",
+            ticker="KXMLBGAME-26JUN261840LADSD-LAD",
+            event_ticker="KXMLBGAME-26JUN261840LADSD",
+            title="Los Angeles D vs San Diego",
+            yes_subtitle="Los Angeles D win the game",
+            status="open",
+            occurrence_datetime=datetime(2026, 6, 26, 22, 40, tzinfo=UTC),
+            implied_yes_ask=Decimal("0.4000"),
+        )
+        session.add_all([game, market])
+        session.flush()
+        session.add(
+            MarketMapping(
+                mlb_game_id=game.id,
+                kalshi_market_id=market.id,
+                mapping_status="confirmed",
+                confidence=Decimal("0.9500"),
+                rationale="MARKET_TICKER_MATCH",
+                resolver_strategy="exact_market_tickers",
+                validation_status="strong",
+                mapping_metadata={"resolver_strategy_used": "exact_market_tickers"},
+            )
+        )
+        session.commit()
+
+        result = candidates.generate_candidates(session)
+        mapping = session.scalar(select(MarketMapping))
+        candidate = session.scalar(select(ModelCandidate))
+        trade = session.scalar(select(PaperTrade))
+
+    assert result["paper_trades"] == 1
+    assert mapping is not None
+    assert mapping.mapping_status == "confirmed"
+    assert mapping.confidence == Decimal("0.9500")
+    assert mapping.resolver_strategy == "exact_market_tickers"
+    assert candidate is not None
+    assert candidate.decision == "paper_trade"
+    assert trade is not None
+
+
 def test_candidate_summary_preserves_zero_values() -> None:
     candidate = ModelCandidate(
         evaluated_at=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
@@ -885,238 +979,94 @@ def test_internal_api_key_allows_explicit_local_without_api_key(monkeypatch) -> 
         get_settings.cache_clear()
 
 
-def test_market_sync_uses_valid_filters_and_clears_stale_orderbook(monkeypatch) -> None:
+def test_team_abbreviation_normalization() -> None:
+    assert normalize_team_abbreviation("Kansas City Royals") == "KC"
+    assert normalize_team_abbreviation("Chicago White Sox") == "CWS"
+    assert normalize_team_abbreviation("Arizona Diamondbacks") == "ARI"
+    assert normalize_team_abbreviation("Athletics") == "ATH"
+    assert normalize_team_abbreviation("Unknown Team", "UTM") == "UTM"
+
+
+def test_candidate_event_ticker_generation_uses_observed_format() -> None:
+    game = MlbGame(
+        external_game_id="ticker-format-1",
+        home_team="Detroit Tigers",
+        away_team="Houston Astros",
+        home_abbreviation="DET",
+        away_abbreviation="HOU",
+        scheduled_start=datetime(2026, 6, 26, 22, 40, tzinfo=UTC),
+        status="scheduled",
+    )
+
+    events = build_event_ticker_candidates(game)
+    markets = build_market_ticker_candidates(game)
+
+    assert events[0] == "KXMLBGAME-26JUN261840HOUDET"
+    assert "KXMLBGAME-26JUN261840HOUDET-HOU" in markets
+    assert "KXMLBGAME-26JUN261840HOUDET-DET" in markets
+
+
+def test_candidate_event_ticker_generation_uses_fixed_eastern_timezone(monkeypatch) -> None:
+    monkeypatch.setenv("DASHBOARD_TIMEZONE", "UTC")
+    get_settings.cache_clear()
+
+    try:
+        game = MlbGame(
+            external_game_id="ticker-fixed-zone-1",
+            home_team="Detroit Tigers",
+            away_team="Houston Astros",
+            home_abbreviation="DET",
+            away_abbreviation="HOU",
+            scheduled_start=datetime(2026, 6, 26, 22, 40, tzinfo=UTC),
+            status="scheduled",
+        )
+
+        events = build_event_ticker_candidates(game)
+    finally:
+        get_settings.cache_clear()
+
+    assert events[0] == "KXMLBGAME-26JUN261840HOUDET"
+
+
+def test_market_sync_uses_targeted_resolver_and_skips_broad_by_default(monkeypatch) -> None:
     class FakeKalshiClient:
         def __init__(self) -> None:
-            self.params: dict[str, object] | None = None
+            self.ticker_requests: list[list[str]] = []
+            self.broad_calls = 0
 
-        def iter_markets(self, params: dict[str, object], max_pages: int):
-            self.params = params
-            assert max_pages == 1
-            yield {
-                "id": "market-open",
-                "ticker": "KXMLB-OPEN",
-                "title": "MLB Yankees baseball market",
-                "status": "open",
-                "yes_ask": 46,
-                "occurrence_datetime": "2026-07-01T23:00:00Z",
-                "expected_expiration_time": "2026-08-15T23:00:00Z",
-                "close_time": "2026-09-01T23:00:00Z",
-            }
-            yield {
-                "id": "market-future",
-                "ticker": "KXMLB-FUTURE",
-                "title": "MLB future baseball market",
-                "status": "open",
-                "yes_ask": 45,
-                "expected_expiration_time": "2026-08-15T23:00:00Z",
-                "close_time": "2026-09-01T23:00:00Z",
-            }
-            yield {
-                "id": "market-closed",
-                "ticker": "KXMLB-CLOSED",
-                "title": "MLB closed baseball market",
-                "status": "closed",
-                "yes_ask": 48,
-                "close_time": "2026-07-01T23:00:00Z",
+        def get_markets_by_tickers(self, tickers: list[str]):
+            self.ticker_requests.append(tickers)
+            event = "KXMLBGAME-26JUN261840HOUDET"
+            return {
+                "markets": [
+                    {
+                        "id": "market-targeted",
+                        "ticker": f"{event}-HOU",
+                        "event_ticker": event,
+                        "title": "Will the Houston Astros win the game against the Detroit Tigers?",
+                        "status": "active",
+                        "yes_bid_dollars": "0.1200",
+                        "yes_ask_dollars": "0.3400",
+                        "no_bid_dollars": "0.6500",
+                        "no_ask_dollars": "0.8700",
+                        "last_price_dollars": "0.2500",
+                        "occurrence_datetime": "2026-06-26T22:40:00Z",
+                    }
+                ]
             }
 
-        def get_orderbook(self, ticker: str):
-            raise RuntimeError(f"orderbook unavailable for {ticker}")
+        def get_event(self, event_ticker: str):
+            raise AssertionError("exact ticker resolver should stop after match")
 
-    fake_client = FakeKalshiClient()
-    monkeypatch.setattr(market_sync.KalshiClient, "from_settings", staticmethod(lambda: fake_client))
-    monkeypatch.setattr(market_sync, "utc_now", lambda: datetime(2026, 6, 30, 12, 0, tzinfo=UTC))
+        def get_markets_by_event_ticker(self, event_ticker: str, limit: int = 100):
+            raise AssertionError("exact ticker resolver should stop after match")
 
-    engine = create_engine("sqlite+pysqlite:///:memory:")
-    Base.metadata.create_all(engine)
-
-    with Session(engine) as session:
-        session.add(
-            KalshiMarket(
-                kalshi_market_id="market-open",
-                ticker="KXMLB-OPEN",
-                title="Old MLB market",
-                status="open",
-                best_yes_bid=Decimal("0.4200"),
-                best_no_bid=Decimal("0.5700"),
-                implied_yes_ask=Decimal("0.4300"),
-                implied_no_ask=Decimal("0.5800"),
-            )
-        )
-        session.commit()
-
-        count = market_sync.sync_kalshi_markets(session, max_pages=1)
-
-        assert count == 1
-        assert fake_client.params is not None
-        assert "status" not in fake_client.params
-        assert "min_close_ts" not in fake_client.params
-        assert "max_close_ts" not in fake_client.params
-
-        open_market = session.scalar(select(KalshiMarket).where(KalshiMarket.ticker == "KXMLB-OPEN"))
-        future_market = session.scalar(select(KalshiMarket).where(KalshiMarket.ticker == "KXMLB-FUTURE"))
-        closed_market = session.scalar(select(KalshiMarket).where(KalshiMarket.ticker == "KXMLB-CLOSED"))
-
-        assert future_market is None
-        assert closed_market is None
-        assert open_market is not None
-        assert open_market.occurrence_datetime == datetime(2026, 7, 1, 23, 0)
-        assert open_market.close_time == datetime(2026, 9, 1, 23, 0)
-        assert open_market.best_yes_bid is None
-        assert open_market.best_no_bid is None
-        assert open_market.implied_yes_ask is None
-        assert open_market.implied_no_ask is None
-        assert open_market.yes_ask == Decimal("0.4600")
-        assert open_market.orderbook_raw == {"error": "orderbook unavailable for KXMLB-OPEN"}
-
-
-def test_market_sync_reads_kalshi_dollar_price_fields(monkeypatch) -> None:
-    class FakeKalshiClient:
-        def __init__(self) -> None:
-            self.max_pages: int | None | object = object()
+        def get_markets_by_series_window(self, *args, **kwargs):
+            raise AssertionError("series fallback should not run after exact match")
 
         def iter_markets(self, params: dict[str, object], max_pages: int | None):
-            self.max_pages = max_pages
-            yield {
-                "id": "market-dollar-fields",
-                "ticker": "KXMLB-DOLLARS",
-                "title": "MLB Yankees baseball market",
-                "status": "open",
-                "yes_bid_dollars": "0.1200",
-                "yes_ask_dollars": "0.3400",
-                "no_bid_dollars": "0.6500",
-                "no_ask_dollars": "0.8700",
-                "last_price_dollars": "0.2500",
-                "close_time": "2026-07-01T23:00:00Z",
-            }
-
-        def get_orderbook(self, ticker: str):
-            raise AssertionError("orderbook fetch is disabled in this test")
-
-    fake_client = FakeKalshiClient()
-    monkeypatch.setattr(market_sync.KalshiClient, "from_settings", staticmethod(lambda: fake_client))
-
-    engine = create_engine("sqlite+pysqlite:///:memory:")
-    Base.metadata.create_all(engine)
-
-    with Session(engine) as session:
-        count = market_sync.sync_kalshi_markets(session, fetch_orderbooks=False)
-        row = session.scalar(select(KalshiMarket).where(KalshiMarket.ticker == "KXMLB-DOLLARS"))
-
-        assert count == 1
-        assert fake_client.max_pages is None
-        assert row is not None
-        assert row.yes_bid == Decimal("0.1200")
-        assert row.yes_ask == Decimal("0.3400")
-        assert row.yes_mid == Decimal("0.2300")
-        assert row.no_bid == Decimal("0.6500")
-        assert row.no_ask == Decimal("0.8700")
-        assert row.no_mid == Decimal("0.7600")
-        assert row.last_price == Decimal("0.2500")
-
-
-def test_market_sync_reads_legacy_cent_price_fields(monkeypatch) -> None:
-    class FakeKalshiClient:
-        def iter_markets(self, params: dict[str, object], max_pages: int | None):
-            yield {
-                "id": "market-legacy-cents",
-                "ticker": "KXMLB-CENTS",
-                "title": "MLB Yankees baseball market",
-                "status": "open",
-                "yes_bid": 1,
-                "yes_ask": 2,
-                "no_bid": 99,
-                "no_ask": 98,
-                "last_price": 1,
-                "close_time": "2026-07-01T23:00:00Z",
-            }
-
-        def get_orderbook(self, ticker: str):
-            raise AssertionError("orderbook fetch is disabled in this test")
-
-    monkeypatch.setattr(market_sync.KalshiClient, "from_settings", staticmethod(lambda: FakeKalshiClient()))
-
-    engine = create_engine("sqlite+pysqlite:///:memory:")
-    Base.metadata.create_all(engine)
-
-    with Session(engine) as session:
-        count = market_sync.sync_kalshi_markets(session, fetch_orderbooks=False)
-        row = session.scalar(select(KalshiMarket).where(KalshiMarket.ticker == "KXMLB-CENTS"))
-
-        assert count == 1
-        assert row is not None
-        assert row.yes_bid == Decimal("0.0100")
-        assert row.yes_ask == Decimal("0.0200")
-        assert row.yes_mid == Decimal("0.0150")
-        assert row.no_bid == Decimal("0.9900")
-        assert row.no_ask == Decimal("0.9800")
-        assert row.no_mid == Decimal("0.9850")
-        assert row.last_price == Decimal("0.0100")
-
-
-def test_market_sync_updates_existing_closed_market(monkeypatch) -> None:
-    class FakeKalshiClient:
-        def iter_markets(self, params: dict[str, object], max_pages: int):
-            yield {
-                "id": "market-closing",
-                "ticker": "KXMLB-CLOSING",
-                "title": "MLB Yankees baseball market",
-                "status": "closed",
-                "yes_ask": 12,
-                "close_time": "2026-07-01T23:00:00Z",
-            }
-
-        def get_orderbook(self, ticker: str):
-            raise AssertionError("closed markets should not fetch orderbooks")
-
-    monkeypatch.setattr(market_sync.KalshiClient, "from_settings", staticmethod(lambda: FakeKalshiClient()))
-
-    engine = create_engine("sqlite+pysqlite:///:memory:")
-    Base.metadata.create_all(engine)
-
-    with Session(engine) as session:
-        session.add(
-            KalshiMarket(
-                kalshi_market_id="market-closing",
-                ticker="KXMLB-CLOSING",
-                title="Old MLB market",
-                status="open",
-                yes_ask=Decimal("0.4400"),
-                yes_mid=Decimal("0.4300"),
-                best_yes_bid=Decimal("0.4200"),
-                best_no_bid=Decimal("0.5700"),
-                implied_yes_ask=Decimal("0.4300"),
-                implied_no_ask=Decimal("0.5800"),
-            )
-        )
-        session.commit()
-
-        count = market_sync.sync_kalshi_markets(session, max_pages=1)
-        row = session.scalar(select(KalshiMarket).where(KalshiMarket.ticker == "KXMLB-CLOSING"))
-
-        assert count == 1
-        assert row is not None
-        assert row.status == "closed"
-        assert row.yes_ask == Decimal("0.1200")
-        assert row.yes_mid is None
-        assert row.best_yes_bid is None
-        assert row.best_no_bid is None
-        assert row.implied_yes_ask is None
-        assert row.implied_no_ask is None
-        assert row.orderbook_raw == {"skipped": "market status closed"}
-
-
-def test_market_sync_reads_fixed_point_orderbook_wrapper(monkeypatch) -> None:
-    class FakeKalshiClient:
-        def iter_markets(self, params: dict[str, object], max_pages: int):
-            yield {
-                "id": "market-fp",
-                "ticker": "KXMLB-FP",
-                "title": "MLB Yankees baseball market",
-                "status": "open",
-                "close_time": "2026-07-01T23:00:00Z",
-            }
+            self.broad_calls += 1
+            raise AssertionError("broad discovery should be disabled by default")
 
         def get_orderbook(self, ticker: str):
             return {
@@ -1126,21 +1076,424 @@ def test_market_sync_reads_fixed_point_orderbook_wrapper(monkeypatch) -> None:
                 }
             }
 
-    monkeypatch.setattr(market_sync.KalshiClient, "from_settings", staticmethod(lambda: FakeKalshiClient()))
+    fake_client = FakeKalshiClient()
+    monkeypatch.setattr(market_sync.KalshiClient, "from_settings", staticmethod(lambda: fake_client))
+    monkeypatch.setattr(market_sync, "utc_now", lambda: datetime(2026, 6, 25, 12, 0, tzinfo=UTC))
 
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
 
     with Session(engine) as session:
-        count = market_sync.sync_kalshi_markets(session, max_pages=1)
-        row = session.scalar(select(KalshiMarket).where(KalshiMarket.ticker == "KXMLB-FP"))
+        game = MlbGame(
+            external_game_id="targeted-1",
+            home_team="Detroit Tigers",
+            away_team="Houston Astros",
+            home_abbreviation="DET",
+            away_abbreviation="HOU",
+            scheduled_start=datetime(2026, 6, 26, 22, 40, tzinfo=UTC),
+            status="scheduled",
+        )
+        session.add(game)
+        session.commit()
 
-        assert count == 1
-        assert row is not None
-        assert row.best_yes_bid == Decimal("0.4200")
-        assert row.best_no_bid == Decimal("0.5600")
-        assert row.implied_yes_ask == Decimal("0.4400")
-        assert row.implied_no_ask == Decimal("0.5800")
+        summary = market_sync.sync_kalshi_markets(session)
+        row = session.scalar(select(KalshiMarket).where(KalshiMarket.ticker == "KXMLBGAME-26JUN261840HOUDET-HOU"))
+        mapping = session.scalar(select(MarketMapping))
+
+    assert summary["games_considered"] == 1
+    assert summary["markets_upserted"] == 1
+    assert summary["confirmed_mappings"] == 1
+    assert fake_client.broad_calls == 0
+    assert row is not None
+    assert row.status == "open"
+    assert row.raw_status == "active"
+    assert row.yes_bid == Decimal("0.1200")
+    assert row.yes_ask == Decimal("0.3400")
+    assert row.best_yes_bid == Decimal("0.4200")
+    assert row.implied_yes_ask == Decimal("0.4400")
+    assert mapping is not None
+    assert mapping.mapping_status == "confirmed"
+    assert mapping.resolver_strategy == "exact_market_tickers"
+    assert mapping.mapping_metadata["attempted_event_tickers"][0] == "KXMLBGAME-26JUN261840HOUDET"
+
+
+def test_series_window_fallback_uses_mve_filter_exclude() -> None:
+    client = KalshiClient(base_url="https://example.test")
+    calls: list[tuple[dict[str, object], int | None]] = []
+
+    def fake_iter_markets(params: dict[str, object], max_pages: int | None = None):
+        calls.append((dict(params), max_pages))
+        return iter([])
+
+    client.iter_markets = fake_iter_markets  # type: ignore[method-assign]
+
+    markets = client.get_markets_by_series_window("KXMLBGAME", 1, 2, limit=50, max_pages=2)
+
+    assert markets == []
+    assert calls == [
+        (
+            {
+                "series_ticker": "KXMLBGAME",
+                "min_close_ts": 1,
+                "max_close_ts": 2,
+                "limit": 50,
+                "mve_filter": "exclude",
+            },
+            2,
+        )
+    ]
+
+
+def test_resolver_series_fallback_close_window_covers_mlb_expiration() -> None:
+    class FakeKalshiClient:
+        def __init__(self) -> None:
+            self.series_call: tuple[str, int, int, int, int] | None = None
+
+        def get_markets_by_tickers(self, tickers: list[str]):
+            return {"markets": []}
+
+        def get_event(self, event_ticker: str):
+            return {"event": {"markets": []}}
+
+        def get_markets_by_event_ticker(self, event_ticker: str, limit: int = 100):
+            return {"markets": []}
+
+        def get_markets_by_series_window(
+            self,
+            series_ticker: str,
+            min_close_ts: int,
+            max_close_ts: int,
+            *,
+            limit: int = 100,
+            max_pages: int = 2,
+        ):
+            self.series_call = (series_ticker, min_close_ts, max_close_ts, limit, max_pages)
+            return []
+
+    client = FakeKalshiClient()
+    scheduled_start = datetime(2026, 6, 26, 22, 40, tzinfo=UTC)
+    game = MlbGame(
+        external_game_id="series-window-1",
+        home_team="Detroit Tigers",
+        away_team="Houston Astros",
+        home_abbreviation="DET",
+        away_abbreviation="HOU",
+        scheduled_start=scheduled_start,
+        status="scheduled",
+    )
+
+    resolve_game_markets(client, game)
+
+    assert client.series_call is not None
+    series_ticker, min_close_ts, max_close_ts, limit, max_pages = client.series_call
+    assert series_ticker == "KXMLBGAME"
+    assert min_close_ts == int((scheduled_start - timedelta(days=1)).timestamp())
+    assert max_close_ts == int((scheduled_start + timedelta(days=21)).timestamp())
+    assert max_close_ts - min_close_ts == 22 * 24 * 60 * 60
+    assert limit == 100
+    assert max_pages == 2
+
+
+def test_market_sync_drops_unrelated_series_fallback_markets(monkeypatch) -> None:
+    class FakeKalshiClient:
+        def __init__(self) -> None:
+            self.orderbook_calls: list[str] = []
+
+        def get_markets_by_tickers(self, tickers: list[str]):
+            return {"markets": []}
+
+        def get_event(self, event_ticker: str):
+            return {"event": {"markets": []}}
+
+        def get_markets_by_event_ticker(self, event_ticker: str, limit: int = 100):
+            return {"markets": []}
+
+        def get_markets_by_series_window(
+            self,
+            series_ticker: str,
+            min_close_ts: int,
+            max_close_ts: int,
+            *,
+            limit: int = 100,
+            max_pages: int = 2,
+        ):
+            return [
+                {
+                    "id": "unrelated-fallback-market",
+                    "ticker": "KXMLBGAME-26JUN261940KCCWS-KC",
+                    "event_ticker": "KXMLBGAME-26JUN261940KCCWS",
+                    "title": "Kansas City Royals vs Chicago White Sox",
+                    "status": "open",
+                    "occurrence_datetime": "2026-06-26T23:40:00Z",
+                    "yes_ask_dollars": "0.4400",
+                }
+            ]
+
+        def get_orderbook(self, ticker: str):
+            self.orderbook_calls.append(ticker)
+            raise AssertionError("unrelated fallback markets should not fetch orderbooks")
+
+    fake_client = FakeKalshiClient()
+    monkeypatch.setattr(market_sync.KalshiClient, "from_settings", staticmethod(lambda: fake_client))
+    monkeypatch.setattr(market_sync, "utc_now", lambda: datetime(2026, 6, 25, 12, 0, tzinfo=UTC))
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        session.add(
+            MlbGame(
+                external_game_id="fallback-unrelated-1",
+                home_team="Detroit Tigers",
+                away_team="Houston Astros",
+                home_abbreviation="DET",
+                away_abbreviation="HOU",
+                scheduled_start=datetime(2026, 6, 26, 22, 40, tzinfo=UTC),
+                status="scheduled",
+            )
+        )
+        session.commit()
+
+        summary = market_sync.sync_kalshi_markets(session)
+        markets = list(session.scalars(select(KalshiMarket)))
+        mappings = list(session.scalars(select(MarketMapping)))
+
+    assert summary["games_considered"] == 1
+    assert summary["markets_upserted"] == 0
+    assert summary["mappings_created_or_updated"] == 0
+    assert markets == []
+    assert mappings == []
+    assert fake_client.orderbook_calls == []
+
+
+def test_market_sync_rejects_multivariate_markets(monkeypatch) -> None:
+    class FakeKalshiClient:
+        def get_markets_by_tickers(self, tickers: list[str]):
+            event = "KXMVE-26JUN261840HOUDET"
+            return {
+                "markets": [
+                    {
+                        "id": "market-mve",
+                        "ticker": "KXMV-MLB-COMBO",
+                        "event_ticker": event,
+                        "title": "Multivariate MLB combo",
+                        "status": "open",
+                        "mve_selected_legs": [{"ticker": "KXMLBGAME-26JUN261840HOUDET-HOU"}],
+                    }
+                ]
+            }
+
+        def get_event(self, event_ticker: str):
+            return {"event": {"markets": []}}
+
+        def get_markets_by_event_ticker(self, event_ticker: str, limit: int = 100):
+            return {"markets": []}
+
+        def get_markets_by_series_window(self, *args, **kwargs):
+            return []
+
+        def get_orderbook(self, ticker: str):
+            raise AssertionError("multivariate markets should not fetch orderbooks")
+
+    monkeypatch.setattr(market_sync.KalshiClient, "from_settings", staticmethod(lambda: FakeKalshiClient()))
+    monkeypatch.setattr(market_sync, "utc_now", lambda: datetime(2026, 6, 25, 12, 0, tzinfo=UTC))
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        session.add(
+            MlbGame(
+                external_game_id="mve-1",
+                home_team="Detroit Tigers",
+                away_team="Houston Astros",
+                home_abbreviation="DET",
+                away_abbreviation="HOU",
+                scheduled_start=datetime(2026, 6, 26, 22, 40, tzinfo=UTC),
+                status="scheduled",
+            )
+        )
+        session.commit()
+
+        summary = market_sync.sync_kalshi_markets(session)
+        mapping = session.scalar(select(MarketMapping))
+        row = session.scalar(select(KalshiMarket).where(KalshiMarket.ticker == "KXMV-MLB-COMBO"))
+
+    assert summary["rejected_multivariate"] == 1
+    assert mapping is not None
+    assert mapping.mapping_status == "rejected_multivariate"
+    assert mapping.validation_status == "rejected_multivariate"
+    assert row is not None
+    assert row.orderbook_raw == {"skipped": "multivariate market"}
+
+
+def test_market_sync_continues_fallbacks_after_rejected_only_exact_result(monkeypatch) -> None:
+    class FakeKalshiClient:
+        def __init__(self) -> None:
+            self.event_calls: list[str] = []
+
+        def get_markets_by_tickers(self, tickers: list[str]):
+            return {
+                "markets": [
+                    {
+                        "id": "market-mve",
+                        "ticker": "KXMV-MLB-COMBO",
+                        "event_ticker": "KXMVE-26JUN261840HOUDET",
+                        "title": "Multivariate MLB combo",
+                        "status": "open",
+                        "mve_selected_legs": [{"ticker": "KXMLBGAME-26JUN261840HOUDET-HOU"}],
+                    }
+                ]
+            }
+
+        def get_event(self, event_ticker: str):
+            self.event_calls.append(event_ticker)
+            if event_ticker != "KXMLBGAME-26JUN261840HOUDET":
+                return {"event": {"markets": []}}
+            return {
+                "event": {
+                    "markets": [
+                        {
+                            "id": "market-targeted",
+                            "ticker": "KXMLBGAME-26JUN261840HOUDET-HOU",
+                            "event_ticker": "KXMLBGAME-26JUN261840HOUDET",
+                            "title": "Will the Houston Astros win the game against the Detroit Tigers?",
+                            "status": "open",
+                            "occurrence_datetime": "2026-06-26T22:40:00Z",
+                            "yes_ask_dollars": "0.3400",
+                        }
+                    ]
+                }
+            }
+
+        def get_markets_by_event_ticker(self, event_ticker: str, limit: int = 100):
+            raise AssertionError("event lookup should stop after usable fallback match")
+
+        def get_markets_by_series_window(self, *args, **kwargs):
+            raise AssertionError("series fallback should not run after usable fallback match")
+
+        def get_orderbook(self, ticker: str):
+            if ticker == "KXMV-MLB-COMBO":
+                raise AssertionError("multivariate markets should not fetch orderbooks")
+            return {"orderbook_fp": {"yes_dollars": [["0.3400", "10.00"]], "no_dollars": [["0.6500", "10.00"]]}}
+
+    fake_client = FakeKalshiClient()
+    monkeypatch.setattr(market_sync.KalshiClient, "from_settings", staticmethod(lambda: fake_client))
+    monkeypatch.setattr(market_sync, "utc_now", lambda: datetime(2026, 6, 25, 12, 0, tzinfo=UTC))
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        session.add(
+            MlbGame(
+                external_game_id="mve-fallback-1",
+                home_team="Detroit Tigers",
+                away_team="Houston Astros",
+                home_abbreviation="DET",
+                away_abbreviation="HOU",
+                scheduled_start=datetime(2026, 6, 26, 22, 40, tzinfo=UTC),
+                status="scheduled",
+            )
+        )
+        session.commit()
+
+        summary = market_sync.sync_kalshi_markets(session)
+        mappings = list(session.scalars(select(MarketMapping).order_by(MarketMapping.mapping_status)))
+
+    assert "KXMLBGAME-26JUN261840HOUDET" in fake_client.event_calls
+    assert summary["rejected_multivariate"] == 1
+    assert summary["confirmed_mappings"] == 1
+    assert {mapping.mapping_status for mapping in mappings} == {"confirmed", "rejected_multivariate"}
+
+
+def test_market_sync_returns_structured_upstream_errors(monkeypatch) -> None:
+    class FakeKalshiClient:
+        def _error(self):
+            return KalshiAPIError(
+                "upstream failed",
+                source=HttpJsonError(
+                    "GET failed",
+                    endpoint="https://kalshi.example/markets",
+                    params={"tickers": "KXMLBGAME-TEST"},
+                    status_code=502,
+                    body_preview="bad gateway",
+                ),
+            )
+
+        def get_markets_by_tickers(self, tickers: list[str]):
+            raise self._error()
+
+        def get_event(self, event_ticker: str):
+            raise self._error()
+
+        def get_markets_by_event_ticker(self, event_ticker: str, limit: int = 100):
+            raise self._error()
+
+        def get_markets_by_series_window(self, *args, **kwargs):
+            raise self._error()
+
+    monkeypatch.setattr(market_sync.KalshiClient, "from_settings", staticmethod(lambda: FakeKalshiClient()))
+    monkeypatch.setattr(market_sync, "utc_now", lambda: datetime(2026, 6, 25, 12, 0, tzinfo=UTC))
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        session.add(
+            MlbGame(
+                external_game_id="error-1",
+                home_team="Detroit Tigers",
+                away_team="Houston Astros",
+                home_abbreviation="DET",
+                away_abbreviation="HOU",
+                scheduled_start=datetime(2026, 6, 26, 22, 40, tzinfo=UTC),
+                status="scheduled",
+            )
+        )
+        session.commit()
+
+        summary = market_sync.sync_kalshi_markets(session)
+
+    assert summary["markets_upserted"] == 0
+    assert summary["errors"]
+    first_error = summary["errors"][0]
+    assert first_error["endpoint"] == "https://kalshi.example/markets"
+    assert first_error["upstream_status_code"] == 502
+    assert first_error["body_preview"] == "bad gateway"
+    assert first_error["retry_or_fallback_attempted"] is True
+
+
+def test_resolve_preview_shape_without_db_writes() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        session.add(
+            MlbGame(
+                external_game_id="preview-1",
+                home_team="Detroit Tigers",
+                away_team="Houston Astros",
+                home_abbreviation="DET",
+                away_abbreviation="HOU",
+                scheduled_start=datetime(2026, 6, 26, 22, 40, tzinfo=UTC),
+                status="scheduled",
+            )
+        )
+        session.commit()
+
+        preview = market_sync.resolve_preview_for_date(session, datetime(2026, 6, 26, tzinfo=UTC).date(), query_kalshi=False)
+        market_count = len(list(session.scalars(select(KalshiMarket))))
+        mapping_count = len(list(session.scalars(select(MarketMapping))))
+
+    assert preview["games_considered"] == 1
+    game_preview = preview["games"][0]
+    assert game_preview["game_label"] == "Houston Astros @ Detroit Tigers"
+    assert game_preview["home_abbreviation"] == "DET"
+    assert game_preview["away_abbreviation"] == "HOU"
+    assert game_preview["attempted_event_tickers"][0] == "KXMLBGAME-26JUN261840HOUDET"
+    assert market_count == 0
+    assert mapping_count == 0
 
 
 def test_list_today_markets_uses_occurrence_or_mapped_game_time(monkeypatch) -> None:

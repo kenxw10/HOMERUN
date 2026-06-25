@@ -5,7 +5,7 @@ from decimal import Decimal
 from typing import Any
 
 from app.config import get_settings
-from app.services.http_json import get_json
+from app.services.http_json import HttpJsonError, get_json
 
 
 def _as_decimal(value: object) -> Decimal | None:
@@ -67,6 +67,18 @@ def derive_orderbook_prices(orderbook: dict[str, Any]) -> dict[str, Decimal | No
     }
 
 
+class KalshiAPIError(RuntimeError):
+    def __init__(self, message: str, *, source: HttpJsonError, retry_or_fallback_attempted: bool = False) -> None:
+        super().__init__(message)
+        self.source = source
+        self.retry_or_fallback_attempted = retry_or_fallback_attempted
+
+    def to_detail(self) -> dict[str, object]:
+        detail = self.source.to_detail()
+        detail["retry_or_fallback_attempted"] = self.retry_or_fallback_attempted
+        return detail
+
+
 @dataclass
 class KalshiClient:
     base_url: str
@@ -89,13 +101,51 @@ class KalshiClient:
             headers["KALSHI-ACCESS-KEY"] = self.api_key
         return headers
 
+    def _get_json(self, path: str, params: dict[str, object] | None = None) -> dict[str, Any]:
+        endpoint = f"{self.base_url}{path}"
+        try:
+            return get_json(
+                endpoint,
+                params=params or {},
+                headers=self._headers(),
+                timeout=self.timeout_seconds,
+            )
+        except HttpJsonError as exc:
+            raise KalshiAPIError(f"Kalshi GET {path} failed.", source=exc) from exc
+
     def get_markets(self, params: dict[str, object] | None = None) -> dict[str, Any]:
-        return get_json(
-            f"{self.base_url}/markets",
-            params=params or {},
-            headers=self._headers(),
-            timeout=self.timeout_seconds,
+        return self._get_json("/markets", params=params or {})
+
+    def get_markets_by_tickers(self, tickers: list[str]) -> dict[str, Any]:
+        return self.get_markets({"tickers": ",".join(tickers), "limit": len(tickers), "mve_filter": "exclude"})
+
+    def get_markets_by_event_ticker(self, event_ticker: str, limit: int = 100) -> dict[str, Any]:
+        return self.get_markets({"event_ticker": event_ticker, "limit": limit, "mve_filter": "exclude"})
+
+    def get_markets_by_series_window(
+        self,
+        series_ticker: str,
+        min_close_ts: int,
+        max_close_ts: int,
+        *,
+        limit: int = 100,
+        max_pages: int = 2,
+    ) -> list[dict[str, Any]]:
+        return list(
+            self.iter_markets(
+                params={
+                    "series_ticker": series_ticker,
+                    "min_close_ts": min_close_ts,
+                    "max_close_ts": max_close_ts,
+                    "limit": limit,
+                    "mve_filter": "exclude",
+                },
+                max_pages=max_pages,
+            )
         )
+
+    def get_event(self, event_ticker: str) -> dict[str, Any]:
+        return self._get_json(f"/events/{event_ticker}")
 
     def iter_markets(self, params: dict[str, object] | None = None, max_pages: int | None = None):
         query = dict(params or {})
@@ -113,8 +163,4 @@ class KalshiClient:
             query["cursor"] = cursor
 
     def get_orderbook(self, ticker: str) -> dict[str, Any]:
-        return get_json(
-            f"{self.base_url}/markets/{ticker}/orderbook",
-            headers=self._headers(),
-            timeout=self.timeout_seconds,
-        )
+        return self._get_json(f"/markets/{ticker}/orderbook")

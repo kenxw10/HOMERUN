@@ -28,10 +28,23 @@ class Settings(BaseSettings):
     )
     mlb_stats_base_url: str = Field(default="https://statsapi.mlb.com/api/v1", alias="MLB_STATS_BASE_URL")
     market_discovery_enabled: bool = Field(default=True, alias="MARKET_DISCOVERY_ENABLED")
+    kalshi_enable_broad_discovery: bool = Field(default=False, alias="KALSHI_ENABLE_BROAD_DISCOVERY")
+    kalshi_market_sync_max_pages: int = Field(default=2, alias="KALSHI_MARKET_SYNC_MAX_PAGES")
+    kalshi_market_sync_limit: int = Field(default=100, alias="KALSHI_MARKET_SYNC_LIMIT")
     paper_candidate_engine_enabled: bool = Field(default=True, alias="PAPER_CANDIDATE_ENGINE_ENABLED")
     default_paper_contracts: int = Field(default=1, alias="DEFAULT_PAPER_CONTRACTS")
     dashboard_timezone: str = Field(default="America/New_York", alias="DASHBOARD_TIMEZONE")
     backend_api_key: SecretStr | None = Field(default=None, alias="BACKEND_API_KEY")
+
+    @field_validator("kalshi_market_sync_max_pages")
+    @classmethod
+    def validate_kalshi_market_sync_max_pages(cls, value: int) -> int:
+        return max(value, 1)
+
+    @field_validator("kalshi_market_sync_limit")
+    @classmethod
+    def validate_kalshi_market_sync_limit(cls, value: int) -> int:
+        return min(max(value, 1), 200)
 
     @field_validator("default_paper_contracts")
     @classmethod
