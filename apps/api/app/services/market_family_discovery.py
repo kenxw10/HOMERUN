@@ -508,11 +508,7 @@ def run_market_family_discovery(
                         }
                     )
                     continue
-                dedupe_key = (
-                    (family_key, ticker)
-                    if probe.source_strategy == "series_ticker_window"
-                    else (game.id, family_key, ticker)
-                )
+                dedupe_key = (family_key, ticker)
                 if dedupe_key in seen:
                     continue
                 seen.add(dedupe_key)

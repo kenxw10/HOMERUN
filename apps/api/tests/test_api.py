@@ -2476,6 +2476,59 @@ def test_market_family_discovery_parses_line_from_ticker_tail_not_date_prefix() 
     assert item.line_value != Decimal("26.0000")
 
 
+def test_market_family_discovery_dedupes_same_ticker_across_probe_strategies() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    duplicate_market = {
+        "ticker": "KXMLBSPREAD-26JUL011900SEAPIT-PIT-1.5",
+        "event_ticker": "KXMLBSPREAD-26JUL011900SEAPIT",
+        "title": "Pittsburgh Pirates spread -1.5 vs Seattle Mariners",
+        "status": "open",
+        "functional_strike": "-1.5",
+    }
+
+    class FakeDuplicateProbeClient:
+        def get_event(self, event_ticker: str):
+            return {"event": {"markets": []}}
+
+        def get_markets_by_event_ticker(self, event_ticker: str):
+            if event_ticker == "KXMLBSPREAD-26JUL011900SEAPIT":
+                return {"markets": [duplicate_market]}
+            return {"markets": []}
+
+        def iter_markets(self, params: dict[str, object], max_pages: int | None = None):
+            if params["series_ticker"] == "KXMLBSPREAD":
+                return iter([duplicate_market])
+            return iter([])
+
+    with Session(engine) as session:
+        session.add(
+            MlbGame(
+                external_game_id="discovery-dedupe-line",
+                home_team="Pittsburgh Pirates",
+                away_team="Seattle Mariners",
+                home_abbreviation="PIT",
+                away_abbreviation="SEA",
+                scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+                status="scheduled",
+            )
+        )
+        session.commit()
+
+        result = market_family_discovery.run_market_family_discovery(
+            session,
+            date(2026, 7, 1),
+            client=FakeDuplicateProbeClient(),
+        )
+        items = list(session.scalars(select(MarketFamilyDiscoveryItem)))
+
+    assert result["markets_found"] == 1
+    assert result["by_family"]["full_game_spread"]["market_count"] == 1
+    assert len(items) == 1
+    assert items[0].returned_ticker == duplicate_market["ticker"]
+
+
 def test_market_family_discovery_series_window_filters_to_matching_game() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
@@ -2671,7 +2724,7 @@ def test_open_position_price_refresh_updates_only_open_paper_trades() -> None:
     assert snapshot.snapshot_type == "open_position_price_refresh"
 
 
-def test_open_position_price_refresh_does_not_stamp_stale_trade_price_on_orderbook_error() -> None:
+def test_open_position_price_refresh_does_not_stamp_cached_prices_on_orderbook_error() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
 
@@ -2686,6 +2739,7 @@ def test_open_position_price_refresh_does_not_stamp_stale_trade_price_on_orderbo
             ticker="KXMLBGAME-26JUL011900SEAPIT-PIT",
             title="Will Pittsburgh win?",
             status="open",
+            best_yes_bid=Decimal("0.4100"),
         )
         session.add(market)
         session.flush()
