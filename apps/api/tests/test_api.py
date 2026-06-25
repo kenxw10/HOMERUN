@@ -385,6 +385,46 @@ def test_generate_candidates_blocks_unknown_market_type_from_paper_trading(monke
     assert all_trades == []
 
 
+def test_generate_candidates_uses_contract_subtitles_for_market_type(monkeypatch) -> None:
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+    monkeypatch.setattr(candidates, "utc_now", lambda: now)
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        game = MlbGame(
+            external_game_id="subtitle-type-1",
+            home_team="New York Yankees",
+            away_team="Boston Red Sox",
+            scheduled_start=datetime(2026, 7, 1, 23, 5, tzinfo=UTC),
+            status="scheduled",
+        )
+        market = KalshiMarket(
+            kalshi_market_id="KX-SUBTITLE-TYPE",
+            ticker="KXMLB-SUBTITLE-TYPE",
+            title="New York Yankees vs Boston Red Sox",
+            yes_subtitle="New York Yankees win the game",
+            no_subtitle="Boston Red Sox win the game",
+            status="open",
+            occurrence_datetime=datetime(2026, 7, 1, 23, 10, tzinfo=UTC),
+            implied_yes_ask=Decimal("0.4000"),
+        )
+        session.add_all([game, market])
+        session.commit()
+
+        result = candidates.generate_candidates(session)
+        candidate = session.scalar(select(ModelCandidate))
+        trade = session.scalar(select(PaperTrade))
+
+    assert result["candidates"] == 1
+    assert result["paper_trades"] == 1
+    assert candidate is not None
+    assert candidate.market_type == "full_game_moneyline"
+    assert candidate.decision == "paper_trade"
+    assert trade is not None
+
+
 def test_generate_candidates_preserves_zero_market_price(monkeypatch) -> None:
     now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
     monkeypatch.setattr(candidates, "utc_now", lambda: now)
@@ -1125,6 +1165,13 @@ def test_list_today_markets_uses_occurrence_or_mapped_game_time(monkeypatch) -> 
             scheduled_start=datetime(2026, 7, 1, 22, 0, tzinfo=UTC),
             status="scheduled",
         )
+        duplicate_mapping_game = MlbGame(
+            external_game_id="market-list-duplicate-game",
+            home_team="New York Yankees",
+            away_team="Boston Red Sox",
+            scheduled_start=datetime(2026, 7, 1, 20, 0, tzinfo=UTC),
+            status="scheduled",
+        )
         mapped_today_market = KalshiMarket(
             kalshi_market_id="KX-MAPPED-TODAY",
             ticker="KXMLB-MAPPED-TODAY",
@@ -1147,21 +1194,43 @@ def test_list_today_markets_uses_occurrence_or_mapped_game_time(monkeypatch) -> 
             status="open",
             close_time=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
         )
-        session.add_all([occurrence_today_market, mapped_game, mapped_today_market, tomorrow_market, close_today_only_market])
+        session.add_all(
+            [
+                occurrence_today_market,
+                mapped_game,
+                duplicate_mapping_game,
+                mapped_today_market,
+                tomorrow_market,
+                close_today_only_market,
+            ]
+        )
         session.flush()
-        session.add(
-            MarketMapping(
-                mlb_game_id=mapped_game.id,
-                kalshi_market_id=mapped_today_market.id,
-                mapping_status="candidate",
-                confidence=Decimal("0.9500"),
-            )
+        session.add_all(
+            [
+                MarketMapping(
+                    mlb_game_id=mapped_game.id,
+                    kalshi_market_id=mapped_today_market.id,
+                    mapping_status="candidate",
+                    confidence=Decimal("0.9500"),
+                ),
+                MarketMapping(
+                    mlb_game_id=duplicate_mapping_game.id,
+                    kalshi_market_id=mapped_today_market.id,
+                    mapping_status="needs_review",
+                    confidence=Decimal("0.7000"),
+                ),
+            ]
         )
         session.commit()
 
         rows = dashboard.list_today_markets(session)
 
-    assert {market.ticker for market, _ in rows} == {"KXMLB-OCCURRENCE-TODAY", "KXMLB-MAPPED-TODAY"}
+    tickers = [market.ticker for market, _ in rows]
+    mapped_row = next((market, mapping) for market, mapping in rows if market.ticker == "KXMLB-MAPPED-TODAY")
+    assert tickers.count("KXMLB-MAPPED-TODAY") == 1
+    assert set(tickers) == {"KXMLB-OCCURRENCE-TODAY", "KXMLB-MAPPED-TODAY"}
+    assert mapped_row[1] is not None
+    assert mapped_row[1].mapping_status == "candidate"
 
 
 def test_dashboard_uses_newest_portfolio_snapshots() -> None:

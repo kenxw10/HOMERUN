@@ -34,6 +34,21 @@ def _market_yes_price(market: KalshiMarket) -> Decimal | None:
     return None
 
 
+def _market_classification_text(market: KalshiMarket) -> str:
+    return " ".join(
+        value or ""
+        for value in (
+            market.title,
+            market.subtitle,
+            market.rules,
+            market.yes_subtitle,
+            market.no_subtitle,
+            market.ticker,
+            market.event_ticker,
+        )
+    )
+
+
 def _candidate_ids_with_trades(session: Session, candidate_ids: list[int]) -> set[int]:
     if not candidate_ids:
         return set()
@@ -106,8 +121,7 @@ def generate_candidates(session: Session) -> dict[str, int]:
     for mapping, game, market in mappings:
         minutes_to_start = int((ensure_aware_utc(game.scheduled_start) - now).total_seconds() / 60)
         bucket = classify_time_bucket(minutes_to_start)
-        text = " ".join(value or "" for value in (market.title, market.subtitle, market.rules))
-        market_type = infer_market_type(text)
+        market_type = infer_market_type(_market_classification_text(market))
         probability = Decimal("0.500000")
         price = _market_yes_price(market)
         gross_ev = (probability - price).quantize(Decimal("0.000001")) if price is not None else None

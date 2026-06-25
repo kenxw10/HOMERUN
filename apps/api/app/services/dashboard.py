@@ -29,6 +29,8 @@ from app.schemas import (
 )
 from app.time_utils import eastern_display, ensure_aware_utc, get_dashboard_zone, to_eastern_iso, today_eastern, utc_now
 
+MAPPING_STATUS_PRIORITY = {"confirmed": 0, "candidate": 1, "needs_review": 2}
+
 
 def empty_dashboard_summary() -> DashboardSummary:
     settings = get_settings()
@@ -95,6 +97,13 @@ def _position_from_position(position: Position) -> PositionSummary:
         status=position.status,
         resolution=position.resolution,
     )
+
+
+def _mapping_priority(mapping: MarketMapping | None) -> tuple[int, Decimal]:
+    if mapping is None:
+        return (99, Decimal("0"))
+    status_priority = MAPPING_STATUS_PRIORITY.get(mapping.mapping_status, 50)
+    return (status_priority, -(mapping.confidence or Decimal("0")))
 
 
 def dashboard_summary_from_db(session: Session) -> DashboardSummary:
@@ -168,7 +177,7 @@ def list_today_games(session: Session):
 
 def list_today_markets(session: Session):
     _, start, end = today_bounds()
-    return list(
+    rows = list(
         session.execute(
             select(KalshiMarket, MarketMapping)
             .outerjoin(MarketMapping, KalshiMarket.id == MarketMapping.kalshi_market_id)
@@ -180,9 +189,15 @@ def list_today_markets(session: Session):
                 )
             )
             .order_by(KalshiMarket.occurrence_datetime.asc().nullslast(), MlbGame.scheduled_start.asc().nullslast())
-            .limit(500)
         )
     )
+    deduped: dict[int, tuple[KalshiMarket, MarketMapping | None]] = {}
+    for market, mapping in rows:
+        existing = deduped.get(market.id)
+        if existing is None or _mapping_priority(mapping) < _mapping_priority(existing[1]):
+            deduped[market.id] = (market, mapping)
+
+    return list(deduped.values())[:500]
 
 
 def list_today_candidates(session: Session):
