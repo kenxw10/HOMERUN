@@ -62,10 +62,21 @@ type DashboardSummary = {
   };
   model_status: {
     active_model_version: string | null;
+    feature_version: string | null;
+    calibration_status: string | null;
     last_training_run: string | null;
     last_calibration_run: string | null;
     candidate_count: number;
-    notes: string;
+    resolved_mature_samples: number;
+    training_eligible_count: number;
+    last_governance_status: string | null;
+    trade_policy: Record<string, unknown>;
+    trade_caps_used: Record<string, unknown>;
+    data_quality_summary: {
+      avg?: number | null;
+      feature_version?: string | null;
+    };
+    notes: string | string[];
   };
 };
 
@@ -144,10 +155,18 @@ const emptySummary: DashboardSummary = {
   },
   model_status: {
     active_model_version: null,
+    feature_version: null,
+    calibration_status: "not_run",
     last_training_run: null,
     last_calibration_run: null,
     candidate_count: 0,
-    notes: "No model has been trained yet.",
+    resolved_mature_samples: 0,
+    training_eligible_count: 0,
+    last_governance_status: "not_run",
+    trade_policy: {},
+    trade_caps_used: {},
+    data_quality_summary: {},
+    notes: ["No mature model has been trained yet."],
   },
 };
 
@@ -200,6 +219,26 @@ function formatPercent(value: number | null | undefined): string {
     style: "percent",
     maximumFractionDigits: 2,
   }).format(value);
+}
+
+function formatNumber(value: number | null | undefined): string {
+  if (value === null || value === undefined || Number.isNaN(value)) {
+    return "N/A";
+  }
+  return new Intl.NumberFormat("en-US", { maximumFractionDigits: 2 }).format(value);
+}
+
+function formatUnknown(value: unknown): string {
+  if (typeof value === "number") {
+    return formatNumber(value);
+  }
+  if (typeof value === "boolean") {
+    return value ? "TRUE" : "FALSE";
+  }
+  if (typeof value === "string") {
+    return value.toUpperCase();
+  }
+  return "N/A";
 }
 
 function formatPrice(value: number | null | undefined): string {
@@ -716,6 +755,10 @@ function StatusTable({
   );
 }
 
+function modelNotes(notes: string | string[]): string {
+  return Array.isArray(notes) ? notes.join(" ") : notes;
+}
+
 export default function DashboardPage() {
   const apiBaseUrl = useMemo(() => getApiBaseUrl(), []);
   const refreshMs = useMemo(() => getRefreshMs(), []);
@@ -752,7 +795,23 @@ export default function DashboardPage() {
 
   const modelRows: StatusRow[] = [
     { label: "ACTIVE MODEL VERSION", value: summary.model_status.active_model_version ?? "NONE" },
+    { label: "FEATURE VERSION", value: summary.model_status.feature_version ?? "NONE" },
+    {
+      label: "CALIBRATION STATUS",
+      value: summary.model_status.calibration_status ?? "NOT RUN",
+      tone: summary.model_status.calibration_status === "calibrated" ? "green" : "amber",
+    },
     { label: "CANDIDATES", value: String(summary.model_status.candidate_count) },
+    { label: "TRAINING ELIGIBLE", value: String(summary.model_status.training_eligible_count) },
+    { label: "RESOLVED MATURE SAMPLES", value: String(summary.model_status.resolved_mature_samples) },
+    { label: "DATA QUALITY AVG", value: formatNumber(summary.model_status.data_quality_summary.avg ?? null) },
+    {
+      label: "TRADES USED / MAX TODAY",
+      value: `${formatUnknown(summary.model_status.trade_caps_used.paper_trades)} / ${formatUnknown(
+        summary.model_status.trade_policy.paper_max_trades_per_slate,
+      )}`,
+    },
+    { label: "LAST GOVERNANCE", value: summary.model_status.last_governance_status ?? "NOT RUN" },
     { label: "LAST TRAINING", value: formatEastern(summary.model_status.last_training_run) },
     { label: "LAST CALIBRATION", value: formatEastern(summary.model_status.last_calibration_run) },
   ];
@@ -785,6 +844,12 @@ export default function DashboardPage() {
         </section>
       ) : null}
 
+      {summary.model_status.calibration_status !== "calibrated" ? (
+        <section className="model-warning" role="status">
+          MODEL UNCALIBRATED OR SAMPLE-LIMITED: PAPER TRADES USE STRICT PR3C CAPS AND CONSERVATIVE SHRINKAGE.
+        </section>
+      ) : null}
+
       <PortfolioChart summary={summary} />
 
       <section className="metrics-grid" aria-label="Performance metrics">
@@ -802,13 +867,13 @@ export default function DashboardPage() {
       />
 
       <section className="status-grid">
-        <StatusTable title="MODEL STATUS" rows={modelRows} note={summary.model_status.notes} />
+        <StatusTable title="MODEL QUALITY" rows={modelRows} note={modelNotes(summary.model_status.notes)} />
         <StatusTable title="SYSTEM STATUS" rows={systemRows} note={system?.database.message ?? "DATABASE STATUS UNAVAILABLE."} />
       </section>
 
       <footer className="terminal-footer">
         <span>ALL TIMES DISPLAYED IN EDT/EST</span>
-        <span>HOMERUN V0.3.1 | PR3B MARKET FAMILY WIRING</span>
+        <span>HOMERUN V0.3.2 | PR3C MATURE MODEL GOVERNANCE</span>
       </footer>
     </main>
   );

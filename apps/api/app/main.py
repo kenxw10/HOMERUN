@@ -2,10 +2,11 @@ from datetime import UTC, date, datetime
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import select
 
 from app.config import get_settings
 from app.database import database_status, get_session_factory
-from app.models import KalshiMarket, MarketMapping, MlbGame, ModelCandidate
+from app.models import KalshiMarket, MarketMapping, MlbGame, ModelCandidate, ModelPredictionOutput, ModelPredictionRun
 from app.schemas import (
     BackendStatus,
     CandidateSummary,
@@ -34,13 +35,14 @@ from app.services.market_family_discovery import (
     run_market_family_discovery,
 )
 from app.services.market_family_mapping import latest_market_family_mapping_report, sync_market_family_mappings
-from app.services.modeling import run_model_governance
+from app.services.features import feature_coverage, sync_mlb_features
+from app.services.modeling import governance_status, repair_training_eligibility, run_model_governance
 from app.services.market_sync import resolve_preview_for_date, sync_kalshi_markets
 from app.services.mlb import sync_results, sync_schedule
 from app.services.position_refresh import refresh_open_position_prices
 from app.services.portfolio import create_balance_snapshot
 from app.services.settlement import settle_paper_trades
-from app.time_utils import eastern_display, to_eastern_iso
+from app.time_utils import eastern_display, today_eastern, to_eastern_iso
 
 settings = get_settings()
 
@@ -183,8 +185,13 @@ def _candidate_summary(candidate: ModelCandidate, game: MlbGame | None, market: 
         time_bucket=candidate.time_bucket,
         time_to_start_minutes=candidate.time_to_start_minutes,
         model_probability=_decimal_float(_prefer_not_none(candidate.model_probability, candidate.probability)),
+        probability_raw=_decimal_float(candidate.probability_raw),
+        probability_calibrated=_decimal_float(candidate.probability_calibrated),
         executable_price=_decimal_float(_prefer_not_none(candidate.executable_price, candidate.market_price)),
         net_expected_value=_decimal_float(candidate.net_expected_value),
+        data_quality=_decimal_float(candidate.data_quality),
+        calibration_status=candidate.calibration_status,
+        training_eligible=candidate.training_eligible,
         decision=candidate.decision,
     )
 
@@ -320,6 +327,82 @@ def run_model_governance_endpoint(_: None = Depends(require_internal_api_key)) -
     with _db_session_or_503() as session:
         result = run_model_governance(session)
     return RunResponse(ok=True, action="model_governance", result=result)
+
+
+@app.get("/v1/model/governance/status", response_model=RunResponse)
+def model_governance_status(_: None = Depends(require_internal_api_key)) -> RunResponse:
+    with _db_session_or_503() as session:
+        result = governance_status(session)
+    return RunResponse(ok=True, action="model_governance_status", result=result)
+
+
+@app.get("/v1/model/features/coverage", response_model=RunResponse)
+def model_feature_coverage(
+    target_date: date | None = Query(default=None, alias="date"),
+    _: None = Depends(require_internal_api_key),
+) -> RunResponse:
+    with _db_session_or_503() as session:
+        result = feature_coverage(session, target_date)
+    return RunResponse(ok=True, action="model_feature_coverage", result=result)
+
+
+@app.get("/v1/model/predictions/today", response_model=RunResponse)
+def model_predictions_today(_: None = Depends(require_internal_api_key)) -> RunResponse:
+    with _db_session_or_503() as session:
+        rows = list(
+            session.execute(
+                select(ModelPredictionOutput, ModelCandidate, KalshiMarket)
+                .join(ModelPredictionRun, ModelPredictionOutput.prediction_run_id == ModelPredictionRun.id)
+                .outerjoin(ModelCandidate, ModelPredictionOutput.candidate_id == ModelCandidate.id)
+                .outerjoin(KalshiMarket, ModelCandidate.kalshi_market_id == KalshiMarket.id)
+                .where(ModelPredictionRun.target_date == today_eastern())
+                .order_by(ModelPredictionOutput.id.desc())
+                .limit(500)
+            )
+        )
+        items = [
+            {
+                "candidate_id": candidate.id if candidate else None,
+                "market_ticker": market.ticker if market else None,
+                "market_family": output.market_family,
+                "probability_raw": _decimal_float(output.probability_raw),
+                "probability_calibrated": _decimal_float(output.probability_calibrated),
+                "fair_value": _decimal_float(output.fair_value),
+                "data_quality": _decimal_float(output.data_quality),
+                "calibration_status": output.calibration_status,
+                "trade_rank": output.trade_rank,
+                "decision_reason": output.decision_reason,
+            }
+            for output, candidate, market in rows
+        ]
+    return RunResponse(ok=True, action="model_predictions_today", result={"items": items, "count": len(items)})
+
+
+@app.post("/v1/sync/mlb-features", response_model=RunResponse)
+def run_mlb_feature_sync(
+    target_date: date | None = Query(default=None),
+    _: None = Depends(require_internal_api_key),
+) -> RunResponse:
+    with _db_session_or_503() as session:
+        result = sync_mlb_features(session, target_date)
+    return RunResponse(ok=True, action="mlb_feature_sync", result=result)
+
+
+@app.post("/v1/run/model-feature-snapshot-backfill", response_model=RunResponse)
+def run_model_feature_snapshot_backfill(
+    target_date: date | None = Query(default=None),
+    _: None = Depends(require_internal_api_key),
+) -> RunResponse:
+    with _db_session_or_503() as session:
+        result = sync_mlb_features(session, target_date)
+    return RunResponse(ok=True, action="model_feature_snapshot_backfill", result=result)
+
+
+@app.post("/v1/run/training-eligibility-repair", response_model=RunResponse)
+def run_training_eligibility_repair(_: None = Depends(require_internal_api_key)) -> RunResponse:
+    with _db_session_or_503() as session:
+        result = repair_training_eligibility(session)
+    return RunResponse(ok=True, action="training_eligibility_repair", result=result)
 
 
 @app.post("/v1/run/market-family-discovery", response_model=RunResponse)

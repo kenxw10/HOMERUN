@@ -43,10 +43,24 @@ KALSHI_MARKET_DATA_MAX_RETRIES=2
 KALSHI_MARKET_DATA_BACKOFF_BASE_MS=1000
 KALSHI_MARKET_DATA_BACKOFF_MAX_MS=10000
 OPEN_POSITION_PRICE_REFRESH_ENABLED=true
+OPEN_POSITION_PRICE_REFRESH_MAX_PER_RUN=100
 PAPER_CANDIDATE_ENGINE_ENABLED=true
 DEFAULT_PAPER_CONTRACTS=1
+PAPER_MAX_TRADES_PER_SLATE=20
+PAPER_MAX_TRADES_PER_GAME=3
+PAPER_MAX_TRADES_PER_MARKET_FAMILY=8
+PAPER_MAX_OPEN_POSITIONS=50
+PAPER_MIN_NET_EV=0.05
+PAPER_MIN_PROB_EDGE=0.03
+PAPER_MIN_DATA_QUALITY=0.60
+PAPER_REQUIRE_CALIBRATED_FOR_TRADE=false
 PAPER_STARTING_BALANCE=1000.00
 MODEL_TRAINING_MIN_SAMPLES=100
+MODEL_MIN_SAMPLES_TRAIN=250
+MODEL_MIN_SAMPLES_CALIBRATE=250
+MODEL_MIN_SAMPLES_PROMOTE=500
+MODEL_PROMOTION_MIN_LOGLOSS_IMPROVEMENT=0.01
+MODEL_PROMOTION_MAX_ECE=0.05
 DASHBOARD_TIMEZONE=America/New_York
 BACKEND_API_KEY=replace-with-a-long-random-secret
 ```
@@ -54,7 +68,7 @@ BACKEND_API_KEY=replace-with-a-long-random-secret
 Use the exact Vercel dashboard origin for `CORS_ORIGINS`, without a trailing slash. Example: `https://homerun.vercel.app`.
 
 9. Required for Railway: set `BACKEND_API_KEY` to a long random value. Internal POST run endpoints reject unauthenticated requests outside local development.
-10. Do not add production Kalshi credentials in PR 3b.
+10. Do not add production Kalshi credentials in PR 3c.
 11. Deploy the service.
 12. Run database migrations.
 13. After deploy, open `/health` and `/v1/system/status` on the Railway backend URL.
@@ -84,7 +98,7 @@ alembic upgrade head
 
 If migration fails, check that `DATABASE_URL` exists and points to the Railway PostgreSQL service.
 
-## PR 3b One-Off Job Commands
+## PR 3c One-Off Job Commands
 
 Run these from the Railway backend service shell after migrations succeed:
 
@@ -96,6 +110,9 @@ python -m app.jobs.mlb_results_sync
 python -m app.jobs.paper_settlement_sync
 python -m app.jobs.balance_snapshot
 python -m app.jobs.model_governance
+python -m app.jobs.mlb_feature_sync
+python -m app.jobs.model_feature_snapshot_backfill
+python -m app.jobs.training_eligibility_repair
 python -m app.jobs.market_family_discovery
 python -m app.jobs.market_family_mapping_sync
 python -m app.jobs.open_position_price_refresh
@@ -103,7 +120,7 @@ python -m app.jobs.open_position_price_refresh
 
 These commands create database records for the dashboard and paper engine. They do not place live orders.
 
-## PR 3b Targeted Resolver, Discovery, Mapping, And Paper Results Validation
+## PR 3c Targeted Resolver, Discovery, Mapping, Model, And Paper Results Validation
 
 PR 3 keeps Kalshi market sync on targeted MLB resolution and adds paper results/model workflows. Normal production should leave broad discovery disabled:
 
@@ -122,6 +139,9 @@ Invoke-RestMethod -Method Post -Headers @{"X-API-Key"="YOUR_KEY"} https://YOUR-R
 Invoke-RestMethod -Method Post -Headers @{"X-API-Key"="YOUR_KEY"} https://YOUR-RAILWAY-API/v1/run/paper-settlement-sync
 Invoke-RestMethod -Method Post -Headers @{"X-API-Key"="YOUR_KEY"} https://YOUR-RAILWAY-API/v1/run/balance-snapshot
 Invoke-RestMethod -Method Post -Headers @{"X-API-Key"="YOUR_KEY"} https://YOUR-RAILWAY-API/v1/run/model-governance
+Invoke-RestMethod -Headers @{"X-API-Key"="YOUR_KEY"} https://YOUR-RAILWAY-API/v1/model/governance/status
+Invoke-RestMethod -Method Post -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-RAILWAY-API/v1/sync/mlb-features?target_date=2026-06-26"
+Invoke-RestMethod -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-RAILWAY-API/v1/model/features/coverage?date=2026-06-26"
 Invoke-RestMethod -Method Post -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-RAILWAY-API/v1/run/market-family-discovery?target_date=2026-06-26"
 Invoke-RestMethod -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-RAILWAY-API/v1/market-families/discovery?date=2026-06-26"
 Invoke-RestMethod -Method Post -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-RAILWAY-API/v1/sync/market-family-mappings?target_date=2026-06-26"
@@ -135,13 +155,15 @@ Expected behavior:
 - Resolve preview returns `ok=true` with per-game warnings/partial errors when only some games miss.
 - Kalshi sync returns a structured summary with mapping counts and actionable error details if Kalshi upstream calls fail.
 - Missing matching Kalshi markets should produce a clean summary, not a blank 502.
-- Paper candidate engine creates candidates with `heuristic_full_game_winner_v1` probabilities only after confirmed or candidate mappings exist.
+- Paper candidate engine creates candidates with `mature_mlb_run_distribution_v1` probabilities only after validated paper-supported mappings exist.
 - MLB results sync updates final scores/status.
 - Paper settlement sync settles completed supported full-game winner paper trades.
 - Balance snapshots populate `/v1/dashboard/summary`.
-- Model governance records either a trained/promoted model or a clear skipped reason due to insufficient samples.
+- Model governance records either a trained/promoted model or a clear skipped reason due to insufficient mature resolved samples.
+- Model feature coverage reports explicit source statuses and does not fake missing lineup, weather, injury, umpire, team-total, or sportsbook data.
 - PR 3b market-family discovery returns structured `by_family` output from the observed deterministic prefixes `KXMLBGAME`, `KXMLBSPREAD`, `KXMLBTOTAL`, `KXMLBF5`, `KXMLBF5SPREAD`, and `KXMLBF5TOTAL`, while mapping sync promotes only parseable validated rows to `paper_supported`.
 - Candidate generation can paper trade supported spread, total, and first-five mappings only when the market is open, the ask is executable, the edge threshold clears, and the safety posture remains paper-only.
+- Candidate generation applies slate, game, market-family, open-position, and correlated game/family caps before creating paper trades.
 - First-five settlement requires MLB linescore innings. Missing linescore should produce a skipped result and leave the trade open.
 - Discovery uses batched exact ticker queries first, capped fallback offsets second, and `event_ticker` filtering only as a secondary fallback. The result should include `request_count`, `requests_saved_by_batching`, `rate_limited_count`, `retries_attempted`, and `stopped_due_to_rate_limit`.
 - Open-position price refresh updates REST last marks for open paper positions only.

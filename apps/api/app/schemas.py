@@ -62,10 +62,18 @@ class BotMode(BaseModel):
 
 class ModelStatus(BaseModel):
     active_model_version: str | None
+    feature_version: str | None = None
+    calibration_status: str | None = None
     last_training_run: datetime | None
     last_calibration_run: datetime | None
     candidate_count: int
-    notes: str
+    resolved_mature_samples: int = 0
+    training_eligible_count: int = 0
+    last_governance_status: str | None = None
+    trade_policy: dict[str, object] = Field(default_factory=dict)
+    trade_caps_used: dict[str, object] = Field(default_factory=dict)
+    data_quality_summary: dict[str, object] = Field(default_factory=dict)
+    notes: str | list[str]
 
 
 class DashboardSummary(BaseModel):
@@ -158,8 +166,13 @@ class CandidateSummary(BaseModel):
     time_bucket: str | None
     time_to_start_minutes: int | None
     model_probability: float | None
+    probability_raw: float | None = None
+    probability_calibrated: float | None = None
     executable_price: float | None
     net_expected_value: float | None
+    data_quality: float | None = None
+    calibration_status: str | None = None
+    training_eligible: bool | None = None
     decision: str
 
 
