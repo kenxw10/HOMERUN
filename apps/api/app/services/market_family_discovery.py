@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 from app.config import get_settings
 from app.models import MarketFamilyDiscoveryItem, MarketFamilyDiscoveryRun, MlbGame
 from app.services.kalshi import KalshiAPIError, KalshiClient
-from app.services.kalshi_mlb_resolver import build_event_ticker_candidates, is_multivariate_market
+from app.services.kalshi_mlb_resolver import build_event_ticker_candidates, game_team_codes, is_multivariate_market
 from app.time_utils import ensure_aware_utc, get_dashboard_zone, today_eastern, utc_now
 
 RESOLVER_MODE = "deterministic_ticker_registry_v1"
@@ -354,6 +354,23 @@ def _event_ticker_candidates(game: MlbGame, family_key: str) -> list[tuple[str, 
     return values
 
 
+def _direct_market_ticker_candidates(game: MlbGame, family_key: str, event_ticker: str) -> list[str]:
+    away_code, home_code = game_team_codes(game)
+    if family_key == "full_game_winner":
+        suffixes = (away_code, home_code)
+    elif family_key == "first_five_winner":
+        suffixes = (away_code, home_code, "TIE")
+    else:
+        return []
+
+    tickers: list[str] = []
+    for suffix in suffixes:
+        ticker = f"{event_ticker}-{suffix}"
+        if ticker not in tickers:
+            tickers.append(ticker)
+    return tickers
+
+
 def _matches_game_candidate_event(game: MlbGame, family_key: str, market: dict[str, Any]) -> bool:
     event_tickers = {event_ticker for _series_ticker, event_ticker in _event_ticker_candidates(game, family_key)}
     returned_event_ticker = str(market.get("event_ticker") or "").upper()
@@ -600,34 +617,35 @@ def _probe_markets(
     found: list[tuple[DiscoveryProbe, dict[str, Any]]] = []
 
     for series_ticker, event_ticker in _event_ticker_candidates(game, family_key):
-        direct_probe = DiscoveryProbe(
-            family_key,
-            series_ticker,
-            event_ticker,
-            event_ticker,
-            "direct_market_lookup",
-        )
-        try:
-            payload = client.get_market(event_ticker)
-            markets = _markets_from_payload(payload)
-            probe_attempts.append(
-                _probe_attempt_record(
+        for market_ticker in _direct_market_ticker_candidates(game, family_key, event_ticker):
+            direct_probe = DiscoveryProbe(
+                family_key,
+                series_ticker,
+                event_ticker,
+                market_ticker,
+                "direct_market_lookup",
+            )
+            try:
+                payload = client.get_market(market_ticker)
+                markets = _markets_from_payload(payload)
+                probe_attempts.append(
+                    _probe_attempt_record(
+                        game=game,
+                        probe=direct_probe,
+                        outcome="found" if markets else "no_match",
+                        markets_found=len(markets),
+                    )
+                )
+                found.extend((direct_probe, market) for market in markets)
+            except Exception as exc:
+                _record_probe_exception(
                     game=game,
                     probe=direct_probe,
-                    outcome="found" if markets else "no_match",
-                    markets_found=len(markets),
+                    exc=exc,
+                    warnings=warnings,
+                    errors=errors,
+                    probe_attempts=probe_attempts,
                 )
-            )
-            found.extend((direct_probe, market) for market in markets)
-        except Exception as exc:
-            _record_probe_exception(
-                game=game,
-                probe=direct_probe,
-                exc=exc,
-                warnings=warnings,
-                errors=errors,
-                probe_attempts=probe_attempts,
-            )
 
         filter_probe = DiscoveryProbe(
             family_key,
@@ -938,7 +956,9 @@ def market_family_discovery_preview(session: Session, target_date: date | None =
                     event_ticker for _series_ticker, event_ticker in _event_ticker_candidates(game, family_key)
                 ][:9],
                 "candidate_market_tickers": [
-                    event_ticker for _series_ticker, event_ticker in _event_ticker_candidates(game, family_key)
+                    market_ticker
+                    for _series_ticker, event_ticker in _event_ticker_candidates(game, family_key)
+                    for market_ticker in _direct_market_ticker_candidates(game, family_key, event_ticker)
                 ][:9],
                 "candidate_series_tickers": FULL_REGISTRY[family_key]["candidate_series_tickers"],
             }

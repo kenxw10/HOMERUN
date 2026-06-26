@@ -2373,8 +2373,6 @@ def test_market_family_discovery_persists_structured_by_family_and_excludes_mve(
 
         def get_market(self, ticker: str):
             self.direct_market_tickers.append(ticker)
-            if ticker == "KXMLBSPREAD-26JUL011900SEAPIT":
-                return {"market": spread_market}
             return {"markets": []}
 
         def get_markets_by_event_ticker(self, event_ticker: str):
@@ -2425,9 +2423,10 @@ def test_market_family_discovery_persists_structured_by_family_and_excludes_mve(
     assert run.raw_summary["markets_found"] == 1
     assert len(items) == 1
     assert items[0].family_key == "full_game_spread"
-    assert items[0].candidate_market_ticker == "KXMLBSPREAD-26JUL011900SEAPIT"
+    assert items[0].candidate_market_ticker is None
     assert items[0].line_value == Decimal("-1.5000")
-    assert "KXMLBSPREAD-26JUL011900SEAPIT" in fake_client.direct_market_tickers
+    assert "KXMLBSPREAD-26JUL011900SEAPIT" not in fake_client.direct_market_tickers
+    assert all(ticker.count("-") >= 2 for ticker in fake_client.direct_market_tickers)
     assert "KXMLBSPREAD-26JUL011900SEAPIT" in fake_client.event_tickers
     assert result["attempted_event_tickers_count"] > 0
     assert result["attempted_market_tickers_count"] > 0
@@ -2596,16 +2595,19 @@ def test_market_family_discovery_handles_direct_market_response() -> None:
     Base.metadata.create_all(engine)
 
     class FakeDirectMarketClient:
+        def __init__(self) -> None:
+            self.direct_market_tickers: list[str] = []
+
         def get_market(self, ticker: str):
-            if ticker != "KXMLBSPREAD-26JUL011900SEAPIT":
+            self.direct_market_tickers.append(ticker)
+            if ticker != "KXMLBGAME-26JUL011900SEAPIT-PIT":
                 return {"markets": []}
             return {
                 "market": {
-                    "ticker": "KXMLBSPREAD-26JUL011900SEAPIT-PIT-1.5",
-                    "event_ticker": "KXMLBSPREAD-26JUL011900SEAPIT",
-                    "title": "Pittsburgh Pirates spread -1.5 vs Seattle Mariners",
+                    "ticker": "KXMLBGAME-26JUL011900SEAPIT-PIT",
+                    "event_ticker": "KXMLBGAME-26JUL011900SEAPIT",
+                    "title": "Will the Pittsburgh Pirates win against the Seattle Mariners?",
                     "status": "open",
-                    "functional_strike": "-1.5",
                 }
             }
 
@@ -2626,10 +2628,11 @@ def test_market_family_discovery_handles_direct_market_response() -> None:
         )
         session.commit()
 
+        fake_client = FakeDirectMarketClient()
         result = market_family_discovery.run_market_family_discovery(
             session,
             date(2026, 7, 1),
-            client=FakeDirectMarketClient(),
+            client=fake_client,
         )
         run = session.scalar(select(MarketFamilyDiscoveryRun))
         item = session.scalar(select(MarketFamilyDiscoveryItem))
@@ -2639,9 +2642,11 @@ def test_market_family_discovery_handles_direct_market_response() -> None:
     assert run is not None
     assert run.status == "completed"
     assert item is not None
-    assert item.returned_ticker == "KXMLBSPREAD-26JUL011900SEAPIT-PIT-1.5"
+    assert item.family_key == "full_game_winner"
+    assert item.returned_ticker == "KXMLBGAME-26JUL011900SEAPIT-PIT"
     assert item.source_strategy == "direct_market_lookup"
-    assert item.candidate_market_ticker == "KXMLBSPREAD-26JUL011900SEAPIT"
+    assert item.candidate_market_ticker == "KXMLBGAME-26JUL011900SEAPIT-PIT"
+    assert "KXMLBGAME-26JUL011900SEAPIT" not in fake_client.direct_market_tickers
 
 
 def test_market_family_discovery_job_returns_nonzero_for_failed_status(monkeypatch) -> None:
@@ -2798,6 +2803,28 @@ def test_market_family_discovery_uses_observed_prefix_registry_only() -> None:
 
     assert "KXMLBTEAMTOTAL" not in active_prefixes
     assert set(market_family_discovery.RETIRED_LEGACY_PREFIXES_NOT_USED).isdisjoint(active_prefixes)
+    assert market_family_discovery._direct_market_ticker_candidates(
+        game,
+        "full_game_winner",
+        "KXMLBGAME-26JUL011900SEAPIT",
+    ) == [
+        "KXMLBGAME-26JUL011900SEAPIT-SEA",
+        "KXMLBGAME-26JUL011900SEAPIT-PIT",
+    ]
+    assert market_family_discovery._direct_market_ticker_candidates(
+        game,
+        "first_five_winner",
+        "KXMLBF5-26JUL011900SEAPIT",
+    ) == [
+        "KXMLBF5-26JUL011900SEAPIT-SEA",
+        "KXMLBF5-26JUL011900SEAPIT-PIT",
+        "KXMLBF5-26JUL011900SEAPIT-TIE",
+    ]
+    assert market_family_discovery._direct_market_ticker_candidates(
+        game,
+        "full_game_spread",
+        "KXMLBSPREAD-26JUL011900SEAPIT",
+    ) == []
 
 
 def test_market_family_discovery_first_five_winner_can_represent_tie() -> None:
