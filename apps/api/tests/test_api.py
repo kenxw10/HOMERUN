@@ -3274,6 +3274,17 @@ def test_market_family_discovery_parses_total_ticker_tail_as_positive_line() -> 
     ) == Decimal("4.5000")
 
 
+def test_market_family_discovery_prefers_total_side_from_ticker_before_text() -> None:
+    payload = {
+        "ticker": "KXMLBTOTAL-26JUL011900SEAPIT-UNDER-8",
+        "title": "Total runs market",
+        "no_sub_title": "No wins if the game goes over 8 runs",
+        "rules_primary": "Over 8 is the opposite side of this contract.",
+    }
+
+    assert market_family_discovery._over_under_side(payload) == "under"
+
+
 def test_market_family_discovery_skips_event_filter_for_exact_found_family() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
