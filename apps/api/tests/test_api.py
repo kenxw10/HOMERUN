@@ -2880,7 +2880,7 @@ def test_pr3c_trade_policy_caps_slate_trades(monkeypatch) -> None:
     Base.metadata.create_all(engine)
 
     try:
-        with Session(engine) as session:
+        with Session(engine, autoflush=False) as session:
             for index in range(5):
                 game = MlbGame(
                     external_game_id=f"cap-game-{index}",
@@ -2896,7 +2896,7 @@ def test_pr3c_trade_policy_caps_slate_trades(monkeypatch) -> None:
                     ticker=f"KXMLBGAME-CAP-{index}-H{index}",
                     title="Cheap home winner",
                     status="open",
-                    implied_yes_ask=Decimal("0.0000"),
+                    implied_yes_ask=Decimal("0.1000"),
                 )
                 session.add_all([game, market])
                 session.flush()
@@ -2907,6 +2907,7 @@ def test_pr3c_trade_policy_caps_slate_trades(monkeypatch) -> None:
             trades = list(session.scalars(select(PaperTrade)))
             prediction_run = session.scalar(select(ModelPredictionRun))
             outputs = list(session.scalars(select(ModelPredictionOutput).order_by(ModelPredictionOutput.id.asc())))
+            snapshot = session.get(BalanceSnapshot, result["snapshot_id"])
     finally:
         get_settings.cache_clear()
 
@@ -2914,6 +2915,9 @@ def test_pr3c_trade_policy_caps_slate_trades(monkeypatch) -> None:
     assert len(trades) == 2
     assert prediction_run is not None
     assert prediction_run.trade_policy["paper_max_trades_per_slate"] == 2
+    assert snapshot is not None
+    assert snapshot.cash_balance == Decimal("999.80")
+    assert snapshot.portfolio_value == Decimal("1000.00")
     assert result["cap_counts"]["no_trade_slate_cap"] == 3
     assert result["decision_counts"] == {"paper_trade": 2, "no_trade_slate_cap": 3}
     assert prediction_run.summary["decision_counts"] == {"paper_trade": 2, "no_trade_slate_cap": 3}
@@ -4529,6 +4533,71 @@ def test_open_position_price_refresh_falls_back_to_orderbook_when_batch_quote_mi
     assert result["request_counters"]["market_batch_requests"] == 1
     assert result["request_counters"]["orderbook_requests"] == 1
     assert open_trade.current_price == Decimal("0.4700")
+
+
+def test_open_position_price_refresh_complements_last_price_for_no_side_batch_mark() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    class FakeLastPriceClient:
+        request_count = 0
+        rate_limited_count = 0
+
+        def get_markets_by_tickers(self, tickers: list[str]):
+            self.request_count += 1
+            return {
+                "markets": [
+                    {
+                        "ticker": "KXMLBGAME-26JUL011900SEAPIT-PIT",
+                        "id": "KX-REFRESH-NO-LAST",
+                        "title": "Will Pittsburgh win?",
+                        "last_price_dollars": "0.7000",
+                    }
+                ]
+            }
+
+        def get_orderbook(self, ticker: str):
+            raise AssertionError("last price complement should avoid orderbook fallback")
+
+    with Session(engine) as session:
+        market = KalshiMarket(
+            kalshi_market_id="KX-REFRESH-NO-LAST",
+            ticker="KXMLBGAME-26JUL011900SEAPIT-PIT",
+            title="Will Pittsburgh win?",
+            status="open",
+        )
+        session.add(market)
+        session.flush()
+        candidate = ModelCandidate(
+            kalshi_market_id=market.id,
+            evaluated_at=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
+            features={},
+            decision="paper_trade",
+            market_type="full_game_winner",
+        )
+        session.add(candidate)
+        session.flush()
+        open_trade = PaperTrade(
+            candidate_id=candidate.id,
+            market_ticker=market.ticker,
+            contract_side="no",
+            entry_price=Decimal("0.4000"),
+            current_price=Decimal("0.4000"),
+            quantity=1,
+            entry_time=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
+            status="open",
+        )
+        session.add(open_trade)
+        session.commit()
+
+        result = position_refresh.refresh_open_position_prices(session, client=FakeLastPriceClient())
+        session.refresh(open_trade)
+
+    assert result["checked"] == 1
+    assert result["updated"] == 1
+    assert result["request_counters"]["market_batch_requests"] == 1
+    assert result["request_counters"]["orderbook_requests"] == 0
+    assert open_trade.current_price == Decimal("0.3000")
 
 
 def test_open_position_price_refresh_does_not_stamp_cached_prices_on_orderbook_error() -> None:

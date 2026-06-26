@@ -35,9 +35,13 @@ def _mark_from_market(market: KalshiMarket | None, trade: PaperTrade) -> Decimal
             if value is not None:
                 return value
     else:
-        for value in (market.best_no_bid, market.no_bid, market.last_price):
+        for value in (market.best_no_bid, market.no_bid):
             if value is not None:
                 return value
+        if market.last_price is not None:
+            complement = Decimal("1.0000") - market.last_price
+            if complement >= Decimal("0"):
+                return complement
     return None
 
 

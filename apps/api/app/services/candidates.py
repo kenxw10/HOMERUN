@@ -472,6 +472,7 @@ def generate_candidates(session: Session) -> dict[str, object]:
             )
 
     selected_trades, cap_counts = _apply_trade_caps(session, trade_intents, day_start, day_end)
+    session.flush()
     for intent in trade_intents:
         output = session.scalar(
             select(ModelPredictionOutput)
@@ -534,6 +535,7 @@ def generate_candidates(session: Session) -> dict[str, object]:
             session.add(output)
         paper_trades += 1
 
+    session.flush()
     decision_counts: dict[str, int] = {}
     for candidate in evaluated_candidates:
         decision = candidate.decision or "unknown"
