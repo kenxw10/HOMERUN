@@ -84,6 +84,13 @@ class KalshiMarket(TimestampMixin, Base):
     close_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     occurrence_datetime: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     resolve_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    market_family: Mapped[str | None] = mapped_column(String(80))
+    market_type: Mapped[str | None] = mapped_column(String(80))
+    line_value: Mapped[Decimal | None] = mapped_column(Numeric(10, 4))
+    selection_code: Mapped[str | None] = mapped_column(String(40))
+    over_under_side: Mapped[str | None] = mapped_column(String(20))
+    inning_scope: Mapped[str | None] = mapped_column(String(40))
+    settlement_rule_status: Mapped[str | None] = mapped_column(String(80))
     raw_payload: Mapped[dict[str, object] | None] = mapped_column(JSON)
     orderbook_raw: Mapped[dict[str, object] | None] = mapped_column(JSON)
 
@@ -100,6 +107,13 @@ class MarketMapping(TimestampMixin, Base):
     rationale: Mapped[str | None] = mapped_column(Text)
     resolver_strategy: Mapped[str | None] = mapped_column(String(80))
     validation_status: Mapped[str | None] = mapped_column(String(80))
+    market_family: Mapped[str | None] = mapped_column(String(80))
+    market_type: Mapped[str | None] = mapped_column(String(80))
+    line_value: Mapped[Decimal | None] = mapped_column(Numeric(10, 4))
+    selection_code: Mapped[str | None] = mapped_column(String(40))
+    over_under_side: Mapped[str | None] = mapped_column(String(20))
+    inning_scope: Mapped[str | None] = mapped_column(String(40))
+    settlement_rule_status: Mapped[str | None] = mapped_column(String(80))
     mapping_metadata: Mapped[dict[str, object] | None] = mapped_column(JSON)
 
 
@@ -150,6 +164,14 @@ class ModelCandidate(TimestampMixin, Base):
     selection_display: Mapped[str | None] = mapped_column(String(40))
     matchup_display: Mapped[str | None] = mapped_column(String(80))
     contract_display: Mapped[str | None] = mapped_column(Text)
+    feature_version: Mapped[str | None] = mapped_column(String(80))
+    training_eligible: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    market_family: Mapped[str | None] = mapped_column(String(80))
+    line_value: Mapped[Decimal | None] = mapped_column(Numeric(10, 4))
+    selection_code: Mapped[str | None] = mapped_column(String(40))
+    over_under_side: Mapped[str | None] = mapped_column(String(20))
+    inning_scope: Mapped[str | None] = mapped_column(String(40))
+    settlement_rule_status: Mapped[str | None] = mapped_column(String(80))
 
 
 class PaperTrade(TimestampMixin, Base):
@@ -177,6 +199,13 @@ class PaperTrade(TimestampMixin, Base):
     selection_display: Mapped[str | None] = mapped_column(String(40))
     matchup_display: Mapped[str | None] = mapped_column(String(80))
     contract_display: Mapped[str | None] = mapped_column(Text)
+    market_family: Mapped[str | None] = mapped_column(String(80))
+    line_value: Mapped[Decimal | None] = mapped_column(Numeric(10, 4))
+    selection_code: Mapped[str | None] = mapped_column(String(40))
+    over_under_side: Mapped[str | None] = mapped_column(String(20))
+    inning_scope: Mapped[str | None] = mapped_column(String(40))
+    settlement_rule_status: Mapped[str | None] = mapped_column(String(80))
+    training_eligible: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
 
 class Order(TimestampMixin, Base):

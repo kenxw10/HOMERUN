@@ -10,7 +10,7 @@ The user wants the system to become as hands-off as possible. Calibration, thres
 
 ## 2. Current Scope
 
-PR 3a builds on the merged PR 3 paper-results workflow:
+PR 3b builds on the merged PR 3a discovery and operator-repair workflow:
 
 - FastAPI backend in `apps/api`.
 - Next.js TypeScript frontend in `apps/web`.
@@ -21,20 +21,20 @@ PR 3a builds on the merged PR 3 paper-results workflow:
 - Auditable MLB game to Kalshi market mapping with confidence and rationale.
 - Conservative paper candidate and paper-trade generation using a transparent heuristic probability model.
 - MLB results sync for completed games.
-- Paper full-game winner settlement and realized P/L tracking.
+- Paper settlement and realized P/L tracking for validated supported MLB market families.
 - Paper balance snapshots from starting balance, open cost, realized P/L, and open mark value.
 - Feature snapshot storage for model candidates with explicit missing-source markers.
 - Automated model governance runs that skip training/promotion until sample thresholds are met.
 - PR3a governance repair that normalizes resolved `KXMLBGAME` candidates to `full_game_winner` before counting samples.
-- Discovery-only Kalshi MLB market-family audit runs for spread, total, and first-five families.
+- Kalshi MLB market-family discovery plus mapping sync for validated spread, total, and first-five families.
 - REST last-mark refresh for open paper positions.
 - Database-backed dashboard API responses when data exists.
-- Light-theme trading-terminal dashboard that renders portfolio snapshots, chart range/P&L controls, paper metrics, open positions, game status, last mark time, model status, and system status.
+- Light-theme trading-terminal dashboard that renders portfolio snapshots, chart range/P&L controls, paper metrics, open positions, closed positions by selected date, game status, last mark time, model status, and system status.
 - Railway backend and PostgreSQL setup documentation.
 - Vercel frontend setup documentation.
 - CI scaffolding for backend tests and frontend checks.
 
-The system still has no live trading, no production credentials requirement, no sportsbook logic, and no support for spreads, totals, or first-five markets.
+The system still has no live trading, no production credentials requirement, no sportsbook logic, and no support for team totals, multivariate/MVE markets, guessed/retired prefixes, or live execution. Non-winner market families are paper-only and require validated `paper_supported` mapping metadata.
 
 ## 3. Non-Goals
 
@@ -80,8 +80,10 @@ It also exposes controlled internal run endpoints:
 - `POST /v1/run/model-governance`
 - `POST /v1/run/open-position-price-refresh`
 - `POST /v1/run/market-family-discovery?target_date=YYYY-MM-DD`
+- `POST /v1/sync/market-family-mappings?target_date=YYYY-MM-DD`
 - `GET /v1/market-families/discovery?date=YYYY-MM-DD`
 - `GET /v1/market-families/discovery-preview?date=YYYY-MM-DD`
+- `GET /v1/market-families/mappings?date=YYYY-MM-DD`
 - `GET /v1/kalshi/resolve-preview?date=YYYY-MM-DD`
 
 The database layer is PostgreSQL-ready but the API can still boot locally without a database for frontend and health-check work.
@@ -151,7 +153,7 @@ Required operator views:
 - ROI.
 - Profit and loss.
 - Record.
-- Contracts or positions table.
+- Open and closed positions tables.
 - Entry price, current price, quantity, status, and resolution state.
 - Model status panel.
 - System status panel.
@@ -276,7 +278,38 @@ Expected next PR scope:
 - PR3b should review PR3a discovery reports and wire only proven reliable market families into mapping/candidate/settlement/model logic.
 - A later operator PR can add scheduled runs after the one-shot jobs are validated in production.
 
-## 15. PR Change Log
+## 15. PR3b Validated Market-Family Paper Wiring
+
+PR 3b wires validated discovery outputs into paper-only candidate generation and settlement:
+
+- Migration `0006_pr3b_family_wiring.py` adds market-family metadata to `kalshi_markets`, `market_mappings`, `model_candidates`, and `paper_trades`.
+- `app.jobs.market_family_mapping_sync` and protected `POST /v1/sync/market-family-mappings?target_date=YYYY-MM-DD` consume the latest finalized market-family discovery run and normalize only supported rows.
+- Supported paper families are `full_game_winner`, `full_game_spread`, `full_game_total`, `first_five_winner`, `first_five_spread`, and `first_five_total`.
+- `KXMLBTEAMTOTAL`, guessed/retired prefixes, MVE/multivariate markets, and sportsbook concepts remain unsupported.
+- Mapping sync marks rows `paper_supported` only when family, line/selection, inning scope, and settlement rule are clear. Otherwise rows remain `needs_review` or unsupported.
+- Candidate generation no longer runs legacy heuristic market remapping first. It consumes explicit mappings, keeps existing resolver-confirmed mappings stable, and creates candidates for paper-supported families.
+- Full-game winner candidates continue to use `heuristic_full_game_winner_v1` and remain training eligible.
+- Newly wired non-winner families use `baseline_market_family_wire_v1`, feature tag `market_family_wire_v1_pre_full_model`, placeholder probability `0.50`, and `training_eligible=false` until a real model is built.
+- Paper trades still require safe paper posture, non-live execution, an open/active market, an executable YES ask, and positive EV over the temporary threshold.
+- Settlement supports full-game winner, full-game spread, full-game total, first-five winner including `TIE`, first-five spread, and first-five total. Spread/total pushes are handled explicitly.
+- First-five settlement requires MLB linescore innings; missing linescore rows are skipped and left open rather than force-settled.
+- `/v1/dashboard/summary?closed_date=YYYY-MM-DD` returns `closed_positions`, `closed_positions_date`, and `closed_positions_count`.
+- The frontend dashboard shows a closed positions table below open positions with `PREVIOUS`, `TODAY`, `TOMORROW`, and compact date-picker controls.
+
+PR 3b safety posture:
+
+- Still no live orders.
+- Still no production Kalshi credential requirement.
+- Still no cron, admin page, monthly calendar, sportsbook integration, or team-total trading.
+- New family trades are paper-only baseline plumbing and should not be treated as mature model training samples.
+
+Expected next PR scope:
+
+- Replace placeholder non-winner probabilities with measured family-specific models or calibrated heuristics.
+- Add fee-aware EV after current Kalshi fee terms are verified.
+- Add scheduler/automation only after the manual one-shot flow is production validated.
+
+## 16. PR Change Log
 
 Every future PR must update this section with:
 
@@ -364,3 +397,15 @@ Every future PR must update this section with:
 - No schema migration, safety posture change, live execution, sportsbook logic, team totals, admin page, calendar, or new family trade enablement was added.
 - Validation performed: backend `tests/test_api.py` passed locally with 78 tests; final PR validation should also run Ruff, compileall, and diff checks.
 - Expected next PR scope remains PR3b: review production discovery reports from this stable flow and wire only validated non-winner families into mapping, candidates, settlement, and model logic.
+
+### PR 3b - Validated MLB Market-Family Paper Wiring
+
+- Added migration `0006_pr3b_family_wiring.py` for market-family metadata on Kalshi markets, mappings, model candidates, and paper trades.
+- Added `app.jobs.market_family_mapping_sync`, protected `POST /v1/sync/market-family-mappings`, and protected `GET /v1/market-families/mappings`.
+- Wired validated discovery rows for full-game winner, full-game spread, full-game total, first-five winner, first-five spread, and first-five total into mapping, candidate generation, paper trades, settlement, and dashboard summaries.
+- Kept team totals, MVE/multivariate markets, sportsbook data, guessed prefixes, retired prefixes, live execution, cron, admin pages, and monthly calendars out of scope.
+- Tagged newly wired non-winner family candidates as `baseline_market_family_wire_v1`, `market_family_wire_v1_pre_full_model`, and `training_eligible=false`.
+- Extended paper settlement for spread/total push handling and first-five winner/spread/total settlement with missing-linescore skips.
+- Added `/v1/dashboard/summary?closed_date=YYYY-MM-DD` closed-position rows and a frontend closed positions table with previous/today/tomorrow/date controls.
+- Kept paper-first safety posture unchanged: no live orders, live trading disabled, kill switch enabled, no production credential requirement.
+- Validation performed: backend Ruff, backend pytest, backend compileall, frontend lint, frontend typecheck, frontend build, and `git diff --check`.

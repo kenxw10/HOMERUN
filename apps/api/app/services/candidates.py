@@ -8,14 +8,23 @@ from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.models import FeatureSnapshot, KalshiMarket, MarketMapping, MlbGame, ModelCandidate, PaperTrade
-from app.services.contracts import SUPPORTED_MARKET_FAMILY, contract_labels, has_trusted_selection, market_type_from_ticker
+from app.services.contracts import (
+    FULL_GAME_WINNER,
+    PAPER_SUPPORTED_MARKET_FAMILIES,
+    contract_labels,
+    game_team_codes,
+    has_trusted_selection,
+    market_type_from_ticker,
+)
 from app.services.features import FEATURE_VERSION, build_feature_snapshot
-from app.services.mapping import infer_market_type, sync_market_mappings
+from app.services.mapping import infer_market_type
 from app.services.modeling import get_or_create_heuristic_model_version, score_candidate_probability
 from app.services.portfolio import create_balance_snapshot
 from app.time_utils import classify_time_bucket, ensure_aware_utc, get_dashboard_zone, utc_now
 
 TEMPORARY_EDGE_THRESHOLD = Decimal("0.0500")
+PR3B_FEATURE_VERSION = "market_family_wire_v1_pre_full_model"
+PR3B_MODEL_VERSION_TAG = "baseline_market_family_wire_v1"
 ACTIVE_SLATE_LOOKAHEAD = timedelta(days=21)
 TRADABLE_MARKET_STATUSES = {"active", "open"}
 PLAYABLE_GAME_STATUSES = {"pre-game", "preview", "scheduled", "warmup"}
@@ -76,6 +85,13 @@ def _open_trade_for_market(session: Session, market_ticker: str, contract_side: 
     )
 
 
+def _has_trusted_candidate_selection(mapping: MarketMapping, game: MlbGame, market: KalshiMarket) -> bool:
+    if has_trusted_selection(game, market.ticker):
+        return True
+    selection = (mapping.selection_code or market.selection_code or "").upper()
+    return selection in game_team_codes(game)
+
+
 def _decision(
     mapping: MarketMapping,
     game: MlbGame,
@@ -88,8 +104,13 @@ def _decision(
     settings = get_settings()
     if mapping.mapping_status == "needs_review" or (mapping.confidence or Decimal("0")) < Decimal("0.55"):
         return "no_trade_mapping_uncertain"
-    if market_type != SUPPORTED_MARKET_FAMILY:
-        return "no_trade_unsupported_market_type"
+    if market_type not in PAPER_SUPPORTED_MARKET_FAMILIES:
+        return "no_trade_unsupported_family"
+    settlement_status = mapping.settlement_rule_status or market.settlement_rule_status
+    if market_type != FULL_GAME_WINNER and settlement_status != "paper_supported":
+        if mapping.line_value is None and market.line_value is None and market_type.endswith(("spread", "total")):
+            return "no_trade_missing_line"
+        return "no_trade_parse_uncertain"
     if minutes_to_start <= 0:
         return "no_trade_game_started"
     if price is None:
@@ -100,7 +121,10 @@ def _decision(
         return "no_trade_edge_too_low"
     if not settings.paper_candidate_engine_enabled:
         return "candidate_only"
-    if settings.safe_execution_posture and not has_trusted_selection(game, market.ticker):
+    selection_required = market_type in {FULL_GAME_WINNER, "full_game_spread", "first_five_winner", "first_five_spread"}
+    if settings.safe_execution_posture and selection_required and not _has_trusted_candidate_selection(mapping, game, market):
+        if market_type == "first_five_winner" and (mapping.selection_code or market.selection_code) == "TIE":
+            return "paper_trade"
         return "no_trade_untrusted_selection"
     if settings.safe_execution_posture:
         return "paper_trade"
@@ -108,7 +132,6 @@ def _decision(
 
 
 def generate_candidates(session: Session) -> dict[str, int]:
-    sync_market_mappings(session)
     settings = get_settings()
     now = utc_now()
     day, day_start, day_end = _candidate_day_bounds(now)
@@ -129,25 +152,43 @@ def generate_candidates(session: Session) -> dict[str, int]:
     for mapping, game, market in mappings:
         minutes_to_start = int((ensure_aware_utc(game.scheduled_start) - now).total_seconds() / 60)
         bucket = classify_time_bucket(minutes_to_start)
-        market_type = market_type_from_ticker(market.ticker, infer_market_type(_market_classification_text(market)))
+        market_type = (
+            mapping.market_type
+            or market.market_type
+            or market_type_from_ticker(market.ticker, infer_market_type(_market_classification_text(market)))
+        )
         price = _market_yes_price(market)
         contract_side = "yes"
         features = build_feature_snapshot(game, market, mapping)
-        labels = contract_labels(game=game, market=market, market_ticker=market.ticker, market_type=market_type)
-        if market_type == SUPPORTED_MARKET_FAMILY:
+        labels = contract_labels(
+            game=game,
+            market=market,
+            market_ticker=market.ticker,
+            market_type=market_type,
+            selection_code=mapping.selection_code or market.selection_code,
+        )
+        if market_type == FULL_GAME_WINNER:
             model_score = score_candidate_probability(features, contract_side)
             probability = model_score.probability
             fair_value = model_score.fair_value
             scoring_rationale = model_score.rationale
+            model_version_tag = model_version.version_tag
+            feature_version = FEATURE_VERSION
+            training_eligible = True
         else:
             probability = Decimal("0.500000")
             fair_value = Decimal("0.5000")
             scoring_rationale = {
-                "model_version": model_version.version_tag,
-                "feature_version": FEATURE_VERSION,
-                "reason": "unsupported_market_family",
+                "model_version": PR3B_MODEL_VERSION_TAG,
+                "feature_version": PR3B_FEATURE_VERSION,
+                "model_family": market_type,
+                "reason": "pr3b_market_family_plumbing_baseline",
                 "uses_market_price": False,
+                "base_probability": 0.5,
             }
+            model_version_tag = PR3B_MODEL_VERSION_TAG
+            feature_version = PR3B_FEATURE_VERSION
+            training_eligible = False
         gross_ev = (probability - price).quantize(Decimal("0.000001")) if price is not None else None
         fee = Decimal("0.000000")
         net_ev = (gross_ev - fee).quantize(Decimal("0.000001")) if gross_ev is not None else None
@@ -183,6 +224,24 @@ def generate_candidates(session: Session) -> dict[str, int]:
             open_trade_for_market.selection_display = open_trade_for_market.selection_display or labels.selection_display
             open_trade_for_market.matchup_display = open_trade_for_market.matchup_display or labels.matchup_display
             open_trade_for_market.contract_display = open_trade_for_market.contract_display or labels.contract_display
+            open_trade_for_market.market_family = open_trade_for_market.market_family or mapping.market_family or market.market_family
+            open_trade_for_market.line_value = (
+                open_trade_for_market.line_value
+                if open_trade_for_market.line_value is not None
+                else mapping.line_value if mapping.line_value is not None else market.line_value
+            )
+            open_trade_for_market.selection_code = (
+                open_trade_for_market.selection_code or mapping.selection_code or market.selection_code
+            )
+            open_trade_for_market.over_under_side = (
+                open_trade_for_market.over_under_side or mapping.over_under_side or market.over_under_side
+            )
+            open_trade_for_market.inning_scope = open_trade_for_market.inning_scope or mapping.inning_scope or market.inning_scope
+            open_trade_for_market.settlement_rule_status = (
+                open_trade_for_market.settlement_rule_status
+                or mapping.settlement_rule_status
+                or market.settlement_rule_status
+            )
             session.add(open_trade_for_market)
         if (traded_candidate_ids or open_trade_for_market is not None) and decision == "paper_trade":
             decision = "candidate_only_existing_trade"
@@ -202,12 +261,20 @@ def generate_candidates(session: Session) -> dict[str, int]:
         candidate.time_to_start_minutes = minutes_to_start
         candidate.contract_side = contract_side
         candidate.decision = decision
-        candidate.model_version_tag = model_version.version_tag
+        candidate.model_version_tag = model_version_tag
+        candidate.feature_version = feature_version
+        candidate.training_eligible = training_eligible
         candidate.scoring_rationale = scoring_rationale
         candidate.market_display = labels.market_display
         candidate.selection_display = labels.selection_display
         candidate.matchup_display = labels.matchup_display
         candidate.contract_display = labels.contract_display
+        candidate.market_family = mapping.market_family or market.market_family or market_type
+        candidate.line_value = mapping.line_value if mapping.line_value is not None else market.line_value
+        candidate.selection_code = mapping.selection_code or market.selection_code
+        candidate.over_under_side = mapping.over_under_side or market.over_under_side
+        candidate.inning_scope = mapping.inning_scope or market.inning_scope
+        candidate.settlement_rule_status = mapping.settlement_rule_status or market.settlement_rule_status
         session.add(candidate)
         session.flush()
         session.add(
@@ -215,7 +282,7 @@ def generate_candidates(session: Session) -> dict[str, int]:
                 candidate_id=candidate.id,
                 captured_at=now,
                 features=features,
-                source=FEATURE_VERSION,
+                source=feature_version,
             )
         )
         created_or_updated += 1
@@ -237,6 +304,13 @@ def generate_candidates(session: Session) -> dict[str, int]:
                     selection_display=labels.selection_display,
                     matchup_display=labels.matchup_display,
                     contract_display=labels.contract_display,
+                    market_family=candidate.market_family,
+                    line_value=candidate.line_value,
+                    selection_code=candidate.selection_code,
+                    over_under_side=candidate.over_under_side,
+                    inning_scope=candidate.inning_scope,
+                    settlement_rule_status=candidate.settlement_rule_status,
+                    training_eligible=training_eligible,
                 )
                 session.add(trade)
                 session.flush()

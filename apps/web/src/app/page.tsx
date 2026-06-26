@@ -17,6 +17,8 @@ type PerformanceMetrics = {
 type PositionSummary = {
   time_entered: string | null;
   time_entered_display: string | null;
+  time_closed: string | null;
+  time_closed_display: string | null;
   market: string;
   market_ticker: string | null;
   market_display: string | null;
@@ -25,6 +27,7 @@ type PositionSummary = {
   contract_display: string | null;
   side: "yes" | "no";
   entry_price: number;
+  exit_price: number | null;
   current_price: number | null;
   current_price_updated_at: string | null;
   current_price_updated_at_display: string | null;
@@ -35,12 +38,16 @@ type PositionSummary = {
   game_status: string | null;
   game_status_display: string | null;
   resolution: string | null;
+  outcome: string | null;
 };
 
 type DashboardSummary = {
   portfolio_series: PortfolioPoint[];
   performance: PerformanceMetrics;
   positions: PositionSummary[];
+  closed_positions: PositionSummary[];
+  closed_positions_date: string | null;
+  closed_positions_count: number;
   cash_balance: number | null;
   portfolio_value: number | null;
   paper_starting_balance: number | null;
@@ -80,6 +87,8 @@ type SystemStatus = {
     live_trading_enabled: boolean;
     execution_kill_switch: boolean;
     kalshi_env: string;
+    kalshi_market_data_source: string;
+    kalshi_market_data_base_kind: string;
     kalshi_credentials: "not_set" | "set_redacted";
   };
 };
@@ -118,6 +127,9 @@ const emptySummary: DashboardSummary = {
     record: "0-0-0",
   },
   positions: [],
+  closed_positions: [],
+  closed_positions_date: null,
+  closed_positions_count: 0,
   cash_balance: null,
   portfolio_value: null,
   paper_starting_balance: 1000,
@@ -220,6 +232,41 @@ function formatEastern(value: string | null | undefined): string {
     minute: "2-digit",
     timeZoneName: "short",
   }).format(date);
+}
+
+function easternDateString(date: Date = new Date()): string {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/New_York",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(date);
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${values.year}-${values.month}-${values.day}`;
+}
+
+function shiftDate(value: string, days: number): string {
+  const date = new Date(`${value}T12:00:00Z`);
+  date.setUTCDate(date.getUTCDate() + days);
+  return date.toISOString().slice(0, 10);
+}
+
+function formatDateButton(value: string | null | undefined): string {
+  if (!value) {
+    return "SELECT DATE";
+  }
+  const date = new Date(`${value}T12:00:00Z`);
+  if (Number.isNaN(date.getTime())) {
+    return value.toUpperCase();
+  }
+  return new Intl.DateTimeFormat("en-US", {
+    timeZone: "UTC",
+    month: "short",
+    day: "2-digit",
+    year: "numeric",
+  })
+    .format(date)
+    .toUpperCase();
 }
 
 function pctClass(value: number | null | undefined): string {
@@ -545,6 +592,103 @@ function PositionsTable({ positions }: { positions: PositionSummary[] }) {
   );
 }
 
+function ClosedPositionsTable({
+  positions,
+  selectedDate,
+  onSelectedDateChange,
+}: {
+  positions: PositionSummary[];
+  selectedDate: string;
+  onSelectedDateChange: (value: string) => void;
+}) {
+  const [pickerOpen, setPickerOpen] = useState(false);
+  return (
+    <section className="panel positions-panel">
+      <div className="panel-heading positions-heading">
+        <h2>CLOSED POSITIONS</h2>
+        <div className="closed-position-controls">
+          <button type="button" onClick={() => onSelectedDateChange(shiftDate(selectedDate, -1))}>
+            PREVIOUS
+          </button>
+          <button type="button" onClick={() => onSelectedDateChange(easternDateString())}>
+            TODAY
+          </button>
+          <button type="button" onClick={() => onSelectedDateChange(shiftDate(selectedDate, 1))}>
+            TOMORROW
+          </button>
+          <button type="button" onClick={() => setPickerOpen((open) => !open)}>
+            {formatDateButton(selectedDate)}
+          </button>
+          <span>{positions.length} CLOSED POSITIONS</span>
+          {pickerOpen ? (
+            <input
+              aria-label="Closed positions date"
+              type="date"
+              value={selectedDate}
+              onChange={(event) => {
+                onSelectedDateChange(event.target.value);
+                setPickerOpen(false);
+              }}
+            />
+          ) : null}
+        </div>
+      </div>
+      <div className="terminal-table-wrap">
+        <table className="terminal-table">
+          <thead>
+            <tr>
+              <th>TIME ENTERED (EDT/EST)</th>
+              <th>TIME CLOSED (EDT/EST)</th>
+              <th>MARKET</th>
+              <th>SIDE</th>
+              <th>ENTRY PRICE</th>
+              <th>EXIT PRICE</th>
+              <th>QTY</th>
+              <th>P/L ($)</th>
+              <th>P/L (%)</th>
+              <th>GAME STATUS</th>
+              <th>STATUS</th>
+              <th>RESOLUTION</th>
+            </tr>
+          </thead>
+          <tbody>
+            {positions.length === 0 ? (
+              <tr>
+                <td colSpan={12} className="table-empty">
+                  <b>NO CLOSED POSITIONS FOR SELECTED DATE</b>
+                  <span>{formatDateButton(selectedDate)}</span>
+                </td>
+              </tr>
+            ) : (
+              positions.map((position) => (
+                <tr key={`${position.market}-${position.side}-${position.time_entered}-${position.time_closed}`}>
+                  <td>{position.time_entered_display ?? formatEastern(position.time_entered)}</td>
+                  <td>{position.time_closed_display ?? formatEastern(position.time_closed)}</td>
+                  <td>
+                    <span className="market-primary">{position.contract_display ?? position.market}</span>
+                    <span className="market-secondary" title={position.market_ticker ?? position.market}>
+                      {position.market_ticker ?? position.market}
+                    </span>
+                  </td>
+                  <td>{position.side.toUpperCase()}</td>
+                  <td>{formatPrice(position.entry_price)}</td>
+                  <td>{formatPrice(position.exit_price)}</td>
+                  <td>{position.quantity}</td>
+                  <td className={pctClass(position.profit_loss)}>{formatSignedCurrency(position.profit_loss)}</td>
+                  <td className={pctClass(position.profit_loss_percent)}>{formatPercent(position.profit_loss_percent)}</td>
+                  <td>{position.game_status_display ?? position.game_status ?? "UNKNOWN"}</td>
+                  <td>{position.status}</td>
+                  <td>{position.resolution ?? position.outcome ?? "PENDING"}</td>
+                </tr>
+              ))
+            )}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  );
+}
+
 function StatusTable({
   title,
   rows,
@@ -575,12 +719,13 @@ function StatusTable({
 export default function DashboardPage() {
   const apiBaseUrl = useMemo(() => getApiBaseUrl(), []);
   const refreshMs = useMemo(() => getRefreshMs(), []);
+  const [selectedClosedDate, setSelectedClosedDate] = useState<string>(() => easternDateString());
   const [state, setState] = useState<DashboardState>({ status: "loading" });
 
   const loadDashboard = useCallback(async () => {
     try {
       const [summary, system] = await Promise.all([
-        fetchJson<DashboardSummary>(`${apiBaseUrl}/v1/dashboard/summary`),
+        fetchJson<DashboardSummary>(`${apiBaseUrl}/v1/dashboard/summary?closed_date=${selectedClosedDate}`),
         fetchJson<SystemStatus>(`${apiBaseUrl}/v1/system/status`),
       ]);
       setState({ status: "ready", summary, system });
@@ -593,7 +738,7 @@ export default function DashboardPage() {
         system: previous.status === "loading" ? null : previous.system,
       }));
     }
-  }, [apiBaseUrl]);
+  }, [apiBaseUrl, selectedClosedDate]);
 
   useEffect(() => {
     loadDashboard();
@@ -650,6 +795,11 @@ export default function DashboardPage() {
       </section>
 
       <PositionsTable positions={summary.positions} />
+      <ClosedPositionsTable
+        positions={summary.closed_positions}
+        selectedDate={summary.closed_positions_date ?? selectedClosedDate}
+        onSelectedDateChange={setSelectedClosedDate}
+      />
 
       <section className="status-grid">
         <StatusTable title="MODEL STATUS" rows={modelRows} note={summary.model_status.notes} />
@@ -658,7 +808,7 @@ export default function DashboardPage() {
 
       <footer className="terminal-footer">
         <span>ALL TIMES DISPLAYED IN EDT/EST</span>
-        <span>HOMERUN V0.3.0 | PR3 PAPER RESULTS</span>
+        <span>HOMERUN V0.3.1 | PR3B MARKET FAMILY WIRING</span>
       </footer>
     </main>
   );

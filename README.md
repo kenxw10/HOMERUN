@@ -1,6 +1,6 @@
 # HOMERUN
 
-HOMERUN is a Kalshi-native MLB paper-trading system and dashboard. The current version includes the deployable PR 1 foundation, PR 2 data layer, PR 2.5 targeted Kalshi MLB resolver, PR 3 paper results/model infrastructure, and PR 3a discovery/operator repairs: MLB slate/results ingestion, targeted Kalshi `KXMLBGAME` market resolution, auditable game-to-market mapping, conservative paper candidates, full-game winner paper settlement, market-family discovery audits, portfolio snapshots, and a light trading-terminal dashboard.
+HOMERUN is a Kalshi-native MLB paper-trading system and dashboard. The current version includes the deployable PR 1 foundation, PR 2 data layer, PR 2.5 targeted Kalshi MLB resolver, PR 3 paper results/model infrastructure, PR 3a discovery/operator repairs, and PR 3b validated market-family paper wiring: MLB slate/results ingestion, targeted Kalshi `KXMLBGAME` market resolution, auditable game-to-market mapping, conservative paper candidates, paper settlement for validated MLB market families, market-family discovery audits, portfolio snapshots, and a light trading-terminal dashboard.
 
 This is not a sportsbook app. It does not use DraftKings, FanDuel, Odds API, or sportsbook odds behavior. Future trading logic should use Kalshi yes/no contract math, account for fees, and assume hold-to-settlement unless a later PR changes that context deliberately.
 
@@ -20,7 +20,7 @@ This is not a sportsbook app. It does not use DraftKings, FanDuel, Odds API, or 
 - Kalshi credentials are optional for PR 3 paper-mode discovery and must not be production credentials unless a later PR explicitly changes the safety plan.
 - `BACKEND_API_KEY` is optional only for local development. Public or deployed backends must set it, and internal POST run endpoints require `X-API-Key`.
 - Broad Kalshi discovery is diagnostic-only and disabled by default with `KALSHI_ENABLE_BROAD_DISCOVERY=false`.
-- PR 3a market-family discovery is audit-only. It does not trade spreads, totals, or first-five markets.
+- PR 3b wires only validated MLB market-family rows into paper trading. Team totals, multivariate/MVE markets, sportsbook data, and guessed/retired prefixes remain out of scope.
 - Open-position current price is a REST last mark, not a WebSocket live price.
 - `PAPER_STARTING_BALANCE=1000.00` by default.
 - `MODEL_TRAINING_MIN_SAMPLES=100` prevents trained-model promotion on tiny samples.
@@ -62,6 +62,7 @@ From `apps/api` after installing backend dependencies:
 .\.venv\Scripts\python.exe -m app.jobs.balance_snapshot
 .\.venv\Scripts\python.exe -m app.jobs.model_governance
 .\.venv\Scripts\python.exe -m app.jobs.market_family_discovery
+.\.venv\Scripts\python.exe -m app.jobs.market_family_mapping_sync
 .\.venv\Scripts\python.exe -m app.jobs.open_position_price_refresh
 ```
 
@@ -72,6 +73,7 @@ You can pass a specific date to the MLB schedule job:
 .\.venv\Scripts\python.exe -m app.jobs.mlb_results_sync 2026-06-24
 .\.venv\Scripts\python.exe -m app.jobs.paper_settlement_sync 2026-06-24
 .\.venv\Scripts\python.exe -m app.jobs.market_family_discovery 2026-06-24
+.\.venv\Scripts\python.exe -m app.jobs.market_family_mapping_sync 2026-06-24
 ```
 
 PR 3 exposes these internal API run endpoints:
@@ -85,17 +87,21 @@ PR 3 exposes these internal API run endpoints:
 - `POST /v1/run/model-governance`
 - `POST /v1/run/open-position-price-refresh`
 - `POST /v1/run/market-family-discovery?target_date=YYYY-MM-DD`
+- `POST /v1/sync/market-family-mappings?target_date=YYYY-MM-DD`
 - `GET /v1/market-families/discovery?date=YYYY-MM-DD`
 - `GET /v1/market-families/discovery-preview?date=YYYY-MM-DD`
+- `GET /v1/market-families/mappings?date=YYYY-MM-DD`
 - `GET /v1/kalshi/resolve-preview?date=YYYY-MM-DD`
 
 For local development, these endpoints can run without a key when `APP_ENV=local` and `BACKEND_API_KEY` is empty. For any public or deployed backend, set `BACKEND_API_KEY` and call these endpoints with an `X-API-Key` header.
 
-`/v1/sync/kalshi-markets` now uses MLB games as its primary input and resolves the empirically observed `KXMLBGAME` full-game winner family first. Market sync, resolve preview, market-family discovery, and open-position mark refresh read from `KALSHI_MARKET_DATA_BASE_URL` by default without credentials. `KALSHI_REST_BASE_URL` and `KALSHI_ENV` remain the safe demo/execution context. Spread, total, and first-five families are still discovery-only and are not trade-enabled.
+`/v1/sync/kalshi-markets` now uses MLB games as its primary input and resolves the empirically observed `KXMLBGAME` full-game winner family first. Market sync, resolve preview, market-family discovery, and open-position mark refresh read from `KALSHI_MARKET_DATA_BASE_URL` by default without credentials. `KALSHI_REST_BASE_URL` and `KALSHI_ENV` remain the safe demo/execution context.
 
 PR3a fix3 market-family discovery uses low-request deterministic probes. It first batches exact scheduled-time ticker lookups with `GET /markets?tickers=...&mve_filter=exclude`, then optionally tries capped fallback time offsets for no-match families, then uses `event_ticker` filtering only as a secondary fallback. The discovery run summary reports request counts, batching savings, retry counts, rate-limit counts, and whether the 429 circuit breaker stopped remaining probes.
 
-Paper settlement currently supports only `full_game_winner`. It determines the selected team from the Kalshi ticker suffix, settles YES/NO contracts from final MLB scores, and uses hold-to-settlement P/L. Fees remain structured but zero until the exact Kalshi fee formula is implemented.
+PR3b adds `market_family_mapping_sync`, which consumes the latest finalized discovery run and promotes only parseable rows for `full_game_winner`, `full_game_spread`, `full_game_total`, `first_five_winner`, `first_five_spread`, and `first_five_total` to `paper_supported`. Rows with missing line/selection/settlement metadata stay `needs_review`; `KXMLBTEAMTOTAL`, MVE/multivariate, sportsbook, and guessed prefixes stay unsupported.
+
+Paper settlement supports full-game winner, full-game spread, full-game total, first-five winner, first-five spread, and first-five total when the row is `paper_supported`. First-five settlement requires MLB linescore innings; if missing, the trade stays open with a skipped reason. Fees remain structured but zero until the exact Kalshi fee formula is implemented.
 
 The PR 3 model pipeline uses `heuristic_full_game_winner_v1`, a deterministic paper-only model with explicit feature JSON and missing-source markers. PR 3a repairs governance sample counting so resolved `KXMLBGAME` candidates with older raw family names are normalized to `full_game_winner` before counting. Model governance still records skipped training/calibration runs until enough clean resolved candidates exist for chronological validation.
 
@@ -137,6 +143,8 @@ PR 3 adds migration `0004_pr3_results_model.py` for paper settlement fields, rea
 
 PR 3a adds migration `0005_pr3a_discovery.py` for market-family discovery audit tables and paper-trade current mark timestamps.
 
+PR 3b adds migration `0006_pr3b_family_wiring.py` for market-family metadata on markets, mappings, candidates, and paper trades.
+
 ## PR 3a Production Validation
 
 After deploy and migration:
@@ -159,12 +167,14 @@ Add these PR 3a checks after the PR 3 flow:
 ```powershell
 Invoke-RestMethod -Method Post -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-RAILWAY-API/v1/run/market-family-discovery?target_date=2026-06-26"
 Invoke-RestMethod -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-RAILWAY-API/v1/market-families/discovery?date=2026-06-26"
+Invoke-RestMethod -Method Post -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-RAILWAY-API/v1/sync/market-family-mappings?target_date=2026-06-26"
+Invoke-RestMethod -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-RAILWAY-API/v1/market-families/mappings?date=2026-06-26"
 Invoke-RestMethod -Method Post -Headers @{"X-API-Key"="YOUR_KEY"} https://YOUR-RAILWAY-API/v1/run/open-position-price-refresh
 ```
 
-Expected result: health and system status remain safe, `/v1/system/status` reports `config.kalshi_market_data_source: "production_public_market_data"` and `config.kalshi_market_data_base_kind: "production_public_market_data"` when the default public market-data URL is used, Alembic is at `0005_pr3a_discovery`, resolve preview keeps exact `KXMLBGAME` matches confirmed for paper, market-family discovery returns a structured `by_family` report without trade-enabling new families, open-position price refresh updates REST last marks for open paper positions only, the dashboard shows `GAME STATUS` and `LAST MARK TIME`, chart range/P&L controls work, and model governance reports resolved samples correctly after settled candidate outcomes exist.
+Expected result: health and system status remain safe, `/v1/system/status` reports `config.kalshi_market_data_source: "production_public_market_data"` and `config.kalshi_market_data_base_kind: "production_public_market_data"` when the default public market-data URL is used, Alembic is at `0006_pr3b_family_wiring`, resolve preview keeps exact `KXMLBGAME` matches confirmed for paper, market-family discovery returns a structured `by_family` report, mapping sync promotes only parseable validated rows to `paper_supported`, open-position price refresh updates REST last marks for open paper positions only, the dashboard shows `GAME STATUS`, `LAST MARK TIME`, closed positions by selected date, chart range/P&L controls work, and model governance reports resolved training-eligible full-game winner samples correctly after settled candidate outcomes exist.
 
-PR3a deterministic discovery validation: the registry contains `KXMLBGAME`, `KXMLBSPREAD`, `KXMLBTOTAL`, `KXMLBF5`, `KXMLBF5SPREAD`, and `KXMLBF5TOTAL`. Normal market-family discovery does not redundantly probe `KXMLBGAME`, because full-game winner is handled by targeted sync/resolve. It does not probe guessed legacy variants or `KXMLBTEAMTOTAL`. If candidate probes return 404/no-match responses, the discovery POST should still return structured JSON with status `completed` or `partial_error`. The report GET should return the latest finalized run, not a stale running row. `markets_found=0` and zero `market_family_discovery_items` are valid when no markets are found, but `market_family_discovery_runs.raw_summary` must include attempted ticker counts, no-match counts, probe details, request/rate-limit metrics, and any warnings/errors.
+PR3b deterministic discovery validation: the registry contains `KXMLBGAME`, `KXMLBSPREAD`, `KXMLBTOTAL`, `KXMLBF5`, `KXMLBF5SPREAD`, and `KXMLBF5TOTAL`. Normal market-family discovery does not redundantly probe `KXMLBGAME`, because full-game winner is handled by targeted sync/resolve. It does not probe guessed legacy variants or `KXMLBTEAMTOTAL`. If candidate probes return 404/no-match responses, the discovery POST should still return structured JSON with status `completed` or `partial_error`. The report GET should return the latest finalized run, not a stale running row. `markets_found=0` and zero `market_family_discovery_items` are valid when no markets are found, but `market_family_discovery_runs.raw_summary` must include attempted ticker counts, no-match counts, probe details, request/rate-limit metrics, and any warnings/errors. Mapping sync is the only step that can make non-winner families paper-supported, and only when line/selection/settlement metadata parses cleanly.
 
 ## Deployment
 

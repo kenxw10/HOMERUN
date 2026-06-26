@@ -125,6 +125,7 @@ def _resolved_supported_candidates(session: Session) -> list[ModelCandidate]:
         select(ModelCandidate, KalshiMarket)
         .outerjoin(KalshiMarket, ModelCandidate.kalshi_market_id == KalshiMarket.id)
         .where(ModelCandidate.outcome.in_(["win", "loss"]))
+        .where(ModelCandidate.training_eligible.is_(True))
     )
     return [
         candidate

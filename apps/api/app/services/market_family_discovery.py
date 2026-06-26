@@ -286,6 +286,10 @@ def _parse_ticker_tail_line(market: dict[str, Any]) -> Decimal | None:
     if not ticker:
         return None
 
+    total_tail_line = re.search(r"-(?:O|U|OVER|UNDER)-(\d+(?:\.\d+)?)$", ticker)
+    if total_tail_line:
+        return _decimal(total_tail_line.group(1))
+
     selected_team_line = re.search(r"-[A-Z0-9]{2,5}([+-]\d+(?:\.\d+)?)$", ticker)
     if selected_team_line:
         parsed = _decimal(selected_team_line.group(1))
@@ -336,6 +340,11 @@ def _selection_code(market: dict[str, Any]) -> str | None:
 
 def _over_under_side(market: dict[str, Any]) -> str | None:
     ticker = str(market.get("ticker") or "").upper()
+    total_tail = re.search(r"-(O|U|OVER|UNDER)-\d+(?:\.\d+)?$", ticker)
+    if total_tail:
+        side = total_tail.group(1)
+        return "over" if side in {"O", "OVER"} else "under"
+
     tail = ticker.rsplit("-", 1)[-1] if ticker else ""
     if tail in {"O", "OVER"}:
         return "over"

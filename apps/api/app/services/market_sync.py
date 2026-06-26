@@ -205,6 +205,14 @@ def _upsert_mapping(
     mapping.rationale = match.rationale
     mapping.resolver_strategy = match.resolver_strategy
     mapping.validation_status = match.validation_status
+    mapping.market_family = "full_game_winner"
+    mapping.market_type = "full_game_winner"
+    match_ticker = str(match.market.get("ticker") or "")
+    mapping.selection_code = match_ticker.rsplit("-", 1)[-1].upper() if "-" in match_ticker else None
+    mapping.inning_scope = "full_game"
+    mapping.settlement_rule_status = (
+        "paper_supported" if match.validation_status == "confirmed_for_paper" else "needs_review"
+    )
     mapping.mapping_metadata = _mapping_metadata(resolution, match)
     session.add(mapping)
 
@@ -284,6 +292,13 @@ def sync_kalshi_markets(session: Session, max_pages: int | None = None, fetch_or
             market = session.scalar(select(KalshiMarket).where(KalshiMarket.ticker == ticker))
             market = market or KalshiMarket(ticker=ticker, kalshi_market_id=str(match.market.get("id") or ticker))
             _update_market_fields(market, match.market, ticker, raw_status)
+            market.market_family = "full_game_winner"
+            market.market_type = "full_game_winner"
+            market.selection_code = ticker.rsplit("-", 1)[-1].upper() if "-" in ticker else None
+            market.inning_scope = "full_game"
+            market.settlement_rule_status = (
+                "paper_supported" if match.validation_status == "confirmed_for_paper" else "needs_review"
+            )
             if fetch_orderbooks and match.mapping_status != "rejected_multivariate":
                 _fetch_orderbook(client, market)
             elif match.mapping_status == "rejected_multivariate":
