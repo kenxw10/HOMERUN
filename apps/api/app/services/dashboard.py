@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, time, timedelta
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 
 from sqlalchemy import func, or_, select
@@ -34,12 +34,16 @@ from app.time_utils import eastern_display, ensure_aware_utc, get_dashboard_zone
 MAPPING_STATUS_PRIORITY = {"confirmed": 0, "candidate": 1, "needs_review": 2}
 
 
-def empty_dashboard_summary() -> DashboardSummary:
+def empty_dashboard_summary(closed_date: date | None = None) -> DashboardSummary:
     settings = get_settings()
+    selected_closed_date = closed_date or today_eastern()
     return DashboardSummary(
         portfolio_series=[],
         performance=PerformanceMetrics(win_rate=None, roi=None, profit_loss=0.0, record="0-0-0"),
         positions=[],
+        closed_positions=[],
+        closed_positions_date=selected_closed_date.isoformat(),
+        closed_positions_count=0,
         bot=BotMode(
             mode="paper",
             paper_trading=settings.paper_trading,
@@ -64,6 +68,13 @@ def _float(value: Decimal | None) -> float | None:
     return float(value) if value is not None else None
 
 
+def _first_decimal(*values: Decimal | None) -> Decimal:
+    for value in values:
+        if value is not None:
+            return value
+    raise ValueError("at least one decimal value is required")
+
+
 def _game_status_display(game: MlbGame | None) -> str:
     if game is None:
         return "UNKNOWN"
@@ -86,9 +97,13 @@ def _position_from_trade(
     game: MlbGame | None = None,
     market: KalshiMarket | None = None,
 ) -> PositionSummary:
-    current = trade.current_price if trade.current_price is not None else trade.entry_price
-    pnl = ((current - trade.entry_price) * trade.quantity).quantize(Decimal("0.01"))
-    pnl_percent = ((current - trade.entry_price) / trade.entry_price).quantize(Decimal("0.0001")) if trade.entry_price else None
+    current = _first_decimal(trade.exit_price, trade.current_price, trade.entry_price)
+    pnl = (
+        trade.realized_pnl
+        if trade.realized_pnl is not None
+        else ((current - trade.entry_price) * trade.quantity).quantize(Decimal("0.01"))
+    )
+    pnl_percent = ((pnl / (trade.entry_price * trade.quantity)).quantize(Decimal("0.0001"))) if trade.entry_price else None
     fallback_labels = contract_labels(
         game=game,
         market=market,
@@ -99,6 +114,8 @@ def _position_from_trade(
     return PositionSummary(
         time_entered=to_eastern_iso(trade.entry_time),
         time_entered_display=eastern_display(trade.entry_time),
+        time_closed=to_eastern_iso(trade.exit_time or trade.settled_at),
+        time_closed_display=eastern_display(trade.exit_time or trade.settled_at),
         market=display,
         market_ticker=trade.market_ticker,
         market_display=trade.market_display or fallback_labels.market_display,
@@ -107,6 +124,7 @@ def _position_from_trade(
         contract_display=display,
         side=trade.contract_side,
         entry_price=float(trade.entry_price),
+        exit_price=float(trade.exit_price) if trade.exit_price is not None else None,
         current_price=float(current),
         current_price_updated_at=to_eastern_iso(trade.current_price_updated_at),
         current_price_updated_at_display=eastern_display(trade.current_price_updated_at),
@@ -117,6 +135,7 @@ def _position_from_trade(
         game_status=_game_status_display(game),
         game_status_display=_game_status_display(game),
         resolution=trade.resolution,
+        outcome=trade.outcome,
     )
 
 
@@ -133,6 +152,8 @@ def _position_from_position(position: Position) -> PositionSummary:
     return PositionSummary(
         time_entered=to_eastern_iso(position.opened_at),
         time_entered_display=eastern_display(position.opened_at),
+        time_closed=to_eastern_iso(position.closed_at),
+        time_closed_display=eastern_display(position.closed_at),
         market=fallback_labels.contract_display,
         market_ticker=position.market_ticker,
         market_display=fallback_labels.market_display,
@@ -141,6 +162,7 @@ def _position_from_position(position: Position) -> PositionSummary:
         contract_display=fallback_labels.contract_display,
         side=position.contract_side,
         entry_price=float(position.entry_price),
+        exit_price=None,
         current_price=float(current),
         current_price_updated_at=None,
         current_price_updated_at_display=None,
@@ -151,6 +173,7 @@ def _position_from_position(position: Position) -> PositionSummary:
         game_status="UNKNOWN",
         game_status_display="UNKNOWN",
         resolution=position.resolution,
+        outcome=None,
     )
 
 
@@ -161,8 +184,15 @@ def _mapping_priority(mapping: MarketMapping | None) -> tuple[int, Decimal]:
     return (status_priority, -(mapping.confidence or Decimal("0")))
 
 
-def dashboard_summary_from_db(session: Session) -> DashboardSummary:
-    summary = empty_dashboard_summary()
+def _date_bounds(day: date) -> tuple[datetime, datetime]:
+    local_start = datetime.combine(day, time.min, tzinfo=get_dashboard_zone())
+    start = ensure_aware_utc(local_start)
+    return start, start + timedelta(days=1)
+
+
+def dashboard_summary_from_db(session: Session, closed_date: date | None = None) -> DashboardSummary:
+    selected_closed_date = closed_date or today_eastern()
+    summary = empty_dashboard_summary(selected_closed_date)
     newest_snapshots = list(
         session.scalars(select(BalanceSnapshot).order_by(BalanceSnapshot.captured_at.desc()).limit(500))
     )
@@ -210,6 +240,27 @@ def dashboard_summary_from_db(session: Session) -> DashboardSummary:
         for trade, game, market in open_trade_rows
         if (trade.market_ticker, trade.contract_side) not in position_keys
     )
+    closed_start, closed_end = _date_bounds(selected_closed_date)
+    closed_trade_rows = list(
+        session.execute(
+            select(PaperTrade, MlbGame, KalshiMarket)
+            .outerjoin(ModelCandidate, PaperTrade.candidate_id == ModelCandidate.id)
+            .outerjoin(MlbGame, ModelCandidate.mlb_game_id == MlbGame.id)
+            .outerjoin(KalshiMarket, ModelCandidate.kalshi_market_id == KalshiMarket.id)
+            .where(PaperTrade.status.in_(["settled", "closed", "void"]))
+            .where(
+                or_(
+                    (PaperTrade.exit_time >= closed_start) & (PaperTrade.exit_time < closed_end),
+                    (PaperTrade.settled_at >= closed_start) & (PaperTrade.settled_at < closed_end),
+                )
+            )
+            .order_by(PaperTrade.exit_time.desc().nullslast(), PaperTrade.settled_at.desc().nullslast())
+            .limit(200)
+        )
+    )
+    summary.closed_positions = [_position_from_trade(trade, game, market) for trade, game, market in closed_trade_rows]
+    summary.closed_positions_date = selected_closed_date.isoformat()
+    summary.closed_positions_count = len(summary.closed_positions)
 
     active_version = session.scalar(select(ModelVersion).where(ModelVersion.is_active.is_(True)))
     last_training = session.scalar(select(TrainingRun).order_by(TrainingRun.started_at.desc()))

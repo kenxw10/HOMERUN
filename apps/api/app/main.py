@@ -33,6 +33,7 @@ from app.services.market_family_discovery import (
     market_family_discovery_preview,
     run_market_family_discovery,
 )
+from app.services.market_family_mapping import latest_market_family_mapping_report, sync_market_family_mappings
 from app.services.modeling import run_model_governance
 from app.services.market_sync import resolve_preview_for_date, sync_kalshi_markets
 from app.services.mlb import sync_results, sync_schedule
@@ -75,16 +76,16 @@ def health() -> HealthResponse:
 
 
 @app.get("/v1/dashboard/summary", response_model=DashboardSummary)
-def dashboard_summary() -> DashboardSummary:
+def dashboard_summary(closed_date: date | None = Query(default=None)) -> DashboardSummary:
     if not database_status()["ready"]:
-        return empty_dashboard_summary()
+        return empty_dashboard_summary(closed_date)
 
     try:
         session_factory = get_session_factory()
         with session_factory() as session:
-            return dashboard_summary_from_db(session)
+            return dashboard_summary_from_db(session, closed_date)
     except Exception:
-        return empty_dashboard_summary()
+        return empty_dashboard_summary(closed_date)
 
 
 @app.get("/v1/system/status", response_model=SystemStatus)
@@ -336,6 +337,26 @@ def run_market_family_discovery_endpoint(
                 result={"status": "failed", "error": {"message": str(exc), "type": exc.__class__.__name__}},
             )
     return RunResponse(ok=result.get("status") != "failed", action="market_family_discovery", result=result)
+
+
+@app.post("/v1/sync/market-family-mappings", response_model=RunResponse)
+def run_market_family_mapping_sync(
+    target_date: date | None = Query(default=None),
+    _: None = Depends(require_internal_api_key),
+) -> RunResponse:
+    with _db_session_or_503() as session:
+        result = sync_market_family_mappings(session, target_date)
+    return RunResponse(ok=result.get("status") != "failed", action="market_family_mapping_sync", result=result)
+
+
+@app.get("/v1/market-families/mappings", response_model=RunResponse)
+def market_family_mapping_report(
+    target_date: date | None = Query(default=None, alias="date"),
+    _: None = Depends(require_internal_api_key),
+) -> RunResponse:
+    with _db_session_or_503() as session:
+        result = latest_market_family_mapping_report(session, target_date)
+    return RunResponse(ok=True, action="market_family_mapping_report", result=result)
 
 
 @app.get("/v1/market-families/discovery", response_model=RunResponse)

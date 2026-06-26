@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class HealthResponse(BaseModel):
@@ -28,6 +28,8 @@ class PerformanceMetrics(BaseModel):
 class PositionSummary(BaseModel):
     time_entered: str | None = None
     time_entered_display: str | None = None
+    time_closed: str | None = None
+    time_closed_display: str | None = None
     market: str
     market_ticker: str | None = None
     market_display: str | None = None
@@ -36,6 +38,7 @@ class PositionSummary(BaseModel):
     contract_display: str | None = None
     side: Literal["yes", "no"]
     entry_price: float
+    exit_price: float | None = None
     current_price: float | None
     current_price_updated_at: str | None = None
     current_price_updated_at_display: str | None = None
@@ -46,6 +49,7 @@ class PositionSummary(BaseModel):
     game_status: str | None = None
     game_status_display: str | None = None
     resolution: str | None
+    outcome: str | None = None
 
 
 class BotMode(BaseModel):
@@ -68,6 +72,9 @@ class DashboardSummary(BaseModel):
     portfolio_series: list[PortfolioPoint]
     performance: PerformanceMetrics
     positions: list[PositionSummary]
+    closed_positions: list[PositionSummary] = Field(default_factory=list)
+    closed_positions_date: str | None = None
+    closed_positions_count: int = 0
     bot: BotMode
     model_status: ModelStatus
     cash_balance: float | None = None
