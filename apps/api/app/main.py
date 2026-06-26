@@ -105,6 +105,7 @@ def system_status() -> SystemStatus:
             live_trading_enabled=settings.live_trading_enabled,
             execution_kill_switch=settings.execution_kill_switch,
             kalshi_env=settings.kalshi_env,
+            kalshi_market_data_source=settings.kalshi_market_data_source,
             kalshi_credentials=credentials_state,
         ),
     )

@@ -187,7 +187,7 @@ PR 2.5 switches the primary Kalshi market sync from broad universe crawling to t
 - The initial supported family is `full_game_winner` with series ticker `KXMLBGAME`.
 - Observed event format: `KXMLBGAME-YYMMMDDHHMMAWAYHOME`, for example `KXMLBGAME-26JUN261840HOUDET`.
 - Observed market format: `{EVENT}-{TEAM}`, for example `KXMLBGAME-26JUN261840HOUDET-HOU`.
-- Spread, total, and first-five families remain `unknown_pending_discovery` and must not be faked.
+- Spread, total, and first-five families remain discovery-only until validated and must not be faked.
 - `mve_filter=exclude` is used for narrow market queries where supported.
 - Multivariate markets are rejected for normal MLB mapping in PR 2.5.
 - Broad discovery is diagnostic-only, disabled by default, bounded by page/limit env vars, and must not block targeted resolver success.
@@ -245,9 +245,12 @@ PR 3a adds production repairs and discovery-only market-family infrastructure:
 - Migration `0005_pr3a_discovery.py` adds market-family discovery run/item audit tables and `paper_trades.current_price_updated_at`.
 - The supported trading/settlement/model family remains `full_game_winner` only.
 - `full_game_spread`, `full_game_total`, `first_five_winner`, `first_five_spread`, and `first_five_total` remain discovery-only and are not wired into candidate generation, paper trading, settlement, or model scoring.
-- `app.jobs.market_family_discovery` and `POST /v1/run/market-family-discovery` produce a structured `by_family` report and persisted audit rows.
+- `app.jobs.market_family_discovery` and `POST /v1/run/market-family-discovery` produce a structured deterministic `by_family` report and persisted audit rows.
+- Active market-family discovery prefixes are `KXMLBGAME`, `KXMLBSPREAD`, `KXMLBTOTAL`, `KXMLBF5`, `KXMLBF5SPREAD`, and `KXMLBF5TOTAL`.
+- Retired guessed prefixes are explicitly not active, and `KXMLBTEAMTOTAL` is not part of PR3a discovery.
+- Market sync, market-family discovery, and open-position price refresh read from `KALSHI_MARKET_DATA_BASE_URL` by default. The default is the public Kalshi production market-data endpoint; `KALSHI_REST_BASE_URL` and `KALSHI_ENV` remain the demo/execution context.
 - The PR3a hotfix makes discovery persist a completed or `partial_error` run even when candidate spread, total, or first-five probes return 404/no-match responses and no markets are found.
-- Discovery probes candidate MLB Kalshi family series/event tickers from the MLB slate and uses `mve_filter=exclude` where supported; multivariate markets are excluded from normal discovery items.
+- Discovery constructs deterministic `{SERIES_PREFIX}-{YYMMMDDHHMMAWAYHOME}` tickers from the MLB slate, probes both direct market lookup and `event_ticker` market lookup, and uses `mve_filter=exclude` where supported; multivariate markets are excluded from normal discovery items.
 - `app.jobs.open_position_price_refresh` and `POST /v1/run/open-position-price-refresh` refresh open paper-trade marks from REST orderbook snapshots only. No WebSocket/live streaming is added.
 - Dashboard summary position rows now include `game_status`, `game_status_display`, `current_price_updated_at`, and `current_price_updated_at_display`.
 - Dashboard summary includes `paper_starting_balance` for frontend chart P/L modes.
@@ -257,8 +260,8 @@ PR 3a adds production repairs and discovery-only market-family infrastructure:
 
 Known PR 3a limitations:
 
-- Discovery can prove that candidate series names return markets, but PR3a does not claim settlement or line parsing is reliable enough to trade spreads, totals, or first-five markets.
-- A valid discovery run may find zero spread, total, or first-five markets. In that case `market_family_discovery_runs.raw_summary` should still show attempted probes, warnings, and errors so production validation can audit the no-match result.
+- Discovery can prove that observed deterministic prefixes return markets, but PR3a does not claim settlement or line parsing is reliable enough to trade spreads, totals, or first-five markets.
+- A valid discovery run may find zero markets. In that case `market_family_discovery_runs.raw_summary` should still show attempted event/market ticker counts, no-match counts, probe details, warnings, and errors so production validation can audit the no-match result.
 - Current price remains a REST last mark, not a real-time WebSocket mark.
 - No cron jobs or dashboard admin controls are added.
 - No live execution path exists.
@@ -334,3 +337,12 @@ Every future PR must update this section with:
 - `GET /v1/market-families/discovery?date=YYYY-MM-DD` should return the latest run instead of `run: null` after a zero-market discovery run.
 - No schema migration, safety posture change, live execution, or spread/total/F5 trade enablement was added.
 - Production validation steps: run the protected discovery POST, confirm structured JSON instead of a blank upstream error, confirm the protected report GET returns `run` not null, confirm the run row exists with probe attempts in `raw_summary`, confirm discovery item rows may be zero, and confirm `KXMLBGAME` full-game winner resolver behavior remains `confirmed_for_paper`.
+
+### PR 3a Fix 2 - Deterministic Kalshi MLB Ticker Registry
+
+- Replaced guessed PR3a market-family probes with the deterministic observed MLB registry: `KXMLBGAME`, `KXMLBSPREAD`, `KXMLBTOTAL`, `KXMLBF5`, `KXMLBF5SPREAD`, and `KXMLBF5TOTAL`.
+- Retired guessed legacy prefixes from active discovery and kept `KXMLBTEAMTOTAL` out of scope.
+- Discovery now probes direct market lookup and `event_ticker` market lookup for each constructed ticker and records attempted ticker counts, no-match counts, examples, warnings, and errors.
+- Added `KALSHI_MARKET_DATA_BASE_URL` for public market-data reads used by market sync, discovery, and open-position price refresh; demo/execution settings remain separate and paper-only.
+- Report reads return the latest finalized discovery run, not stale `running` rows.
+- No schema migration, safety posture change, live execution, or new family trade enablement was added.

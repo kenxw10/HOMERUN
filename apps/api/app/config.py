@@ -24,6 +24,9 @@ class Settings(BaseSettings):
     kalshi_rest_base_url: str = Field(
         default="https://demo-api.kalshi.co/trade-api/v2", alias="KALSHI_REST_BASE_URL"
     )
+    kalshi_market_data_base_url: str = Field(
+        default="https://external-api.kalshi.com/trade-api/v2", alias="KALSHI_MARKET_DATA_BASE_URL"
+    )
     kalshi_ws_base_url: str = Field(
         default="wss://demo-api.kalshi.co/trade-api/ws/v2", alias="KALSHI_WS_BASE_URL"
     )
@@ -101,6 +104,15 @@ class Settings(BaseSettings):
     @property
     def backend_api_key_configured(self) -> bool:
         return bool(self.backend_api_key and self.backend_api_key.get_secret_value())
+
+    @property
+    def kalshi_market_data_source(self) -> str:
+        normalized = self.kalshi_market_data_base_url.strip().lower()
+        if "external-api.kalshi.com" in normalized:
+            return "production_public_market_data"
+        if "demo-api.kalshi.co" in normalized:
+            return "demo_market_data"
+        return "custom_market_data"
 
     @property
     def safe_execution_posture(self) -> bool:

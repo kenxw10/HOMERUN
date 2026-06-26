@@ -42,7 +42,7 @@ def refresh_open_position_prices(
             "skipped_reason": "OPEN_POSITION_PRICE_REFRESH_DISABLED",
         }
 
-    kalshi_client = client or KalshiClient.from_settings()
+    kalshi_client = client or KalshiClient.from_market_data_settings()
     now = utc_now()
     trades = list(session.scalars(select(PaperTrade).where(PaperTrade.status == "open").order_by(PaperTrade.id.asc())))
     updated = 0

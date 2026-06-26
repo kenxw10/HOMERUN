@@ -26,6 +26,7 @@ EXECUTION_KILL_SWITCH=true
 KALSHI_ENV=demo
 CORS_ORIGINS=https://YOUR-VERCEL-DASHBOARD-URL
 KALSHI_REST_BASE_URL=https://demo-api.kalshi.co/trade-api/v2
+KALSHI_MARKET_DATA_BASE_URL=https://external-api.kalshi.com/trade-api/v2
 KALSHI_WS_BASE_URL=wss://demo-api.kalshi.co/trade-api/ws/v2
 MLB_STATS_BASE_URL=https://statsapi.mlb.com/api/v1
 MARKET_DISCOVERY_ENABLED=true
@@ -63,6 +64,7 @@ Expected `/v1/system/status` result should include:
 - `database.ready: true`
 - `config.live_trading_enabled: false`
 - `config.execution_kill_switch: true`
+- `config.kalshi_market_data_source: "production_public_market_data"` when using the default market-data URL.
 
 ## Migration Command
 
@@ -112,7 +114,7 @@ Invoke-RestMethod -Method Post -Headers @{"X-API-Key"="YOUR_KEY"} https://YOUR-R
 Invoke-RestMethod -Method Post -Headers @{"X-API-Key"="YOUR_KEY"} https://YOUR-RAILWAY-API/v1/run/balance-snapshot
 Invoke-RestMethod -Method Post -Headers @{"X-API-Key"="YOUR_KEY"} https://YOUR-RAILWAY-API/v1/run/model-governance
 Invoke-RestMethod -Method Post -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-RAILWAY-API/v1/run/market-family-discovery?target_date=2026-06-26"
-Invoke-RestMethod "https://YOUR-RAILWAY-API/v1/market-families/discovery?date=2026-06-26"
+Invoke-RestMethod -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-RAILWAY-API/v1/market-families/discovery?date=2026-06-26"
 Invoke-RestMethod -Method Post -Headers @{"X-API-Key"="YOUR_KEY"} https://YOUR-RAILWAY-API/v1/run/open-position-price-refresh
 ```
 
@@ -127,5 +129,5 @@ Expected behavior:
 - Paper settlement sync settles completed supported full-game winner paper trades.
 - Balance snapshots populate `/v1/dashboard/summary`.
 - Model governance records either a trained/promoted model or a clear skipped reason due to insufficient samples.
-- PR 3a market-family discovery returns structured `by_family` output but does not trade spread, total, or first-five markets.
+- PR 3a market-family discovery returns structured `by_family` output from the observed deterministic prefixes `KXMLBGAME`, `KXMLBSPREAD`, `KXMLBTOTAL`, `KXMLBF5`, `KXMLBF5SPREAD`, and `KXMLBF5TOTAL`, but does not trade spread, total, or first-five markets.
 - Open-position price refresh updates REST last marks for open paper positions only.

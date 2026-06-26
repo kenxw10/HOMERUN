@@ -249,7 +249,7 @@ def _run_broad_discovery_diagnostic(client: KalshiClient, max_pages: int | None 
 
 
 def sync_kalshi_markets(session: Session, max_pages: int | None = None, fetch_orderbooks: bool = True) -> dict[str, object]:
-    client = KalshiClient.from_settings()
+    client = KalshiClient.from_market_data_settings()
     settings = get_settings()
     summary = _empty_summary()
 
@@ -305,7 +305,7 @@ def sync_kalshi_markets(session: Session, max_pages: int | None = None, fetch_or
 
 
 def resolve_preview_for_date(session: Session, target_date: date, *, query_kalshi: bool = True) -> dict[str, object]:
-    client = KalshiClient.from_settings()
+    client = KalshiClient.from_market_data_settings()
     games = games_for_eastern_date(session, target_date)
     previews = [resolve_game_markets(client, game, query_kalshi=query_kalshi).to_preview_dict() for game in games]
     partial_errors = [

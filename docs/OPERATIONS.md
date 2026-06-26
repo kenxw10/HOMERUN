@@ -10,14 +10,15 @@ Before treating a deployment as valid:
 4. Confirm `LIVE_TRADING_ENABLED=false`.
 5. Confirm `EXECUTION_KILL_SWITCH=true`.
 6. Confirm `KALSHI_ENV=demo` for PR 3 unless a later PR explicitly approves production credentials.
-7. Confirm Vercel has `NEXT_PUBLIC_API_BASE_URL` pointed at the Railway backend.
-8. Confirm Railway `/v1/system/status` reports `database.ready: true` after opening a real database connection.
-9. Confirm the Vercel dashboard loads the light terminal UI without a dark theme, admin page, calendar, or sportsbook concepts.
-10. Confirm the dashboard shows API connected, paper mode, live trading disabled, kill switch on, and database ready.
-11. Confirm `BACKEND_API_KEY` is set in every public/deployed backend environment, and confirm internal POST endpoints reject requests without `X-API-Key`.
-12. Confirm `KALSHI_ENABLE_BROAD_DISCOVERY=false` unless you are deliberately running bounded diagnostics.
-13. Confirm PR 3a discovery-only families are not trade-enabled.
-14. Confirm open-position current price is treated as a REST last mark, not WebSocket live price.
+7. Confirm `/v1/system/status` reports `config.kalshi_market_data_source: "production_public_market_data"` when `KALSHI_MARKET_DATA_BASE_URL` uses the default public Kalshi market-data URL.
+8. Confirm Vercel has `NEXT_PUBLIC_API_BASE_URL` pointed at the Railway backend.
+9. Confirm Railway `/v1/system/status` reports `database.ready: true` after opening a real database connection.
+10. Confirm the Vercel dashboard loads the light terminal UI without a dark theme, admin page, calendar, or sportsbook concepts.
+11. Confirm the dashboard shows API connected, paper mode, live trading disabled, kill switch on, and database ready.
+12. Confirm `BACKEND_API_KEY` is set in every public/deployed backend environment, and confirm internal POST endpoints reject requests without `X-API-Key`.
+13. Confirm `KALSHI_ENABLE_BROAD_DISCOVERY=false` unless you are deliberately running bounded diagnostics.
+14. Confirm PR 3a discovery-only families are not trade-enabled.
+15. Confirm open-position current price is treated as a REST last mark, not WebSocket live price.
 
 ## No-Live-Trading Safety Checklist
 
@@ -73,11 +74,12 @@ The jobs currently cover:
 - Paper balance snapshots.
 - Feature snapshots and conservative heuristic model scoring.
 - Model governance records that skip training/promotion until sample thresholds are met.
-- Discovery-only market-family audit reports for spread, total, and first-five families.
+- Deterministic discovery-only market-family audit reports for `KXMLBGAME`, `KXMLBSPREAD`, `KXMLBTOTAL`, `KXMLBF5`, `KXMLBF5SPREAD`, and `KXMLBF5TOTAL`.
 - REST last-mark refresh for open paper positions.
 
 They do not cover scheduled automation or live execution.
 They also do not fake spread, total, or first-five market tickers.
+They do not probe retired guessed prefixes or `KXMLBTEAMTOTAL`.
 
 Each worker should be idempotent where possible, log risk events, and avoid live order execution unless future safety gates are in place.
 
@@ -116,8 +118,8 @@ After deploying PR 3 and running `alembic upgrade head`, validate in this order:
 10. `POST /v1/run/paper-settlement-sync` settles completed supported full-game winner paper trades.
 11. `POST /v1/run/balance-snapshot` creates a snapshot and `/v1/dashboard/summary` uses it for the portfolio chart.
 12. `POST /v1/run/model-governance` records a training/calibration run and counts resolved `KXMLBGAME` candidates even when older rows used `full_game_moneyline`.
-13. `POST /v1/run/market-family-discovery?target_date=YYYY-MM-DD` returns structured `by_family` output and persists a `market_family_discovery_runs` row even when no candidate spread, total, or first-five markets are found.
-14. `GET /v1/market-families/discovery?date=YYYY-MM-DD` returns the latest persisted report with `run` not null after the POST succeeds.
+13. `POST /v1/run/market-family-discovery?target_date=YYYY-MM-DD` returns structured `by_family` output, attempted event/market ticker counts, no-match counts, and persists a finalized `market_family_discovery_runs` row even when no candidate markets are found.
+14. `GET /v1/market-families/discovery?date=YYYY-MM-DD` returns the latest finalized report with `run` not null after the POST succeeds.
 15. Confirm discovered spread, total, or first-five families do not create paper candidates/trades.
 16. `POST /v1/run/open-position-price-refresh` updates current marks and last mark timestamps for open paper positions only.
 17. The Vercel dashboard shows readable contract labels with the raw Kalshi ticker as secondary text.
@@ -132,7 +134,7 @@ Broad market discovery is diagnostic-only:
 
 ## PR 3a Hotfix Validation
 
-The PR3a market-family discovery hotfix handles expected Kalshi no-match responses without aborting the job.
+The PR3a market-family discovery path is deterministic. It handles expected Kalshi no-match responses without aborting the job.
 
 Validate the hotfix after deploy:
 
@@ -140,10 +142,11 @@ Validate the hotfix after deploy:
 2. Confirm the response is structured JSON, not a blank upstream error.
 3. Confirm the response status is `completed` for 404/no-match-only runs or `partial_error` when non-404 upstream errors were recorded but the job completed.
 4. Run `GET /v1/market-families/discovery?date=YYYY-MM-DD` with `X-API-Key`.
-5. Confirm `run` is not null and `market_family_discovery_runs.raw_summary` includes `attempted_probe_count` and `probe_attempts`.
+5. Confirm `run` is not null and `market_family_discovery_runs.raw_summary` includes `attempted_event_tickers_count`, `attempted_market_tickers_count`, `no_match_counts`, `attempted_probe_count`, and `probe_attempts`.
 6. Treat `markets_found=0` and zero `market_family_discovery_items` as valid when no markets are returned.
-7. Confirm spread, total, and first-five families remain discovery-only and do not create paper candidates or trades.
-8. Confirm known `KXMLBGAME` full-game winner resolver matches remain `confirmed_for_paper`.
+7. Confirm active discovery prefixes are only `KXMLBGAME`, `KXMLBSPREAD`, `KXMLBTOTAL`, `KXMLBF5`, `KXMLBF5SPREAD`, and `KXMLBF5TOTAL`; guessed legacy prefixes and `KXMLBTEAMTOTAL` must not be probed.
+8. Confirm spread, total, and first-five families remain discovery-only and do not create paper candidates or trades.
+9. Confirm known `KXMLBGAME` full-game winner resolver matches remain `confirmed_for_paper`.
 
 ## Required Context Updates
 

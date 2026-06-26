@@ -96,6 +96,7 @@ class ConfigStatus(BaseModel):
     live_trading_enabled: bool
     execution_kill_switch: bool
     kalshi_env: str
+    kalshi_market_data_source: str
     kalshi_credentials: Literal["not_set", "set_redacted"]
 
 
