@@ -6,7 +6,7 @@ from sqlalchemy import select
 
 from app.config import get_settings
 from app.database import database_status, get_session_factory
-from app.models import KalshiMarket, MarketMapping, MlbGame, ModelCandidate, ModelPredictionOutput
+from app.models import KalshiMarket, MarketMapping, MlbGame, ModelCandidate, ModelPredictionOutput, ModelPredictionRun
 from app.schemas import (
     BackendStatus,
     CandidateSummary,
@@ -42,7 +42,7 @@ from app.services.mlb import sync_results, sync_schedule
 from app.services.position_refresh import refresh_open_position_prices
 from app.services.portfolio import create_balance_snapshot
 from app.services.settlement import settle_paper_trades
-from app.time_utils import eastern_display, to_eastern_iso
+from app.time_utils import eastern_display, today_eastern, to_eastern_iso
 
 settings = get_settings()
 
@@ -349,8 +349,10 @@ def model_predictions_today() -> RunResponse:
         rows = list(
             session.execute(
                 select(ModelPredictionOutput, ModelCandidate, KalshiMarket)
+                .join(ModelPredictionRun, ModelPredictionOutput.prediction_run_id == ModelPredictionRun.id)
                 .outerjoin(ModelCandidate, ModelPredictionOutput.candidate_id == ModelCandidate.id)
                 .outerjoin(KalshiMarket, ModelCandidate.kalshi_market_id == KalshiMarket.id)
+                .where(ModelPredictionRun.target_date == today_eastern())
                 .order_by(ModelPredictionOutput.id.desc())
                 .limit(500)
             )

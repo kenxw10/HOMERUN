@@ -23,6 +23,7 @@ from app.models import (
     MlbGame,
     MlbFeatureSnapshot,
     ModelCandidate,
+    ModelPredictionOutput,
     ModelPredictionRun,
     ModelVersion,
     PaperTrade,
@@ -2808,6 +2809,137 @@ def test_pr3c_trade_policy_caps_slate_trades(monkeypatch) -> None:
     assert prediction_run is not None
     assert prediction_run.trade_policy["paper_max_trades_per_slate"] == 2
     assert result["cap_counts"]["no_trade_slate_cap"] == 3
+
+
+def test_pr3c_trade_policy_counts_settled_trades_against_daily_caps(monkeypatch) -> None:
+    monkeypatch.setenv("PAPER_MAX_TRADES_PER_GAME", "1")
+    monkeypatch.setenv("PAPER_MAX_TRADES_PER_SLATE", "20")
+    get_settings.cache_clear()
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+    monkeypatch.setattr(candidates, "utc_now", lambda: now)
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    try:
+        with Session(engine) as session:
+            game = MlbGame(
+                external_game_id="settled-cap-game",
+                home_team="Pittsburgh Pirates",
+                away_team="Seattle Mariners",
+                home_abbreviation="PIT",
+                away_abbreviation="SEA",
+                scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+                status="scheduled",
+            )
+            market = KalshiMarket(
+                kalshi_market_id="KX-SETTLED-CAP-NEW",
+                ticker="KXMLBGAME-SETTLED-CAP-PIT",
+                title="Cheap home winner",
+                status="open",
+                implied_yes_ask=Decimal("0.0000"),
+            )
+            session.add_all([game, market])
+            session.flush()
+            _add_candidate_mapping(session, game, market)
+
+            settled_candidate = ModelCandidate(
+                mlb_game_id=game.id,
+                evaluated_at=now - timedelta(hours=1),
+                features={},
+                decision="paper_trade",
+                market_family="full_game_winner",
+            )
+            session.add(settled_candidate)
+            session.flush()
+            session.add(
+                PaperTrade(
+                    candidate_id=settled_candidate.id,
+                    market_ticker="KXMLBGAME-SETTLED-CAP-OLD",
+                    contract_side="yes",
+                    entry_price=Decimal("0.4000"),
+                    current_price=Decimal("1.0000"),
+                    quantity=1,
+                    entry_time=now - timedelta(hours=1),
+                    status="settled",
+                    market_family="full_game_winner",
+                )
+            )
+            session.commit()
+
+            result = candidates.generate_candidates(session)
+            new_trades = list(
+                session.scalars(
+                    select(PaperTrade).where(PaperTrade.market_ticker == "KXMLBGAME-SETTLED-CAP-PIT")
+                )
+            )
+            latest_candidate = session.scalar(
+                select(ModelCandidate).where(ModelCandidate.mapping_id.is_not(None)).order_by(ModelCandidate.id.desc())
+            )
+    finally:
+        get_settings.cache_clear()
+
+    assert result["paper_trades"] == 0
+    assert result["cap_counts"]["no_trade_game_cap"] == 1
+    assert new_trades == []
+    assert latest_candidate is not None
+    assert latest_candidate.decision == "no_trade_game_cap"
+
+
+def test_model_predictions_today_filters_by_prediction_run_target_date(monkeypatch) -> None:
+    engine = create_engine(
+        "sqlite+pysqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    SessionLocal = sessionmaker(bind=engine)
+
+    monkeypatch.setattr(main_module, "today_eastern", lambda: date(2026, 7, 2))
+    monkeypatch.setattr(
+        main_module,
+        "database_status",
+        lambda: {"ready": True, "configured": True, "dialect": "sqlite", "message": "ok"},
+    )
+    monkeypatch.setattr(main_module, "get_session_factory", lambda: SessionLocal)
+
+    with SessionLocal() as session:
+        old_run = ModelPredictionRun(
+            started_at=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
+            target_date=date(2026, 7, 1),
+            status="completed",
+        )
+        today_run = ModelPredictionRun(
+            started_at=datetime(2026, 7, 2, 16, 0, tzinfo=UTC),
+            target_date=date(2026, 7, 2),
+            status="completed",
+        )
+        session.add_all([old_run, today_run])
+        session.flush()
+        session.add_all(
+            [
+                ModelPredictionOutput(
+                    prediction_run_id=old_run.id,
+                    market_family="full_game_winner",
+                    probability_calibrated=Decimal("0.610000"),
+                    decision_reason="yesterday",
+                ),
+                ModelPredictionOutput(
+                    prediction_run_id=today_run.id,
+                    market_family="full_game_total",
+                    probability_calibrated=Decimal("0.550000"),
+                    decision_reason="today",
+                ),
+            ]
+        )
+        session.commit()
+
+    response = client.get("/v1/model/predictions/today")
+    payload = response.json()
+
+    assert response.status_code == 200
+    assert payload["result"]["count"] == 1
+    assert payload["result"]["items"][0]["decision_reason"] == "today"
 
 
 def test_training_eligibility_repair_excludes_pre_pr3c_candidates() -> None:

@@ -180,7 +180,6 @@ def _today_trade_counts(
             .outerjoin(ModelCandidate, PaperTrade.candidate_id == ModelCandidate.id)
             .where(PaperTrade.entry_time >= start)
             .where(PaperTrade.entry_time < end)
-            .where(PaperTrade.status == "open")
         )
     )
     game_counts: dict[int, int] = {}
