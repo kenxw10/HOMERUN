@@ -3695,6 +3695,64 @@ def test_market_family_mapping_sync_promotes_only_parseable_supported_families()
     }
 
 
+def test_market_family_mapping_parses_event_level_spread_selection_from_yes_text() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        game = MlbGame(
+            external_game_id="event-level-spread",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+            status="scheduled",
+        )
+        run = MarketFamilyDiscoveryRun(
+            target_date=date(2026, 7, 1),
+            started_at=datetime(2026, 7, 1, 12, 0, tzinfo=UTC),
+            completed_at=datetime(2026, 7, 1, 12, 1, tzinfo=UTC),
+            status="completed",
+            games_considered=1,
+            families_considered=6,
+            markets_found=1,
+            errors=[],
+            warnings=[],
+            raw_summary={},
+        )
+        session.add_all([game, run])
+        session.flush()
+        session.add(
+            MarketFamilyDiscoveryItem(
+                run_id=run.id,
+                mlb_game_id=game.id,
+                family_key="full_game_spread",
+                returned_ticker="KXMLBSPREAD-26JUL011900SEAPIT",
+                returned_event_ticker="KXMLBSPREAD-26JUL011900SEAPIT",
+                title="Seattle Mariners vs Pittsburgh Pirates run line",
+                yes_sub_title="Pittsburgh -1.5",
+                no_sub_title="Seattle +1.5",
+                raw_status="open",
+                confidence=Decimal("0.9500"),
+                line_value=Decimal("-1.5000"),
+            )
+        )
+        session.commit()
+
+        result = market_family_mapping.sync_market_family_mappings(session, date(2026, 7, 1))
+        mapping = session.scalar(select(MarketMapping))
+        market = session.scalar(select(KalshiMarket))
+
+    assert result["paper_supported"] == 1
+    assert mapping is not None
+    assert mapping.mapping_status == "confirmed"
+    assert mapping.settlement_rule_status == "paper_supported"
+    assert mapping.selection_code == "PIT"
+    assert market is not None
+    assert market.selection_code == "PIT"
+
+
 def test_new_market_families_require_paper_supported_metadata_for_trades(monkeypatch) -> None:
     now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
     monkeypatch.setattr(candidates, "utc_now", lambda: now)

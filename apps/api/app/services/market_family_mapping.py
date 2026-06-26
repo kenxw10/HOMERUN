@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
+import re
 from typing import Any
 
 from sqlalchemy import select
@@ -36,6 +37,7 @@ NEEDS_REVIEW = "needs_review"
 UNSUPPORTED = "unsupported"
 DISCOVERY_FINAL_STATUSES = {"completed", "partial_error"}
 TEAM_TOTAL_PREFIX = "KXMLBTEAMTOTAL"
+YES_SELECTION_TEXT_FIELDS = ("yes_sub_title", "yes_subtitle", "title", "subtitle")
 
 
 @dataclass(frozen=True)
@@ -111,6 +113,57 @@ def _is_team_selection(selection: str | None, game: MlbGame) -> bool:
     return selection in game_team_codes(game)
 
 
+def _text_tokens(value: str) -> list[str]:
+    return re.findall(r"[a-z0-9]+", value.lower())
+
+
+def _contains_phrase(tokens: list[str], phrase: str) -> bool:
+    phrase_tokens = _text_tokens(phrase)
+    if not phrase_tokens:
+        return False
+    return any(tokens[index : index + len(phrase_tokens)] == phrase_tokens for index in range(len(tokens)))
+
+
+def _team_aliases(team: str, code: str | None) -> tuple[str, ...]:
+    tokens = _text_tokens(team)
+    aliases: list[str] = []
+    if code:
+        aliases.append(code)
+    if tokens:
+        aliases.append(" ".join(tokens))
+    if len(tokens) >= 2:
+        city = " ".join(tokens[:-1])
+        nickname = tokens[-1]
+        aliases.extend((city, nickname, f"{city} {nickname[0]}"))
+    return tuple(dict.fromkeys(alias for alias in aliases if alias))
+
+
+def _team_selection_from_text(value: object, game: MlbGame) -> str | None:
+    tokens = _text_tokens(str(value or ""))
+    if not tokens:
+        return None
+
+    matches = set()
+    for team, code in (
+        (game.home_team, game.home_abbreviation),
+        (game.away_team, game.away_abbreviation),
+    ):
+        normalized_code = (code or "").upper()
+        if normalized_code and any(_contains_phrase(tokens, alias) for alias in _team_aliases(team, normalized_code)):
+            matches.add(normalized_code)
+    if len(matches) == 1:
+        return next(iter(matches))
+    return None
+
+
+def _spread_selection_from_yes_text(raw: dict[str, Any], game: MlbGame) -> str | None:
+    for field in YES_SELECTION_TEXT_FIELDS:
+        selection = _team_selection_from_text(raw.get(field), game)
+        if selection is not None:
+            return selection
+    return None
+
+
 def _parse_discovered_item(item: MarketFamilyDiscoveryItem, game: MlbGame) -> ParsedFamilyMarket:
     raw = _raw_market(item)
     ticker = str(raw.get("ticker") or item.returned_ticker or "").upper()
@@ -159,6 +212,8 @@ def _parse_discovered_item(item: MarketFamilyDiscoveryItem, game: MlbGame) -> Pa
         paper_supported = _is_team_selection(selection, game) or selection == "TIE"
         reason = "outcome_selection_parsed" if paper_supported else "missing_or_invalid_f5_selection"
     elif family_key in {FULL_GAME_SPREAD, FIRST_FIVE_SPREAD}:
+        if not _is_team_selection(selection, game):
+            selection = _spread_selection_from_yes_text(raw, game)
         paper_supported = _is_team_selection(selection, game) and line_value is not None
         reason = "spread_selection_and_line_parsed" if paper_supported else "missing_spread_selection_or_line"
     elif family_key in {FULL_GAME_TOTAL, FIRST_FIVE_TOTAL}:
