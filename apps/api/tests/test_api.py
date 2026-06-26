@@ -789,7 +789,7 @@ def test_generate_candidates_preserves_confirmed_targeted_resolver_mapping(monke
             yes_subtitle="Los Angeles D win the game",
             status="open",
             occurrence_datetime=datetime(2026, 6, 26, 22, 40, tzinfo=UTC),
-            implied_yes_ask=Decimal("0.4000"),
+            implied_yes_ask=Decimal("0.9000"),
         )
         session.add_all([game, market])
         session.flush()
@@ -2781,6 +2781,54 @@ def test_pr3c_model_outputs_bounded_probabilities_for_all_supported_families(
     assert score.rationale["run_expectations"]["home_full_game_runs_mean"] != 0
 
 
+def test_full_game_winner_probabilities_allocate_tie_mass_to_no_tie_outcomes() -> None:
+    game = MlbGame(
+        external_game_id="model-no-tie-winner",
+        home_team="Pittsburgh Pirates",
+        away_team="Seattle Mariners",
+        home_abbreviation="PIT",
+        away_abbreviation="SEA",
+        scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+        status="scheduled",
+    )
+
+    def _score_for(selection_code: str) -> modeling.ModelScore:
+        market = KalshiMarket(
+            kalshi_market_id=f"KX-NO-TIE-{selection_code}",
+            ticker=f"KXMLBGAME-NO-TIE-{selection_code}",
+            title="Synthetic no-tie winner market",
+            status="open",
+            market_family="full_game_winner",
+            market_type="full_game_winner",
+            selection_code=selection_code,
+            settlement_rule_status="paper_supported",
+        )
+        mapping = MarketMapping(
+            mlb_game_id=1,
+            kalshi_market_id=1,
+            mapping_status="confirmed",
+            confidence=Decimal("0.9500"),
+            market_family="full_game_winner",
+            market_type="full_game_winner",
+            selection_code=selection_code,
+            settlement_rule_status="paper_supported",
+        )
+        snapshot = features.build_feature_snapshot(
+            game,
+            market,
+            mapping,
+            now=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
+        )
+        return modeling.score_mature_candidate(snapshot, market_type="full_game_winner", settlement_status="paper_supported")
+
+    home_score = _score_for("PIT")
+    away_score = _score_for("SEA")
+
+    assert home_score.probability_raw is not None
+    assert away_score.probability_raw is not None
+    assert home_score.probability_raw + away_score.probability_raw == Decimal("1.000000")
+
+
 def test_pr3c_trade_policy_caps_slate_trades(monkeypatch) -> None:
     monkeypatch.setenv("PAPER_MAX_TRADES_PER_SLATE", "2")
     get_settings.cache_clear()
@@ -4382,6 +4430,62 @@ def test_open_position_price_refresh_updates_only_open_paper_trades() -> None:
     assert snapshot is not None
     assert snapshot.source == "paper"
     assert snapshot.snapshot_type == "open_position_price_refresh"
+
+
+def test_open_position_price_refresh_falls_back_to_orderbook_when_batch_quote_missing() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    class FakePartialBatchClient:
+        request_count = 0
+        rate_limited_count = 0
+
+        def get_markets_by_tickers(self, tickers: list[str]):
+            self.request_count += 1
+            return {"markets": []}
+
+        def get_orderbook(self, ticker: str):
+            return {"orderbook": {"yes": [[47, 10]], "no": [[52, 20]]}}
+
+    with Session(engine) as session:
+        market = KalshiMarket(
+            kalshi_market_id="KX-REFRESH-BATCH-MISS",
+            ticker="KXMLBGAME-26JUL011900SEAPIT-PIT",
+            title="Will Pittsburgh win?",
+            status="open",
+        )
+        session.add(market)
+        session.flush()
+        candidate = ModelCandidate(
+            kalshi_market_id=market.id,
+            evaluated_at=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
+            features={},
+            decision="paper_trade",
+            market_type="full_game_winner",
+        )
+        session.add(candidate)
+        session.flush()
+        open_trade = PaperTrade(
+            candidate_id=candidate.id,
+            market_ticker=market.ticker,
+            contract_side="yes",
+            entry_price=Decimal("0.4000"),
+            current_price=Decimal("0.4000"),
+            quantity=1,
+            entry_time=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
+            status="open",
+        )
+        session.add(open_trade)
+        session.commit()
+
+        result = position_refresh.refresh_open_position_prices(session, client=FakePartialBatchClient())
+        session.refresh(open_trade)
+
+    assert result["checked"] == 1
+    assert result["updated"] == 1
+    assert result["request_counters"]["market_batch_requests"] == 1
+    assert result["request_counters"]["orderbook_requests"] == 1
+    assert open_trade.current_price == Decimal("0.4700")
 
 
 def test_open_position_price_refresh_does_not_stamp_cached_prices_on_orderbook_error() -> None:

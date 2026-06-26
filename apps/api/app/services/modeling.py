@@ -221,6 +221,13 @@ def _joint_probability(
     return _bounded(total, Decimal("0"), Decimal("1")).quantize(Decimal("0.000001"))
 
 
+def _conditional_no_tie_probability(win_probability: Decimal, tie_probability: Decimal) -> Decimal:
+    non_tie_probability = Decimal("1.000000") - tie_probability
+    if non_tie_probability <= Decimal("0"):
+        return Decimal("0.500000")
+    return _bounded(win_probability / non_tie_probability, Decimal("0"), Decimal("1")).quantize(Decimal("0.000001"))
+
+
 def _selected_side(features: dict[str, object]) -> str | None:
     market_context = _module(features, "market_context")
     selected = market_context.get("selection_code")
@@ -264,8 +271,14 @@ def _probability_from_distribution(
             probability = _joint_probability(away_dist, home_dist, lambda away, home: away == home)
         elif selected == home_code:
             probability = _joint_probability(away_dist, home_dist, lambda away, home: home > away)
+            if market_type == FULL_GAME_WINNER:
+                tie_probability = _joint_probability(away_dist, home_dist, lambda away, home: away == home)
+                probability = _conditional_no_tie_probability(probability, tie_probability)
         elif selected == away_code:
             probability = _joint_probability(away_dist, home_dist, lambda away, home: away > home)
+            if market_type == FULL_GAME_WINNER:
+                tie_probability = _joint_probability(away_dist, home_dist, lambda away, home: away == home)
+                probability = _conditional_no_tie_probability(probability, tie_probability)
         else:
             probability = Decimal("0.000000")
     elif market_type in {FULL_GAME_SPREAD, FIRST_FIVE_SPREAD} and line is not None:

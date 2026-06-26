@@ -119,7 +119,7 @@ def refresh_open_position_prices(
                 )
             _update_market_fields(market, payload, trade.market_ticker, _market_status(payload))
             mark = _mark_from_market(market, trade)
-        elif not hasattr(kalshi_client, "get_markets_by_tickers"):
+        if mark is None and hasattr(kalshi_client, "get_orderbook"):
             try:
                 request_counters["orderbook_requests"] += 1
                 orderbook = kalshi_client.get_orderbook(trade.market_ticker)
