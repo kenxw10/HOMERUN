@@ -330,21 +330,24 @@ def run_model_governance_endpoint(_: None = Depends(require_internal_api_key)) -
 
 
 @app.get("/v1/model/governance/status", response_model=RunResponse)
-def model_governance_status() -> RunResponse:
+def model_governance_status(_: None = Depends(require_internal_api_key)) -> RunResponse:
     with _db_session_or_503() as session:
         result = governance_status(session)
     return RunResponse(ok=True, action="model_governance_status", result=result)
 
 
 @app.get("/v1/model/features/coverage", response_model=RunResponse)
-def model_feature_coverage(target_date: date | None = Query(default=None, alias="date")) -> RunResponse:
+def model_feature_coverage(
+    target_date: date | None = Query(default=None, alias="date"),
+    _: None = Depends(require_internal_api_key),
+) -> RunResponse:
     with _db_session_or_503() as session:
         result = feature_coverage(session, target_date)
     return RunResponse(ok=True, action="model_feature_coverage", result=result)
 
 
 @app.get("/v1/model/predictions/today", response_model=RunResponse)
-def model_predictions_today() -> RunResponse:
+def model_predictions_today(_: None = Depends(require_internal_api_key)) -> RunResponse:
     with _db_session_or_503() as session:
         rows = list(
             session.execute(

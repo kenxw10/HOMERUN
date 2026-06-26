@@ -143,11 +143,14 @@ def _base_decision(
         return "no_trade_missing_price"
     if market.status.strip().lower() not in TRADABLE_MARKET_STATUSES:
         return "no_trade_market_closed"
-    if settings.safe_execution_posture and market_type in SELECTION_REQUIRED_FAMILIES and not _has_trusted_candidate_selection(
-        mapping, game, market
+    selection_code = (mapping.selection_code or market.selection_code or "").upper()
+    trusted_tie_selection = market_type == "first_five_winner" and selection_code == "TIE"
+    if (
+        settings.safe_execution_posture
+        and market_type in SELECTION_REQUIRED_FAMILIES
+        and not trusted_tie_selection
+        and not _has_trusted_candidate_selection(mapping, game, market)
     ):
-        if market_type == "first_five_winner" and (mapping.selection_code or market.selection_code) == "TIE":
-            return "eligible_for_paper_trade"
         return "no_trade_untrusted_selection"
     if data_quality is None or data_quality < settings.paper_min_data_quality:
         return "no_trade_low_data_quality"
@@ -469,12 +472,32 @@ def generate_candidates(session: Session) -> dict[str, object]:
             )
 
     selected_trades, cap_counts = _apply_trade_caps(session, trade_intents, day_start, day_end)
+    for intent in trade_intents:
+        output = session.scalar(
+            select(ModelPredictionOutput)
+            .where(ModelPredictionOutput.candidate_id == intent.candidate.id)
+            .where(ModelPredictionOutput.prediction_run_id == prediction_run.id)
+            .limit(1)
+        )
+        if output is not None:
+            output.decision_reason = intent.candidate.decision
+            session.add(output)
+
     for rank, intent in enumerate(selected_trades, start=1):
         candidate = intent.candidate
         existing_trade = session.scalar(select(PaperTrade).where(PaperTrade.candidate_id == candidate.id))
         if existing_trade is not None:
             candidate.decision = "candidate_only_existing_trade"
             session.add(candidate)
+            output = session.scalar(
+                select(ModelPredictionOutput)
+                .where(ModelPredictionOutput.candidate_id == candidate.id)
+                .where(ModelPredictionOutput.prediction_run_id == prediction_run.id)
+                .limit(1)
+            )
+            if output is not None:
+                output.decision_reason = candidate.decision
+                session.add(output)
             continue
         trade = PaperTrade(
             candidate_id=candidate.id,

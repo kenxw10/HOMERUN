@@ -1068,6 +1068,22 @@ def test_market_family_discovery_report_endpoints_require_api_key_when_configure
     assert preview_response.status_code == 401
 
 
+def test_model_read_endpoints_require_api_key_when_configured(monkeypatch) -> None:
+    monkeypatch.setenv("BACKEND_API_KEY", "secret-test-key")
+    get_settings.cache_clear()
+
+    try:
+        governance_response = client.get("/v1/model/governance/status")
+        coverage_response = client.get("/v1/model/features/coverage?date=2026-07-01")
+        predictions_response = client.get("/v1/model/predictions/today")
+    finally:
+        get_settings.cache_clear()
+
+    assert governance_response.status_code == 401
+    assert coverage_response.status_code == 401
+    assert predictions_response.status_code == 401
+
+
 def test_internal_sync_endpoints_fail_closed_in_production_without_api_key(monkeypatch) -> None:
     monkeypatch.setenv("APP_ENV", "production")
     monkeypatch.delenv("BACKEND_API_KEY", raising=False)
@@ -2801,6 +2817,7 @@ def test_pr3c_trade_policy_caps_slate_trades(monkeypatch) -> None:
             result = candidates.generate_candidates(session)
             trades = list(session.scalars(select(PaperTrade)))
             prediction_run = session.scalar(select(ModelPredictionRun))
+            outputs = list(session.scalars(select(ModelPredictionOutput).order_by(ModelPredictionOutput.id.asc())))
     finally:
         get_settings.cache_clear()
 
@@ -2809,6 +2826,70 @@ def test_pr3c_trade_policy_caps_slate_trades(monkeypatch) -> None:
     assert prediction_run is not None
     assert prediction_run.trade_policy["paper_max_trades_per_slate"] == 2
     assert result["cap_counts"]["no_trade_slate_cap"] == 3
+    assert [output.decision_reason for output in outputs].count("paper_trade") == 2
+    assert [output.decision_reason for output in outputs].count("no_trade_slate_cap") == 3
+
+
+def test_first_five_tie_markets_still_obey_normal_trade_gates(monkeypatch) -> None:
+    monkeypatch.setenv("PAPER_CANDIDATE_ENGINE_ENABLED", "false")
+    monkeypatch.setenv("PAPER_MIN_DATA_QUALITY", "0")
+    monkeypatch.setenv("PAPER_MIN_NET_EV", "0")
+    monkeypatch.setenv("PAPER_MIN_PROB_EDGE", "0")
+    get_settings.cache_clear()
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+    monkeypatch.setattr(candidates, "utc_now", lambda: now)
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    try:
+        with Session(engine) as session:
+            game = MlbGame(
+                external_game_id="tie-normal-gates",
+                home_team="Pittsburgh Pirates",
+                away_team="Seattle Mariners",
+                home_abbreviation="PIT",
+                away_abbreviation="SEA",
+                scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+                status="scheduled",
+            )
+            market = KalshiMarket(
+                kalshi_market_id="KX-TIE-NORMAL-GATES",
+                ticker="KXMLBF5-26JUL011900SEAPIT-TIE",
+                title="Will the first five innings end tied?",
+                status="open",
+                implied_yes_ask=Decimal("0.0000"),
+                market_family="first_five_winner",
+                market_type="first_five_winner",
+                selection_code="TIE",
+                inning_scope="first_five",
+                settlement_rule_status="paper_supported",
+            )
+            session.add_all([game, market])
+            session.flush()
+            _add_candidate_mapping(
+                session,
+                game,
+                market,
+                mapping_status="confirmed",
+                market_family="first_five_winner",
+                market_type="first_five_winner",
+                selection_code="TIE",
+                inning_scope="first_five",
+                settlement_rule_status="paper_supported",
+            )
+            session.commit()
+
+            result = candidates.generate_candidates(session)
+            candidate = session.scalar(select(ModelCandidate))
+            trade = session.scalar(select(PaperTrade))
+    finally:
+        get_settings.cache_clear()
+
+    assert result["paper_trades"] == 0
+    assert candidate is not None
+    assert candidate.decision == "candidate_only"
+    assert trade is None
 
 
 def test_pr3c_trade_policy_counts_settled_trades_against_daily_caps(monkeypatch) -> None:
@@ -2934,8 +3015,12 @@ def test_model_predictions_today_filters_by_prediction_run_target_date(monkeypat
         )
         session.commit()
 
-    response = client.get("/v1/model/predictions/today")
-    payload = response.json()
+    app.dependency_overrides[require_internal_api_key] = lambda: None
+    try:
+        response = client.get("/v1/model/predictions/today")
+        payload = response.json()
+    finally:
+        app.dependency_overrides.clear()
 
     assert response.status_code == 200
     assert payload["result"]["count"] == 1
