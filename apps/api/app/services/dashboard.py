@@ -275,7 +275,11 @@ def dashboard_summary_from_db(session: Session, closed_date: date | None = None)
     active_version = session.scalar(select(ModelVersion).where(ModelVersion.is_active.is_(True)))
     last_training = session.scalar(select(TrainingRun).order_by(TrainingRun.started_at.desc()))
     last_calibration = session.scalar(select(CalibrationRun).order_by(CalibrationRun.started_at.desc()))
-    last_prediction = session.scalar(select(ModelPredictionRun).order_by(ModelPredictionRun.started_at.desc()))
+    last_prediction = session.scalar(
+        select(ModelPredictionRun)
+        .where(ModelPredictionRun.target_date == today_eastern())
+        .order_by(ModelPredictionRun.started_at.desc())
+    )
     candidate_count = session.scalar(select(func.count(ModelCandidate.id))) or 0
     training_eligible_count = (
         session.scalar(select(func.count(ModelCandidate.id)).where(ModelCandidate.training_eligible.is_(True))) or 0

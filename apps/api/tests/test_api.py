@@ -2509,6 +2509,47 @@ def test_dashboard_summary_uses_labels_snapshots_and_settled_performance() -> No
     assert "EDT" in summary.positions[0].time_entered_display
 
 
+def test_dashboard_trade_caps_use_today_prediction_run(monkeypatch) -> None:
+    monkeypatch.setattr(dashboard, "today_eastern", lambda: date(2026, 7, 2))
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        session.add(
+            ModelPredictionRun(
+                started_at=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
+                target_date=date(2026, 7, 1),
+                status="completed",
+                trades_created=9,
+                trade_policy={"paper_max_trades_per_slate": 20},
+                summary={"cap_counts": {"no_trade_slate_cap": 4}},
+            )
+        )
+        session.commit()
+
+        summary_before_today_run = dashboard.dashboard_summary_from_db(session)
+
+        session.add(
+            ModelPredictionRun(
+                started_at=datetime(2026, 7, 2, 16, 0, tzinfo=UTC),
+                target_date=date(2026, 7, 2),
+                status="completed",
+                trades_created=2,
+                trade_policy={"paper_max_trades_per_slate": 10},
+                summary={"cap_counts": {"no_trade_slate_cap": 1}},
+            )
+        )
+        session.commit()
+
+        summary_after_today_run = dashboard.dashboard_summary_from_db(session)
+
+    assert summary_before_today_run.model_status.trade_policy == {}
+    assert summary_before_today_run.model_status.trade_caps_used == {"paper_trades": 0}
+    assert summary_after_today_run.model_status.trade_policy == {"paper_max_trades_per_slate": 10}
+    assert summary_after_today_run.model_status.trade_caps_used == {"no_trade_slate_cap": 1, "paper_trades": 2}
+
+
 def test_generate_candidates_uses_heuristic_probability_and_feature_snapshot(monkeypatch) -> None:
     now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
     monkeypatch.setattr(candidates, "utc_now", lambda: now)
