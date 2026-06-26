@@ -144,6 +144,8 @@ class ModelCandidate(TimestampMixin, Base):
     features: Mapped[dict[str, object]] = mapped_column(JSON, default=dict, nullable=False)
     probability: Mapped[Decimal | None] = mapped_column(Numeric(8, 6))
     model_probability: Mapped[Decimal | None] = mapped_column(Numeric(8, 6))
+    probability_raw: Mapped[Decimal | None] = mapped_column(Numeric(8, 6))
+    probability_calibrated: Mapped[Decimal | None] = mapped_column(Numeric(8, 6))
     fair_value: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
     market_price: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
     executable_price: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
@@ -166,6 +168,9 @@ class ModelCandidate(TimestampMixin, Base):
     contract_display: Mapped[str | None] = mapped_column(Text)
     feature_version: Mapped[str | None] = mapped_column(String(80))
     training_eligible: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    training_exclusion_reason: Mapped[str | None] = mapped_column(String(120))
+    data_quality: Mapped[Decimal | None] = mapped_column(Numeric(6, 4))
+    calibration_status: Mapped[str | None] = mapped_column(String(80))
     market_family: Mapped[str | None] = mapped_column(String(80))
     line_value: Mapped[Decimal | None] = mapped_column(Numeric(10, 4))
     selection_code: Mapped[str | None] = mapped_column(String(40))
@@ -295,6 +300,65 @@ class FeatureSnapshot(TimestampMixin, Base):
     captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     features: Mapped[dict[str, object]] = mapped_column(JSON, default=dict, nullable=False)
     source: Mapped[str] = mapped_column(String(80), nullable=False)
+    feature_version: Mapped[str | None] = mapped_column(String(80))
+    source_statuses: Mapped[dict[str, object] | None] = mapped_column(JSON)
+
+
+class MlbFeatureSnapshot(TimestampMixin, Base):
+    __tablename__ = "mlb_feature_snapshots"
+    __table_args__ = (UniqueConstraint("mlb_game_id", "target_date", "source", name="uq_mlb_feature_game_date_source"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    mlb_game_id: Mapped[int | None] = mapped_column(ForeignKey("mlb_games.id"))
+    target_date: Mapped[date] = mapped_column(Date, nullable=False)
+    source: Mapped[str] = mapped_column(String(80), nullable=False)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    data_quality: Mapped[Decimal | None] = mapped_column(Numeric(6, 4))
+    source_statuses: Mapped[dict[str, object] | None] = mapped_column(JSON)
+    features: Mapped[dict[str, object]] = mapped_column(JSON, default=dict, nullable=False)
+
+
+class ModelPredictionRun(TimestampMixin, Base):
+    __tablename__ = "model_prediction_runs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    target_date: Mapped[date | None] = mapped_column(Date)
+    status: Mapped[str] = mapped_column(String(40), default="running", nullable=False)
+    model_version_tag: Mapped[str | None] = mapped_column(String(120))
+    feature_version: Mapped[str | None] = mapped_column(String(80))
+    candidates_evaluated: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    trades_created: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    trade_policy: Mapped[dict[str, object] | None] = mapped_column(JSON)
+    summary: Mapped[dict[str, object] | None] = mapped_column(JSON)
+
+
+class ModelPredictionOutput(TimestampMixin, Base):
+    __tablename__ = "model_prediction_outputs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    prediction_run_id: Mapped[int | None] = mapped_column(ForeignKey("model_prediction_runs.id"))
+    candidate_id: Mapped[int | None] = mapped_column(ForeignKey("model_candidates.id"))
+    market_family: Mapped[str | None] = mapped_column(String(80))
+    probability_raw: Mapped[Decimal | None] = mapped_column(Numeric(8, 6))
+    probability_calibrated: Mapped[Decimal | None] = mapped_column(Numeric(8, 6))
+    fair_value: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
+    data_quality: Mapped[Decimal | None] = mapped_column(Numeric(6, 4))
+    calibration_status: Mapped[str | None] = mapped_column(String(80))
+    trade_rank: Mapped[int | None] = mapped_column(Integer)
+    decision_reason: Mapped[str | None] = mapped_column(String(120))
+    raw_output: Mapped[dict[str, object] | None] = mapped_column(JSON)
+
+
+class ModelGovernanceEvent(TimestampMixin, Base):
+    __tablename__ = "model_governance_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(80), nullable=False)
+    status: Mapped[str] = mapped_column(String(40), nullable=False)
+    details: Mapped[dict[str, object] | None] = mapped_column(JSON)
 
 
 class RiskEvent(TimestampMixin, Base):

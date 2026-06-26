@@ -14,6 +14,7 @@ from app.models import (
     MarketMapping,
     MlbGame,
     ModelCandidate,
+    ModelPredictionRun,
     ModelVersion,
     PaperTrade,
     Position,
@@ -53,10 +54,18 @@ def empty_dashboard_summary(closed_date: date | None = None) -> DashboardSummary
         ),
         model_status=ModelStatus(
             active_model_version=None,
+            feature_version=None,
+            calibration_status="not_run",
             last_training_run=None,
             last_calibration_run=None,
             candidate_count=0,
-            notes="No model has been trained yet. PR 2 adds candidate plumbing.",
+            resolved_mature_samples=0,
+            training_eligible_count=0,
+            last_governance_status="not_run",
+            trade_policy={},
+            trade_caps_used={},
+            data_quality_summary={},
+            notes=["No mature model run has been recorded yet."],
         ),
         paper_starting_balance=float(settings.paper_starting_balance),
         last_update=to_eastern_iso(utc_now()),
@@ -266,13 +275,48 @@ def dashboard_summary_from_db(session: Session, closed_date: date | None = None)
     active_version = session.scalar(select(ModelVersion).where(ModelVersion.is_active.is_(True)))
     last_training = session.scalar(select(TrainingRun).order_by(TrainingRun.started_at.desc()))
     last_calibration = session.scalar(select(CalibrationRun).order_by(CalibrationRun.started_at.desc()))
+    last_prediction = session.scalar(select(ModelPredictionRun).order_by(ModelPredictionRun.started_at.desc()))
     candidate_count = session.scalar(select(func.count(ModelCandidate.id))) or 0
+    training_eligible_count = (
+        session.scalar(select(func.count(ModelCandidate.id)).where(ModelCandidate.training_eligible.is_(True))) or 0
+    )
+    resolved_mature_samples = (
+        session.scalar(
+            select(func.count(ModelCandidate.id))
+            .where(ModelCandidate.training_eligible.is_(True))
+            .where(ModelCandidate.outcome.in_(["win", "loss"]))
+            .where(ModelCandidate.feature_version == "mature_mlb_features_v1")
+        )
+        or 0
+    )
+    avg_data_quality = session.scalar(
+        select(func.avg(ModelCandidate.data_quality)).where(ModelCandidate.feature_version == "mature_mlb_features_v1")
+    )
     summary.model_status = ModelStatus(
         active_model_version=active_version.version_tag if active_version else None,
+        feature_version=active_version.feature_version if active_version else None,
+        calibration_status=last_calibration.status if last_calibration else "not_run",
         last_training_run=last_training.started_at if last_training else None,
         last_calibration_run=last_calibration.started_at if last_calibration else None,
         candidate_count=int(candidate_count),
-        notes="PR3 uses a paper-only heuristic model and skips trained promotion until sample thresholds are met.",
+        resolved_mature_samples=int(resolved_mature_samples),
+        training_eligible_count=int(training_eligible_count),
+        last_governance_status=last_training.status if last_training else "not_run",
+        trade_policy=last_prediction.trade_policy if last_prediction and last_prediction.trade_policy else {},
+        trade_caps_used=(
+            {
+                **((last_prediction.summary or {}).get("cap_counts", {}) if last_prediction else {}),
+                "paper_trades": last_prediction.trades_created if last_prediction else 0,
+            }
+        ),
+        data_quality_summary={
+            "avg": float(avg_data_quality) if avg_data_quality is not None else None,
+            "feature_version": active_version.feature_version if active_version else None,
+        },
+        notes=[
+            "PR3c mature run-distribution model is paper-only.",
+            "Calibration remains conservative until resolved mature sample thresholds are met.",
+        ],
     )
     summary.last_update = to_eastern_iso(utc_now())
     summary.last_update_display = eastern_display(utc_now())

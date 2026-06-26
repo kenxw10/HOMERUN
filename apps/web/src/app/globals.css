@@ -153,6 +153,16 @@ button {
   font-weight: 800;
 }
 
+.model-warning {
+  margin-bottom: 14px;
+  border: 1px solid #e8cc77;
+  padding: 10px 12px;
+  background: #fff9e7;
+  color: #8a5b00;
+  font-weight: 900;
+  letter-spacing: 0.4px;
+}
+
 .panel {
   border: 1px solid #d3dae4;
   border-radius: 4px;

@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 from app.config import get_settings
 from app.models import KalshiMarket, ModelCandidate, PaperTrade, Position
 from app.services.kalshi import KalshiAPIError, KalshiClient, derive_orderbook_prices
+from app.services.market_sync import _market_status, _update_market_fields
 from app.services.portfolio import create_balance_snapshot
 from app.time_utils import utc_now
 
@@ -24,6 +25,43 @@ def _mark_from_orderbook(orderbook: dict[str, object], market: KalshiMarket | No
     if trade.contract_side.lower() == "yes":
         return derived["best_yes_bid"]
     return derived["best_no_bid"]
+
+
+def _mark_from_market(market: KalshiMarket | None, trade: PaperTrade) -> Decimal | None:
+    if market is None:
+        return None
+    if trade.contract_side.lower() == "yes":
+        for value in (market.best_yes_bid, market.yes_bid, market.last_price):
+            if value is not None:
+                return value
+    else:
+        for value in (market.best_no_bid, market.no_bid, market.last_price):
+            if value is not None:
+                return value
+    return None
+
+
+def _chunks(values: list[str], size: int = 50):
+    for index in range(0, len(values), size):
+        yield values[index : index + size]
+
+
+def _markets_by_ticker(client: KalshiClient, tickers: list[str]) -> tuple[dict[str, dict[str, object]], list[dict[str, object]]]:
+    markets: dict[str, dict[str, object]] = {}
+    errors: list[dict[str, object]] = []
+    for chunk in _chunks(tickers):
+        try:
+            payload = client.get_markets_by_tickers(chunk)
+        except KalshiAPIError as exc:
+            errors.append({"tickers": chunk, "error": exc.to_detail()})
+            continue
+        except Exception as exc:
+            errors.append({"tickers": chunk, "error": {"message": str(exc), "type": exc.__class__.__name__}})
+            continue
+        for market in payload.get("markets") or []:
+            if isinstance(market, dict) and market.get("ticker"):
+                markets[str(market["ticker"]).upper()] = market
+    return markets, errors
 
 
 def refresh_open_position_prices(
@@ -44,10 +82,19 @@ def refresh_open_position_prices(
 
     kalshi_client = client or KalshiClient.from_market_data_settings()
     now = utc_now()
-    trades = list(session.scalars(select(PaperTrade).where(PaperTrade.status == "open").order_by(PaperTrade.id.asc())))
+    all_trades = list(session.scalars(select(PaperTrade).where(PaperTrade.status == "open").order_by(PaperTrade.id.asc())))
+    trades = all_trades[: settings.open_position_price_refresh_max_per_run]
+    skipped_due_to_limit = max(len(all_trades) - len(trades), 0)
     updated = 0
-    skipped = 0
+    skipped = skipped_due_to_limit
     errors: list[dict[str, object]] = []
+    request_counters = {"market_batch_requests": 0, "orderbook_requests": 0}
+    batch_markets: dict[str, dict[str, object]] = {}
+    if hasattr(kalshi_client, "get_markets_by_tickers") and trades:
+        tickers = sorted({trade.market_ticker for trade in trades})
+        batch_markets, batch_errors = _markets_by_ticker(kalshi_client, tickers)
+        request_counters["market_batch_requests"] = (len(tickers) + 49) // 50
+        errors.extend(batch_errors)
 
     for trade in trades:
         market = None
@@ -62,18 +109,30 @@ def refresh_open_position_prices(
             market = session.scalar(select(KalshiMarket).where(KalshiMarket.ticker == trade.market_ticker).limit(1))
 
         mark = None
-        try:
-            orderbook = kalshi_client.get_orderbook(trade.market_ticker)
-            mark = _mark_from_orderbook(orderbook, market, trade)
-        except KalshiAPIError as exc:
-            errors.append({"market_ticker": trade.market_ticker, "error": exc.to_detail()})
-        except Exception as exc:
-            errors.append(
-                {
-                    "market_ticker": trade.market_ticker,
-                    "error": {"message": str(exc), "type": exc.__class__.__name__},
-                }
-            )
+        payload = batch_markets.get(trade.market_ticker.upper())
+        if payload is not None:
+            if market is None:
+                market = KalshiMarket(
+                    ticker=trade.market_ticker,
+                    kalshi_market_id=str(payload.get("id") or payload.get("market_id") or trade.market_ticker),
+                    title=str(payload.get("title") or trade.market_ticker),
+                )
+            _update_market_fields(market, payload, trade.market_ticker, _market_status(payload))
+            mark = _mark_from_market(market, trade)
+        elif not hasattr(kalshi_client, "get_markets_by_tickers"):
+            try:
+                request_counters["orderbook_requests"] += 1
+                orderbook = kalshi_client.get_orderbook(trade.market_ticker)
+                mark = _mark_from_orderbook(orderbook, market, trade)
+            except KalshiAPIError as exc:
+                errors.append({"market_ticker": trade.market_ticker, "error": exc.to_detail()})
+            except Exception as exc:
+                errors.append(
+                    {
+                        "market_ticker": trade.market_ticker,
+                        "error": {"message": str(exc), "type": exc.__class__.__name__},
+                    }
+                )
 
         if mark is None:
             skipped += 1
@@ -103,7 +162,11 @@ def refresh_open_position_prices(
         "checked": len(trades),
         "updated": updated,
         "skipped": skipped,
+        "skipped_due_to_limit": skipped_due_to_limit,
         "errors": errors,
         "snapshot_id": snapshot.id,
         "last_marked_at": now.isoformat(),
+        "request_counters": request_counters,
+        "kalshi_request_count": getattr(kalshi_client, "request_count", None),
+        "rate_limited_count": getattr(kalshi_client, "rate_limited_count", None),
     }

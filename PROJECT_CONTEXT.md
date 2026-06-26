@@ -19,12 +19,12 @@ PR 3b builds on the merged PR 3a discovery and operator-repair workflow:
 - Targeted Kalshi MLB market resolution from MLB game rows using the empirically observed `KXMLBGAME` full-game winner family.
 - Kalshi yes/no orderbook parsing and raw payload storage for targeted markets only.
 - Auditable MLB game to Kalshi market mapping with confidence and rationale.
-- Conservative paper candidate and paper-trade generation using a transparent heuristic probability model.
+- Conservative paper candidate and paper-trade generation using a transparent MLB run-distribution probability model.
 - MLB results sync for completed games.
 - Paper settlement and realized P/L tracking for validated supported MLB market families.
 - Paper balance snapshots from starting balance, open cost, realized P/L, and open mark value.
-- Feature snapshot storage for model candidates with explicit missing-source markers.
-- Automated model governance runs that skip training/promotion until sample thresholds are met.
+- Mature MLB feature snapshot storage for model candidates with explicit source-status markers.
+- Automated model governance runs that skip training/calibration/promotion until sample thresholds are met.
 - PR3a governance repair that normalizes resolved `KXMLBGAME` candidates to `full_game_winner` before counting samples.
 - Kalshi MLB market-family discovery plus mapping sync for validated spread, total, and first-five families.
 - REST last-mark refresh for open paper positions.
@@ -34,7 +34,7 @@ PR 3b builds on the merged PR 3a discovery and operator-repair workflow:
 - Vercel frontend setup documentation.
 - CI scaffolding for backend tests and frontend checks.
 
-The system still has no live trading, no production credentials requirement, no sportsbook logic, and no support for team totals, multivariate/MVE markets, guessed/retired prefixes, or live execution. Non-winner market families are paper-only and require validated `paper_supported` mapping metadata.
+The system still has no live trading, no production credentials requirement, no sportsbook logic, and no support for team totals, multivariate/MVE markets, guessed/retired prefixes, or live execution. All supported market families are paper-only and require validated `paper_supported` mapping metadata.
 
 ## 3. Non-Goals
 
@@ -44,7 +44,7 @@ PR 3 still intentionally excludes:
 
 - Live order placement.
 - Production Kalshi credentials.
-- A trained predictive model.
+- A trained challenger model with enough sample support for promotion.
 - Admin password pages.
 - Monthly calendars.
 - Hidden dashboard-triggered worker automation.
@@ -309,7 +309,33 @@ Expected next PR scope:
 - Add fee-aware EV after current Kalshi fee terms are verified.
 - Add scheduler/automation only after the manual one-shot flow is production validated.
 
-## 16. PR Change Log
+## 16. PR3c Full MLB Model And Automated Governance
+
+PR 3c replaces the PR3b placeholder family probabilities with a paper-only mature MLB model and governance layer:
+
+- Migration `0007_pr3c_model_governance.py` adds mature MLB feature snapshots, model prediction runs/outputs, governance events, and extra candidate/model feature metadata.
+- Candidate generation now scores `full_game_winner`, `full_game_spread`, `full_game_total`, `first_five_winner`, `first_five_spread`, and `first_five_total` with `mature_mlb_run_distribution_v1`.
+- Feature snapshots use `mature_mlb_features_v1` and record source status as available, partial, missing, or unavailable instead of filling gaps with fake data.
+- The model uses a transparent run-distribution approach for full-game and first-five probabilities. It does not blend toward Kalshi market price and does not use sportsbook odds.
+- Missing lineup, injury, weather, bullpen, defense/catcher, and other unavailable inputs are explicitly marked. Umpire data, team totals, sportsbook APIs, and MVE/multivariate markets remain out of scope.
+- Paper trades are capped by slate, game, market family, open-position count, duplicate market ticker, and correlated game/family exposure before any trade row is created.
+- Governance records resolved mature samples, reliability metrics, Brier/log-loss summaries, calibration status, and skipped reasons when sample thresholds are not met.
+- New protected model endpoints expose governance status, feature coverage, prediction outputs, MLB feature sync, feature snapshot backfill, and training-eligibility repair.
+- The dashboard model panel now shows active model, feature version, calibration status, training-eligible count, resolved mature samples, data quality, trade cap usage, and last governance status.
+
+PR 3c safety posture:
+
+- Still no live orders.
+- Still no production Kalshi credential requirement.
+- Still no cron, admin page, monthly calendar, sportsbook integration, team-total trading, or live execution path.
+- `PAPER_REQUIRE_CALIBRATED_FOR_TRADE=false` by default so paper validation can continue while governance collects samples; production operators can turn it on later if they want stricter paper gating.
+
+Expected next PR scope:
+
+- PR3d should add the Railway cron/orchestration layer for the validated one-shot jobs, with stuck-run protection and operator monitoring.
+- PR4 should add only a live-readiness shell and risk controls while keeping live execution off by default.
+
+## 17. PR Change Log
 
 Every future PR must update this section with:
 
@@ -409,3 +435,14 @@ Every future PR must update this section with:
 - Added `/v1/dashboard/summary?closed_date=YYYY-MM-DD` closed-position rows and a frontend closed positions table with previous/today/tomorrow/date controls.
 - Kept paper-first safety posture unchanged: no live orders, live trading disabled, kill switch enabled, no production credential requirement.
 - Validation performed: backend Ruff, backend pytest, backend compileall, frontend lint, frontend typecheck, frontend build, and `git diff --check`.
+
+### PR 3c - Full MLB Model And Automated Governance
+
+- Added migration `0007_pr3c_model_governance.py` for mature MLB feature snapshots, model prediction runs/outputs, governance events, and extra candidate/model feature metadata.
+- Replaced PR3b placeholder non-winner probabilities with `mature_mlb_run_distribution_v1` across supported full-game and first-five winner/spread/total families.
+- Added `mature_mlb_features_v1` snapshots with explicit source statuses and no fake missing lineup, weather, injury, umpire, sportsbook, team-total, or MVE data.
+- Added strict paper trade caps by slate, game, market family, open-position count, duplicate market ticker, and correlated game/family exposure.
+- Added governance status, feature coverage, prediction output, feature sync, feature snapshot backfill, and training-eligibility repair endpoints/jobs.
+- Updated the dashboard model quality panel with active model, feature version, calibration status, training samples, data quality, cap usage, and governance state.
+- Kept paper-first safety posture unchanged: no live orders, live trading disabled, kill switch enabled, no production credential requirement, no cron setup.
+- Validation performed: backend Ruff, backend pytest, backend compileall, Alembic head check, frontend lint, frontend typecheck, frontend build, and `git diff --check`.

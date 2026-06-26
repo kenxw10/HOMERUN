@@ -49,10 +49,26 @@ class Settings(BaseSettings):
     kalshi_market_data_backoff_base_ms: int = Field(default=1000, alias="KALSHI_MARKET_DATA_BACKOFF_BASE_MS")
     kalshi_market_data_backoff_max_ms: int = Field(default=10000, alias="KALSHI_MARKET_DATA_BACKOFF_MAX_MS")
     open_position_price_refresh_enabled: bool = Field(default=True, alias="OPEN_POSITION_PRICE_REFRESH_ENABLED")
+    open_position_price_refresh_max_per_run: int = Field(default=100, alias="OPEN_POSITION_PRICE_REFRESH_MAX_PER_RUN")
     paper_candidate_engine_enabled: bool = Field(default=True, alias="PAPER_CANDIDATE_ENGINE_ENABLED")
     default_paper_contracts: int = Field(default=1, alias="DEFAULT_PAPER_CONTRACTS")
+    paper_max_trades_per_slate: int = Field(default=20, alias="PAPER_MAX_TRADES_PER_SLATE")
+    paper_max_trades_per_game: int = Field(default=3, alias="PAPER_MAX_TRADES_PER_GAME")
+    paper_max_trades_per_market_family: int = Field(default=8, alias="PAPER_MAX_TRADES_PER_MARKET_FAMILY")
+    paper_max_open_positions: int = Field(default=50, alias="PAPER_MAX_OPEN_POSITIONS")
+    paper_min_net_ev: Decimal = Field(default=Decimal("0.05"), alias="PAPER_MIN_NET_EV")
+    paper_min_prob_edge: Decimal = Field(default=Decimal("0.03"), alias="PAPER_MIN_PROB_EDGE")
+    paper_min_data_quality: Decimal = Field(default=Decimal("0.60"), alias="PAPER_MIN_DATA_QUALITY")
+    paper_require_calibrated_for_trade: bool = Field(default=False, alias="PAPER_REQUIRE_CALIBRATED_FOR_TRADE")
     paper_starting_balance: Decimal = Field(default=Decimal("1000.00"), alias="PAPER_STARTING_BALANCE")
     model_training_min_samples: int = Field(default=100, alias="MODEL_TRAINING_MIN_SAMPLES")
+    model_min_samples_train: int = Field(default=250, alias="MODEL_MIN_SAMPLES_TRAIN")
+    model_min_samples_calibrate: int = Field(default=250, alias="MODEL_MIN_SAMPLES_CALIBRATE")
+    model_min_samples_promote: int = Field(default=500, alias="MODEL_MIN_SAMPLES_PROMOTE")
+    model_promotion_min_logloss_improvement: Decimal = Field(
+        default=Decimal("0.01"), alias="MODEL_PROMOTION_MIN_LOGLOSS_IMPROVEMENT"
+    )
+    model_promotion_max_ece: Decimal = Field(default=Decimal("0.05"), alias="MODEL_PROMOTION_MAX_ECE")
     dashboard_timezone: str = Field(default="America/New_York", alias="DASHBOARD_TIMEZONE")
     backend_api_key: SecretStr | None = Field(default=None, alias="BACKEND_API_KEY")
 
@@ -100,6 +116,31 @@ class Settings(BaseSettings):
     @classmethod
     def validate_default_paper_contracts(cls, value: int) -> int:
         return max(value, 1)
+
+    @field_validator(
+        "open_position_price_refresh_max_per_run",
+        "paper_max_trades_per_slate",
+        "paper_max_trades_per_game",
+        "paper_max_trades_per_market_family",
+        "paper_max_open_positions",
+        "model_min_samples_train",
+        "model_min_samples_calibrate",
+        "model_min_samples_promote",
+    )
+    @classmethod
+    def validate_positive_ints(cls, value: int) -> int:
+        return max(value, 1)
+
+    @field_validator(
+        "paper_min_net_ev",
+        "paper_min_prob_edge",
+        "paper_min_data_quality",
+        "model_promotion_min_logloss_improvement",
+        "model_promotion_max_ece",
+    )
+    @classmethod
+    def validate_nonnegative_decimals(cls, value: Decimal) -> Decimal:
+        return max(value, Decimal("0"))
 
     @field_validator("paper_starting_balance")
     @classmethod
