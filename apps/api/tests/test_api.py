@@ -90,6 +90,7 @@ def test_system_status_redacts_secrets_and_allows_missing_database() -> None:
     assert payload["database"]["ready"] is False
     assert payload["config"]["ready"] is True
     assert payload["config"]["kalshi_market_data_source"] == "production_public_market_data"
+    assert payload["config"]["kalshi_market_data_base_kind"] == "production_public_market_data"
     assert payload["config"]["kalshi_credentials"] == "not_set"
     assert "KALSHI_API_KEY" not in str(payload)
 
@@ -146,6 +147,42 @@ def test_kalshi_client_iter_markets_follows_cursor_until_exhausted(monkeypatch) 
 
     assert [market["ticker"] for market in markets] == ["PAGE-1", "PAGE-2"]
     assert calls == [{"limit": 200}, {"limit": 200, "cursor": "next-page"}]
+
+
+def test_kalshi_client_retries_429_and_respects_retry_after(monkeypatch) -> None:
+    client_instance = KalshiClient(
+        base_url="https://example.test",
+        max_retries=1,
+        backoff_base_ms=1000,
+        backoff_max_ms=10000,
+    )
+    calls = 0
+    sleeps: list[float] = []
+
+    def fake_raw_get_json(path: str, params: dict[str, object] | None = None):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise HttpJsonError(
+                "rate limited",
+                endpoint=f"https://example.test{path}",
+                params=params or {},
+                status_code=429,
+                body_preview="too_many_requests",
+                response_headers={"Retry-After": "2"},
+            )
+        return {"markets": []}
+
+    monkeypatch.setattr(client_instance, "_raw_get_json", fake_raw_get_json)
+    monkeypatch.setattr("app.services.kalshi.time.sleep", lambda seconds: sleeps.append(seconds))
+
+    payload = client_instance.get_markets({"limit": 1})
+
+    assert payload == {"markets": []}
+    assert calls == 2
+    assert client_instance.rate_limited_count == 1
+    assert client_instance.retries_attempted == 1
+    assert sleeps == [2.0]
 
 
 def test_time_bucket_classification() -> None:
@@ -2316,30 +2353,71 @@ def test_model_governance_counts_samples_after_settlement_labels_candidates() ->
     assert governance_result["resolved_samples"] == 1
 
 
-def test_resolve_game_markets_exact_kxmlb_match_stays_confirmed_for_paper() -> None:
+@pytest.mark.parametrize(
+    ("external_game_id", "home_team", "away_team", "home_code", "away_code", "scheduled_start", "market_ticker"),
+    [
+        (
+            "exact-resolver-kc-tb",
+            "Tampa Bay Rays",
+            "Kansas City Royals",
+            "TB",
+            "KC",
+            datetime(2026, 6, 25, 16, 10, tzinfo=UTC),
+            "KXMLBGAME-26JUN251210KCTB-KC",
+        ),
+        (
+            "exact-resolver-tex-tor",
+            "Toronto Blue Jays",
+            "Texas Rangers",
+            "TOR",
+            "TEX",
+            datetime(2026, 6, 25, 23, 7, tzinfo=UTC),
+            "KXMLBGAME-26JUN251907TEXTOR-TEX",
+        ),
+    ],
+)
+def test_resolve_game_markets_exact_kxmlb_match_stays_confirmed_for_paper(
+    external_game_id: str,
+    home_team: str,
+    away_team: str,
+    home_code: str,
+    away_code: str,
+    scheduled_start: datetime,
+    market_ticker: str,
+) -> None:
     game = MlbGame(
-        external_game_id="exact-resolver-lock-1",
-        home_team="Detroit Tigers",
-        away_team="Houston Astros",
-        home_abbreviation="DET",
-        away_abbreviation="HOU",
-        scheduled_start=datetime(2026, 6, 26, 22, 40, tzinfo=UTC),
+        external_game_id=external_game_id,
+        home_team=home_team,
+        away_team=away_team,
+        home_abbreviation=home_code,
+        away_abbreviation=away_code,
+        scheduled_start=scheduled_start,
         status="scheduled",
     )
+    event_ticker = market_ticker.rsplit("-", 1)[0]
 
     class FakeExactClient:
         def get_markets_by_tickers(self, tickers):
-            assert "KXMLBGAME-26JUN261840HOUDET-HOU" in tickers
+            assert market_ticker in tickers
             return {
                 "markets": [
                     {
-                        "ticker": "KXMLBGAME-26JUN261840HOUDET-HOU",
-                        "event_ticker": "KXMLBGAME-26JUN261840HOUDET",
-                        "title": "Houston vs Detroit",
+                        "ticker": market_ticker,
+                        "event_ticker": event_ticker,
+                        "title": f"{away_team} vs {home_team}",
                         "status": "open",
                     }
                 ]
             }
+
+        def get_event(self, event_ticker: str):
+            raise AssertionError("exact direct match should not need event fallback")
+
+        def get_markets_by_event_ticker(self, event_ticker: str, limit: int = 100):
+            raise AssertionError("exact direct match should not need event filter fallback")
+
+        def get_markets_by_series_window(self, *args, **kwargs):
+            raise AssertionError("exact direct match should not need series fallback")
 
     resolution = resolve_game_markets(FakeExactClient(), game)
 
@@ -2347,8 +2425,15 @@ def test_resolve_game_markets_exact_kxmlb_match_stays_confirmed_for_paper() -> N
     match = resolution.matches[0]
     assert match.mapping_status == "confirmed"
     assert match.validation_status == "confirmed_for_paper"
+    assert match.confidence == Decimal("0.9700")
     assert match.metadata["time_delta_minutes"] == 0
     assert match.metadata["team_match_score"] == 1.0
+    assert match.metadata["ticker_team_codes_match"] is True
+    assert "MARKET_TICKER_MATCH" in match.rationale
+    assert "EVENT_TICKER_MATCH" in match.rationale
+    assert "TICKER_TEAM_CODE_MATCH" in match.rationale
+    assert "TIME_DELTA_MINUTES:0" in match.rationale
+    assert "TEAM_MATCH_SCORE:1.00" in match.rationale
 
 
 def test_market_family_discovery_persists_structured_by_family_and_excludes_mve() -> None:
@@ -2356,7 +2441,7 @@ def test_market_family_discovery_persists_structured_by_family_and_excludes_mve(
     Base.metadata.create_all(engine)
 
     spread_market = {
-        "ticker": "KXMLBSPREAD-26JUL011900SEAPIT-PIT-1.5",
+        "ticker": "KXMLBSPREAD-26JUL011900SEAPIT",
         "event_ticker": "KXMLBSPREAD-26JUL011900SEAPIT",
         "title": "Pittsburgh Pirates spread -1.5 vs Seattle Mariners",
         "yes_sub_title": "Pittsburgh -1.5",
@@ -2368,28 +2453,33 @@ def test_market_family_discovery_persists_structured_by_family_and_excludes_mve(
 
     class FakeDiscoveryClient:
         def __init__(self) -> None:
-            self.direct_market_tickers: list[str] = []
+            self.ticker_batches: list[list[str]] = []
             self.event_tickers: list[str] = []
 
         def get_market(self, ticker: str):
-            self.direct_market_tickers.append(ticker)
-            return {"markets": []}
+            raise AssertionError("discovery should use batched ticker lookup, not one request per ticker")
+
+        def get_markets_by_tickers(self, tickers: list[str]):
+            self.ticker_batches.append(tickers)
+            markets = []
+            if "KXMLBSPREAD-26JUL011900SEAPIT" in tickers:
+                markets.append(spread_market)
+            if "KXMLBTOTAL-26JUL011900SEAPIT" in tickers:
+                markets.append(
+                    {
+                        "ticker": "KXMLBTOTAL-26JUL011900SEAPIT",
+                        "event_ticker": "KXMLBTOTAL-26JUL011900SEAPIT",
+                        "title": "Multivariate combo",
+                        "mve_selected_legs": [{"ticker": "LEG"}],
+                    }
+                )
+            return {"markets": markets}
 
         def get_markets_by_event_ticker(self, event_ticker: str):
             self.event_tickers.append(event_ticker)
-            if not event_ticker.startswith("KXMLBSPREAD-"):
-                return {"markets": []}
-            return {
-                "markets": [
-                    spread_market,
-                    {
-                        "ticker": "KXMV-MLB-COMBO",
-                        "event_ticker": "KXMVE-MLB-COMBO",
-                        "title": "Multivariate combo",
-                        "mve_selected_legs": [{"ticker": "LEG"}],
-                    },
-                ]
-            }
+            if event_ticker.startswith("KXMLBSPREAD-"):
+                raise AssertionError("event filter should not run for a family already found by exact batch")
+            return {"markets": []}
 
     fake_client = FakeDiscoveryClient()
     with Session(engine) as session:
@@ -2423,11 +2513,13 @@ def test_market_family_discovery_persists_structured_by_family_and_excludes_mve(
     assert run.raw_summary["markets_found"] == 1
     assert len(items) == 1
     assert items[0].family_key == "full_game_spread"
-    assert items[0].candidate_market_ticker is None
+    assert items[0].candidate_market_ticker == "KXMLBSPREAD-26JUL011900SEAPIT"
     assert items[0].line_value == Decimal("-1.5000")
-    assert "KXMLBSPREAD-26JUL011900SEAPIT" not in fake_client.direct_market_tickers
-    assert all(ticker.count("-") >= 2 for ticker in fake_client.direct_market_tickers)
-    assert "KXMLBSPREAD-26JUL011900SEAPIT" in fake_client.event_tickers
+    assert any("KXMLBSPREAD-26JUL011900SEAPIT" in batch for batch in fake_client.ticker_batches)
+    assert "KXMLBSPREAD-26JUL011900SEAPIT" not in fake_client.event_tickers
+    assert all(not ticker.startswith("KXMLBGAME-") for batch in fake_client.ticker_batches for ticker in batch)
+    assert result["request_count"] > 0
+    assert result["requests_saved_by_batching"] > 0
     assert result["attempted_event_tickers_count"] > 0
     assert result["attempted_market_tickers_count"] > 0
     assert "KXMLBTEAMTOTAL" not in result["retired_legacy_prefixes_not_used"]
@@ -2457,7 +2549,10 @@ def test_market_family_discovery_persists_zero_market_run_when_all_probes_404(mo
 
     class FakeNoMatchClient:
         def get_market(self, ticker: str):
-            raise _kalshi_probe_error(404, f"https://kalshi.test/markets/{ticker}")
+            raise AssertionError("discovery should use batched ticker lookup, not one request per ticker")
+
+        def get_markets_by_tickers(self, tickers: list[str]):
+            raise _kalshi_probe_error(404, "https://kalshi.test/markets")
 
         def get_markets_by_event_ticker(self, event_ticker: str):
             raise _kalshi_probe_error(404, "https://kalshi.test/markets")
@@ -2506,6 +2601,8 @@ def test_market_family_discovery_persists_zero_market_run_when_all_probes_404(mo
     assert post_payload["result"]["warnings"][0]["message"] == "MARKET_FAMILY_PROBE_NO_MATCH"
     assert post_payload["result"]["attempted_probe_count"] > 0
     assert post_payload["result"]["probe_attempts"][0]["outcome"] == "no_match"
+    assert post_payload["result"]["request_count"] > 0
+    assert post_payload["result"]["stopped_due_to_rate_limit"] is False
 
     assert get_response.status_code == 200
     assert get_payload["result"]["run"] is not None
@@ -2516,6 +2613,7 @@ def test_market_family_discovery_persists_zero_market_run_when_all_probes_404(mo
     with SessionLocal() as session:
         run = session.scalar(select(MarketFamilyDiscoveryRun))
         items = list(session.scalars(select(MarketFamilyDiscoveryItem)))
+        running_run = session.scalar(select(MarketFamilyDiscoveryRun).where(MarketFamilyDiscoveryRun.status == "running"))
 
     assert run is not None
     assert run.status == "completed"
@@ -2525,7 +2623,130 @@ def test_market_family_discovery_persists_zero_market_run_when_all_probes_404(mo
     assert run.raw_summary["attempted_probe_count"] > 0
     assert run.raw_summary["attempted_market_tickers_count"] > 0
     assert run.raw_summary["probe_attempts"][0]["outcome"] == "no_match"
+    assert running_run is None
     assert items == []
+
+
+def test_market_family_discovery_rate_limit_circuit_breaker_finalizes_partial_error(monkeypatch) -> None:
+    monkeypatch.setenv("KALSHI_DISCOVERY_MAX_429_ERRORS", "1")
+    get_settings.cache_clear()
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    class FakeRateLimitedClient:
+        request_count = 0
+        rate_limited_count = 0
+        retries_attempted = 0
+
+        def get_market(self, ticker: str):
+            raise AssertionError("discovery should use batched ticker lookup, not one request per ticker")
+
+        def get_markets_by_tickers(self, tickers: list[str]):
+            self.request_count += 1
+            self.rate_limited_count += 1
+            raise _kalshi_probe_error(429, "https://kalshi.test/markets")
+
+        def get_markets_by_event_ticker(self, event_ticker: str):
+            raise AssertionError("event fallback should stop after the rate-limit circuit breaker opens")
+
+    try:
+        with Session(engine) as session:
+            session.add(
+                MlbGame(
+                    external_game_id="rate-limit-market-family",
+                    home_team="Pittsburgh Pirates",
+                    away_team="Seattle Mariners",
+                    home_abbreviation="PIT",
+                    away_abbreviation="SEA",
+                    scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+                    status="scheduled",
+                )
+            )
+            session.commit()
+
+            result = market_family_discovery.run_market_family_discovery(
+                session,
+                date(2026, 7, 1),
+                client=FakeRateLimitedClient(),
+            )
+            run = session.scalar(select(MarketFamilyDiscoveryRun))
+            running_run = session.scalar(
+                select(MarketFamilyDiscoveryRun).where(MarketFamilyDiscoveryRun.status == "running")
+            )
+    finally:
+        get_settings.cache_clear()
+
+    assert result["status"] == "partial_error"
+    assert result["stopped_due_to_rate_limit"] is True
+    assert result["rate_limited_count"] >= 1
+    assert result["errors"][0]["error"]["upstream_status_code"] == 429
+    assert run is not None
+    assert run.status == "partial_error"
+    assert run.completed_at is not None
+    assert running_run is None
+
+
+def test_market_family_discovery_finalizes_stale_running_runs(monkeypatch) -> None:
+    fixed_now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+    monkeypatch.setattr(market_family_discovery, "utc_now", lambda: fixed_now)
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    class EmptyDiscoveryClient:
+        def get_market(self, ticker: str):
+            raise AssertionError("discovery should use batched ticker lookup, not one request per ticker")
+
+        def get_markets_by_tickers(self, tickers: list[str]):
+            return {"markets": []}
+
+        def get_markets_by_event_ticker(self, event_ticker: str):
+            return {"markets": []}
+
+    with Session(engine) as session:
+        stale_run = MarketFamilyDiscoveryRun(
+            target_date=date(2026, 7, 1),
+            started_at=fixed_now - timedelta(minutes=11),
+            status="running",
+            games_considered=1,
+            families_considered=6,
+            markets_found=0,
+            errors=[],
+            warnings=[],
+            raw_summary={},
+        )
+        session.add_all(
+            [
+                stale_run,
+                MlbGame(
+                    external_game_id="stale-run-finalizer",
+                    home_team="Pittsburgh Pirates",
+                    away_team="Seattle Mariners",
+                    home_abbreviation="PIT",
+                    away_abbreviation="SEA",
+                    scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+                    status="scheduled",
+                ),
+            ]
+        )
+        session.commit()
+        stale_run_id = stale_run.id
+
+        result = market_family_discovery.run_market_family_discovery(
+            session,
+            date(2026, 7, 1),
+            client=EmptyDiscoveryClient(),
+        )
+        finalized = session.get(MarketFamilyDiscoveryRun, stale_run_id)
+        running_run = session.scalar(select(MarketFamilyDiscoveryRun).where(MarketFamilyDiscoveryRun.status == "running"))
+
+    assert result["stale_runs_finalized"] == 1
+    assert finalized is not None
+    assert finalized.status == "partial_error"
+    assert finalized.completed_at == fixed_now.replace(tzinfo=None)
+    assert finalized.warnings[0]["message"] == "STALE_RUNNING_RUN_FINALIZED"
+    assert running_run is None
 
 
 def test_market_family_discovery_records_non_404_errors_and_continues() -> None:
@@ -2537,9 +2758,12 @@ def test_market_family_discovery_records_non_404_errors_and_continues() -> None:
             self.failed_once = False
 
         def get_market(self, ticker: str):
+            raise AssertionError("discovery should use batched ticker lookup, not one request per ticker")
+
+        def get_markets_by_tickers(self, tickers: list[str]):
             if not self.failed_once:
                 self.failed_once = True
-                raise _kalshi_probe_error(500, f"https://kalshi.test/markets/{ticker}")
+                raise _kalshi_probe_error(500, "https://kalshi.test/markets")
             return {"markets": []}
 
         def get_markets_by_event_ticker(self, event_ticker: str):
@@ -2590,28 +2814,34 @@ def test_market_family_discovery_records_non_404_errors_and_continues() -> None:
     assert item.returned_ticker == "KXMLBSPREAD-26JUL011900SEAPIT-PIT-1.5"
 
 
-def test_market_family_discovery_handles_direct_market_response() -> None:
+def test_market_family_discovery_handles_batched_exact_market_response() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
 
-    class FakeDirectMarketClient:
+    spread_market = {
+        "ticker": "KXMLBSPREAD-26JUL011900SEAPIT",
+        "event_ticker": "KXMLBSPREAD-26JUL011900SEAPIT",
+        "title": "Pittsburgh Pirates spread -1.5 vs Seattle Mariners",
+        "status": "open",
+        "functional_strike": "-1.5",
+    }
+
+    class FakeBatchedExactClient:
         def __init__(self) -> None:
-            self.direct_market_tickers: list[str] = []
+            self.ticker_batches: list[list[str]] = []
 
         def get_market(self, ticker: str):
-            self.direct_market_tickers.append(ticker)
-            if ticker != "KXMLBGAME-26JUL011900SEAPIT-PIT":
-                return {"markets": []}
-            return {
-                "market": {
-                    "ticker": "KXMLBGAME-26JUL011900SEAPIT-PIT",
-                    "event_ticker": "KXMLBGAME-26JUL011900SEAPIT",
-                    "title": "Will the Pittsburgh Pirates win against the Seattle Mariners?",
-                    "status": "open",
-                }
-            }
+            raise AssertionError("discovery should use batched ticker lookup, not one request per ticker")
+
+        def get_markets_by_tickers(self, tickers: list[str]):
+            self.ticker_batches.append(tickers)
+            if "KXMLBSPREAD-26JUL011900SEAPIT" in tickers:
+                return {"markets": [spread_market]}
+            return {"markets": []}
 
         def get_markets_by_event_ticker(self, event_ticker: str):
+            if event_ticker == "KXMLBSPREAD-26JUL011900SEAPIT":
+                raise AssertionError("event filter should not run after exact batch finds the family")
             return {"markets": []}
 
     with Session(engine) as session:
@@ -2628,7 +2858,7 @@ def test_market_family_discovery_handles_direct_market_response() -> None:
         )
         session.commit()
 
-        fake_client = FakeDirectMarketClient()
+        fake_client = FakeBatchedExactClient()
         result = market_family_discovery.run_market_family_discovery(
             session,
             date(2026, 7, 1),
@@ -2642,11 +2872,12 @@ def test_market_family_discovery_handles_direct_market_response() -> None:
     assert run is not None
     assert run.status == "completed"
     assert item is not None
-    assert item.family_key == "full_game_winner"
-    assert item.returned_ticker == "KXMLBGAME-26JUL011900SEAPIT-PIT"
-    assert item.source_strategy == "direct_market_lookup"
-    assert item.candidate_market_ticker == "KXMLBGAME-26JUL011900SEAPIT-PIT"
-    assert "KXMLBGAME-26JUL011900SEAPIT" not in fake_client.direct_market_tickers
+    assert item.family_key == "full_game_spread"
+    assert item.returned_ticker == "KXMLBSPREAD-26JUL011900SEAPIT"
+    assert item.source_strategy == "batched_exact_ticker"
+    assert item.candidate_market_ticker == "KXMLBSPREAD-26JUL011900SEAPIT"
+    assert len(fake_client.ticker_batches) < result["attempted_market_tickers_count"]
+    assert result["requests_saved_by_batching"] > 0
 
 
 def test_market_family_discovery_job_returns_nonzero_for_failed_status(monkeypatch) -> None:
@@ -2674,6 +2905,9 @@ def test_market_family_discovery_parses_line_from_ticker_tail_not_date_prefix() 
 
     class FakeTickerTailClient:
         def get_market(self, ticker: str):
+            raise AssertionError("discovery should use batched ticker lookup, not one request per ticker")
+
+        def get_markets_by_tickers(self, tickers: list[str]):
             return {"markets": []}
 
         def get_markets_by_event_ticker(self, event_ticker: str):
@@ -2719,27 +2953,34 @@ def test_market_family_discovery_parses_line_from_ticker_tail_not_date_prefix() 
     assert item.line_value != Decimal("26.0000")
 
 
-def test_market_family_discovery_dedupes_same_ticker_across_probe_strategies() -> None:
+def test_market_family_discovery_skips_event_filter_for_exact_found_family() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
 
-    duplicate_market = {
-        "ticker": "KXMLBSPREAD-26JUL011900SEAPIT-PIT-1.5",
+    exact_market = {
+        "ticker": "KXMLBSPREAD-26JUL011900SEAPIT",
         "event_ticker": "KXMLBSPREAD-26JUL011900SEAPIT",
         "title": "Pittsburgh Pirates spread -1.5 vs Seattle Mariners",
         "status": "open",
         "functional_strike": "-1.5",
     }
 
-    class FakeDuplicateProbeClient:
+    class FakeExactFoundClient:
+        def __init__(self) -> None:
+            self.event_tickers: list[str] = []
+
         def get_market(self, ticker: str):
-            if ticker == "KXMLBSPREAD-26JUL011900SEAPIT":
-                return {"market": duplicate_market}
+            raise AssertionError("discovery should use batched ticker lookup, not one request per ticker")
+
+        def get_markets_by_tickers(self, tickers: list[str]):
+            if "KXMLBSPREAD-26JUL011900SEAPIT" in tickers:
+                return {"markets": [exact_market]}
             return {"markets": []}
 
         def get_markets_by_event_ticker(self, event_ticker: str):
             if event_ticker == "KXMLBSPREAD-26JUL011900SEAPIT":
-                return {"markets": [duplicate_market]}
+                raise AssertionError("event filter should not run after exact batch finds the family")
+            self.event_tickers.append(event_ticker)
             return {"markets": []}
 
     with Session(engine) as session:
@@ -2759,14 +3000,80 @@ def test_market_family_discovery_dedupes_same_ticker_across_probe_strategies() -
         result = market_family_discovery.run_market_family_discovery(
             session,
             date(2026, 7, 1),
-            client=FakeDuplicateProbeClient(),
+            client=FakeExactFoundClient(),
         )
         items = list(session.scalars(select(MarketFamilyDiscoveryItem)))
 
     assert result["markets_found"] == 1
     assert result["by_family"]["full_game_spread"]["market_count"] == 1
+    assert result["by_family"]["full_game_spread"]["event_filter_attempts"] == 0
     assert len(items) == 1
-    assert items[0].returned_ticker == duplicate_market["ticker"]
+    assert items[0].returned_ticker == exact_market["ticker"]
+
+
+def test_market_family_discovery_does_not_suppress_fallback_after_discarded_exact_hit() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    mve_market = {
+        "ticker": "KXMLBSPREAD-26JUL011900SEAPIT",
+        "event_ticker": "KXMLBSPREAD-26JUL011900SEAPIT",
+        "title": "Multivariate combo",
+        "mve_selected_legs": [{"ticker": "LEG"}],
+    }
+    fallback_market = {
+        "ticker": "KXMLBSPREAD-26JUL011900SEAPIT-PIT-1.5",
+        "event_ticker": "KXMLBSPREAD-26JUL011900SEAPIT",
+        "title": "Pittsburgh Pirates spread -1.5 vs Seattle Mariners",
+        "status": "open",
+        "functional_strike": "-1.5",
+    }
+
+    class FakeDiscardedExactClient:
+        def __init__(self) -> None:
+            self.event_tickers: list[str] = []
+
+        def get_market(self, ticker: str):
+            raise AssertionError("discovery should use batched ticker lookup, not one request per ticker")
+
+        def get_markets_by_tickers(self, tickers: list[str]):
+            if "KXMLBSPREAD-26JUL011900SEAPIT" in tickers:
+                return {"markets": [mve_market]}
+            return {"markets": []}
+
+        def get_markets_by_event_ticker(self, event_ticker: str):
+            self.event_tickers.append(event_ticker)
+            if event_ticker == "KXMLBSPREAD-26JUL011900SEAPIT":
+                return {"markets": [fallback_market]}
+            return {"markets": []}
+
+    fake_client = FakeDiscardedExactClient()
+    with Session(engine) as session:
+        session.add(
+            MlbGame(
+                external_game_id="discarded-exact-hit",
+                home_team="Pittsburgh Pirates",
+                away_team="Seattle Mariners",
+                home_abbreviation="PIT",
+                away_abbreviation="SEA",
+                scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+                status="scheduled",
+            )
+        )
+        session.commit()
+
+        result = market_family_discovery.run_market_family_discovery(
+            session,
+            date(2026, 7, 1),
+            client=fake_client,
+        )
+        items = list(session.scalars(select(MarketFamilyDiscoveryItem)))
+
+    assert "KXMLBSPREAD-26JUL011900SEAPIT" in fake_client.event_tickers
+    assert result["markets_found"] == 1
+    assert result["warnings"][0]["message"] == "MULTIVARIATE_MARKET_EXCLUDED"
+    assert len(items) == 1
+    assert items[0].returned_ticker == fallback_market["ticker"]
 
 
 def test_market_family_discovery_uses_observed_prefix_registry_only() -> None:
@@ -2788,6 +3095,14 @@ def test_market_family_discovery_uses_observed_prefix_registry_only() -> None:
         "first_five_spread": "KXMLBF5SPREAD",
         "first_five_total": "KXMLBF5TOTAL",
     }
+    expected_statuses = {
+        "full_game_winner": "supported_targeted_current",
+        "full_game_spread": "deterministic_observed_pending_validation",
+        "full_game_total": "deterministic_observed_pending_validation",
+        "first_five_winner": "deterministic_observed_pending_validation",
+        "first_five_spread": "deterministic_observed_pending_validation",
+        "first_five_total": "deterministic_observed_pending_validation",
+    }
     active_prefixes = {
         prefix
         for definition in market_family_discovery.FULL_REGISTRY.values()
@@ -2796,6 +3111,7 @@ def test_market_family_discovery_uses_observed_prefix_registry_only() -> None:
 
     for family_key, prefix in expected_prefixes.items():
         assert market_family_discovery.FULL_REGISTRY[family_key]["candidate_series_tickers"] == [prefix]
+        assert market_family_discovery.FULL_REGISTRY[family_key]["status"] == expected_statuses[family_key]
         assert (prefix, f"{prefix}-26JUL011900SEAPIT") in market_family_discovery._event_ticker_candidates(
             game,
             family_key,
@@ -2803,6 +3119,14 @@ def test_market_family_discovery_uses_observed_prefix_registry_only() -> None:
 
     assert "KXMLBTEAMTOTAL" not in active_prefixes
     assert set(market_family_discovery.RETIRED_LEGACY_PREFIXES_NOT_USED).isdisjoint(active_prefixes)
+    assert market_family_discovery.DISCOVERY_QUERY_FAMILIES == [
+        "full_game_spread",
+        "full_game_total",
+        "first_five_winner",
+        "first_five_spread",
+        "first_five_total",
+    ]
+    assert "full_game_winner" not in market_family_discovery.DISCOVERY_QUERY_FAMILIES
     assert market_family_discovery._direct_market_ticker_candidates(
         game,
         "full_game_winner",
@@ -2824,7 +3148,7 @@ def test_market_family_discovery_uses_observed_prefix_registry_only() -> None:
         game,
         "full_game_spread",
         "KXMLBSPREAD-26JUL011900SEAPIT",
-    ) == []
+    ) == ["KXMLBSPREAD-26JUL011900SEAPIT"]
 
 
 def test_market_family_discovery_first_five_winner_can_represent_tie() -> None:
@@ -2833,16 +3157,16 @@ def test_market_family_discovery_first_five_winner_can_represent_tie() -> None:
 
     class FakeFirstFiveTieClient:
         def get_market(self, ticker: str):
-            return {"markets": []}
+            raise AssertionError("discovery should use batched ticker lookup, not one request per ticker")
 
-        def get_markets_by_event_ticker(self, event_ticker: str):
-            if event_ticker != "KXMLBF5-26JUL011900SEAPIT":
+        def get_markets_by_tickers(self, tickers: list[str]):
+            if "KXMLBF5-26JUL011900SEAPIT-TIE" not in tickers:
                 return {"markets": []}
             return {
                 "markets": [
                     {
                         "ticker": "KXMLBF5-26JUL011900SEAPIT-TIE",
-                        "event_ticker": event_ticker,
+                        "event_ticker": "KXMLBF5-26JUL011900SEAPIT",
                         "title": "Seattle Mariners vs Pittsburgh Pirates first five innings tie",
                         "yes_sub_title": "Tie after five innings",
                         "rules_primary": "If the score is tied after five innings, Yes wins.",
@@ -2850,6 +3174,11 @@ def test_market_family_discovery_first_five_winner_can_represent_tie() -> None:
                     }
                 ]
             }
+
+        def get_markets_by_event_ticker(self, event_ticker: str):
+            if event_ticker == "KXMLBF5-26JUL011900SEAPIT":
+                raise AssertionError("event filter should not run after exact batch finds first-five tie")
+            return {"markets": []}
 
     with Session(engine) as session:
         session.add(

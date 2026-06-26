@@ -246,11 +246,15 @@ PR 3a adds production repairs and discovery-only market-family infrastructure:
 - The supported trading/settlement/model family remains `full_game_winner` only.
 - `full_game_spread`, `full_game_total`, `first_five_winner`, `first_five_spread`, and `first_five_total` remain discovery-only and are not wired into candidate generation, paper trading, settlement, or model scoring.
 - `app.jobs.market_family_discovery` and `POST /v1/run/market-family-discovery` produce a structured deterministic `by_family` report and persisted audit rows.
-- Active market-family discovery prefixes are `KXMLBGAME`, `KXMLBSPREAD`, `KXMLBTOTAL`, `KXMLBF5`, `KXMLBF5SPREAD`, and `KXMLBF5TOTAL`.
+- The deterministic registry contains `KXMLBGAME`, `KXMLBSPREAD`, `KXMLBTOTAL`, `KXMLBF5`, `KXMLBF5SPREAD`, and `KXMLBF5TOTAL`.
+- PR3a fix3 keeps `KXMLBGAME` in the registry for status/reporting, but normal market-family discovery only probes the five non-full-game-winner families because full-game winner is already handled by the targeted resolver.
 - Retired guessed prefixes are explicitly not active, and `KXMLBTEAMTOTAL` is not part of PR3a discovery.
-- Market sync, market-family discovery, and open-position price refresh read from `KALSHI_MARKET_DATA_BASE_URL` by default. The default is the public Kalshi production market-data endpoint; `KALSHI_REST_BASE_URL` and `KALSHI_ENV` remain the demo/execution context.
+- Market sync, market-family discovery, resolve preview, and open-position price refresh read from `KALSHI_MARKET_DATA_BASE_URL` by default. The default is the public Kalshi production market-data endpoint; `KALSHI_REST_BASE_URL` and `KALSHI_ENV` remain the demo/execution context.
 - The PR3a hotfix makes discovery persist a completed or `partial_error` run even when candidate spread, total, or first-five probes return 404/no-match responses and no markets are found.
-- Discovery constructs deterministic `{SERIES_PREFIX}-{YYMMMDDHHMMAWAYHOME}` tickers from the MLB slate, probes both direct market lookup and `event_ticker` market lookup, and uses `mve_filter=exclude` where supported; multivariate markets are excluded from normal discovery items.
+- PR3a fix3 changed discovery to a low-request flow: first batch exact scheduled-time ticker queries with `GET /markets?tickers=...&mve_filter=exclude`, then optionally try capped fallback time offsets, then use `event_ticker` filtering only as a secondary fallback for no-match game/family pairs.
+- Market-data reads now have configurable throttling, 429 retry/backoff with `Retry-After` support, and a per-run 429 circuit breaker. Discovery summaries include request counts, rate-limit counts, retry counts, batching savings, and whether the circuit breaker stopped remaining probes.
+- Discovery finalizes stale `running` runs older than 10 minutes and should not leave a run in `running` after the endpoint returns.
+- Exact `KXMLBGAME` full-game winner resolver matches are an invariant: direct ticker, event ticker, team-code, and Eastern scheduled-time matches must stay `confirmed_for_paper` with confidence around `0.9700`, zero or near-zero time delta, and team match score `1.0`.
 - `app.jobs.open_position_price_refresh` and `POST /v1/run/open-position-price-refresh` refresh open paper-trade marks from REST orderbook snapshots only. No WebSocket/live streaming is added.
 - Dashboard summary position rows now include `game_status`, `game_status_display`, `current_price_updated_at`, and `current_price_updated_at_display`.
 - Dashboard summary includes `paper_starting_balance` for frontend chart P/L modes.
@@ -262,6 +266,7 @@ Known PR 3a limitations:
 
 - Discovery can prove that observed deterministic prefixes return markets, but PR3a does not claim settlement or line parsing is reliable enough to trade spreads, totals, or first-five markets.
 - A valid discovery run may find zero markets. In that case `market_family_discovery_runs.raw_summary` should still show attempted event/market ticker counts, no-match counts, probe details, warnings, and errors so production validation can audit the no-match result.
+- Production validation after PR3a fix2 found the registry directionally valid, with real `KXMLBSPREAD`, `KXMLBF5`, and `KXMLBF5TOTAL` markets discovered, but the old event-filter-heavy flow hit repeated Kalshi 429 responses and was too chatty for stable production use.
 - Current price remains a REST last mark, not a real-time WebSocket mark.
 - No cron jobs or dashboard admin controls are added.
 - No live execution path exists.
@@ -346,3 +351,16 @@ Every future PR must update this section with:
 - Added `KALSHI_MARKET_DATA_BASE_URL` for public market-data reads used by market sync, discovery, and open-position price refresh; demo/execution settings remain separate and paper-only.
 - Report reads return the latest finalized discovery run, not stale `running` rows.
 - No schema migration, safety posture change, live execution, or new family trade enablement was added.
+
+### PR 3a Fix 3 - Stable Deterministic Kalshi Discovery
+
+- Production validation after PR3a fix2 confirmed the deterministic prefix direction but produced `partial_error` runs due to repeated Kalshi 429 responses, especially from repeated `event_ticker` filters.
+- Refactored market-family discovery to batch exact scheduled-time ticker probes first, use capped fallback time offsets only for no-match game/family pairs, and reserve `event_ticker` filtering as a secondary fallback.
+- Added market-data throttle/retry/backoff settings and a discovery 429 circuit breaker: `KALSHI_MARKET_DATA_MIN_REQUEST_INTERVAL_MS`, `KALSHI_MARKET_DATA_MAX_RETRIES`, `KALSHI_MARKET_DATA_BACKOFF_BASE_MS`, `KALSHI_MARKET_DATA_BACKOFF_MAX_MS`, `KALSHI_DISCOVERY_ENABLE_FALLBACK_TIME_OFFSETS`, `KALSHI_DISCOVERY_MAX_FALLBACK_OFFSETS`, and `KALSHI_DISCOVERY_MAX_429_ERRORS`.
+- Discovery summaries now report `request_count`, `requests_saved_by_batching`, `rate_limited_count`, `retries_attempted`, `stopped_due_to_rate_limit`, exact/fallback/event-filter attempt counts, and per-family no-match counts.
+- Stale `market_family_discovery_runs` rows older than 10 minutes are finalized with `STALE_RUNNING_RUN_FINALIZED`; endpoint runs should return structured JSON and should not leave status `running`.
+- `/v1/system/status` now exposes both `kalshi_market_data_source` and `kalshi_market_data_base_kind`, with the default public URL reported as `production_public_market_data`.
+- Locked exact `KXMLBGAME` full-game winner resolver behavior so direct ticker matches for KC at TB and TEX at TOR remain `confirmed_for_paper` with confidence `0.9700`, zero time delta, and team match score `1.0`.
+- No schema migration, safety posture change, live execution, sportsbook logic, team totals, admin page, calendar, or new family trade enablement was added.
+- Validation performed: backend `tests/test_api.py` passed locally with 78 tests; final PR validation should also run Ruff, compileall, and diff checks.
+- Expected next PR scope remains PR3b: review production discovery reports from this stable flow and wire only validated non-winner families into mapping, candidates, settlement, and model logic.

@@ -10,7 +10,7 @@ Before treating a deployment as valid:
 4. Confirm `LIVE_TRADING_ENABLED=false`.
 5. Confirm `EXECUTION_KILL_SWITCH=true`.
 6. Confirm `KALSHI_ENV=demo` for PR 3 unless a later PR explicitly approves production credentials.
-7. Confirm `/v1/system/status` reports `config.kalshi_market_data_source: "production_public_market_data"` when `KALSHI_MARKET_DATA_BASE_URL` uses the default public Kalshi market-data URL.
+7. Confirm `/v1/system/status` reports `config.kalshi_market_data_source: "production_public_market_data"` and `config.kalshi_market_data_base_kind: "production_public_market_data"` when `KALSHI_MARKET_DATA_BASE_URL` uses the default public Kalshi market-data URL.
 8. Confirm Vercel has `NEXT_PUBLIC_API_BASE_URL` pointed at the Railway backend.
 9. Confirm Railway `/v1/system/status` reports `database.ready: true` after opening a real database connection.
 10. Confirm the Vercel dashboard loads the light terminal UI without a dark theme, admin page, calendar, or sportsbook concepts.
@@ -74,7 +74,7 @@ The jobs currently cover:
 - Paper balance snapshots.
 - Feature snapshots and conservative heuristic model scoring.
 - Model governance records that skip training/promotion until sample thresholds are met.
-- Deterministic discovery-only market-family audit reports for `KXMLBGAME`, `KXMLBSPREAD`, `KXMLBTOTAL`, `KXMLBF5`, `KXMLBF5SPREAD`, and `KXMLBF5TOTAL`.
+- Deterministic discovery-only market-family audit reports for `KXMLBGAME`, `KXMLBSPREAD`, `KXMLBTOTAL`, `KXMLBF5`, `KXMLBF5SPREAD`, and `KXMLBF5TOTAL`. Normal PR3a fix3 discovery does not redundantly probe `KXMLBGAME`; full-game winner remains handled by targeted sync/resolve.
 - REST last-mark refresh for open paper positions.
 
 They do not cover scheduled automation or live execution.
@@ -118,7 +118,7 @@ After deploying PR 3 and running `alembic upgrade head`, validate in this order:
 10. `POST /v1/run/paper-settlement-sync` settles completed supported full-game winner paper trades.
 11. `POST /v1/run/balance-snapshot` creates a snapshot and `/v1/dashboard/summary` uses it for the portfolio chart.
 12. `POST /v1/run/model-governance` records a training/calibration run and counts resolved `KXMLBGAME` candidates even when older rows used `full_game_moneyline`.
-13. `POST /v1/run/market-family-discovery?target_date=YYYY-MM-DD` returns structured `by_family` output, attempted event/market ticker counts, no-match counts, and persists a finalized `market_family_discovery_runs` row even when no candidate markets are found.
+13. `POST /v1/run/market-family-discovery?target_date=YYYY-MM-DD` returns structured `by_family` output, attempted event/market ticker counts, exact/fallback/event-filter attempt counts, no-match counts, request/rate-limit metrics, and persists a finalized `market_family_discovery_runs` row even when no candidate markets are found.
 14. `GET /v1/market-families/discovery?date=YYYY-MM-DD` returns the latest finalized report with `run` not null after the POST succeeds.
 15. Confirm discovered spread, total, or first-five families do not create paper candidates/trades.
 16. `POST /v1/run/open-position-price-refresh` updates current marks and last mark timestamps for open paper positions only.
@@ -134,7 +134,7 @@ Broad market discovery is diagnostic-only:
 
 ## PR 3a Hotfix Validation
 
-The PR3a market-family discovery path is deterministic. It handles expected Kalshi no-match responses without aborting the job.
+The PR3a market-family discovery path is deterministic. It handles expected Kalshi no-match responses without aborting the job, and PR3a fix3 keeps request volume low enough for production by batching exact ticker queries before using fallback probes.
 
 Validate the hotfix after deploy:
 
@@ -142,11 +142,12 @@ Validate the hotfix after deploy:
 2. Confirm the response is structured JSON, not a blank upstream error.
 3. Confirm the response status is `completed` for 404/no-match-only runs or `partial_error` when non-404 upstream errors were recorded but the job completed.
 4. Run `GET /v1/market-families/discovery?date=YYYY-MM-DD` with `X-API-Key`.
-5. Confirm `run` is not null and `market_family_discovery_runs.raw_summary` includes `attempted_event_tickers_count`, `attempted_market_tickers_count`, `no_match_counts`, `attempted_probe_count`, and `probe_attempts`.
+5. Confirm `run` is not null and `market_family_discovery_runs.raw_summary` includes `attempted_event_tickers_count`, `attempted_market_tickers_count`, `no_match_counts`, `attempted_probe_count`, `probe_attempts`, `request_count`, `requests_saved_by_batching`, `rate_limited_count`, `retries_attempted`, and `stopped_due_to_rate_limit`.
 6. Treat `markets_found=0` and zero `market_family_discovery_items` as valid when no markets are returned.
-7. Confirm active discovery prefixes are only `KXMLBGAME`, `KXMLBSPREAD`, `KXMLBTOTAL`, `KXMLBF5`, `KXMLBF5SPREAD`, and `KXMLBF5TOTAL`; guessed legacy prefixes and `KXMLBTEAMTOTAL` must not be probed.
+7. Confirm active registry prefixes are only `KXMLBGAME`, `KXMLBSPREAD`, `KXMLBTOTAL`, `KXMLBF5`, `KXMLBF5SPREAD`, and `KXMLBF5TOTAL`; guessed legacy prefixes and `KXMLBTEAMTOTAL` must not be probed.
 8. Confirm spread, total, and first-five families remain discovery-only and do not create paper candidates or trades.
-9. Confirm known `KXMLBGAME` full-game winner resolver matches remain `confirmed_for_paper`.
+9. Confirm known exact `KXMLBGAME` full-game winner resolver matches remain `confirmed_for_paper` with confidence around `0.9700`, zero or near-zero time delta, and team match score `1.0`.
+10. Confirm `request_count` is materially lower than the previous event-filter-heavy validation run, and that repeated 429s produce `partial_error` with `stopped_due_to_rate_limit=true` rather than leaving a run in `running`.
 
 ## Required Context Updates
 
