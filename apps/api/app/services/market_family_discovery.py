@@ -903,6 +903,20 @@ def _filter_probe_entries_for_missing_keys(
     ]
 
 
+def _is_persistable_discovery_hit(market: dict[str, Any]) -> bool:
+    return bool(str(market.get("ticker") or "").upper()) and not is_multivariate_market(market)
+
+
+def _persistable_found_keys(
+    found: list[tuple[DiscoveryProbe, MlbGame, dict[str, Any]]],
+) -> set[tuple[object, str]]:
+    return {
+        _game_family_key(game, probe.family_key)
+        for probe, game, market in found
+        if _is_persistable_discovery_hit(market)
+    }
+
+
 def _event_filter_probe_entries(
     games: list[MlbGame],
     families: list[str],
@@ -961,7 +975,7 @@ def _discover_markets_low_request(
         max_429_errors=max_429_errors,
     )
     found.extend(exact_found)
-    found_keys.update(_game_family_key(game, probe.family_key) for probe, game, _market in exact_found)
+    found_keys.update(_persistable_found_keys(exact_found))
 
     fallback_offsets = _fallback_offsets(settings)
     if fallback_offsets and not metrics.stopped_due_to_rate_limit:
@@ -984,7 +998,7 @@ def _discover_markets_low_request(
             max_429_errors=max_429_errors,
         )
         found.extend(fallback_found)
-        found_keys.update(_game_family_key(game, probe.family_key) for probe, game, _market in fallback_found)
+        found_keys.update(_persistable_found_keys(fallback_found))
 
     if not metrics.stopped_due_to_rate_limit:
         event_offsets = (0, *fallback_offsets)
@@ -999,7 +1013,7 @@ def _discover_markets_low_request(
             max_429_errors=max_429_errors,
         )
         found.extend(event_found)
-        found_keys.update(_game_family_key(game, probe.family_key) for probe, game, _market in event_found)
+        found_keys.update(_persistable_found_keys(event_found))
 
     _merge_client_metrics(metrics, client)
     if metrics.stopped_due_to_rate_limit:

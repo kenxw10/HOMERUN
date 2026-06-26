@@ -3011,6 +3011,71 @@ def test_market_family_discovery_skips_event_filter_for_exact_found_family() -> 
     assert items[0].returned_ticker == exact_market["ticker"]
 
 
+def test_market_family_discovery_does_not_suppress_fallback_after_discarded_exact_hit() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    mve_market = {
+        "ticker": "KXMLBSPREAD-26JUL011900SEAPIT",
+        "event_ticker": "KXMLBSPREAD-26JUL011900SEAPIT",
+        "title": "Multivariate combo",
+        "mve_selected_legs": [{"ticker": "LEG"}],
+    }
+    fallback_market = {
+        "ticker": "KXMLBSPREAD-26JUL011900SEAPIT-PIT-1.5",
+        "event_ticker": "KXMLBSPREAD-26JUL011900SEAPIT",
+        "title": "Pittsburgh Pirates spread -1.5 vs Seattle Mariners",
+        "status": "open",
+        "functional_strike": "-1.5",
+    }
+
+    class FakeDiscardedExactClient:
+        def __init__(self) -> None:
+            self.event_tickers: list[str] = []
+
+        def get_market(self, ticker: str):
+            raise AssertionError("discovery should use batched ticker lookup, not one request per ticker")
+
+        def get_markets_by_tickers(self, tickers: list[str]):
+            if "KXMLBSPREAD-26JUL011900SEAPIT" in tickers:
+                return {"markets": [mve_market]}
+            return {"markets": []}
+
+        def get_markets_by_event_ticker(self, event_ticker: str):
+            self.event_tickers.append(event_ticker)
+            if event_ticker == "KXMLBSPREAD-26JUL011900SEAPIT":
+                return {"markets": [fallback_market]}
+            return {"markets": []}
+
+    fake_client = FakeDiscardedExactClient()
+    with Session(engine) as session:
+        session.add(
+            MlbGame(
+                external_game_id="discarded-exact-hit",
+                home_team="Pittsburgh Pirates",
+                away_team="Seattle Mariners",
+                home_abbreviation="PIT",
+                away_abbreviation="SEA",
+                scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+                status="scheduled",
+            )
+        )
+        session.commit()
+
+        result = market_family_discovery.run_market_family_discovery(
+            session,
+            date(2026, 7, 1),
+            client=fake_client,
+        )
+        items = list(session.scalars(select(MarketFamilyDiscoveryItem)))
+
+    assert "KXMLBSPREAD-26JUL011900SEAPIT" in fake_client.event_tickers
+    assert result["markets_found"] == 1
+    assert result["warnings"][0]["message"] == "MULTIVARIATE_MARKET_EXCLUDED"
+    assert len(items) == 1
+    assert items[0].returned_ticker == fallback_market["ticker"]
+
+
 def test_market_family_discovery_uses_observed_prefix_registry_only() -> None:
     game = MlbGame(
         external_game_id="registry-prefixes",
