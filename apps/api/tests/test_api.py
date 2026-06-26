@@ -32,6 +32,8 @@ from app.models import (
     TrainingRun,
 )
 from app.jobs import market_family_discovery as market_family_discovery_job
+from app.jobs import mlb_feature_sync as mlb_feature_sync_job
+from app.jobs import model_feature_snapshot_backfill as model_feature_snapshot_backfill_job
 from app.security import require_internal_api_key
 from app.services import (
     candidates,
@@ -1122,6 +1124,19 @@ def test_internal_api_key_allows_explicit_local_without_api_key(monkeypatch) -> 
         assert require_internal_api_key(x_api_key=None) is None
     finally:
         get_settings.cache_clear()
+
+
+def test_feature_jobs_accept_positional_date_and_env_fallback(monkeypatch) -> None:
+    monkeypatch.setenv("TARGET_DATE", "2026-06-24")
+
+    assert mlb_feature_sync_job._target_date("2026-06-25") == date(2026, 6, 25)
+    assert mlb_feature_sync_job._target_date() == date(2026, 6, 24)
+    assert model_feature_snapshot_backfill_job._target_date("2026-06-26") == date(2026, 6, 26)
+    assert model_feature_snapshot_backfill_job._target_date() == date(2026, 6, 24)
+
+    monkeypatch.delenv("TARGET_DATE")
+    assert mlb_feature_sync_job._target_date() is None
+    assert model_feature_snapshot_backfill_job._target_date() is None
 
 
 def test_team_abbreviation_normalization() -> None:
