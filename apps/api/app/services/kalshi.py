@@ -95,6 +95,11 @@ class KalshiClient:
             api_secret=settings.kalshi_api_secret.get_secret_value() if settings.kalshi_api_secret else None,
         )
 
+    @classmethod
+    def from_market_data_settings(cls) -> "KalshiClient":
+        settings = get_settings()
+        return cls(base_url=settings.kalshi_market_data_base_url.rstrip("/"))
+
     def _headers(self) -> dict[str, str]:
         headers = {"Accept": "application/json"}
         if self.api_key:
@@ -115,6 +120,9 @@ class KalshiClient:
 
     def get_markets(self, params: dict[str, object] | None = None) -> dict[str, Any]:
         return self._get_json("/markets", params=params or {})
+
+    def get_market(self, ticker: str) -> dict[str, Any]:
+        return self._get_json(f"/markets/{ticker}")
 
     def get_markets_by_tickers(self, tickers: list[str]) -> dict[str, Any]:
         return self.get_markets({"tickers": ",".join(tickers), "limit": len(tickers), "mve_filter": "exclude"})

@@ -15,15 +15,30 @@ from app.services.kalshi import KalshiAPIError, KalshiClient
 from app.services.kalshi_mlb_resolver import build_event_ticker_candidates, is_multivariate_market
 from app.time_utils import ensure_aware_utc, get_dashboard_zone, today_eastern, utc_now
 
-SUPPORTED_TARGETED = "supported_targeted"
+RESOLVER_MODE = "deterministic_ticker_registry_v1"
+SUPPORTED_TARGETED_CURRENT = "supported_targeted_current"
+DETERMINISTIC_OBSERVED_PENDING_VALIDATION = "deterministic_observed_pending_validation"
 DISCOVERED_UNVERIFIED = "discovered_unverified"
 UNKNOWN_PENDING_DISCOVERY = "unknown_pending_discovery"
+RETIRED_LEGACY_PREFIXES_NOT_USED = [
+    "KXMLBF5GAME",
+    "KXMLB5GAME",
+    "KXMLBFFGAME",
+    "KXMLB5SPREAD",
+    "KXMLBFFSPREAD",
+    "KXMLB5TOTAL",
+    "KXMLBFFTOTAL",
+    "KXMLBGAMESPREAD",
+    "KXMLBRUNLINE",
+    "KXMLBGAMETOTAL",
+    "KXMLBRUNSTOTAL",
+]
 
 FULL_REGISTRY: dict[str, dict[str, object]] = {
     "full_game_winner": {
         "family_key": "full_game_winner",
         "display_name": "Full Game Winner",
-        "status": SUPPORTED_TARGETED,
+        "status": SUPPORTED_TARGETED_CURRENT,
         "series_ticker": "KXMLBGAME",
         "candidate_series_tickers": ["KXMLBGAME"],
         "notes": "Confirmed targeted resolver and paper trading family.",
@@ -31,46 +46,47 @@ FULL_REGISTRY: dict[str, dict[str, object]] = {
     "full_game_spread": {
         "family_key": "full_game_spread",
         "display_name": "Full Game Spread",
-        "status": UNKNOWN_PENDING_DISCOVERY,
-        "series_ticker": None,
-        "candidate_series_tickers": ["KXMLBSPREAD", "KXMLBGAMESPREAD", "KXMLBRUNLINE"],
-        "notes": "Discovery-only in PR3a; not trade-enabled.",
+        "status": DETERMINISTIC_OBSERVED_PENDING_VALIDATION,
+        "series_ticker": "KXMLBSPREAD",
+        "candidate_series_tickers": ["KXMLBSPREAD"],
+        "notes": "Deterministic observed dashboard-export prefix; discovery-only and not trade-enabled.",
     },
     "full_game_total": {
         "family_key": "full_game_total",
         "display_name": "Full Game Total",
-        "status": UNKNOWN_PENDING_DISCOVERY,
-        "series_ticker": None,
-        "candidate_series_tickers": ["KXMLBTOTAL", "KXMLBGAMETOTAL", "KXMLBRUNSTOTAL"],
-        "notes": "Discovery-only in PR3a; not trade-enabled.",
+        "status": DETERMINISTIC_OBSERVED_PENDING_VALIDATION,
+        "series_ticker": "KXMLBTOTAL",
+        "candidate_series_tickers": ["KXMLBTOTAL"],
+        "notes": "Deterministic observed dashboard-export prefix; discovery-only and not trade-enabled.",
     },
     "first_five_winner": {
         "family_key": "first_five_winner",
         "display_name": "First Five Winner",
-        "status": UNKNOWN_PENDING_DISCOVERY,
-        "series_ticker": None,
-        "candidate_series_tickers": ["KXMLBF5GAME", "KXMLB5GAME", "KXMLBFFGAME"],
-        "notes": "Discovery-only in PR3a; not trade-enabled.",
+        "status": DETERMINISTIC_OBSERVED_PENDING_VALIDATION,
+        "series_ticker": "KXMLBF5",
+        "candidate_series_tickers": ["KXMLBF5"],
+        "notes": "Deterministic observed dashboard-export prefix; discovery-only and may include tie outcomes.",
     },
     "first_five_spread": {
         "family_key": "first_five_spread",
         "display_name": "First Five Spread",
-        "status": UNKNOWN_PENDING_DISCOVERY,
-        "series_ticker": None,
-        "candidate_series_tickers": ["KXMLBF5SPREAD", "KXMLB5SPREAD", "KXMLBFFSPREAD"],
-        "notes": "Discovery-only in PR3a; not trade-enabled.",
+        "status": DETERMINISTIC_OBSERVED_PENDING_VALIDATION,
+        "series_ticker": "KXMLBF5SPREAD",
+        "candidate_series_tickers": ["KXMLBF5SPREAD"],
+        "notes": "Deterministic observed dashboard-export prefix; discovery-only and not trade-enabled.",
     },
     "first_five_total": {
         "family_key": "first_five_total",
         "display_name": "First Five Total",
-        "status": UNKNOWN_PENDING_DISCOVERY,
-        "series_ticker": None,
-        "candidate_series_tickers": ["KXMLBF5TOTAL", "KXMLB5TOTAL", "KXMLBFFTOTAL"],
-        "notes": "Discovery-only in PR3a; not trade-enabled.",
+        "status": DETERMINISTIC_OBSERVED_PENDING_VALIDATION,
+        "series_ticker": "KXMLBF5TOTAL",
+        "candidate_series_tickers": ["KXMLBF5TOTAL"],
+        "notes": "Deterministic observed dashboard-export prefix; discovery-only and not trade-enabled.",
     },
 }
 
-DISCOVERY_FAMILIES = [
+TARGET_FAMILIES = [
+    "full_game_winner",
     "full_game_spread",
     "full_game_total",
     "first_five_winner",
@@ -78,12 +94,15 @@ DISCOVERY_FAMILIES = [
     "first_five_total",
 ]
 
+DISCOVERY_FAMILIES = [family_key for family_key in TARGET_FAMILIES if family_key != "full_game_winner"]
+
 
 @dataclass
 class DiscoveryProbe:
     family_key: str
     candidate_series_ticker: str
     candidate_event_ticker: str | None
+    candidate_market_ticker: str | None
     source_strategy: str
 
 
@@ -155,7 +174,22 @@ def _market_line_text(market: dict[str, Any]) -> str:
     ).lower()
 
 
+def _ticker_text(market: dict[str, Any]) -> str:
+    return " ".join(
+        str(market.get(key) or "")
+        for key in ("ticker", "event_ticker", "series_ticker")
+    ).upper()
+
+
 def _classify_candidate_family(market: dict[str, Any], fallback: str) -> str:
+    ticker_text = _ticker_text(market)
+    if "KXMLBTEAMTOTAL" in ticker_text:
+        return "unsupported_team_total"
+    for family_key, definition in FULL_REGISTRY.items():
+        prefix = definition.get("series_ticker")
+        if isinstance(prefix, str) and re.search(rf"(^|\s){re.escape(prefix)}-", ticker_text):
+            return family_key
+
     text = _market_text(market)
     first_five = bool(re.search(r"\b(first five|first 5|f5|5 innings?)\b", text))
     spread = bool(re.search(r"\b(spread|run line|runline|handicap)\b", text))
@@ -254,6 +288,52 @@ def _selection_code(market: dict[str, Any]) -> str | None:
     return selected or None
 
 
+def _over_under_side(market: dict[str, Any]) -> str | None:
+    ticker = str(market.get("ticker") or "").upper()
+    tail = ticker.rsplit("-", 1)[-1] if ticker else ""
+    if tail in {"O", "OVER"}:
+        return "over"
+    if tail in {"U", "UNDER"}:
+        return "under"
+
+    text = _market_text(market)
+    if re.search(r"\bover\b", text):
+        return "over"
+    if re.search(r"\bunder\b", text):
+        return "under"
+    return None
+
+
+def _classification_metadata(
+    market: dict[str, Any],
+    classified_family: str,
+    line_value: Decimal | None,
+) -> dict[str, object]:
+    ticker_text = _ticker_text(market)
+    text = _market_text(market)
+    has_rules = bool(market.get("rules_primary") or market.get("rules_secondary") or market.get("rules"))
+    return {
+        "family_key": classified_family,
+        "selected_team_code": _selection_code(market),
+        "line_value": str(line_value) if line_value is not None else None,
+        "over_under_side": _over_under_side(market),
+        "inning_scope": "first_five" if "F5" in ticker_text or classified_family.startswith("first_five") else "full_game",
+        "has_multiple_child_outcomes": bool(re.search(r"\btie\b", text)) or "-TIE" in ticker_text,
+        "settlement_rule_status": "text_present_unverified" if has_rules else "unknown_pending_validation",
+        "classifier_inputs": [
+            "ticker",
+            "event_ticker",
+            "title",
+            "subtitle",
+            "yes_subtitle",
+            "no_subtitle",
+            "rules",
+            "custom_strike",
+            "functional_strike",
+        ],
+    }
+
+
 def _event_suffixes(game: MlbGame) -> list[str]:
     suffixes: list[str] = []
     for event_ticker in build_event_ticker_candidates(game):
@@ -295,7 +375,7 @@ def _item_from_market(
     confidence = Decimal("0.5500") if classified_family == family_key else Decimal("0.3000")
     line_value = _parse_line_value(market)
     raw_payload = dict(market)
-    raw_payload["pr3a_classified_family"] = classified_family
+    raw_payload["pr3a_classification"] = _classification_metadata(market, classified_family, line_value)
 
     return MarketFamilyDiscoveryItem(
         run_id=run_id,
@@ -303,7 +383,7 @@ def _item_from_market(
         family_key=family_key,
         candidate_series_ticker=probe.candidate_series_ticker,
         candidate_event_ticker=probe.candidate_event_ticker,
-        candidate_market_ticker=None,
+        candidate_market_ticker=probe.candidate_market_ticker,
         returned_ticker=market.get("ticker"),
         returned_event_ticker=market.get("event_ticker"),
         title=market.get("title"),
@@ -350,6 +430,7 @@ def _probe_attempt_record(
         "family_key": probe.family_key,
         "candidate_series_ticker": probe.candidate_series_ticker,
         "candidate_event_ticker": probe.candidate_event_ticker,
+        "candidate_market_ticker": probe.candidate_market_ticker,
         "source_strategy": probe.source_strategy,
         "markets_found": markets_found,
     }
@@ -423,13 +504,15 @@ def _summarize_by_family(
     items: list[MarketFamilyDiscoveryItem],
     completed_at: datetime,
 ) -> dict[str, dict[str, object]]:
-    by_family = {family_key: _empty_family_summary(family_key) for family_key in ["full_game_winner", *families]}
+    family_order = list(dict.fromkeys(families))
+    by_family = {family_key: _empty_family_summary(family_key) for family_key in family_order}
     coverage: dict[str, set[int]] = {family_key: set() for family_key in by_family}
     parsed_lines: dict[str, int] = {family_key: 0 for family_key in by_family}
 
     for item in items:
         family = by_family[item.family_key]
-        family["status"] = DISCOVERED_UNVERIFIED
+        if item.family_key != "full_game_winner":
+            family["status"] = DISCOVERED_UNVERIFIED
         family["market_count"] = int(family["market_count"]) + 1
         if item.mlb_game_id is not None:
             coverage[item.family_key].add(item.mlb_game_id)
@@ -453,6 +536,59 @@ def _summarize_by_family(
     return by_family
 
 
+def _probe_audit_summary(probe_attempts: list[dict[str, object]]) -> dict[str, object]:
+    event_tickers = {
+        str(attempt["candidate_event_ticker"])
+        for attempt in probe_attempts
+        if attempt.get("candidate_event_ticker")
+    }
+    market_tickers = {
+        str(attempt["candidate_market_ticker"])
+        for attempt in probe_attempts
+        if attempt.get("candidate_market_ticker")
+    }
+    examples: dict[str, dict[str, list[str]]] = {}
+    no_match_counts: dict[str, int] = {}
+
+    for attempt in probe_attempts:
+        family_key = str(attempt.get("family_key") or "unknown")
+        family_examples = examples.setdefault(
+            family_key,
+            {"event_tickers": [], "market_tickers": []},
+        )
+        _append_example(family_examples["event_tickers"], attempt.get("candidate_event_ticker"))  # type: ignore[arg-type]
+        _append_example(family_examples["market_tickers"], attempt.get("candidate_market_ticker"))  # type: ignore[arg-type]
+        if attempt.get("outcome") in {"no_match", "partial_no_match"}:
+            no_match_counts[family_key] = no_match_counts.get(family_key, 0) + 1
+
+    return {
+        "attempted_event_tickers_count": len(event_tickers),
+        "attempted_market_tickers_count": len(market_tickers),
+        "attempted_ticker_examples": examples,
+        "no_match_counts": no_match_counts,
+    }
+
+
+def _item_examples_by_family(items: list[MarketFamilyDiscoveryItem]) -> dict[str, list[dict[str, object]]]:
+    examples: dict[str, list[dict[str, object]]] = {family_key: [] for family_key in TARGET_FAMILIES}
+    for item in items:
+        family_examples = examples.setdefault(item.family_key, [])
+        if len(family_examples) >= 5:
+            continue
+        family_examples.append(
+            {
+                "candidate_event_ticker": item.candidate_event_ticker,
+                "candidate_market_ticker": item.candidate_market_ticker,
+                "returned_ticker": item.returned_ticker,
+                "returned_event_ticker": item.returned_event_ticker,
+                "selection_code": item.selection_code,
+                "line_value": float(item.line_value) if item.line_value is not None else None,
+                "source_strategy": item.source_strategy,
+            }
+        )
+    return examples
+
+
 def _probe_markets(
     client: KalshiClient,
     game: MlbGame,
@@ -461,34 +597,45 @@ def _probe_markets(
     errors: list[object],
     probe_attempts: list[dict[str, object]],
 ) -> list[tuple[DiscoveryProbe, dict[str, Any]]]:
-    settings = get_settings()
     found: list[tuple[DiscoveryProbe, dict[str, Any]]] = []
 
     for series_ticker, event_ticker in _event_ticker_candidates(game, family_key):
-        event_probe = DiscoveryProbe(family_key, series_ticker, event_ticker, "get_event")
+        direct_probe = DiscoveryProbe(
+            family_key,
+            series_ticker,
+            event_ticker,
+            event_ticker,
+            "direct_market_lookup",
+        )
         try:
-            payload = client.get_event(event_ticker)
+            payload = client.get_market(event_ticker)
             markets = _markets_from_payload(payload)
             probe_attempts.append(
                 _probe_attempt_record(
                     game=game,
-                    probe=event_probe,
+                    probe=direct_probe,
                     outcome="found" if markets else "no_match",
                     markets_found=len(markets),
                 )
             )
-            found.extend((event_probe, market) for market in markets)
+            found.extend((direct_probe, market) for market in markets)
         except Exception as exc:
             _record_probe_exception(
                 game=game,
-                probe=event_probe,
+                probe=direct_probe,
                 exc=exc,
                 warnings=warnings,
                 errors=errors,
                 probe_attempts=probe_attempts,
             )
 
-        filter_probe = DiscoveryProbe(family_key, series_ticker, event_ticker, "event_ticker_filter")
+        filter_probe = DiscoveryProbe(
+            family_key,
+            series_ticker,
+            event_ticker,
+            None,
+            "event_ticker_filter",
+        )
         try:
             payload = client.get_markets_by_event_ticker(event_ticker)
             markets = _markets_from_payload(payload)
@@ -511,47 +658,6 @@ def _probe_markets(
                 probe_attempts=probe_attempts,
             )
 
-    start = int((ensure_aware_utc(game.scheduled_start) - timedelta(days=1)).timestamp())
-    end = int((ensure_aware_utc(game.scheduled_start) + timedelta(days=21)).timestamp())
-    for series_ticker in FULL_REGISTRY[family_key]["candidate_series_tickers"]:
-        assert isinstance(series_ticker, str)
-        probe = DiscoveryProbe(family_key, series_ticker, None, "series_ticker_window")
-        markets: list[dict[str, Any]] = []
-        try:
-            for market in client.iter_markets(
-                params={
-                    "series_ticker": series_ticker,
-                    "min_close_ts": start,
-                    "max_close_ts": end,
-                    "limit": 100,
-                    "mve_filter": "exclude",
-                },
-                max_pages=settings.market_family_discovery_max_pages,
-            ):
-                if isinstance(market, dict):
-                    markets.append(market)
-        except Exception as exc:
-            found.extend((probe, market) for market in markets)
-            _record_probe_exception(
-                game=game,
-                probe=probe,
-                exc=exc,
-                warnings=warnings,
-                errors=errors,
-                probe_attempts=probe_attempts,
-                markets_found=len(markets),
-            )
-        else:
-            probe_attempts.append(
-                _probe_attempt_record(
-                    game=game,
-                    probe=probe,
-                    outcome="found" if markets else "no_match",
-                    markets_found=len(markets),
-                )
-            )
-            found.extend((probe, market) for market in markets)
-
     return found
 
 
@@ -564,7 +670,7 @@ def run_market_family_discovery(
     settings = get_settings()
     day = target_date or today_eastern()
     started = utc_now()
-    families = DISCOVERY_FAMILIES
+    families = TARGET_FAMILIES
     games = _games_for_date(session, day)
     errors: list[object] = []
     warnings: list[object] = []
@@ -592,15 +698,21 @@ def run_market_family_discovery(
         result = {
             "run_id": run.id,
             "date": day.isoformat(),
+            "resolver_mode": RESOLVER_MODE,
             "status": "skipped",
             "games_considered": len(games),
             "families_considered": len(families),
+            "attempted_event_tickers_count": 0,
+            "attempted_market_tickers_count": 0,
             "markets_found": 0,
             "by_family": _summarize_by_family(families, [], completed),
             "warnings": [{"message": "MARKET_FAMILY_DISCOVERY_DISABLED"}],
             "errors": [],
             "attempted_probe_count": 0,
             "probe_attempts": [],
+            "attempted_ticker_examples": {},
+            "no_match_counts": {},
+            "retired_legacy_prefixes_not_used": RETIRED_LEGACY_PREFIXES_NOT_USED,
         }
         run.status = "skipped"
         run.completed_at = completed
@@ -613,7 +725,7 @@ def run_market_family_discovery(
         return result
 
     try:
-        kalshi_client = client or KalshiClient.from_settings()
+        kalshi_client = client or KalshiClient.from_market_data_settings()
         seen: set[tuple[object, ...]] = set()
 
         for game in games:
@@ -638,18 +750,6 @@ def run_market_family_discovery(
                             }
                         )
                         continue
-                    if probe.source_strategy == "series_ticker_window" and not _matches_game_candidate_event(
-                        game, family_key, market
-                    ):
-                        warnings.append(
-                            {
-                                "message": "SERIES_WINDOW_MARKET_SKIPPED_UNRELATED",
-                                "family_key": family_key,
-                                "ticker": ticker,
-                                "game_id": game.external_game_id,
-                            }
-                        )
-                        continue
                     dedupe_key = (family_key, ticker)
                     if dedupe_key in seen:
                         continue
@@ -666,19 +766,23 @@ def run_market_family_discovery(
 
         completed = utc_now()
         by_family = _summarize_by_family(families, persisted_items, completed)
+        audit = _probe_audit_summary(probe_attempts)
         status_value = "partial_error" if errors else "completed"
         result = {
             "run_id": run.id,
             "date": day.isoformat(),
+            "resolver_mode": RESOLVER_MODE,
             "status": status_value,
             "games_considered": len(games),
             "families_considered": len(families),
+            **audit,
             "markets_found": len(persisted_items),
             "by_family": by_family,
             "warnings": warnings,
             "errors": errors,
             "attempted_probe_count": len(probe_attempts),
             "probe_attempts": probe_attempts,
+            "retired_legacy_prefixes_not_used": RETIRED_LEGACY_PREFIXES_NOT_USED,
         }
         run.completed_at = completed
         run.status = status_value
@@ -693,18 +797,22 @@ def run_market_family_discovery(
         session.rollback()
         completed = utc_now()
         error = {"message": str(exc), "type": exc.__class__.__name__}
+        audit = _probe_audit_summary(probe_attempts)
         result = {
             "run_id": run_id,
             "date": day.isoformat(),
+            "resolver_mode": RESOLVER_MODE,
             "status": "failed",
             "games_considered": len(games),
             "families_considered": len(families),
+            **audit,
             "markets_found": 0,
             "by_family": _summarize_by_family(families, [], completed),
             "warnings": warnings,
             "errors": [*errors, error],
             "attempted_probe_count": len(probe_attempts),
             "probe_attempts": probe_attempts,
+            "retired_legacy_prefixes_not_used": RETIRED_LEGACY_PREFIXES_NOT_USED,
         }
         failed_run = session.get(MarketFamilyDiscoveryRun, run_id)
         if failed_run is None:
@@ -722,19 +830,35 @@ def run_market_family_discovery(
 
 def latest_market_family_discovery(session: Session, target_date: date | None = None) -> dict[str, object]:
     day = target_date or today_eastern()
-    run = session.scalar(
-        select(MarketFamilyDiscoveryRun)
-        .where(MarketFamilyDiscoveryRun.target_date == day)
-        .order_by(MarketFamilyDiscoveryRun.started_at.desc(), MarketFamilyDiscoveryRun.id.desc())
-        .limit(1)
+    candidate_runs = list(
+        session.scalars(
+            select(MarketFamilyDiscoveryRun)
+            .where(MarketFamilyDiscoveryRun.target_date == day)
+            .where(MarketFamilyDiscoveryRun.status != "running")
+            .order_by(MarketFamilyDiscoveryRun.started_at.desc(), MarketFamilyDiscoveryRun.id.desc())
+            .limit(20)
+        )
+    )
+    run = next(
+        (
+            candidate_run
+            for candidate_run in candidate_runs
+            if (candidate_run.raw_summary or {}).get("resolver_mode") == RESOLVER_MODE
+        ),
+        None,
     )
     if run is None:
         return {
             "date": day.isoformat(),
+            "resolver_mode": RESOLVER_MODE,
             "run": None,
-            "by_family": {
-                family_key: _empty_family_summary(family_key) for family_key in ["full_game_winner", *DISCOVERY_FAMILIES]
-            },
+            "by_family": {family_key: _empty_family_summary(family_key) for family_key in TARGET_FAMILIES},
+            "attempted_event_tickers_count": 0,
+            "attempted_market_tickers_count": 0,
+            "attempted_ticker_examples": {},
+            "no_match_counts": {},
+            "item_examples_by_family": {family_key: [] for family_key in TARGET_FAMILIES},
+            "retired_legacy_prefixes_not_used": RETIRED_LEGACY_PREFIXES_NOT_USED,
             "items": [],
         }
 
@@ -745,8 +869,10 @@ def latest_market_family_discovery(session: Session, target_date: date | None = 
             .order_by(MarketFamilyDiscoveryItem.family_key.asc(), MarketFamilyDiscoveryItem.returned_ticker.asc())
         )
     )
+    raw_summary = run.raw_summary or {}
     return {
         "date": day.isoformat(),
+        "resolver_mode": raw_summary.get("resolver_mode", RESOLVER_MODE),
         "run": {
             "run_id": run.id,
             "started_at": run.started_at.isoformat(),
@@ -758,15 +884,25 @@ def latest_market_family_discovery(session: Session, target_date: date | None = 
             "errors": run.errors or [],
             "warnings": run.warnings or [],
         },
-        "by_family": (run.raw_summary or {}).get("by_family")
-        or _summarize_by_family(DISCOVERY_FAMILIES, items, run.completed_at or utc_now()),
-        "attempted_probe_count": (run.raw_summary or {}).get("attempted_probe_count", 0),
-        "probe_attempts": (run.raw_summary or {}).get("probe_attempts", []),
+        "by_family": raw_summary.get("by_family")
+        or _summarize_by_family(TARGET_FAMILIES, items, run.completed_at or utc_now()),
+        "attempted_event_tickers_count": raw_summary.get("attempted_event_tickers_count", 0),
+        "attempted_market_tickers_count": raw_summary.get("attempted_market_tickers_count", 0),
+        "attempted_ticker_examples": raw_summary.get("attempted_ticker_examples", {}),
+        "no_match_counts": raw_summary.get("no_match_counts", {}),
+        "item_examples_by_family": _item_examples_by_family(items),
+        "retired_legacy_prefixes_not_used": raw_summary.get(
+            "retired_legacy_prefixes_not_used",
+            RETIRED_LEGACY_PREFIXES_NOT_USED,
+        ),
+        "attempted_probe_count": raw_summary.get("attempted_probe_count", 0),
+        "probe_attempts": raw_summary.get("probe_attempts", []),
         "items": [
             {
                 "family_key": item.family_key,
                 "candidate_series_ticker": item.candidate_series_ticker,
                 "candidate_event_ticker": item.candidate_event_ticker,
+                "candidate_market_ticker": item.candidate_market_ticker,
                 "returned_ticker": item.returned_ticker,
                 "returned_event_ticker": item.returned_event_ticker,
                 "title": item.title,
@@ -788,11 +924,11 @@ def market_family_discovery_preview(session: Session, target_date: date | None =
     return {
         "date": day.isoformat(),
         "mode": "planned_probes_only",
+        "resolver_mode": RESOLVER_MODE,
         "games_considered": len(games),
-        "families_considered": len(DISCOVERY_FAMILIES),
-        "by_family": {
-            family_key: _empty_family_summary(family_key) for family_key in ["full_game_winner", *DISCOVERY_FAMILIES]
-        },
+        "families_considered": len(TARGET_FAMILIES),
+        "by_family": {family_key: _empty_family_summary(family_key) for family_key in TARGET_FAMILIES},
+        "retired_legacy_prefixes_not_used": RETIRED_LEGACY_PREFIXES_NOT_USED,
         "probes": [
             {
                 "game_id": game.id,
@@ -801,9 +937,12 @@ def market_family_discovery_preview(session: Session, target_date: date | None =
                 "candidate_event_tickers": [
                     event_ticker for _series_ticker, event_ticker in _event_ticker_candidates(game, family_key)
                 ][:9],
+                "candidate_market_tickers": [
+                    event_ticker for _series_ticker, event_ticker in _event_ticker_candidates(game, family_key)
+                ][:9],
                 "candidate_series_tickers": FULL_REGISTRY[family_key]["candidate_series_tickers"],
             }
             for game in games
-            for family_key in DISCOVERY_FAMILIES
+            for family_key in TARGET_FAMILIES
         ],
     }

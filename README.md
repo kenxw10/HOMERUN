@@ -15,6 +15,7 @@ This is not a sportsbook app. It does not use DraftKings, FanDuel, Odds API, or 
 - `LIVE_TRADING_ENABLED=false`
 - `EXECUTION_KILL_SWITCH=true`
 - `KALSHI_ENV=demo`
+- `KALSHI_MARKET_DATA_BASE_URL=https://external-api.kalshi.com/trade-api/v2` for public market-data reads.
 - Kalshi credentials are optional for PR 3 paper-mode discovery and must not be production credentials unless a later PR explicitly changes the safety plan.
 - `BACKEND_API_KEY` is optional only for local development. Public or deployed backends must set it, and internal POST run endpoints require `X-API-Key`.
 - Broad Kalshi discovery is diagnostic-only and disabled by default with `KALSHI_ENABLE_BROAD_DISCOVERY=false`.
@@ -89,7 +90,7 @@ PR 3 exposes these internal API run endpoints:
 
 For local development, these endpoints can run without a key when `APP_ENV=local` and `BACKEND_API_KEY` is empty. For any public or deployed backend, set `BACKEND_API_KEY` and call these endpoints with an `X-API-Key` header.
 
-`/v1/sync/kalshi-markets` now uses MLB games as its primary input and resolves the empirically observed `KXMLBGAME` full-game winner family first. Spread, total, and first-five families are still pending discovery and are not faked.
+`/v1/sync/kalshi-markets` now uses MLB games as its primary input and resolves the empirically observed `KXMLBGAME` full-game winner family first. Market sync, market-family discovery, and open-position mark refresh read from `KALSHI_MARKET_DATA_BASE_URL` by default without credentials. `KALSHI_REST_BASE_URL` and `KALSHI_ENV` remain the safe demo/execution context. Spread, total, and first-five families are still discovery-only and are not trade-enabled.
 
 Paper settlement currently supports only `full_game_winner`. It determines the selected team from the Kalshi ticker suffix, settles YES/NO contracts from final MLB scores, and uses hold-to-settlement P/L. Fees remain structured but zero until the exact Kalshi fee formula is implemented.
 
@@ -158,9 +159,9 @@ Invoke-RestMethod -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-RAILWAY-API/v
 Invoke-RestMethod -Method Post -Headers @{"X-API-Key"="YOUR_KEY"} https://YOUR-RAILWAY-API/v1/run/open-position-price-refresh
 ```
 
-Expected result: health and system status remain safe, Alembic is at `0005_pr3a_discovery`, resolve preview keeps exact `KXMLBGAME` matches confirmed for paper, market-family discovery returns a structured `by_family` report without trade-enabling new families, open-position price refresh updates REST last marks for open paper positions only, the dashboard shows `GAME STATUS` and `LAST MARK TIME`, chart range/P&L controls work, and model governance reports resolved samples correctly after settled candidate outcomes exist.
+Expected result: health and system status remain safe, `/v1/system/status` reports `config.kalshi_market_data_source: "production_public_market_data"` when the default public market-data URL is used, Alembic is at `0005_pr3a_discovery`, resolve preview keeps exact `KXMLBGAME` matches confirmed for paper, market-family discovery returns a structured `by_family` report without trade-enabling new families, open-position price refresh updates REST last marks for open paper positions only, the dashboard shows `GAME STATUS` and `LAST MARK TIME`, chart range/P&L controls work, and model governance reports resolved samples correctly after settled candidate outcomes exist.
 
-PR3a hotfix validation: if spread, total, or first-five candidate probes return 404/no-match responses, the discovery POST should still return structured JSON with status `completed` or `partial_error`. The report GET should return `run` not null. `markets_found=0` and zero `market_family_discovery_items` are valid when no markets are found, but `market_family_discovery_runs.raw_summary` must include attempted probe details and any warnings/errors.
+PR3a deterministic discovery validation: discovery uses the active observed registry `KXMLBGAME`, `KXMLBSPREAD`, `KXMLBTOTAL`, `KXMLBF5`, `KXMLBF5SPREAD`, and `KXMLBF5TOTAL`. It does not probe guessed legacy variants or `KXMLBTEAMTOTAL`. If candidate probes return 404/no-match responses, the discovery POST should still return structured JSON with status `completed` or `partial_error`. The report GET should return the latest finalized run, not a stale running row. `markets_found=0` and zero `market_family_discovery_items` are valid when no markets are found, but `market_family_discovery_runs.raw_summary` must include attempted ticker counts, no-match counts, probe details, and any warnings/errors.
 
 ## Deployment
 
