@@ -2874,6 +2874,8 @@ def test_pr3c_trade_policy_caps_slate_trades(monkeypatch) -> None:
     assert prediction_run is not None
     assert prediction_run.trade_policy["paper_max_trades_per_slate"] == 2
     assert result["cap_counts"]["no_trade_slate_cap"] == 3
+    assert result["decision_counts"] == {"paper_trade": 2, "no_trade_slate_cap": 3}
+    assert prediction_run.summary["decision_counts"] == {"paper_trade": 2, "no_trade_slate_cap": 3}
     assert [output.decision_reason for output in outputs].count("paper_trade") == 2
     assert [output.decision_reason for output in outputs].count("no_trade_slate_cap") == 3
 

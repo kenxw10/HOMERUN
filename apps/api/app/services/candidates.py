@@ -299,7 +299,7 @@ def generate_candidates(session: Session) -> dict[str, object]:
     ).all()
 
     trade_intents: list[TradeIntent] = []
-    decision_counts: dict[str, int] = {}
+    evaluated_candidates: list[ModelCandidate] = []
 
     for mapping, game, market in mappings:
         minutes_to_start = int((ensure_aware_utc(game.scheduled_start) - now).total_seconds() / 60)
@@ -443,7 +443,7 @@ def generate_candidates(session: Session) -> dict[str, object]:
             )
         )
         created_or_updated += 1
-        decision_counts[decision] = decision_counts.get(decision, 0) + 1
+        evaluated_candidates.append(candidate)
 
         output = ModelPredictionOutput(
             prediction_run_id=prediction_run.id,
@@ -533,6 +533,11 @@ def generate_candidates(session: Session) -> dict[str, object]:
             output.decision_reason = "paper_trade"
             session.add(output)
         paper_trades += 1
+
+    decision_counts: dict[str, int] = {}
+    for candidate in evaluated_candidates:
+        decision = candidate.decision or "unknown"
+        decision_counts[decision] = decision_counts.get(decision, 0) + 1
 
     snapshot = create_balance_snapshot(session, source="candidate_engine")
     prediction_run.completed_at = now
