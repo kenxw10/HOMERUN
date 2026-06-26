@@ -286,6 +286,10 @@ def _parse_ticker_tail_line(market: dict[str, Any]) -> Decimal | None:
     if not ticker:
         return None
 
+    total_tail_line = re.search(r"-(?:O|U|OVER|UNDER)-(\d+(?:\.\d+)?)$", ticker)
+    if total_tail_line:
+        return _decimal(total_tail_line.group(1))
+
     selected_team_line = re.search(r"-[A-Z0-9]{2,5}([+-]\d+(?:\.\d+)?)$", ticker)
     if selected_team_line:
         parsed = _decimal(selected_team_line.group(1))

@@ -3265,6 +3265,15 @@ def test_market_family_discovery_parses_line_from_ticker_tail_not_date_prefix() 
     assert item.line_value != Decimal("26.0000")
 
 
+def test_market_family_discovery_parses_total_ticker_tail_as_positive_line() -> None:
+    assert market_family_discovery._parse_line_value(
+        {"ticker": "KXMLBTOTAL-26JUL011900SEAPIT-OVER-8"}
+    ) == Decimal("8.0000")
+    assert market_family_discovery._parse_line_value(
+        {"ticker": "KXMLBF5TOTAL-26JUL011900SEAPIT-UNDER-4.5"}
+    ) == Decimal("4.5000")
+
+
 def test_market_family_discovery_skips_event_filter_for_exact_found_family() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
@@ -3579,7 +3588,7 @@ def test_market_family_mapping_sync_promotes_only_parseable_supported_families()
             status="completed",
             games_considered=1,
             families_considered=6,
-            markets_found=4,
+            markets_found=5,
             errors=[],
             warnings=[],
             raw_summary={},
@@ -3615,6 +3624,17 @@ def test_market_family_mapping_sync_promotes_only_parseable_supported_families()
                     run_id=run.id,
                     mlb_game_id=game.id,
                     family_key="full_game_total",
+                    returned_ticker="KXMLBTOTAL-26JUL011900SEAPIT-OVER-8",
+                    returned_event_ticker="KXMLBTOTAL-26JUL011900SEAPIT",
+                    title="Pittsburgh Pirates and Seattle Mariners total",
+                    raw_status="open",
+                    confidence=Decimal("0.9500"),
+                    line_value=Decimal("-8.0000"),
+                ),
+                MarketFamilyDiscoveryItem(
+                    run_id=run.id,
+                    mlb_game_id=game.id,
+                    family_key="full_game_total",
                     returned_ticker="KXMLBTEAMTOTAL-26JUL011900SEAPIT-PIT-3.5",
                     title="Pittsburgh team total",
                     raw_status="open",
@@ -3639,19 +3659,28 @@ def test_market_family_mapping_sync_promotes_only_parseable_supported_families()
         mappings = list(session.scalars(select(MarketMapping).order_by(MarketMapping.market_family)))
         markets = list(session.scalars(select(KalshiMarket).order_by(KalshiMarket.market_family)))
 
-    assert result["items_seen"] == 4
-    assert result["paper_supported"] == 2
+    assert result["items_seen"] == 5
+    assert result["paper_supported"] == 3
     assert result["unsupported"] == 2
-    assert result["mappings_created_or_updated"] == 2
-    assert [mapping.market_family for mapping in mappings] == ["first_five_winner", "full_game_spread"]
+    assert result["mappings_created_or_updated"] == 3
+    assert [mapping.market_family for mapping in mappings] == [
+        "first_five_winner",
+        "full_game_spread",
+        "full_game_total",
+    ]
     assert {mapping.settlement_rule_status for mapping in mappings} == {"paper_supported"}
     assert next(mapping for mapping in mappings if mapping.market_family == "full_game_spread").line_value == Decimal(
         "-1.5000"
     )
+    assert next(mapping for mapping in mappings if mapping.market_family == "full_game_total").line_value == Decimal(
+        "8.0000"
+    )
+    assert next(mapping for mapping in mappings if mapping.market_family == "full_game_total").over_under_side == "over"
     assert next(mapping for mapping in mappings if mapping.market_family == "first_five_winner").selection_code == "TIE"
     assert {market.ticker for market in markets} == {
         "KXMLBF5-26JUL011900SEAPIT-TIE",
         "KXMLBSPREAD-26JUL011900SEAPIT-PIT-1.5",
+        "KXMLBTOTAL-26JUL011900SEAPIT-OVER-8",
     }
 
 

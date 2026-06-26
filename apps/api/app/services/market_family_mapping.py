@@ -96,7 +96,15 @@ def _normalized_selection(raw: dict[str, Any], item: MarketFamilyDiscoveryItem) 
 
 
 def _line_value(raw: dict[str, Any], item: MarketFamilyDiscoveryItem) -> Decimal | None:
-    return item.line_value or _parse_line_value(raw)
+    if item.line_value is not None:
+        return item.line_value
+    return _parse_line_value(raw)
+
+
+def _total_line_value(line_value: Decimal | None) -> Decimal | None:
+    if line_value is None:
+        return None
+    return abs(line_value)
 
 
 def _is_team_selection(selection: str | None, game: MlbGame) -> bool:
@@ -154,6 +162,7 @@ def _parse_discovered_item(item: MarketFamilyDiscoveryItem, game: MlbGame) -> Pa
         paper_supported = _is_team_selection(selection, game) and line_value is not None
         reason = "spread_selection_and_line_parsed" if paper_supported else "missing_spread_selection_or_line"
     elif family_key in {FULL_GAME_TOTAL, FIRST_FIVE_TOTAL}:
+        line_value = _total_line_value(line_value)
         paper_supported = over_under in {"over", "under"} and line_value is not None
         reason = "total_side_and_line_parsed" if paper_supported else "missing_total_side_or_line"
 
