@@ -70,6 +70,13 @@ def has_trusted_selection(game: MlbGame | None, market_ticker: str | None) -> bo
     return selected is not None and bool(team_codes) and selected in team_codes
 
 
+def _normalized_selection_code(selection_code: str | None) -> str | None:
+    if selection_code is None:
+        return None
+    selected = re.sub(r"[^A-Za-z0-9]", "", selection_code).upper()
+    return selected or None
+
+
 def matchup_display(game: MlbGame | None) -> str | None:
     if game is None:
         return None
@@ -84,14 +91,20 @@ def contract_labels(
     market: KalshiMarket | None,
     market_ticker: str,
     market_type: str | None,
+    selection_code: str | None = None,
 ) -> ContractLabels:
     ticker = market_ticker.upper()
-    selection = selected_team_from_ticker(ticker) or "UNKNOWN"
     matchup = matchup_display(game)
     title = (market.title if market else None) or ticker
     market_type = market_type_from_ticker(ticker, market_type)
     line_value = getattr(market, "line_value", None)
     over_under_side = getattr(market, "over_under_side", None)
+    parsed_selection = _normalized_selection_code(selection_code or getattr(market, "selection_code", None))
+    ticker_selection = selected_team_from_ticker(ticker) or "UNKNOWN"
+    if market_type in {FULL_GAME_WINNER, FULL_GAME_SPREAD, FIRST_FIVE_WINNER, FIRST_FIVE_SPREAD}:
+        selection = parsed_selection or ticker_selection
+    else:
+        selection = ticker_selection
 
     def fmt_line() -> str:
         if line_value is None:

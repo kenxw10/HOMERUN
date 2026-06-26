@@ -3749,6 +3749,8 @@ def test_market_family_mapping_parses_event_level_spread_selection_from_yes_text
     assert mapping.mapping_status == "confirmed"
     assert mapping.settlement_rule_status == "paper_supported"
     assert mapping.selection_code == "PIT"
+    assert mapping.mapping_metadata["selection_display"] == "PIT -1.5"
+    assert mapping.mapping_metadata["contract_display"] == "FULL GAME SPREAD - SEA @ PIT - PIT -1.5"
     assert market is not None
     assert market.selection_code == "PIT"
 
@@ -3917,8 +3919,11 @@ def test_event_level_spread_with_parsed_selection_can_create_paper_trade(monkeyp
     assert candidate is not None
     assert candidate.decision == "paper_trade"
     assert candidate.selection_code == "PIT"
+    assert candidate.selection_display == "PIT -1.5"
     assert trade is not None
     assert trade.selection_code == "PIT"
+    assert trade.selection_display == "PIT -1.5"
+    assert trade.contract_display == "FULL GAME SPREAD - SEA @ PIT - PIT -1.5"
     assert trade.market_ticker == "KXMLBSPREAD-26JUL011900SEAPIT"
 
 

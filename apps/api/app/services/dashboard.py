@@ -109,6 +109,7 @@ def _position_from_trade(
         market=market,
         market_ticker=trade.market_ticker,
         market_type=market_type_from_ticker(trade.market_ticker),
+        selection_code=trade.selection_code or (market.selection_code if market else None),
     )
     display = trade.contract_display or trade.market_display or fallback_labels.contract_display
     return PositionSummary(

@@ -160,7 +160,13 @@ def generate_candidates(session: Session) -> dict[str, int]:
         price = _market_yes_price(market)
         contract_side = "yes"
         features = build_feature_snapshot(game, market, mapping)
-        labels = contract_labels(game=game, market=market, market_ticker=market.ticker, market_type=market_type)
+        labels = contract_labels(
+            game=game,
+            market=market,
+            market_ticker=market.ticker,
+            market_type=market_type,
+            selection_code=mapping.selection_code or market.selection_code,
+        )
         if market_type == FULL_GAME_WINNER:
             model_score = score_candidate_probability(features, contract_side)
             probability = model_score.probability

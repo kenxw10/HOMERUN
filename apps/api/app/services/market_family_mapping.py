@@ -284,7 +284,13 @@ def _upsert_mapping(
         .where(MarketMapping.kalshi_market_id == market.id)
     )
     mapping = mapping or MarketMapping(mlb_game_id=game.id, kalshi_market_id=market.id)
-    labels = contract_labels(game=game, market=market, market_ticker=market.ticker, market_type=parsed.market_type)
+    labels = contract_labels(
+        game=game,
+        market=market,
+        market_ticker=market.ticker,
+        market_type=parsed.market_type,
+        selection_code=parsed.selection_code,
+    )
     mapping.mapping_status = parsed.mapping_status
     mapping.confidence = item.confidence or Decimal("0.7500")
     mapping.rationale = f"PR3B_DISCOVERY_NORMALIZATION:{parsed.reason}"
