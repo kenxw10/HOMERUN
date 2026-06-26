@@ -15,12 +15,14 @@ class HttpJsonError(RuntimeError):
         params: dict[str, object],
         status_code: int | None = None,
         body_preview: str | None = None,
+        response_headers: dict[str, str] | None = None,
     ) -> None:
         super().__init__(message)
         self.endpoint = endpoint
         self.params = params
         self.status_code = status_code
         self.body_preview = body_preview
+        self.response_headers = response_headers or {}
 
     def to_detail(self) -> dict[str, object]:
         return {
@@ -28,6 +30,7 @@ class HttpJsonError(RuntimeError):
             "query_params": self.params,
             "upstream_status_code": self.status_code,
             "body_preview": self.body_preview,
+            "response_headers": self.response_headers,
         }
 
 
@@ -48,6 +51,7 @@ def get_json(url: str, params: dict[str, object] | None = None, headers: dict[st
             params=dict(query_params),
             status_code=exc.code,
             body_preview=detail[:300],
+            response_headers={key: value for key, value in exc.headers.items()},
         ) from exc
     except URLError as exc:
         raise HttpJsonError(

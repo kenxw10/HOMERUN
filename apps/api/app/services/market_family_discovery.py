@@ -12,7 +12,12 @@ from sqlalchemy.orm import Session
 from app.config import get_settings
 from app.models import MarketFamilyDiscoveryItem, MarketFamilyDiscoveryRun, MlbGame
 from app.services.kalshi import KalshiAPIError, KalshiClient
-from app.services.kalshi_mlb_resolver import build_event_ticker_candidates, game_team_codes, is_multivariate_market
+from app.services.kalshi_mlb_resolver import (
+    KALSHI_EVENT_TIME_ZONE,
+    MONTH_CODES,
+    game_team_codes,
+    is_multivariate_market,
+)
 from app.time_utils import ensure_aware_utc, get_dashboard_zone, today_eastern, utc_now
 
 RESOLVER_MODE = "deterministic_ticker_registry_v1"
@@ -33,6 +38,10 @@ RETIRED_LEGACY_PREFIXES_NOT_USED = [
     "KXMLBGAMETOTAL",
     "KXMLBRUNSTOTAL",
 ]
+EXACT_OFFSETS_MINUTES = (0,)
+FALLBACK_OFFSETS_MINUTES = (-1, 1, -5, 5, -10, 10)
+TICKER_BATCH_SIZE = 50
+STALE_RUNNING_AFTER = timedelta(minutes=10)
 
 FULL_REGISTRY: dict[str, dict[str, object]] = {
     "full_game_winner": {
@@ -95,6 +104,7 @@ TARGET_FAMILIES = [
 ]
 
 DISCOVERY_FAMILIES = [family_key for family_key in TARGET_FAMILIES if family_key != "full_game_winner"]
+DISCOVERY_QUERY_FAMILIES = DISCOVERY_FAMILIES
 
 
 @dataclass
@@ -104,6 +114,16 @@ class DiscoveryProbe:
     candidate_event_ticker: str | None
     candidate_market_ticker: str | None
     source_strategy: str
+    offset_minutes: int = 0
+
+
+@dataclass
+class DiscoveryMetrics:
+    request_count: int = 0
+    rate_limited_count: int = 0
+    retries_attempted: int = 0
+    requests_saved_by_batching: int = 0
+    stopped_due_to_rate_limit: bool = False
 
 
 def _date_bounds(target_date: date) -> tuple[datetime, datetime]:
@@ -122,6 +142,32 @@ def _games_for_date(session: Session, target_date: date) -> list[MlbGame]:
             .order_by(MlbGame.scheduled_start.asc())
         )
     )
+
+
+def _finalize_stale_running_runs(session: Session, now: datetime) -> int:
+    stale_before = now - STALE_RUNNING_AFTER
+    stale_runs = list(
+        session.scalars(
+            select(MarketFamilyDiscoveryRun)
+            .where(MarketFamilyDiscoveryRun.status == "running")
+            .where(MarketFamilyDiscoveryRun.started_at < stale_before)
+        )
+    )
+    for run in stale_runs:
+        warnings = list(run.warnings or [])
+        warnings.append({"message": "STALE_RUNNING_RUN_FINALIZED", "run_id": run.id})
+        run.status = "partial_error"
+        run.completed_at = now
+        run.warnings = warnings
+        raw_summary = dict(run.raw_summary or {})
+        raw_summary["status"] = "partial_error"
+        raw_summary["warnings"] = warnings
+        raw_summary["completed_at"] = now.isoformat()
+        run.raw_summary = raw_summary
+        session.add(run)
+    if stale_runs:
+        session.commit()
+    return len(stale_runs)
 
 
 def _markets_from_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -334,23 +380,28 @@ def _classification_metadata(
     }
 
 
-def _event_suffixes(game: MlbGame) -> list[str]:
-    suffixes: list[str] = []
-    for event_ticker in build_event_ticker_candidates(game):
-        if "-" not in event_ticker:
-            continue
-        suffix = event_ticker.split("-", 1)[1]
-        if suffix not in suffixes:
-            suffixes.append(suffix)
-    return suffixes
+def _event_suffix(game: MlbGame, offset_minutes: int = 0) -> str:
+    away_code, home_code = game_team_codes(game)
+    local = (ensure_aware_utc(game.scheduled_start) + timedelta(minutes=offset_minutes)).astimezone(
+        KALSHI_EVENT_TIME_ZONE
+    )
+    timestamp = f"{local:%y}{MONTH_CODES[local.month - 1]}{local:%d%H%M}"
+    return f"{timestamp}{away_code}{home_code}"
 
 
-def _event_ticker_candidates(game: MlbGame, family_key: str) -> list[tuple[str, str]]:
+def _event_ticker_candidates(
+    game: MlbGame,
+    family_key: str,
+    offsets: tuple[int, ...] = EXACT_OFFSETS_MINUTES,
+) -> list[tuple[str, str]]:
     values: list[tuple[str, str]] = []
     for series_ticker in FULL_REGISTRY[family_key]["candidate_series_tickers"]:
         assert isinstance(series_ticker, str)
-        for suffix in _event_suffixes(game):
-            values.append((series_ticker, f"{series_ticker}-{suffix}"))
+        for offset in offsets:
+            suffix = _event_suffix(game, offset)
+            value = (series_ticker, f"{series_ticker}-{suffix}")
+            if value not in values:
+                values.append(value)
     return values
 
 
@@ -360,6 +411,8 @@ def _direct_market_ticker_candidates(game: MlbGame, family_key: str, event_ticke
         suffixes = (away_code, home_code)
     elif family_key == "first_five_winner":
         suffixes = (away_code, home_code, "TIE")
+    elif family_key in {"full_game_spread", "full_game_total", "first_five_spread", "first_five_total"}:
+        return [event_ticker]
     else:
         return []
 
@@ -449,6 +502,7 @@ def _probe_attempt_record(
         "candidate_event_ticker": probe.candidate_event_ticker,
         "candidate_market_ticker": probe.candidate_market_ticker,
         "source_strategy": probe.source_strategy,
+        "offset_minutes": probe.offset_minutes,
         "markets_found": markets_found,
     }
     if error is not None:
@@ -504,6 +558,12 @@ def _empty_family_summary(family_key: str) -> dict[str, object]:
         "discovered_market_ticker_examples": [],
         "market_count": 0,
         "game_coverage_count": 0,
+        "no_match_count": 0,
+        "exact_scheduled_time_attempts": 0,
+        "fallback_attempts": 0,
+        "event_filter_attempts": 0,
+        "rate_limited_count": 0,
+        "request_count": 0,
         "line_or_strike_parsing_status": "not_applicable" if family_key.endswith("winner") else UNKNOWN_PENDING_DISCOVERY,
         "settlement_rule_status": "supported_current" if family_key == "full_game_winner" else UNKNOWN_PENDING_DISCOVERY,
         "notes": definition["notes"],
@@ -553,6 +613,39 @@ def _summarize_by_family(
     return by_family
 
 
+def _enrich_by_family_with_audit(
+    by_family: dict[str, dict[str, object]],
+    audit: dict[str, object],
+    metrics: DiscoveryMetrics,
+) -> dict[str, dict[str, object]]:
+    no_match_counts = audit.get("no_match_counts") if isinstance(audit.get("no_match_counts"), dict) else {}
+    exact_counts = (
+        audit.get("exact_scheduled_time_attempt_counts")
+        if isinstance(audit.get("exact_scheduled_time_attempt_counts"), dict)
+        else {}
+    )
+    fallback_counts = audit.get("fallback_attempt_counts") if isinstance(audit.get("fallback_attempt_counts"), dict) else {}
+    event_filter_counts = (
+        audit.get("event_filter_attempt_counts") if isinstance(audit.get("event_filter_attempt_counts"), dict) else {}
+    )
+    for family_key, family in by_family.items():
+        family["no_match_count"] = int(no_match_counts.get(family_key, 0))
+        family["exact_scheduled_time_attempts"] = int(exact_counts.get(family_key, 0))
+        family["fallback_attempts"] = int(fallback_counts.get(family_key, 0))
+        family["event_filter_attempts"] = int(event_filter_counts.get(family_key, 0))
+        family["rate_limited_count"] = metrics.rate_limited_count
+        family["request_count"] = metrics.request_count
+        if (
+            family_key in DISCOVERY_QUERY_FAMILIES
+            and int(family["market_count"]) == 0
+            and int(family["no_match_count"]) > 0
+        ):
+            family["status"] = "no_match"
+            if family_key.endswith(("spread", "total")):
+                family["line_or_strike_parsing_status"] = "not_found"
+    return by_family
+
+
 def _probe_audit_summary(probe_attempts: list[dict[str, object]]) -> dict[str, object]:
     event_tickers = {
         str(attempt["candidate_event_ticker"])
@@ -566,6 +659,9 @@ def _probe_audit_summary(probe_attempts: list[dict[str, object]]) -> dict[str, o
     }
     examples: dict[str, dict[str, list[str]]] = {}
     no_match_counts: dict[str, int] = {}
+    exact_attempt_counts: dict[str, int] = {}
+    fallback_attempt_counts: dict[str, int] = {}
+    event_filter_attempt_counts: dict[str, int] = {}
 
     for attempt in probe_attempts:
         family_key = str(attempt.get("family_key") or "unknown")
@@ -575,6 +671,13 @@ def _probe_audit_summary(probe_attempts: list[dict[str, object]]) -> dict[str, o
         )
         _append_example(family_examples["event_tickers"], attempt.get("candidate_event_ticker"))  # type: ignore[arg-type]
         _append_example(family_examples["market_tickers"], attempt.get("candidate_market_ticker"))  # type: ignore[arg-type]
+        source_strategy = str(attempt.get("source_strategy") or "")
+        if source_strategy == "batched_exact_ticker":
+            exact_attempt_counts[family_key] = exact_attempt_counts.get(family_key, 0) + 1
+        elif source_strategy == "batched_fallback_ticker":
+            fallback_attempt_counts[family_key] = fallback_attempt_counts.get(family_key, 0) + 1
+        elif source_strategy == "event_ticker_filter_fallback":
+            event_filter_attempt_counts[family_key] = event_filter_attempt_counts.get(family_key, 0) + 1
         if attempt.get("outcome") in {"no_match", "partial_no_match"}:
             no_match_counts[family_key] = no_match_counts.get(family_key, 0) + 1
 
@@ -583,6 +686,9 @@ def _probe_audit_summary(probe_attempts: list[dict[str, object]]) -> dict[str, o
         "attempted_market_tickers_count": len(market_tickers),
         "attempted_ticker_examples": examples,
         "no_match_counts": no_match_counts,
+        "exact_scheduled_time_attempt_counts": exact_attempt_counts,
+        "fallback_attempt_counts": fallback_attempt_counts,
+        "event_filter_attempt_counts": event_filter_attempt_counts,
     }
 
 
@@ -606,77 +712,306 @@ def _item_examples_by_family(items: list[MarketFamilyDiscoveryItem]) -> dict[str
     return examples
 
 
-def _probe_markets(
+def _chunked(values: list[DiscoveryProbe], size: int) -> list[list[DiscoveryProbe]]:
+    return [values[index : index + size] for index in range(0, len(values), size)]
+
+
+def _is_rate_limit_error(exc: Exception) -> bool:
+    return isinstance(exc, KalshiAPIError) and exc.source.status_code == 429
+
+
+def _client_stat(client: KalshiClient, field_name: str) -> int:
+    value = getattr(client, field_name, 0)
+    return int(value) if isinstance(value, int) else 0
+
+
+def _merge_client_metrics(metrics: DiscoveryMetrics, client: KalshiClient) -> None:
+    metrics.request_count = max(metrics.request_count, _client_stat(client, "request_count"))
+    metrics.rate_limited_count = max(metrics.rate_limited_count, _client_stat(client, "rate_limited_count"))
+    metrics.retries_attempted = max(metrics.retries_attempted, _client_stat(client, "retries_attempted"))
+
+
+def _fallback_offsets(settings) -> tuple[int, ...]:
+    if not settings.kalshi_discovery_enable_fallback_time_offsets:
+        return ()
+    return FALLBACK_OFFSETS_MINUTES[: settings.kalshi_discovery_max_fallback_offsets]
+
+
+def _probes_for_offsets(
+    games: list[MlbGame],
+    families: list[str],
+    offsets: tuple[int, ...],
+    source_strategy: str,
+) -> list[tuple[DiscoveryProbe, MlbGame]]:
+    probes: list[tuple[DiscoveryProbe, MlbGame]] = []
+    for game in games:
+        for family_key in families:
+            for series_ticker, event_ticker in _event_ticker_candidates(game, family_key, offsets):
+                for market_ticker in _direct_market_ticker_candidates(game, family_key, event_ticker):
+                    probes.append(
+                        (
+                            DiscoveryProbe(
+                                family_key=family_key,
+                                candidate_series_ticker=series_ticker,
+                                candidate_event_ticker=event_ticker,
+                                candidate_market_ticker=market_ticker,
+                                source_strategy=source_strategy,
+                                offset_minutes=event_ticker_offset(game, event_ticker),
+                            ),
+                            game,
+                        )
+                    )
+    return probes
+
+
+def event_ticker_offset(game: MlbGame, event_ticker: str) -> int:
+    exact_suffix = _event_suffix(game)
+    if event_ticker.endswith(exact_suffix):
+        return 0
+    for offset in FALLBACK_OFFSETS_MINUTES:
+        if event_ticker.endswith(_event_suffix(game, offset)):
+            return offset
+    return 0
+
+
+def _batch_lookup_markets(
+    *,
     client: KalshiClient,
-    game: MlbGame,
-    family_key: str,
+    probe_entries: list[tuple[DiscoveryProbe, MlbGame]],
     warnings: list[object],
     errors: list[object],
     probe_attempts: list[dict[str, object]],
-) -> list[tuple[DiscoveryProbe, dict[str, Any]]]:
-    found: list[tuple[DiscoveryProbe, dict[str, Any]]] = []
+    metrics: DiscoveryMetrics,
+    max_429_errors: int,
+) -> list[tuple[DiscoveryProbe, MlbGame, dict[str, Any]]]:
+    found: list[tuple[DiscoveryProbe, MlbGame, dict[str, Any]]] = []
+    entry_by_ticker = {
+        str(probe.candidate_market_ticker or "").upper(): (probe, game)
+        for probe, game in probe_entries
+        if probe.candidate_market_ticker
+    }
+    if not entry_by_ticker:
+        return found
 
-    for series_ticker, event_ticker in _event_ticker_candidates(game, family_key):
-        for market_ticker in _direct_market_ticker_candidates(game, family_key, event_ticker):
-            direct_probe = DiscoveryProbe(
-                family_key,
-                series_ticker,
-                event_ticker,
-                market_ticker,
-                "direct_market_lookup",
-            )
-            try:
-                payload = client.get_market(market_ticker)
-                markets = _markets_from_payload(payload)
-                probe_attempts.append(
-                    _probe_attempt_record(
-                        game=game,
-                        probe=direct_probe,
-                        outcome="found" if markets else "no_match",
-                        markets_found=len(markets),
-                    )
-                )
-                found.extend((direct_probe, market) for market in markets)
-            except Exception as exc:
+    for chunk in _chunked([entry[0] for entry in entry_by_ticker.values()], TICKER_BATCH_SIZE):
+        if metrics.rate_limited_count >= max_429_errors:
+            metrics.stopped_due_to_rate_limit = True
+            break
+        tickers = [str(probe.candidate_market_ticker or "") for probe in chunk]
+        metrics.request_count += 1
+        metrics.requests_saved_by_batching += max(len(tickers) - 1, 0)
+        try:
+            payload = client.get_markets_by_tickers(tickers)
+        except Exception as exc:
+            if _is_rate_limit_error(exc):
+                metrics.rate_limited_count += 1
+            _merge_client_metrics(metrics, client)
+            for probe in chunk:
+                game = entry_by_ticker[str(probe.candidate_market_ticker or "").upper()][1]
                 _record_probe_exception(
                     game=game,
-                    probe=direct_probe,
+                    probe=probe,
                     exc=exc,
                     warnings=warnings,
                     errors=errors,
                     probe_attempts=probe_attempts,
                 )
+            continue
 
-        filter_probe = DiscoveryProbe(
-            family_key,
-            series_ticker,
-            event_ticker,
-            None,
-            "event_ticker_filter",
-        )
+        _merge_client_metrics(metrics, client)
+        markets_by_ticker = {str(market.get("ticker") or "").upper(): market for market in _markets_from_payload(payload)}
+        for probe in chunk:
+            market_ticker = str(probe.candidate_market_ticker or "").upper()
+            market = markets_by_ticker.get(market_ticker)
+            game = entry_by_ticker[market_ticker][1]
+            probe_attempts.append(
+                _probe_attempt_record(
+                    game=game,
+                    probe=probe,
+                    outcome="found" if market else "no_match",
+                    markets_found=1 if market else 0,
+                )
+            )
+            if market:
+                found.append((probe, game, market))
+
+    return found
+
+
+def _event_filter_lookup_markets(
+    *,
+    client: KalshiClient,
+    probe_entries: list[tuple[DiscoveryProbe, MlbGame]],
+    warnings: list[object],
+    errors: list[object],
+    probe_attempts: list[dict[str, object]],
+    metrics: DiscoveryMetrics,
+    max_429_errors: int,
+) -> list[tuple[DiscoveryProbe, MlbGame, dict[str, Any]]]:
+    found: list[tuple[DiscoveryProbe, MlbGame, dict[str, Any]]] = []
+    seen_event_tickers: set[str] = set()
+    for probe, game in probe_entries:
+        if metrics.rate_limited_count >= max_429_errors:
+            metrics.stopped_due_to_rate_limit = True
+            break
+        event_ticker = str(probe.candidate_event_ticker or "")
+        if not event_ticker or event_ticker in seen_event_tickers:
+            continue
+        seen_event_tickers.add(event_ticker)
+        metrics.request_count += 1
         try:
             payload = client.get_markets_by_event_ticker(event_ticker)
             markets = _markets_from_payload(payload)
             probe_attempts.append(
                 _probe_attempt_record(
                     game=game,
-                    probe=filter_probe,
+                    probe=probe,
                     outcome="found" if markets else "no_match",
                     markets_found=len(markets),
                 )
             )
-            found.extend((filter_probe, market) for market in markets)
+            found.extend((probe, game, market) for market in markets)
         except Exception as exc:
+            if _is_rate_limit_error(exc):
+                metrics.rate_limited_count += 1
+            _merge_client_metrics(metrics, client)
             _record_probe_exception(
                 game=game,
-                probe=filter_probe,
+                probe=probe,
                 exc=exc,
                 warnings=warnings,
                 errors=errors,
                 probe_attempts=probe_attempts,
             )
-
+            continue
+        _merge_client_metrics(metrics, client)
     return found
+
+
+def _game_family_key(game: MlbGame, family_key: str) -> tuple[object, str]:
+    return (game.id or game.external_game_id, family_key)
+
+
+def _filter_probe_entries_for_missing_keys(
+    probe_entries: list[tuple[DiscoveryProbe, MlbGame]],
+    found_keys: set[tuple[object, str]],
+) -> list[tuple[DiscoveryProbe, MlbGame]]:
+    return [
+        (probe, game)
+        for probe, game in probe_entries
+        if _game_family_key(game, probe.family_key) not in found_keys
+    ]
+
+
+def _event_filter_probe_entries(
+    games: list[MlbGame],
+    families: list[str],
+    offsets: tuple[int, ...],
+    found_keys: set[tuple[object, str]],
+) -> list[tuple[DiscoveryProbe, MlbGame]]:
+    probes: list[tuple[DiscoveryProbe, MlbGame]] = []
+    for game in games:
+        for family_key in families:
+            if _game_family_key(game, family_key) in found_keys:
+                continue
+            for series_ticker, event_ticker in _event_ticker_candidates(game, family_key, offsets):
+                probes.append(
+                    (
+                        DiscoveryProbe(
+                            family_key=family_key,
+                            candidate_series_ticker=series_ticker,
+                            candidate_event_ticker=event_ticker,
+                            candidate_market_ticker=None,
+                            source_strategy="event_ticker_filter_fallback",
+                            offset_minutes=event_ticker_offset(game, event_ticker),
+                        ),
+                        game,
+                    )
+                )
+    return probes
+
+
+def _discover_markets_low_request(
+    *,
+    client: KalshiClient,
+    games: list[MlbGame],
+    settings,
+    warnings: list[object],
+    errors: list[object],
+    probe_attempts: list[dict[str, object]],
+) -> tuple[list[tuple[DiscoveryProbe, MlbGame, dict[str, Any]]], DiscoveryMetrics]:
+    metrics = DiscoveryMetrics()
+    found: list[tuple[DiscoveryProbe, MlbGame, dict[str, Any]]] = []
+    found_keys: set[tuple[object, str]] = set()
+    max_429_errors = settings.kalshi_discovery_max_429_errors
+
+    exact_entries = _probes_for_offsets(
+        games,
+        DISCOVERY_QUERY_FAMILIES,
+        EXACT_OFFSETS_MINUTES,
+        "batched_exact_ticker",
+    )
+    exact_found = _batch_lookup_markets(
+        client=client,
+        probe_entries=exact_entries,
+        warnings=warnings,
+        errors=errors,
+        probe_attempts=probe_attempts,
+        metrics=metrics,
+        max_429_errors=max_429_errors,
+    )
+    found.extend(exact_found)
+    found_keys.update(_game_family_key(game, probe.family_key) for probe, game, _market in exact_found)
+
+    fallback_offsets = _fallback_offsets(settings)
+    if fallback_offsets and not metrics.stopped_due_to_rate_limit:
+        fallback_entries = _filter_probe_entries_for_missing_keys(
+            _probes_for_offsets(
+                games,
+                DISCOVERY_QUERY_FAMILIES,
+                fallback_offsets,
+                "batched_fallback_ticker",
+            ),
+            found_keys,
+        )
+        fallback_found = _batch_lookup_markets(
+            client=client,
+            probe_entries=fallback_entries,
+            warnings=warnings,
+            errors=errors,
+            probe_attempts=probe_attempts,
+            metrics=metrics,
+            max_429_errors=max_429_errors,
+        )
+        found.extend(fallback_found)
+        found_keys.update(_game_family_key(game, probe.family_key) for probe, game, _market in fallback_found)
+
+    if not metrics.stopped_due_to_rate_limit:
+        event_offsets = (0, *fallback_offsets)
+        event_entries = _event_filter_probe_entries(games, DISCOVERY_QUERY_FAMILIES, event_offsets, found_keys)
+        event_found = _event_filter_lookup_markets(
+            client=client,
+            probe_entries=event_entries,
+            warnings=warnings,
+            errors=errors,
+            probe_attempts=probe_attempts,
+            metrics=metrics,
+            max_429_errors=max_429_errors,
+        )
+        found.extend(event_found)
+        found_keys.update(_game_family_key(game, probe.family_key) for probe, game, _market in event_found)
+
+    _merge_client_metrics(metrics, client)
+    if metrics.stopped_due_to_rate_limit:
+        warnings.append(
+            {
+                "message": "DISCOVERY_RATE_LIMIT_CIRCUIT_BREAKER_OPEN",
+                "rate_limited_count": metrics.rate_limited_count,
+                "max_429_errors": max_429_errors,
+            }
+        )
+
+    return found, metrics
 
 
 def run_market_family_discovery(
@@ -688,12 +1023,14 @@ def run_market_family_discovery(
     settings = get_settings()
     day = target_date or today_eastern()
     started = utc_now()
+    stale_runs_finalized = _finalize_stale_running_runs(session, started)
     families = TARGET_FAMILIES
     games = _games_for_date(session, day)
     errors: list[object] = []
     warnings: list[object] = []
     probe_attempts: list[dict[str, object]] = []
     persisted_items: list[MarketFamilyDiscoveryItem] = []
+    metrics = DiscoveryMetrics()
     run = MarketFamilyDiscoveryRun(
         target_date=day,
         started_at=started,
@@ -730,6 +1067,12 @@ def run_market_family_discovery(
             "probe_attempts": [],
             "attempted_ticker_examples": {},
             "no_match_counts": {},
+            "request_count": 0,
+            "requests_saved_by_batching": 0,
+            "rate_limited_count": 0,
+            "retries_attempted": 0,
+            "stopped_due_to_rate_limit": False,
+            "stale_runs_finalized": stale_runs_finalized,
             "retired_legacy_prefixes_not_used": RETIRED_LEGACY_PREFIXES_NOT_USED,
         }
         run.status = "skipped"
@@ -746,46 +1089,49 @@ def run_market_family_discovery(
         kalshi_client = client or KalshiClient.from_market_data_settings()
         seen: set[tuple[object, ...]] = set()
 
-        for game in games:
-            for family_key in families:
-                for probe, market in _probe_markets(
-                    kalshi_client,
-                    game,
-                    family_key,
-                    warnings,
-                    errors,
-                    probe_attempts,
-                ):
-                    ticker = str(market.get("ticker") or "").upper()
-                    if not ticker:
-                        continue
-                    if is_multivariate_market(market):
-                        warnings.append(
-                            {
-                                "message": "MULTIVARIATE_MARKET_EXCLUDED",
-                                "family_key": family_key,
-                                "ticker": ticker,
-                            }
-                        )
-                        continue
-                    dedupe_key = (family_key, ticker)
-                    if dedupe_key in seen:
-                        continue
-                    seen.add(dedupe_key)
-                    item = _item_from_market(
-                        run_id=run.id,
-                        game=game,
-                        family_key=family_key,
-                        probe=probe,
-                        market=market,
-                    )
-                    persisted_items.append(item)
-                    session.add(item)
+        discovered, metrics = _discover_markets_low_request(
+            client=kalshi_client,
+            games=games,
+            settings=settings,
+            warnings=warnings,
+            errors=errors,
+            probe_attempts=probe_attempts,
+        )
+        for probe, game, market in discovered:
+            ticker = str(market.get("ticker") or "").upper()
+            if not ticker:
+                continue
+            if is_multivariate_market(market):
+                warnings.append(
+                    {
+                        "message": "MULTIVARIATE_MARKET_EXCLUDED",
+                        "family_key": probe.family_key,
+                        "ticker": ticker,
+                    }
+                )
+                continue
+            dedupe_key = (probe.family_key, ticker)
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            item = _item_from_market(
+                run_id=run.id,
+                game=game,
+                family_key=probe.family_key,
+                probe=probe,
+                market=market,
+            )
+            persisted_items.append(item)
+            session.add(item)
 
         completed = utc_now()
-        by_family = _summarize_by_family(families, persisted_items, completed)
         audit = _probe_audit_summary(probe_attempts)
-        status_value = "partial_error" if errors else "completed"
+        by_family = _enrich_by_family_with_audit(
+            _summarize_by_family(families, persisted_items, completed),
+            audit,
+            metrics,
+        )
+        status_value = "partial_error" if errors or metrics.stopped_due_to_rate_limit else "completed"
         result = {
             "run_id": run.id,
             "date": day.isoformat(),
@@ -800,6 +1146,12 @@ def run_market_family_discovery(
             "errors": errors,
             "attempted_probe_count": len(probe_attempts),
             "probe_attempts": probe_attempts,
+            "request_count": metrics.request_count,
+            "requests_saved_by_batching": metrics.requests_saved_by_batching,
+            "rate_limited_count": metrics.rate_limited_count,
+            "retries_attempted": metrics.retries_attempted,
+            "stopped_due_to_rate_limit": metrics.stopped_due_to_rate_limit,
+            "stale_runs_finalized": stale_runs_finalized,
             "retired_legacy_prefixes_not_used": RETIRED_LEGACY_PREFIXES_NOT_USED,
         }
         run.completed_at = completed
@@ -830,6 +1182,12 @@ def run_market_family_discovery(
             "errors": [*errors, error],
             "attempted_probe_count": len(probe_attempts),
             "probe_attempts": probe_attempts,
+            "request_count": metrics.request_count,
+            "requests_saved_by_batching": metrics.requests_saved_by_batching,
+            "rate_limited_count": metrics.rate_limited_count,
+            "retries_attempted": metrics.retries_attempted,
+            "stopped_due_to_rate_limit": metrics.stopped_due_to_rate_limit,
+            "stale_runs_finalized": stale_runs_finalized,
             "retired_legacy_prefixes_not_used": RETIRED_LEGACY_PREFIXES_NOT_USED,
         }
         failed_run = session.get(MarketFamilyDiscoveryRun, run_id)
@@ -876,6 +1234,11 @@ def latest_market_family_discovery(session: Session, target_date: date | None = 
             "attempted_ticker_examples": {},
             "no_match_counts": {},
             "item_examples_by_family": {family_key: [] for family_key in TARGET_FAMILIES},
+            "request_count": 0,
+            "requests_saved_by_batching": 0,
+            "rate_limited_count": 0,
+            "retries_attempted": 0,
+            "stopped_due_to_rate_limit": False,
             "retired_legacy_prefixes_not_used": RETIRED_LEGACY_PREFIXES_NOT_USED,
             "items": [],
         }
@@ -909,6 +1272,11 @@ def latest_market_family_discovery(session: Session, target_date: date | None = 
         "attempted_ticker_examples": raw_summary.get("attempted_ticker_examples", {}),
         "no_match_counts": raw_summary.get("no_match_counts", {}),
         "item_examples_by_family": _item_examples_by_family(items),
+        "request_count": raw_summary.get("request_count", 0),
+        "requests_saved_by_batching": raw_summary.get("requests_saved_by_batching", 0),
+        "rate_limited_count": raw_summary.get("rate_limited_count", 0),
+        "retries_attempted": raw_summary.get("retries_attempted", 0),
+        "stopped_due_to_rate_limit": raw_summary.get("stopped_due_to_rate_limit", False),
         "retired_legacy_prefixes_not_used": raw_summary.get(
             "retired_legacy_prefixes_not_used",
             RETIRED_LEGACY_PREFIXES_NOT_USED,
@@ -963,6 +1331,6 @@ def market_family_discovery_preview(session: Session, target_date: date | None =
                 "candidate_series_tickers": FULL_REGISTRY[family_key]["candidate_series_tickers"],
             }
             for game in games
-            for family_key in TARGET_FAMILIES
+            for family_key in DISCOVERY_QUERY_FAMILIES
         ],
     }

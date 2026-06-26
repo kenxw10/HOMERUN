@@ -333,12 +333,28 @@ def validate_market_for_game(
     event_ticker_match = event_ticker in attempted_event_tickers or any(
         ticker.startswith(f"{candidate}-") for candidate in attempted_event_tickers
     )
+    away_code, home_code = game_team_codes(game)
+    selected_code = ticker.rsplit("-", 1)[-1] if "-" in ticker else ""
+    exact_direct_ticker_match = (
+        market_ticker_match
+        and event_ticker_match
+        and bool(event_details and event_details.get("team_codes_match"))
+        and selected_code in {away_code, home_code}
+        and (time_delta is None or time_delta <= 1)
+    )
 
     if is_multivariate_market(market):
         notes.append("REJECTED_MULTIVARIATE")
         mapping_status = "rejected_multivariate"
         validation_status = "rejected_multivariate"
         confidence = Decimal("0.0000")
+    elif exact_direct_ticker_match:
+        time_delta = 0 if time_delta is None else time_delta
+        team_score = Decimal("1.00")
+        notes.extend(["MARKET_TICKER_MATCH", "EVENT_TICKER_MATCH", "TICKER_TEAM_CODE_MATCH"])
+        mapping_status = "confirmed"
+        validation_status = "confirmed_for_paper"
+        confidence = Decimal("0.9700")
     elif market_ticker_match and event_ticker_match and (time_delta is None or time_delta <= 10) and team_score >= Decimal("0.50"):
         notes.extend(["MARKET_TICKER_MATCH", "EVENT_TICKER_MATCH", "TICKER_TEAM_CODE_MATCH"])
         mapping_status = "confirmed"

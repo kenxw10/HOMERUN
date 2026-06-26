@@ -37,6 +37,17 @@ class Settings(BaseSettings):
     kalshi_market_sync_limit: int = Field(default=100, alias="KALSHI_MARKET_SYNC_LIMIT")
     market_family_discovery_enabled: bool = Field(default=True, alias="MARKET_FAMILY_DISCOVERY_ENABLED")
     market_family_discovery_max_pages: int = Field(default=2, alias="MARKET_FAMILY_DISCOVERY_MAX_PAGES")
+    kalshi_discovery_enable_fallback_time_offsets: bool = Field(
+        default=True, alias="KALSHI_DISCOVERY_ENABLE_FALLBACK_TIME_OFFSETS"
+    )
+    kalshi_discovery_max_fallback_offsets: int = Field(default=6, alias="KALSHI_DISCOVERY_MAX_FALLBACK_OFFSETS")
+    kalshi_discovery_max_429_errors: int = Field(default=5, alias="KALSHI_DISCOVERY_MAX_429_ERRORS")
+    kalshi_market_data_min_request_interval_ms: int = Field(
+        default=500, alias="KALSHI_MARKET_DATA_MIN_REQUEST_INTERVAL_MS"
+    )
+    kalshi_market_data_max_retries: int = Field(default=2, alias="KALSHI_MARKET_DATA_MAX_RETRIES")
+    kalshi_market_data_backoff_base_ms: int = Field(default=1000, alias="KALSHI_MARKET_DATA_BACKOFF_BASE_MS")
+    kalshi_market_data_backoff_max_ms: int = Field(default=10000, alias="KALSHI_MARKET_DATA_BACKOFF_MAX_MS")
     open_position_price_refresh_enabled: bool = Field(default=True, alias="OPEN_POSITION_PRICE_REFRESH_ENABLED")
     paper_candidate_engine_enabled: bool = Field(default=True, alias="PAPER_CANDIDATE_ENGINE_ENABLED")
     default_paper_contracts: int = Field(default=1, alias="DEFAULT_PAPER_CONTRACTS")
@@ -59,6 +70,31 @@ class Settings(BaseSettings):
     @classmethod
     def validate_market_family_discovery_max_pages(cls, value: int) -> int:
         return max(value, 1)
+
+    @field_validator("kalshi_discovery_max_fallback_offsets")
+    @classmethod
+    def validate_kalshi_discovery_max_fallback_offsets(cls, value: int) -> int:
+        return min(max(value, 0), 6)
+
+    @field_validator("kalshi_discovery_max_429_errors")
+    @classmethod
+    def validate_kalshi_discovery_max_429_errors(cls, value: int) -> int:
+        return max(value, 1)
+
+    @field_validator("kalshi_market_data_min_request_interval_ms")
+    @classmethod
+    def validate_kalshi_market_data_min_request_interval_ms(cls, value: int) -> int:
+        return max(value, 0)
+
+    @field_validator("kalshi_market_data_max_retries")
+    @classmethod
+    def validate_kalshi_market_data_max_retries(cls, value: int) -> int:
+        return max(value, 0)
+
+    @field_validator("kalshi_market_data_backoff_base_ms", "kalshi_market_data_backoff_max_ms")
+    @classmethod
+    def validate_kalshi_market_data_backoff_ms(cls, value: int) -> int:
+        return max(value, 0)
 
     @field_validator("default_paper_contracts")
     @classmethod
@@ -106,13 +142,17 @@ class Settings(BaseSettings):
         return bool(self.backend_api_key and self.backend_api_key.get_secret_value())
 
     @property
-    def kalshi_market_data_source(self) -> str:
+    def kalshi_market_data_base_kind(self) -> str:
         normalized = self.kalshi_market_data_base_url.strip().lower()
         if "external-api.kalshi.com" in normalized:
             return "production_public_market_data"
         if "demo-api.kalshi.co" in normalized:
             return "demo_market_data"
         return "custom_market_data"
+
+    @property
+    def kalshi_market_data_source(self) -> str:
+        return self.kalshi_market_data_base_kind
 
     @property
     def safe_execution_posture(self) -> bool:

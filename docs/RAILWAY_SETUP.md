@@ -35,6 +35,13 @@ KALSHI_MARKET_SYNC_MAX_PAGES=2
 KALSHI_MARKET_SYNC_LIMIT=100
 MARKET_FAMILY_DISCOVERY_ENABLED=true
 MARKET_FAMILY_DISCOVERY_MAX_PAGES=2
+KALSHI_DISCOVERY_ENABLE_FALLBACK_TIME_OFFSETS=true
+KALSHI_DISCOVERY_MAX_FALLBACK_OFFSETS=6
+KALSHI_DISCOVERY_MAX_429_ERRORS=5
+KALSHI_MARKET_DATA_MIN_REQUEST_INTERVAL_MS=500
+KALSHI_MARKET_DATA_MAX_RETRIES=2
+KALSHI_MARKET_DATA_BACKOFF_BASE_MS=1000
+KALSHI_MARKET_DATA_BACKOFF_MAX_MS=10000
 OPEN_POSITION_PRICE_REFRESH_ENABLED=true
 PAPER_CANDIDATE_ENGINE_ENABLED=true
 DEFAULT_PAPER_CONTRACTS=1
@@ -65,6 +72,7 @@ Expected `/v1/system/status` result should include:
 - `config.live_trading_enabled: false`
 - `config.execution_kill_switch: true`
 - `config.kalshi_market_data_source: "production_public_market_data"` when using the default market-data URL.
+- `config.kalshi_market_data_base_kind: "production_public_market_data"` when using the default market-data URL.
 
 ## Migration Command
 
@@ -129,5 +137,6 @@ Expected behavior:
 - Paper settlement sync settles completed supported full-game winner paper trades.
 - Balance snapshots populate `/v1/dashboard/summary`.
 - Model governance records either a trained/promoted model or a clear skipped reason due to insufficient samples.
-- PR 3a market-family discovery returns structured `by_family` output from the observed deterministic prefixes `KXMLBGAME`, `KXMLBSPREAD`, `KXMLBTOTAL`, `KXMLBF5`, `KXMLBF5SPREAD`, and `KXMLBF5TOTAL`, but does not trade spread, total, or first-five markets.
+- PR 3a market-family discovery returns structured `by_family` output from the observed deterministic prefixes `KXMLBGAME`, `KXMLBSPREAD`, `KXMLBTOTAL`, `KXMLBF5`, `KXMLBF5SPREAD`, and `KXMLBF5TOTAL`, but normal discovery only probes the five non-full-game-winner families and does not trade spread, total, or first-five markets.
+- Discovery uses batched exact ticker queries first, capped fallback offsets second, and `event_ticker` filtering only as a secondary fallback. The result should include `request_count`, `requests_saved_by_batching`, `rate_limited_count`, `retries_attempted`, and `stopped_due_to_rate_limit`.
 - Open-position price refresh updates REST last marks for open paper positions only.

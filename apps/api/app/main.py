@@ -106,6 +106,7 @@ def system_status() -> SystemStatus:
             execution_kill_switch=settings.execution_kill_switch,
             kalshi_env=settings.kalshi_env,
             kalshi_market_data_source=settings.kalshi_market_data_source,
+            kalshi_market_data_base_kind=settings.kalshi_market_data_base_kind,
             kalshi_credentials=credentials_state,
         ),
     )

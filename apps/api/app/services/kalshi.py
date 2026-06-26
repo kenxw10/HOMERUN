@@ -1,7 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
+from email.utils import parsedate_to_datetime
+import random
+import time
 from typing import Any
 
 from app.config import get_settings
@@ -85,6 +88,14 @@ class KalshiClient:
     api_key: str | None = None
     api_secret: str | None = None
     timeout_seconds: int = 15
+    min_request_interval_ms: int = 0
+    max_retries: int = 0
+    backoff_base_ms: int = 0
+    backoff_max_ms: int = 0
+    request_count: int = field(default=0, init=False)
+    rate_limited_count: int = field(default=0, init=False)
+    retries_attempted: int = field(default=0, init=False)
+    _last_request_at: float = field(default=0.0, init=False, repr=False)
 
     @classmethod
     def from_settings(cls) -> "KalshiClient":
@@ -98,7 +109,13 @@ class KalshiClient:
     @classmethod
     def from_market_data_settings(cls) -> "KalshiClient":
         settings = get_settings()
-        return cls(base_url=settings.kalshi_market_data_base_url.rstrip("/"))
+        return cls(
+            base_url=settings.kalshi_market_data_base_url.rstrip("/"),
+            min_request_interval_ms=settings.kalshi_market_data_min_request_interval_ms,
+            max_retries=settings.kalshi_market_data_max_retries,
+            backoff_base_ms=settings.kalshi_market_data_backoff_base_ms,
+            backoff_max_ms=settings.kalshi_market_data_backoff_max_ms,
+        )
 
     def _headers(self) -> dict[str, str]:
         headers = {"Accept": "application/json"}
@@ -106,17 +123,68 @@ class KalshiClient:
             headers["KALSHI-ACCESS-KEY"] = self.api_key
         return headers
 
-    def _get_json(self, path: str, params: dict[str, object] | None = None) -> dict[str, Any]:
-        endpoint = f"{self.base_url}{path}"
+    def _retry_after_seconds(self, exc: HttpJsonError) -> float | None:
+        value = exc.response_headers.get("Retry-After") or exc.response_headers.get("retry-after")
+        if not value:
+            return None
         try:
-            return get_json(
-                endpoint,
-                params=params or {},
-                headers=self._headers(),
-                timeout=self.timeout_seconds,
-            )
-        except HttpJsonError as exc:
-            raise KalshiAPIError(f"Kalshi GET {path} failed.", source=exc) from exc
+            return max(float(value), 0.0)
+        except ValueError:
+            pass
+        try:
+            retry_at = parsedate_to_datetime(value)
+        except (TypeError, ValueError):
+            return None
+        return max(retry_at.timestamp() - time.time(), 0.0)
+
+    def _backoff_seconds(self, attempt: int, exc: HttpJsonError) -> float:
+        retry_after = self._retry_after_seconds(exc)
+        if retry_after is not None:
+            return retry_after
+        base = max(self.backoff_base_ms, 0) / 1000
+        maximum = max(self.backoff_max_ms, self.backoff_base_ms, 0) / 1000
+        if base <= 0:
+            return 0.0
+        return min(base * (2**attempt), maximum) + random.uniform(0, min(base, 0.25))
+
+    def _throttle(self) -> None:
+        interval = max(self.min_request_interval_ms, 0) / 1000
+        if interval <= 0:
+            return
+        elapsed = time.monotonic() - self._last_request_at
+        if self._last_request_at > 0 and elapsed < interval:
+            time.sleep(interval - elapsed)
+
+    def _raw_get_json(self, path: str, params: dict[str, object] | None = None) -> dict[str, Any]:
+        endpoint = f"{self.base_url}{path}"
+        self._throttle()
+        self.request_count += 1
+        self._last_request_at = time.monotonic()
+        return get_json(
+            endpoint,
+            params=params or {},
+            headers=self._headers(),
+            timeout=self.timeout_seconds,
+        )
+
+    def _get_json(self, path: str, params: dict[str, object] | None = None) -> dict[str, Any]:
+        for attempt in range(self.max_retries + 1):
+            try:
+                return self._raw_get_json(path, params=params)
+            except HttpJsonError as exc:
+                if exc.status_code == 429:
+                    self.rate_limited_count += 1
+                if exc.status_code != 429 or attempt >= self.max_retries:
+                    raise KalshiAPIError(
+                        f"Kalshi GET {path} failed.",
+                        source=exc,
+                        retry_or_fallback_attempted=attempt > 0,
+                    ) from exc
+
+                self.retries_attempted += 1
+                time.sleep(self._backoff_seconds(attempt, exc))
+
+        raise RuntimeError("unreachable Kalshi retry state")
 
     def get_markets(self, params: dict[str, object] | None = None) -> dict[str, Any]:
         return self._get_json("/markets", params=params or {})
