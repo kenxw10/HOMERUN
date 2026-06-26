@@ -3863,6 +3863,65 @@ def test_paper_supported_market_family_can_create_pre_model_paper_trade(monkeypa
     assert trade.settlement_rule_status == "paper_supported"
 
 
+def test_event_level_spread_with_parsed_selection_can_create_paper_trade(monkeypatch) -> None:
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+    monkeypatch.setattr(candidates, "utc_now", lambda: now)
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        game = MlbGame(
+            external_game_id="event-spread-paper-supported-1",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+            status="scheduled",
+        )
+        market = KalshiMarket(
+            kalshi_market_id="KX-EVENT-SPREAD-PAPER-SUPPORTED",
+            ticker="KXMLBSPREAD-26JUL011900SEAPIT",
+            title="Seattle Mariners vs Pittsburgh Pirates run line",
+            yes_subtitle="Pittsburgh -1.5",
+            status="open",
+            occurrence_datetime=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+            implied_yes_ask=Decimal("0.4000"),
+            market_family="full_game_spread",
+            market_type="full_game_spread",
+            line_value=Decimal("-1.5000"),
+            inning_scope="full_game",
+            settlement_rule_status="paper_supported",
+        )
+        session.add_all([game, market])
+        _add_candidate_mapping(
+            session,
+            game,
+            market,
+            mapping_status="confirmed",
+            market_family="full_game_spread",
+            market_type="full_game_spread",
+            line_value=Decimal("-1.5000"),
+            selection_code="PIT",
+            inning_scope="full_game",
+            settlement_rule_status="paper_supported",
+        )
+        session.commit()
+
+        result = candidates.generate_candidates(session)
+        candidate = session.scalar(select(ModelCandidate))
+        trade = session.scalar(select(PaperTrade))
+
+    assert result["paper_trades"] == 1
+    assert candidate is not None
+    assert candidate.decision == "paper_trade"
+    assert candidate.selection_code == "PIT"
+    assert trade is not None
+    assert trade.selection_code == "PIT"
+    assert trade.market_ticker == "KXMLBSPREAD-26JUL011900SEAPIT"
+
+
 def test_open_position_price_refresh_updates_only_open_paper_trades() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)

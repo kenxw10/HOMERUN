@@ -12,6 +12,7 @@ from app.services.contracts import (
     FULL_GAME_WINNER,
     PAPER_SUPPORTED_MARKET_FAMILIES,
     contract_labels,
+    game_team_codes,
     has_trusted_selection,
     market_type_from_ticker,
 )
@@ -84,6 +85,13 @@ def _open_trade_for_market(session: Session, market_ticker: str, contract_side: 
     )
 
 
+def _has_trusted_candidate_selection(mapping: MarketMapping, game: MlbGame, market: KalshiMarket) -> bool:
+    if has_trusted_selection(game, market.ticker):
+        return True
+    selection = (mapping.selection_code or market.selection_code or "").upper()
+    return selection in game_team_codes(game)
+
+
 def _decision(
     mapping: MarketMapping,
     game: MlbGame,
@@ -114,7 +122,7 @@ def _decision(
     if not settings.paper_candidate_engine_enabled:
         return "candidate_only"
     selection_required = market_type in {FULL_GAME_WINNER, "full_game_spread", "first_five_winner", "first_five_spread"}
-    if settings.safe_execution_posture and selection_required and not has_trusted_selection(game, market.ticker):
+    if settings.safe_execution_posture and selection_required and not _has_trusted_candidate_selection(mapping, game, market):
         if market_type == "first_five_winner" and (mapping.selection_code or market.selection_code) == "TIE":
             return "paper_trade"
         return "no_trade_untrusted_selection"
