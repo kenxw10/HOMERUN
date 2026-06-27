@@ -308,6 +308,14 @@ def _slate_trade_counts(
                     & (MlbGame.scheduled_start >= start)
                     & (MlbGame.scheduled_start < end)
                 )
+                | (
+                    (PaperTrade.entry_time >= start)
+                    & (PaperTrade.entry_time < end)
+                    & (
+                        (ModelCandidate.id.is_(None))
+                        | ((ModelCandidate.target_date.is_(None)) & (MlbGame.id.is_(None)))
+                    )
+                )
             )
         )
     )

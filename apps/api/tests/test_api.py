@@ -3373,6 +3373,69 @@ def test_pr3c_trade_policy_counts_settled_trades_against_daily_caps(monkeypatch)
     assert latest_candidate.decision == "no_trade_game_cap"
 
 
+def test_candidate_less_trade_entry_time_counts_against_slate_cap(monkeypatch) -> None:
+    monkeypatch.setenv("PAPER_MAX_TRADES_PER_SLATE", "1")
+    monkeypatch.setenv("PAPER_MIN_NET_EV", "0")
+    monkeypatch.setenv("PAPER_MIN_PROB_EDGE", "0")
+    get_settings.cache_clear()
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+    monkeypatch.setattr(candidates, "utc_now", lambda: now)
+    monkeypatch.setattr(candidates, "score_mature_candidate", lambda *args, **kwargs: _fixed_model_score("0.900000"))
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    try:
+        with Session(engine) as session:
+            game = MlbGame(
+                external_game_id="candidate-less-slate-cap-game",
+                home_team="Pittsburgh Pirates",
+                away_team="Seattle Mariners",
+                home_abbreviation="PIT",
+                away_abbreviation="SEA",
+                scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+                status="scheduled",
+            )
+            market = KalshiMarket(
+                kalshi_market_id="KX-CANDIDATE-LESS-SLATE-CAP",
+                ticker="KXMLBGAME-CANDIDATE-LESS-SLATE-CAP-PIT",
+                title="Will Pittsburgh win?",
+                status="open",
+                implied_yes_ask=Decimal("0.1000"),
+            )
+            session.add_all([game, market])
+            session.flush()
+            _add_candidate_mapping(session, game, market)
+            session.add(
+                PaperTrade(
+                    candidate_id=None,
+                    market_ticker="LEGACY-MANUAL-PAPER-TRADE",
+                    contract_side="yes",
+                    entry_price=Decimal("0.4000"),
+                    current_price=Decimal("0.4000"),
+                    quantity=1,
+                    entry_time=now - timedelta(hours=1),
+                    status="open",
+                    market_family="full_game_winner",
+                )
+            )
+            session.commit()
+
+            result = candidates.generate_candidates(session)
+            candidate = session.scalar(select(ModelCandidate))
+            new_trade = session.scalar(
+                select(PaperTrade).where(PaperTrade.market_ticker == "KXMLBGAME-CANDIDATE-LESS-SLATE-CAP-PIT")
+            )
+    finally:
+        get_settings.cache_clear()
+
+    assert result["paper_trades"] == 0
+    assert result["cap_counts"]["no_trade_slate_cap"] == 1
+    assert candidate is not None
+    assert candidate.decision == "no_trade_slate_cap"
+    assert new_trade is None
+
+
 def test_line_selection_rejects_correlated_total_lines_before_caps(monkeypatch) -> None:
     monkeypatch.setenv("PAPER_MAX_TRADES_PER_SLATE", "20")
     monkeypatch.setenv("PAPER_MAX_TRADES_PER_GAME_FAMILY", "1")
