@@ -503,3 +503,16 @@ Every future PR must update this section with:
 - Scoped slate/game/family caps to the evaluated target date while keeping open-position cap global.
 - Updated docs and validation steps for `POST /v1/run/paper-candidate-engine?target_date=YYYY-MM-DD` and `GET /v1/model/predictions?date=YYYY-MM-DD`.
 - Kept safety posture unchanged: paper trading only, live trading disabled, kill switch enabled, no live orders, no cron, no sportsbook/team-total/umpire/admin/calendar scope.
+
+### PR3c Fix 2 - Feature-Complete MLB Model Governance
+
+- Added migration `0009_pr3c_fix2_features.py` for additive feature cache tables: team daily/recent features, pitcher daily features, bullpen features, lineup snapshots, injury snapshots, weather snapshots, park factors, travel/schedule features, model parameter versions, model training datasets, and model threshold versions.
+- Replaced `mature_mlb_features_v1` / `mature_mlb_run_distribution_v1` with `mature_mlb_features_v2` / `mature_mlb_run_distribution_v2` while keeping the system paper-only.
+- Added MLB Stats API adapters for probable pitchers and starting lineups. The lineup parser uses MLB boxscore batting-order slots 100 through 900 as starters and excludes substitutes.
+- Added static park, travel/rest, bullpen, pitcher, lineup, and weather feature modules. Optional network-backed feature fetches are off by default behind `FEATURE_SYNC_ENABLE_NETWORK_SOURCES=false`; Open-Meteo and provider API key settings are optional.
+- Changed feature quality scoring from a free base score to module-weighted scoring with explicit `available`, `partial`, `missing`, and `unavailable` statuses, critical-module caps, and a `data_quality_reason`.
+- Added active model parameter versions and bounded governance training: resolved samples create training datasets, challenger parameter/calibration offsets are fitted only above sample thresholds, and promotions require configured sample count, logloss improvement, and ECE gates.
+- Added protected model/feature endpoints for feature detail, active parameters, training summary, and module-specific feature sync runs.
+- Updated the dashboard model quality panel to show active parameter version, feature completeness, critical module warnings, lineup/starter/weather status, and governance status.
+- Kept out of scope: live execution, cron/orchestration, sportsbook odds, team totals, umpire data, admin/calendar UI, and fake production data. PR3d should focus on scheduling/orchestration and monitoring only after this feature/governance stack is validated.
+- Validation performed: backend Ruff, backend pytest, Alembic head check, frontend lint/typecheck/build, and `git diff --check`.

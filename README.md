@@ -1,6 +1,6 @@
 # HOMERUN
 
-HOMERUN is a Kalshi-native MLB paper-trading system and dashboard. The current version includes the deployable PR 1 foundation, PR 2 data layer, PR 2.5 targeted Kalshi MLB resolver, PR 3 paper results/model infrastructure, PR 3a discovery/operator repairs, PR 3b validated market-family paper wiring, PR 3c full MLB model governance, and the PR3c hotfix for date-scoped fee-aware trade selection: MLB slate/results ingestion, targeted Kalshi `KXMLBGAME` market resolution, auditable game-to-market mapping, mature paper-only model candidates, paper settlement for validated MLB market families, market-family discovery audits, portfolio snapshots, and a light trading-terminal dashboard.
+HOMERUN is a Kalshi-native MLB paper-trading system and dashboard. The current version includes the deployable PR 1 foundation, PR 2 data layer, PR 2.5 targeted Kalshi MLB resolver, PR 3 paper results/model infrastructure, PR 3a discovery/operator repairs, PR 3b validated market-family paper wiring, PR 3c full MLB model governance, the PR3c hotfix for date-scoped fee-aware trade selection, and PR3c fix2 feature-complete model governance: MLB slate/results ingestion, targeted Kalshi `KXMLBGAME` market resolution, auditable game-to-market mapping, mature paper-only model candidates, paper settlement for validated MLB market families, feature cache modules, trainable parameter governance, market-family discovery audits, portfolio snapshots, and a light trading-terminal dashboard.
 
 This is not a sportsbook app. It does not use DraftKings, FanDuel, Odds API, or sportsbook odds behavior. Future trading logic should use Kalshi yes/no contract math, account for fees, and assume hold-to-settlement unless a later PR changes that context deliberately.
 
@@ -94,9 +94,19 @@ PR 3c exposes these internal API run endpoints:
 - `POST /v1/run/model-governance`
 - `GET /v1/model/governance/status`
 - `GET /v1/model/features/coverage?date=YYYY-MM-DD`
+- `GET /v1/model/features/detail?date=YYYY-MM-DD`
+- `GET /v1/model/parameters/active`
+- `GET /v1/model/training/latest`
 - `GET /v1/model/predictions?date=YYYY-MM-DD`
 - `GET /v1/model/predictions/today`
 - `POST /v1/sync/mlb-features?target_date=YYYY-MM-DD`
+- `POST /v1/sync/mlb-features?target_date=YYYY-MM-DD&include_modules=all`
+- `POST /v1/sync/mlb-team-features?target_date=YYYY-MM-DD`
+- `POST /v1/sync/mlb-pitcher-features?target_date=YYYY-MM-DD`
+- `POST /v1/sync/mlb-lineups?target_date=YYYY-MM-DD`
+- `POST /v1/sync/mlb-bullpen-features?target_date=YYYY-MM-DD`
+- `POST /v1/sync/weather?target_date=YYYY-MM-DD`
+- `POST /v1/sync/travel-schedule?target_date=YYYY-MM-DD`
 - `POST /v1/run/model-feature-snapshot-backfill?target_date=YYYY-MM-DD`
 - `POST /v1/run/training-eligibility-repair`
 - `POST /v1/run/open-position-price-refresh`
@@ -117,7 +127,7 @@ PR3b adds `market_family_mapping_sync`, which consumes the latest finalized disc
 
 Paper settlement supports full-game winner, full-game spread, full-game total, first-five winner, first-five spread, and first-five total when the row is `paper_supported`. First-five settlement requires MLB linescore innings; if missing, the trade stays open with a skipped reason. Paper candidate generation now estimates conservative configurable Kalshi fees before trade selection using `KALSHI_TRADE_FEE_RATE * quantity * price * (1 - price)`, rounded upward per `KALSHI_FEE_ROUNDING_MODE`; this remains a paper-trading estimate until live fill fees are available.
 
-The PR 3c model pipeline uses `mature_mlb_run_distribution_v1`, a transparent paper-only run-distribution model that scores full-game and first-five winner, spread, and total families from `mature_mlb_features_v1` snapshots. Feature snapshots record source availability as `available`, `partial`, `missing`, or `unavailable`; no sportsbook odds, team totals, umpire data, or fake production inputs are introduced. Candidate runs save every supported prediction for learning, but paper trades require fresh executable prices, clean mappings, trusted settlement metadata, data quality, probability edge, fee-adjusted net EV, and line/correlation selection before caps. Model governance records skipped training/calibration/promotion until enough clean resolved mature candidates exist for chronological validation, reliability metrics, and calibration checks.
+The PR3c fix2 model pipeline uses `mature_mlb_run_distribution_v2`, a transparent paper-only run-distribution model that scores full-game and first-five winner, spread, and total families from `mature_mlb_features_v2` snapshots and additive feature cache tables. Feature snapshots record source availability as `available`, `partial`, `missing`, or `unavailable`; no sportsbook odds, team totals, umpire data, or fake production inputs are introduced. Candidate runs save every supported prediction for learning, but paper trades require fresh executable prices, clean mappings, trusted settlement metadata, data quality, probability edge, fee-adjusted net EV, and line/correlation selection before caps. Model governance creates an active baseline parameter version, records training datasets, fits bounded challenger parameter/calibration offsets only when enough resolved samples exist, and simulates threshold policy changes before promotion.
 
 ## Local Frontend
 
@@ -163,6 +173,8 @@ PR 3c adds migration `0007_pr3c_model_governance.py` for mature MLB feature snap
 
 PR3c hotfix adds migration `0008_pr3c_fee_date_scope.py` for target-date, executable-price, price-staleness, fee, edge, and net-EV diagnostics on model candidates and prediction outputs.
 
+PR3c fix2 adds migration `0009_pr3c_fix2_features.py` for additive MLB feature cache tables, model parameter versions, training datasets, and threshold policy versions.
+
 ## PR 3c Production Validation
 
 After deploy and migration:
@@ -195,7 +207,7 @@ Invoke-RestMethod -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-RAILWAY-API/v
 Invoke-RestMethod -Method Post -Headers @{"X-API-Key"="YOUR_KEY"} https://YOUR-RAILWAY-API/v1/run/open-position-price-refresh
 ```
 
-Expected result: health and system status remain safe, `/v1/system/status` reports `config.kalshi_market_data_source: "production_public_market_data"` and `config.kalshi_market_data_base_kind: "production_public_market_data"` when the default public market-data URL is used, Alembic is at `0008_pr3c_fee_date_scope`, resolve preview keeps exact `KXMLBGAME` matches confirmed for paper, market-family discovery returns a structured `by_family` report, mapping sync promotes only parseable validated rows to `paper_supported`, candidate runs return the requested `target_date` and `prediction_run_target_date`, prediction outputs include nonzero fee estimates for normal prices, cap counts are not the primary selector unless caps are truly hit, open-position price refresh updates REST last marks for open paper positions only, the dashboard shows `GAME STATUS`, `LAST MARK TIME`, closed positions by selected date, chart range/P&L controls work, and model governance reports mature feature/model status without enabling live trading.
+Expected result: health and system status remain safe, `/v1/system/status` reports `config.kalshi_market_data_source: "production_public_market_data"` and `config.kalshi_market_data_base_kind: "production_public_market_data"` when the default public market-data URL is used, Alembic is at `0009_pr3c_fix2_features`, resolve preview keeps exact `KXMLBGAME` matches confirmed for paper, market-family discovery returns a structured `by_family` report, mapping sync promotes only parseable validated rows to `paper_supported`, feature detail shows cache-module statuses, candidate runs return the requested `target_date`, `prediction_run_target_date`, and active parameter version, prediction outputs include nonzero fee estimates for normal prices, cap counts are not the primary selector unless caps are truly hit, open-position price refresh updates REST last marks for open paper positions only, the dashboard shows `GAME STATUS`, `LAST MARK TIME`, closed positions by selected date, chart range/P&L controls work, and model governance reports mature feature/model status without enabling live trading.
 
 PR3b deterministic discovery validation: the registry contains `KXMLBGAME`, `KXMLBSPREAD`, `KXMLBTOTAL`, `KXMLBF5`, `KXMLBF5SPREAD`, and `KXMLBF5TOTAL`. Normal market-family discovery does not redundantly probe `KXMLBGAME`, because full-game winner is handled by targeted sync/resolve. It does not probe guessed legacy variants or `KXMLBTEAMTOTAL`. If candidate probes return 404/no-match responses, the discovery POST should still return structured JSON with status `completed` or `partial_error`. The report GET should return the latest finalized run, not a stale running row. `markets_found=0` and zero `market_family_discovery_items` are valid when no markets are found, but `market_family_discovery_runs.raw_summary` must include attempted ticker counts, no-match counts, probe details, request/rate-limit metrics, and any warnings/errors. Mapping sync is the only step that can make non-winner families paper-supported, and only when line/selection/settlement metadata parses cleanly.
 

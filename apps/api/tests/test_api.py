@@ -17,12 +17,14 @@ from app.models import (
     CalibrationRun,
     FeatureSnapshot,
     KalshiMarket,
+    LineupSnapshot,
     MarketFamilyDiscoveryItem,
     MarketFamilyDiscoveryRun,
     MarketMapping,
     MlbGame,
     MlbFeatureSnapshot,
     ModelCandidate,
+    ModelParameterVersion,
     ModelPredictionOutput,
     ModelPredictionRun,
     ModelVersion,
@@ -30,6 +32,8 @@ from app.models import (
     Position,
     Settlement,
     TrainingRun,
+    TravelScheduleFeature,
+    WeatherSnapshot,
 )
 from app.jobs import market_family_discovery as market_family_discovery_job
 from app.jobs import mlb_feature_sync as mlb_feature_sync_job
@@ -61,6 +65,18 @@ from app.services.settlement import settle_paper_trades
 from app.time_utils import classify_time_bucket, eastern_display
 
 client = TestClient(app)
+
+
+@pytest.fixture(autouse=True)
+def _clear_settings_cache_between_tests():
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
+
+
+def _relax_data_quality_gate(monkeypatch) -> None:
+    monkeypatch.setenv("PAPER_MIN_DATA_QUALITY", "0")
+    get_settings.cache_clear()
 
 
 def _add_candidate_mapping(
@@ -348,6 +364,7 @@ def test_paper_candidate_engine_endpoint_uses_explicit_target_date(monkeypatch) 
 
 
 def test_generate_candidates_preserves_traded_candidate_snapshot(monkeypatch) -> None:
+    _relax_data_quality_gate(monkeypatch)
     now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
     monkeypatch.setattr(candidates, "utc_now", lambda: now)
 
@@ -403,6 +420,7 @@ def test_generate_candidates_preserves_traded_candidate_snapshot(monkeypatch) ->
 
 
 def test_generate_candidates_avoids_duplicate_open_trade_across_days(monkeypatch) -> None:
+    _relax_data_quality_gate(monkeypatch)
     current_time = {"now": datetime(2026, 7, 1, 16, 0, tzinfo=UTC)}
     monkeypatch.setattr(candidates, "utc_now", lambda: current_time["now"])
 
@@ -451,6 +469,7 @@ def test_generate_candidates_avoids_duplicate_open_trade_across_days(monkeypatch
 
 
 def test_generate_candidates_avoids_duplicate_open_trade_across_mappings(monkeypatch) -> None:
+    _relax_data_quality_gate(monkeypatch)
     now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
     monkeypatch.setattr(candidates, "utc_now", lambda: now)
     engine = create_engine("sqlite+pysqlite:///:memory:")
@@ -518,6 +537,7 @@ def test_generate_candidates_avoids_duplicate_open_trade_across_mappings(monkeyp
 
 
 def test_generate_candidates_refreshes_existing_open_trade_price(monkeypatch) -> None:
+    _relax_data_quality_gate(monkeypatch)
     current_time = {"now": datetime(2026, 7, 1, 16, 0, tzinfo=UTC)}
     monkeypatch.setattr(candidates, "utc_now", lambda: current_time["now"])
 
@@ -1163,8 +1183,8 @@ def test_generate_candidates_preserves_confirmed_targeted_resolver_mapping(monke
     assert mapping.confidence == Decimal("0.9500")
     assert mapping.resolver_strategy == "exact_market_tickers"
     assert candidate is not None
-    assert candidate.decision in {"no_trade_edge_too_low", "no_trade_probability_edge_low"}
-    assert candidate.model_version_tag == "mature_mlb_run_distribution_v1"
+    assert candidate.decision in {"no_trade_low_data_quality", "no_trade_edge_too_low", "no_trade_probability_edge_low"}
+    assert candidate.model_version_tag == modeling.MATURE_MODEL_TAG
     assert trade is None
 
 
@@ -1429,6 +1449,41 @@ def test_model_read_endpoints_require_api_key_when_configured(monkeypatch) -> No
     assert coverage_response.status_code == 401
     assert predictions_response.status_code == 401
     assert dated_predictions_response.status_code == 401
+
+
+def test_active_parameters_endpoint_persists_created_baseline(monkeypatch) -> None:
+    engine = create_engine(
+        "sqlite+pysqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    SessionLocal = sessionmaker(bind=engine)
+
+    monkeypatch.setattr(
+        main_module,
+        "database_status",
+        lambda: {"ready": True, "configured": True, "dialect": "sqlite", "message": "ok"},
+    )
+    monkeypatch.setattr(main_module, "get_session_factory", lambda: SessionLocal)
+    app.dependency_overrides[require_internal_api_key] = lambda: None
+
+    try:
+        response = client.get("/v1/model/parameters/active")
+    finally:
+        app.dependency_overrides.clear()
+
+    with SessionLocal() as session:
+        persisted = session.scalar(
+            select(ModelParameterVersion).where(
+                ModelParameterVersion.version_tag == modeling.BASELINE_PARAMETER_VERSION_TAG
+            )
+        )
+
+    assert response.status_code == 200
+    assert response.json()["result"]["version_tag"] == modeling.BASELINE_PARAMETER_VERSION_TAG
+    assert persisted is not None
+    assert persisted.is_active is True
 
 
 def test_internal_sync_endpoints_fail_closed_in_production_without_api_key(monkeypatch) -> None:
@@ -2942,6 +2997,62 @@ def test_dashboard_trade_caps_use_today_prediction_run(monkeypatch) -> None:
     assert summary_after_today_run.model_status.trade_caps_used == {"no_trade_slate_cap": 1, "paper_trades": 2}
 
 
+def test_dashboard_feature_status_uses_active_feature_source(monkeypatch) -> None:
+    monkeypatch.setattr(dashboard, "today_eastern", lambda: date(2026, 7, 1))
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    captured_at = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+
+    with Session(engine) as session:
+        session.add_all(
+            [
+                MlbFeatureSnapshot(
+                    mlb_game_id=1,
+                    target_date=date(2026, 7, 1),
+                    source="mature_mlb_features_v1",
+                    captured_at=captured_at + timedelta(minutes=5),
+                    data_quality=Decimal("0.1000"),
+                    source_statuses={"park_weather": "missing"},
+                    features={},
+                ),
+                MlbFeatureSnapshot(
+                    mlb_game_id=1,
+                    target_date=date(2026, 7, 1),
+                    source=features.FEATURE_VERSION,
+                    captured_at=captured_at,
+                    data_quality=Decimal("0.5000"),
+                    source_statuses={
+                        "lineup": {"home": "available", "away": "available"},
+                        "park_weather": "partial",
+                    },
+                    features={},
+                ),
+                MlbFeatureSnapshot(
+                    mlb_game_id=2,
+                    target_date=date(2026, 7, 1),
+                    source=features.FEATURE_VERSION,
+                    captured_at=captured_at + timedelta(minutes=1),
+                    data_quality=Decimal("0.3000"),
+                    source_statuses={
+                        "lineup": {"home": "missing", "away": "missing"},
+                        "park_weather": "missing",
+                    },
+                    features={},
+                ),
+            ]
+        )
+        session.commit()
+
+        summary = dashboard.dashboard_summary_from_db(session)
+
+    assert summary.model_status.feature_completeness["park_weather"] == {"partial": 1, "missing": 1}
+    assert summary.model_status.feature_completeness["lineup"] == {"available": 1, "missing": 1}
+    assert summary.model_status.lineup_status == "partial"
+    assert summary.model_status.weather_status == "partial"
+    assert "LINEUP MISSING OR DEGRADED" in summary.model_status.critical_module_warnings
+    assert "PARK_WEATHER MISSING OR DEGRADED" in summary.model_status.critical_module_warnings
+
+
 def test_generate_candidates_uses_heuristic_probability_and_feature_snapshot(monkeypatch) -> None:
     now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
     monkeypatch.setattr(candidates, "utc_now", lambda: now)
@@ -2975,11 +3086,11 @@ def test_generate_candidates_uses_heuristic_probability_and_feature_snapshot(mon
         candidate = session.scalar(select(ModelCandidate))
         feature_snapshot = session.scalar(select(FeatureSnapshot))
 
-    assert result["model_version"] == "mature_mlb_run_distribution_v1"
+    assert result["model_version"] == modeling.MATURE_MODEL_TAG
     assert candidate is not None
     assert candidate.model_probability != Decimal("0.500000")
-    assert candidate.model_version_tag == "mature_mlb_run_distribution_v1"
-    assert candidate.feature_version == "mature_mlb_features_v1"
+    assert candidate.model_version_tag == modeling.MATURE_MODEL_TAG
+    assert candidate.feature_version == features.FEATURE_VERSION
     assert candidate.market_type == "full_game_winner"
     assert candidate.contract_display == "FULL GAME WINNER - SEA @ PIT - PIT"
     assert candidate.features["park_weather"]["source_status"] == "missing"
@@ -3025,8 +3136,8 @@ def test_model_governance_keeps_only_one_active_champion() -> None:
         versions = list(session.scalars(select(ModelVersion).order_by(ModelVersion.version_tag)))
 
     active_versions = [version for version in versions if version.is_active]
-    assert result["active_model_version"] == "mature_mlb_run_distribution_v1"
-    assert [version.version_tag for version in active_versions] == ["mature_mlb_run_distribution_v1"]
+    assert result["active_model_version"] == modeling.MATURE_MODEL_TAG
+    assert [version.version_tag for version in active_versions] == [modeling.MATURE_MODEL_TAG]
     assert next(version for version in versions if version.version_tag == "legacy_champion").role == "inactive"
 
 
@@ -3142,12 +3253,695 @@ def test_pr3c_feature_sync_records_source_statuses_and_no_umpire_fields() -> Non
         result = features.sync_mlb_features(session, date(2026, 7, 1))
         snapshot = session.scalar(select(MlbFeatureSnapshot))
 
-    assert result["feature_version"] == "mature_mlb_features_v1"
+    assert result["feature_version"] == features.FEATURE_VERSION
     assert snapshot is not None
-    assert snapshot.source_statuses["lineup"] == "missing"
-    assert snapshot.source_statuses["park_weather"] == "missing"
-    assert snapshot.features["park_weather"]["park"]["source_status"] == "available"
+    assert snapshot.source_statuses["lineup"] == {"home": "missing", "away": "missing"}
+    assert snapshot.source_statuses["park_weather"] == "partial"
+    assert snapshot.features["park_weather"]["park"]["park_factor"] == 0.98
     assert "umpire" not in " ".join(snapshot.features.keys()).lower()
+
+
+def test_feature_coverage_and_detail_filter_to_active_feature_version() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    captured_at = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+
+    with Session(engine) as session:
+        session.add_all(
+            [
+                MlbFeatureSnapshot(
+                    mlb_game_id=1,
+                    target_date=date(2026, 7, 1),
+                    source="mature_mlb_features_v1",
+                    captured_at=captured_at,
+                    data_quality=Decimal("0.1000"),
+                    source_statuses={"park_weather": "missing"},
+                    features={"feature_version": "mature_mlb_features_v1"},
+                ),
+                MlbFeatureSnapshot(
+                    mlb_game_id=1,
+                    target_date=date(2026, 7, 1),
+                    source=features.FEATURE_VERSION,
+                    captured_at=captured_at,
+                    data_quality=Decimal("0.5000"),
+                    source_statuses={"park_weather": "partial"},
+                    features={"feature_version": features.FEATURE_VERSION},
+                ),
+            ]
+        )
+        session.commit()
+
+        coverage = features.feature_coverage(session, date(2026, 7, 1))
+        detail = features.feature_detail(session, date(2026, 7, 1))
+
+    assert coverage["snapshot_count"] == 1
+    assert coverage["items"][0]["source"] == features.FEATURE_VERSION
+    assert detail["count"] == 1
+    assert detail["items"][0]["source"] == features.FEATURE_VERSION
+
+
+def test_feature_sync_hydrates_final_games_for_backfill(monkeypatch) -> None:
+    monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "true")
+    get_settings.cache_clear()
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    def boxscore_team(start_id: int, pitcher_id: int) -> dict[str, object]:
+        batters = list(range(start_id, start_id + 9))
+        players: dict[str, object] = {}
+        for index, person_id in enumerate(batters, start=1):
+            players[f"ID{person_id}"] = {
+                "person": {"id": person_id, "fullName": f"Starter {person_id}"},
+                "battingOrder": str(index * 100),
+                "batSide": {"code": "R"},
+                "position": {"abbreviation": "C" if index == 9 else "CF"},
+            }
+        players[f"ID{pitcher_id}"] = {
+            "person": {"id": pitcher_id, "fullName": f"Pitcher {pitcher_id}"},
+            "pitchHand": {"code": "R"},
+        }
+        return {"batters": batters, "pitchers": [pitcher_id], "players": players}
+
+    def hydrate_final_game(game: MlbGame) -> None:
+        game.raw_payload = {
+            **(game.raw_payload or {}),
+            "liveData": {
+                "boxscore": {
+                    "teams": {
+                        "home": boxscore_team(1000, 1999),
+                        "away": boxscore_team(2000, 2999),
+                    }
+                }
+            },
+        }
+
+    monkeypatch.setattr(features, "_hydrate_game_endpoint_if_available", hydrate_final_game)
+    try:
+        with Session(engine) as session:
+            game = MlbGame(
+                external_game_id="feature-sync-final-backfill",
+                home_team="Pittsburgh Pirates",
+                away_team="Seattle Mariners",
+                home_abbreviation="PIT",
+                away_abbreviation="SEA",
+                scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+                status="Final",
+                home_score=5,
+                away_score=3,
+                raw_payload={"venue": {"id": 31, "name": "PNC Park"}},
+            )
+            session.add(game)
+            session.commit()
+
+            features.sync_mlb_features(session, date(2026, 7, 1))
+            snapshot = session.scalar(select(MlbFeatureSnapshot))
+
+        assert snapshot is not None
+        assert snapshot.source_statuses["lineup"] == {"home": "available", "away": "available"}
+        assert snapshot.source_statuses["starter_identity"] == {"home": "available", "away": "available"}
+    finally:
+        get_settings.cache_clear()
+
+
+def test_lineup_sync_preserves_confirmed_lineup_when_payload_lacks_boxscore() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    captured_at = datetime(2026, 7, 1, 20, 0, tzinfo=UTC)
+
+    players = {
+        f"ID{person_id}": {
+            "person": {"id": person_id, "fullName": f"Starter {slot}"},
+            "battingOrder": str(slot * 100),
+            "batSide": {"code": "R"},
+            "position": {"abbreviation": "CF"},
+        }
+        for slot, person_id in enumerate(range(101, 110), start=1)
+    }
+
+    with Session(engine) as session:
+        game = MlbGame(
+            external_game_id="lineup-preserve-confirmed",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+            status="Final",
+            raw_payload={
+                "venue": {"id": 31, "name": "PNC Park"},
+                "liveData": {"boxscore": {"teams": {"home": {"batters": list(range(101, 110)), "players": players}}}},
+            },
+        )
+        session.add(game)
+        session.flush()
+
+        features._upsert_lineup(session, game, "home", date(2026, 7, 1), captured_at)
+        game.raw_payload = {"venue": {"id": 31, "name": "PNC Park"}}
+        features._upsert_lineup(
+            session,
+            game,
+            "home",
+            date(2026, 7, 1),
+            datetime(2026, 7, 1, 21, 0, tzinfo=UTC),
+        )
+        row = session.scalar(select(LineupSnapshot).where(LineupSnapshot.mlb_game_id == game.id))
+
+    assert row is not None
+    assert row.confirmed is True
+    assert row.source_status == "available"
+    assert row.raw_payload == {"starter_count": 9}
+    assert len(row.features["starters"]) == 9
+
+
+def test_weather_sync_preserves_cached_forecast_when_network_disabled(monkeypatch) -> None:
+    monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "false")
+    get_settings.cache_clear()
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    captured_at = datetime(2026, 7, 1, 20, 0, tzinfo=UTC)
+
+    with Session(engine) as session:
+        game = MlbGame(
+            external_game_id="weather-preserve-cached",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+            status="scheduled",
+            raw_payload={"venue": {"id": 31, "name": "PNC Park"}},
+        )
+        session.add(game)
+        session.flush()
+        session.add(
+            WeatherSnapshot(
+                mlb_game_id=game.id,
+                target_date=date(2026, 7, 1),
+                venue_name="PNC Park",
+                captured_at=captured_at,
+                forecast_time=game.scheduled_start,
+                source=features.OPEN_METEO_SOURCE,
+                source_status="available",
+                confidence=Decimal("0.70"),
+                completeness=Decimal("0.70"),
+                stale=False,
+                features={"temperature_2m": 74, "wind_speed_10m": 8},
+                raw_payload={"cached": True},
+            )
+        )
+        session.flush()
+
+        features._upsert_weather(
+            session,
+            game,
+            date(2026, 7, 1),
+            datetime(2026, 7, 1, 21, 0, tzinfo=UTC),
+        )
+        row = session.scalar(select(WeatherSnapshot).where(WeatherSnapshot.mlb_game_id == game.id))
+
+    assert row is not None
+    assert row.source_status == "available"
+    assert row.features == {"temperature_2m": 74, "wind_speed_10m": 8}
+    assert row.raw_payload == {"cached": True}
+
+
+def test_open_meteo_base_url_tolerates_forecast_suffix(monkeypatch) -> None:
+    monkeypatch.setenv("OPEN_METEO_BASE_URL", "https://api.open-meteo.com/v1/forecast")
+    get_settings.cache_clear()
+    captured: dict[str, object] = {}
+
+    def fake_get_json(url: str, **_kwargs):
+        captured["url"] = url
+        captured["params"] = _kwargs.get("params")
+        return {"hourly": {"time": []}}
+
+    monkeypatch.setattr(features, "get_json", fake_get_json)
+    try:
+        features._fetch_open_meteo(
+            {"latitude": 40.4469, "longitude": -80.0057},
+            datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+        )
+    finally:
+        get_settings.cache_clear()
+
+    assert captured["url"] == "https://api.open-meteo.com/v1/forecast"
+    assert captured["params"]["temperature_unit"] == "fahrenheit"
+    assert captured["params"]["wind_speed_unit"] == "mph"
+
+
+def test_open_meteo_parse_requires_target_forecast_hour() -> None:
+    parsed = features._parse_open_meteo(
+        {
+            "hourly": {
+                "time": ["2026-07-01T18:00"],
+                "temperature_2m": [91],
+                "wind_speed_10m": [12],
+            }
+        },
+        datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+    )
+
+    assert parsed is None
+
+
+def test_feature_sync_keeps_unknown_park_weather_missing() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        game = MlbGame(
+            external_game_id="feature-sync-unknown-park",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+            status="scheduled",
+            raw_payload={"venue": {"id": 999, "name": "Unlisted Test Park"}},
+        )
+        session.add(game)
+        session.commit()
+
+        features.sync_mlb_features(session, date(2026, 7, 1))
+        snapshot = session.scalar(select(MlbFeatureSnapshot))
+
+    assert snapshot is not None
+    assert snapshot.source_statuses["park_weather"] == "missing"
+    assert snapshot.features["park_weather"]["source_status"] == "missing"
+
+
+def test_travel_feature_uses_current_venue_for_away_team() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        previous = MlbGame(
+            external_game_id="travel-previous-sea-home",
+            home_team="Seattle Mariners",
+            away_team="Boston Red Sox",
+            home_abbreviation="SEA",
+            away_abbreviation="BOS",
+            scheduled_start=datetime(2026, 6, 30, 23, 0, tzinfo=UTC),
+            status="Final",
+            home_score=4,
+            away_score=2,
+            raw_payload={"venue": {"id": 680, "name": "T-Mobile Park"}},
+        )
+        current = MlbGame(
+            external_game_id="travel-current-sea-at-pit",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+            status="scheduled",
+            raw_payload={"venue": {"id": 31, "name": "PNC Park"}},
+        )
+        session.add_all([previous, current])
+        session.commit()
+        current_id = current.id
+
+        features.sync_mlb_features(session, date(2026, 7, 1))
+        away_travel = session.scalar(
+            select(TravelScheduleFeature)
+            .where(TravelScheduleFeature.mlb_game_id == current_id)
+            .where(TravelScheduleFeature.team_code == "SEA")
+        )
+
+    assert away_travel is not None
+    assert away_travel.features["travel_distance_miles"] > 1000
+
+
+def test_travel_feature_uses_home_venue_proxy_for_unknown_road_venue() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        previous = MlbGame(
+            external_game_id="travel-previous-sea-home-unknown-road",
+            home_team="Seattle Mariners",
+            away_team="Boston Red Sox",
+            home_abbreviation="SEA",
+            away_abbreviation="BOS",
+            scheduled_start=datetime(2026, 6, 30, 23, 0, tzinfo=UTC),
+            status="Final",
+            home_score=4,
+            away_score=2,
+            raw_payload={"venue": {"id": 680, "name": "T-Mobile Park"}},
+        )
+        current = MlbGame(
+            external_game_id="travel-current-sea-at-unknown",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+            status="scheduled",
+            raw_payload={"venue": {"id": 999, "name": "Unsupported Test Venue"}},
+        )
+        session.add_all([previous, current])
+        session.commit()
+        current_id = current.id
+
+        features.sync_mlb_features(session, date(2026, 7, 1))
+        away_travel = session.scalar(
+            select(TravelScheduleFeature)
+            .where(TravelScheduleFeature.mlb_game_id == current_id)
+            .where(TravelScheduleFeature.team_code == "SEA")
+        )
+
+    assert away_travel is not None
+    assert away_travel.features["travel_distance_miles"] > 1000
+
+
+def test_lineup_parser_extracts_starters_and_excludes_substitutes() -> None:
+    payload = {
+        "liveData": {
+            "boxscore": {
+                "teams": {
+                    "home": {
+                        "batters": [10, 11, 12],
+                        "players": {
+                            "ID10": {
+                                "person": {"id": 10, "fullName": "Starter One"},
+                                "battingOrder": "100",
+                                "batSide": {"code": "R"},
+                                "position": {"abbreviation": "CF"},
+                            },
+                            "ID11": {
+                                "person": {"id": 11, "fullName": "Sub One"},
+                                "battingOrder": "150",
+                                "batSide": {"code": "L"},
+                                "position": {"abbreviation": "LF"},
+                            },
+                            "ID12": {
+                                "person": {"id": 12, "fullName": "Starter Nine"},
+                                "battingOrder": "900",
+                                "batSide": {"code": "L"},
+                                "position": {"abbreviation": "C"},
+                            },
+                        },
+                    }
+                }
+            }
+        }
+    }
+
+    starters = features.parse_starting_lineup_from_game_payload(payload, "home")
+
+    assert [starter["name"] for starter in starters] == ["Starter One", "Starter Nine"]
+    assert [starter["batting_order"] for starter in starters] == [100, 900]
+
+
+def test_probable_pitcher_adapter_uses_boxscore_fallback() -> None:
+    payload = {
+        "teams": {
+            "away": {
+                "probablePitcher": {
+                    "id": 88,
+                    "fullName": "Stale Probable",
+                }
+            }
+        },
+        "liveData": {
+            "boxscore": {
+                "teams": {
+                    "away": {
+                        "pitchers": [99],
+                        "players": {
+                            "ID99": {
+                                "person": {"id": 99, "fullName": "Fallback Starter"},
+                                "pitchHand": {"code": "L"},
+                            }
+                        },
+                    }
+                }
+            }
+        }
+    }
+
+    pitcher = features.probable_pitcher_from_payload(payload, "away")
+
+    assert pitcher == {
+        "id": "99",
+        "name": "Fallback Starter",
+        "handedness": "L",
+        "source_path": "game.liveData.boxscore.teams.away.pitchers[0]",
+    }
+
+
+def test_data_quality_caps_missing_critical_modules() -> None:
+    now = datetime(2026, 7, 1, 21, 45, tzinfo=UTC)
+    game = MlbGame(
+        external_game_id="quality-cap-1",
+        home_team="Pittsburgh Pirates",
+        away_team="Seattle Mariners",
+        home_abbreviation="PIT",
+        away_abbreviation="SEA",
+        scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+        status="scheduled",
+    )
+    market = KalshiMarket(
+        kalshi_market_id="KX-QUALITY-CAP",
+        ticker="KXMLBGAME-QUALITY-CAP-PIT",
+        title="Will Pittsburgh win?",
+        status="open",
+        market_family="full_game_winner",
+    )
+    mapping = MarketMapping(
+        mlb_game_id=1,
+        kalshi_market_id=1,
+        mapping_status="confirmed",
+        confidence=Decimal("0.9500"),
+        market_family="full_game_winner",
+        selection_code="PIT",
+    )
+
+    snapshot = features.build_feature_snapshot(game, market, mapping, now=now)
+
+    assert snapshot["data_quality"] <= 0.60
+    assert "CAP_BOTH_STARTERS_MISSING" in snapshot["data_quality_reason"]
+    assert "CAP_OFFENSE_SEASON_AND_RECENT_MISSING" in snapshot["data_quality_reason"]
+
+
+def test_first_five_expected_runs_use_starter_context_not_static_share() -> None:
+    game = MlbGame(
+        external_game_id="f5-share-1",
+        home_team="Pittsburgh Pirates",
+        away_team="Seattle Mariners",
+        home_abbreviation="PIT",
+        away_abbreviation="SEA",
+        scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+        status="scheduled",
+        raw_payload={
+            "teams": {
+                "home": {"probablePitcher": {"id": 1, "fullName": "Home Starter"}},
+                "away": {"probablePitcher": {"id": 2, "fullName": "Away Starter"}},
+            }
+        },
+    )
+    market = KalshiMarket(
+        kalshi_market_id="KX-F5-SHARE",
+        ticker="KXMLBF5-26JUL011900SEAPIT-PIT",
+        title="Will Pittsburgh lead after five?",
+        status="open",
+        market_family="first_five_winner",
+        selection_code="PIT",
+    )
+    mapping = MarketMapping(
+        mlb_game_id=1,
+        kalshi_market_id=1,
+        mapping_status="confirmed",
+        confidence=Decimal("0.9500"),
+        market_family="first_five_winner",
+        selection_code="PIT",
+        settlement_rule_status="paper_supported",
+    )
+    snapshot = features.build_feature_snapshot(
+        game,
+        market,
+        mapping,
+        now=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
+    )
+
+    expectations = modeling.expected_runs(snapshot)
+
+    assert expectations.home_first_five_runs_mean != (
+        expectations.home_full_game_runs_mean * Decimal("0.49")
+    ).quantize(Decimal("0.0001"))
+
+
+def test_model_parameter_version_creation() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        version = modeling.get_or_create_active_parameter_version(session)
+        again = modeling.get_or_create_active_parameter_version(session)
+
+    assert version.version_tag == modeling.BASELINE_PARAMETER_VERSION_TAG
+    assert again.id == version.id
+    assert version.is_active is True
+    assert "league_average_full_game_runs" in version.parameters
+    assert "kalshi_price" not in " ".join(version.parameters.keys()).lower()
+
+
+def test_active_parameter_version_preserves_promoted_challenger() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    promoted_at = datetime(2026, 7, 3, 12, 0, tzinfo=UTC)
+
+    with Session(engine) as session:
+        baseline = ModelParameterVersion(
+            version_tag=modeling.BASELINE_PARAMETER_VERSION_TAG,
+            model_family=modeling.MODEL_FAMILY,
+            role="inactive",
+            status="active",
+            is_active=False,
+            trained_at=promoted_at,
+            promoted_at=promoted_at,
+            parameters=modeling.DEFAULT_MODEL_PARAMETERS,
+        )
+        challenger = ModelParameterVersion(
+            version_tag="mature_mlb_run_distribution_v2_challenger_promoted",
+            model_family=modeling.MODEL_FAMILY,
+            role="champion",
+            status="active",
+            is_active=True,
+            trained_at=promoted_at,
+            promoted_at=promoted_at + timedelta(minutes=1),
+            parameters={
+                **modeling.DEFAULT_MODEL_PARAMETERS,
+                "trained_from_samples": True,
+                "market_family_probability_offsets": {"__global__": 0.01},
+            },
+        )
+        session.add_all([baseline, challenger])
+        session.commit()
+
+        active = modeling.get_or_create_active_parameter_version(session)
+        baseline_after = session.scalar(
+            select(ModelParameterVersion).where(
+                ModelParameterVersion.version_tag == modeling.BASELINE_PARAMETER_VERSION_TAG
+            )
+        )
+
+    assert active.version_tag == challenger.version_tag
+    assert active.is_active is True
+    assert baseline_after is not None
+    assert baseline_after.is_active is False
+
+
+def test_calibration_applies_global_and_family_offsets() -> None:
+    calibrated, status = modeling._calibrate_probability(
+        Decimal("0.500000"),
+        Decimal("0.8000"),
+        market_type="full_game_winner",
+        parameters={
+            **modeling.DEFAULT_MODEL_PARAMETERS,
+            "trained_from_samples": True,
+            "market_family_probability_offsets": {
+                "__global__": 0.02,
+                "full_game_winner": -0.01,
+            },
+        },
+    )
+
+    assert status == "trained_parameterized"
+    assert calibrated == Decimal("0.510000")
+
+
+def test_family_offsets_are_residual_to_global_offset(monkeypatch) -> None:
+    monkeypatch.setenv("MODEL_MIN_FAMILY_SAMPLES_FOR_FAMILY_CALIBRATION", "2")
+    get_settings.cache_clear()
+    rows = [
+        ModelCandidate(
+            probability_calibrated=Decimal("0.950000"),
+            outcome="win",
+            market_family="full_game_winner",
+        )
+        for _index in range(3)
+    ]
+
+    offsets = modeling._fit_probability_offsets(rows)
+
+    assert offsets["__global__"] == Decimal("0.050000")
+    assert offsets["full_game_winner"] == Decimal("0.000000")
+
+
+def test_challenger_offsets_preserve_active_parameter_offsets() -> None:
+    combined = modeling._combine_probability_offsets(
+        {
+            "market_family_probability_offsets": {
+                "__global__": 0.02,
+                "full_game_winner": -0.01,
+            }
+        },
+        {
+            "__global__": Decimal("0.030000"),
+            "full_game_winner": Decimal("0.020000"),
+        },
+    )
+
+    assert combined["__global__"] == Decimal("0.050000")
+    assert combined["full_game_winner"] == Decimal("0.010000")
+
+
+def test_governance_trains_challenger_when_sample_threshold_met(monkeypatch) -> None:
+    monkeypatch.setenv("MODEL_MIN_SAMPLES_TRAIN", "3")
+    monkeypatch.setenv("MODEL_MIN_SAMPLES_CALIBRATE", "3")
+    monkeypatch.setenv("MODEL_MIN_SAMPLES_PROMOTE", "99")
+    get_settings.cache_clear()
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    target_date = date(2026, 7, 1)
+
+    with Session(engine) as session:
+        game = MlbGame(
+            external_game_id="governance-train-1",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+            status="Final",
+            home_score=5,
+            away_score=3,
+        )
+        session.add(game)
+        session.flush()
+        for index, outcome in enumerate(["win", "win", "loss", "win", "loss"], start=1):
+            session.add(
+                ModelCandidate(
+                    mlb_game_id=game.id,
+                    evaluated_at=datetime(2026, 7, 1, 16, index, tzinfo=UTC),
+                    features={},
+                    probability=Decimal("0.550000"),
+                    probability_calibrated=Decimal("0.550000"),
+                    fee_estimate=Decimal("0.010000"),
+                    target_date=target_date,
+                    price_status="fresh_executable",
+                    time_to_start_minutes=400,
+                    decision="candidate_only",
+                    outcome=outcome,
+                    resolved_at=datetime(2026, 7, 2, 4, index, tzinfo=UTC),
+                    model_version_tag=modeling.MATURE_MODEL_TAG,
+                    feature_version=features.FEATURE_VERSION,
+                    training_eligible=True,
+                    market_family="full_game_winner",
+                )
+            )
+        session.commit()
+
+        result = run_model_governance(session, now=datetime(2026, 7, 2, 12, 0, tzinfo=UTC))
+        challenger = session.scalar(
+            select(ModelParameterVersion).where(ModelParameterVersion.role == "challenger")
+        )
+
+    assert result["status"] == "trained_not_promoted"
+    assert result["challenger_parameter_version"] is not None
+    assert challenger is not None
+    assert challenger.parameters["trained_from_samples"] is True
 
 
 @pytest.mark.parametrize(
@@ -3264,6 +4058,7 @@ def test_full_game_winner_probabilities_allocate_tie_mass_to_no_tie_outcomes() -
 
 def test_pr3c_trade_policy_caps_slate_trades(monkeypatch) -> None:
     monkeypatch.setenv("PAPER_MAX_TRADES_PER_SLATE", "2")
+    monkeypatch.setenv("PAPER_MIN_DATA_QUALITY", "0")
     get_settings.cache_clear()
     now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
     monkeypatch.setattr(candidates, "utc_now", lambda: now)
@@ -3382,6 +4177,7 @@ def test_first_five_tie_markets_still_obey_normal_trade_gates(monkeypatch) -> No
 def test_pr3c_trade_policy_counts_settled_trades_against_daily_caps(monkeypatch) -> None:
     monkeypatch.setenv("PAPER_MAX_TRADES_PER_GAME", "1")
     monkeypatch.setenv("PAPER_MAX_TRADES_PER_SLATE", "20")
+    monkeypatch.setenv("PAPER_MIN_DATA_QUALITY", "0")
     get_settings.cache_clear()
     now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
     monkeypatch.setattr(candidates, "utc_now", lambda: now)
@@ -4878,12 +5674,13 @@ def test_new_market_families_require_paper_supported_metadata_for_trades(monkeyp
     assert candidate.market_type == "full_game_spread"
     assert candidate.decision == "no_trade_missing_line"
     assert candidate.training_eligible is False
-    assert candidate.model_version_tag == "mature_mlb_run_distribution_v1"
-    assert candidate.feature_version == "mature_mlb_features_v1"
+    assert candidate.model_version_tag == modeling.MATURE_MODEL_TAG
+    assert candidate.feature_version == features.FEATURE_VERSION
     assert trade is None
 
 
 def test_paper_supported_market_family_can_create_pre_model_paper_trade(monkeypatch) -> None:
+    _relax_data_quality_gate(monkeypatch)
     now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
     monkeypatch.setattr(candidates, "utc_now", lambda: now)
 
@@ -4939,15 +5736,16 @@ def test_paper_supported_market_family_can_create_pre_model_paper_trade(monkeypa
     assert candidate is not None
     assert candidate.market_type == "full_game_spread"
     assert candidate.model_probability != Decimal("0.500000")
-    assert candidate.model_version_tag == "mature_mlb_run_distribution_v1"
-    assert candidate.training_eligible is True
+    assert candidate.model_version_tag == modeling.MATURE_MODEL_TAG
+    assert candidate.training_eligible is False
     assert candidate.decision in {"no_trade_edge_too_low", "no_trade_probability_edge_low"}
     assert feature_snapshot is not None
-    assert feature_snapshot.source == "mature_mlb_features_v1"
+    assert feature_snapshot.source == features.FEATURE_VERSION
     assert trade is None
 
 
 def test_event_level_spread_with_parsed_selection_can_create_paper_trade(monkeypatch) -> None:
+    _relax_data_quality_gate(monkeypatch)
     now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
     monkeypatch.setattr(candidates, "utc_now", lambda: now)
 
