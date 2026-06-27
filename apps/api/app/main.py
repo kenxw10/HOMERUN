@@ -471,71 +471,78 @@ def model_predictions_today(_: None = Depends(require_internal_api_key)) -> RunR
 def run_mlb_feature_sync(
     target_date: date | None = Query(default=None),
     include_modules: str | None = Query(default=None),
+    refresh_schedule: bool | None = Query(default=None),
     _: None = Depends(require_internal_api_key),
 ) -> RunResponse:
     with _db_session_or_503() as session:
         modules = None if not include_modules or include_modules == "all" else set(include_modules.split(","))
-        result = sync_mlb_features(session, target_date, modules)
+        result = sync_mlb_features(session, target_date, modules, refresh_schedule)
     return RunResponse(ok=True, action="mlb_feature_sync", result=result)
 
 
 @app.post("/v1/sync/mlb-team-features", response_model=RunResponse)
 def run_mlb_team_feature_sync(
     target_date: date | None = Query(default=None),
+    refresh_schedule: bool | None = Query(default=None),
     _: None = Depends(require_internal_api_key),
 ) -> RunResponse:
     with _db_session_or_503() as session:
-        result = sync_mlb_team_features(session, target_date)
+        result = sync_mlb_team_features(session, target_date, refresh_schedule)
     return RunResponse(ok=True, action="mlb_team_feature_sync", result=result)
 
 
 @app.post("/v1/sync/mlb-pitcher-features", response_model=RunResponse)
 def run_mlb_pitcher_feature_sync(
     target_date: date | None = Query(default=None),
+    refresh_schedule: bool | None = Query(default=None),
     _: None = Depends(require_internal_api_key),
 ) -> RunResponse:
     with _db_session_or_503() as session:
-        result = sync_mlb_pitcher_features(session, target_date)
+        result = sync_mlb_pitcher_features(session, target_date, refresh_schedule)
     return RunResponse(ok=True, action="mlb_pitcher_feature_sync", result=result)
 
 
 @app.post("/v1/sync/mlb-lineups", response_model=RunResponse)
 def run_mlb_lineup_sync(
     target_date: date | None = Query(default=None),
+    refresh_schedule: bool | None = Query(default=None),
     _: None = Depends(require_internal_api_key),
 ) -> RunResponse:
     with _db_session_or_503() as session:
-        result = sync_mlb_lineups(session, target_date)
+        result = sync_mlb_lineups(session, target_date, refresh_schedule)
     return RunResponse(ok=True, action="mlb_lineup_sync", result=result)
 
 
 @app.post("/v1/sync/mlb-bullpen-features", response_model=RunResponse)
 def run_mlb_bullpen_feature_sync(
     target_date: date | None = Query(default=None),
+    refresh_schedule: bool | None = Query(default=None),
     _: None = Depends(require_internal_api_key),
 ) -> RunResponse:
     with _db_session_or_503() as session:
-        result = sync_mlb_bullpen_features(session, target_date)
+        result = sync_mlb_bullpen_features(session, target_date, refresh_schedule)
     return RunResponse(ok=True, action="mlb_bullpen_feature_sync", result=result)
 
 
 @app.post("/v1/sync/weather", response_model=RunResponse)
 def run_weather_feature_sync(
     target_date: date | None = Query(default=None),
+    refresh_schedule: bool | None = Query(default=None),
     _: None = Depends(require_internal_api_key),
 ) -> RunResponse:
     with _db_session_or_503() as session:
-        result = sync_weather_features(session, target_date)
+        result = sync_weather_features(session, target_date, refresh_schedule)
     return RunResponse(ok=True, action="weather_feature_sync", result=result)
 
 
 @app.post("/v1/sync/travel-schedule", response_model=RunResponse)
 def run_travel_schedule_feature_sync(
     target_date: date | None = Query(default=None),
+    refresh_schedule: bool | None = Query(default=None),
     _: None = Depends(require_internal_api_key),
 ) -> RunResponse:
     with _db_session_or_503() as session:
-        result = sync_travel_schedule_features(session, target_date)
+        result = sync_travel_schedule_features(session, target_date, refresh_schedule)
     return RunResponse(ok=True, action="travel_schedule_feature_sync", result=result)
 
 

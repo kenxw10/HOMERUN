@@ -7,6 +7,7 @@ from math import atan2, cos, radians, sin, sqrt
 from typing import Any
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
@@ -651,35 +652,113 @@ def _schedule_games_from_payload(payload: dict[str, object]) -> list[dict[str, o
     return games
 
 
+def _source_error(
+    *,
+    source: str,
+    table: str,
+    exc: BaseException,
+    game_pk: object | None = None,
+) -> dict[str, object]:
+    error: dict[str, object] = {
+        "source": source,
+        "table": table,
+        "error_type": exc.__class__.__name__,
+        "message": str(getattr(exc, "orig", exc)),
+    }
+    if game_pk is not None:
+        error["game_pk"] = str(game_pk)
+    if isinstance(exc, HttpJsonError):
+        error["detail"] = exc.to_detail()
+    return error
+
+
 def _hydrate_schedule_window(
     session: Session,
     day: date,
     *,
     client: MLBStatsClient,
     errors: list[dict[str, object]],
-) -> int:
-    upserted = 0
-    try:
-        current_payload = client.get_schedule(day)
-        for game_payload in _schedule_games_from_payload(current_payload):
-            if _upsert_game_from_schedule_payload(session, game_payload) is not None:
-                upserted += 1
-    except HttpJsonError as exc:
-        errors.append({"source": MLB_STATS_SOURCE, "table": "mlb_games", "error": exc.to_detail()})
+) -> dict[str, object]:
+    stats: dict[str, object] = {
+        "rows_seen": 0,
+        "rows_upserted": 0,
+        "duplicate_count": 0,
+        "error_count": 0,
+        "validation_status": "ok",
+        "warnings": [],
+        "errors": [],
+    }
+    deduped: dict[str, tuple[str, dict[str, object]]] = {}
+
+    def add_error(error: dict[str, object]) -> None:
+        stats_errors = stats.setdefault("errors", [])
+        if isinstance(stats_errors, list):
+            stats_errors.append(error)
+        errors.append(error)
+        stats["error_count"] = int(stats.get("error_count", 0)) + 1
+
+    def add_warning(message: str) -> None:
+        warnings = stats.setdefault("warnings", [])
+        if isinstance(warnings, list) and message not in warnings:
+            warnings.append(message)
+
+    def collect(table: str, payload: dict[str, object]) -> None:
+        for game_payload in _schedule_games_from_payload(payload):
+            game_pk = str(game_payload.get("gamePk") or "")
+            if not game_pk:
+                add_error(
+                    {
+                        "source": MLB_STATS_SOURCE,
+                        "table": table,
+                        "error_type": "ValueError",
+                        "message": "MLB schedule game missing gamePk.",
+                    }
+                )
+                continue
+            stats["rows_seen"] = int(stats.get("rows_seen", 0)) + 1
+            if game_pk in deduped:
+                stats["duplicate_count"] = int(stats.get("duplicate_count", 0)) + 1
+                add_warning(f"Duplicate MLB schedule gamePk {game_pk} ignored during hydration.")
+                continue
+            deduped[game_pk] = (table, game_payload)
 
     try:
-        history_payload = client.get_schedule(
-            start_date=day - timedelta(days=45),
-            end_date=day - timedelta(days=1),
-            hydrate="team,venue,linescore",
+        collect("mlb_games", client.get_schedule(day))
+    except (HttpJsonError, ValueError, KeyError, TypeError) as exc:
+        add_error(_source_error(source=MLB_STATS_SOURCE, table="mlb_games", exc=exc))
+    except Exception as exc:  # defensive: source failures should degrade the sync, not 500
+        add_error(_source_error(source=MLB_STATS_SOURCE, table="mlb_games", exc=exc))
+
+    try:
+        collect(
+            "mlb_games_history",
+            client.get_schedule(
+                start_date=day - timedelta(days=45),
+                end_date=day - timedelta(days=1),
+                hydrate="team,venue,linescore",
+            ),
         )
-        for game_payload in _schedule_games_from_payload(history_payload):
-            if _upsert_game_from_schedule_payload(session, game_payload) is not None:
-                upserted += 1
-    except HttpJsonError as exc:
-        errors.append({"source": MLB_STATS_SOURCE, "table": "mlb_games_history", "error": exc.to_detail()})
-    session.flush()
-    return upserted
+    except (HttpJsonError, ValueError, KeyError, TypeError) as exc:
+        add_error(_source_error(source=MLB_STATS_SOURCE, table="mlb_games_history", exc=exc))
+    except Exception as exc:  # defensive: source failures should degrade the sync, not 500
+        add_error(_source_error(source=MLB_STATS_SOURCE, table="mlb_games_history", exc=exc))
+
+    for game_pk, (table, game_payload) in deduped.items():
+        try:
+            with session.begin_nested():
+                if _upsert_game_from_schedule_payload(session, game_payload) is not None:
+                    session.flush()
+                    stats["rows_upserted"] = int(stats.get("rows_upserted", 0)) + 1
+        except (IntegrityError, ValueError, KeyError, TypeError) as exc:
+            add_error(_source_error(source=MLB_STATS_SOURCE, table=table, game_pk=game_pk, exc=exc))
+        except Exception as exc:  # defensive: one bad game row should not abort feature sync
+            add_error(_source_error(source=MLB_STATS_SOURCE, table=table, game_pk=game_pk, exc=exc))
+
+    if int(stats.get("error_count", 0)) > 0:
+        stats["validation_status"] = "degraded_with_errors"
+    elif int(stats.get("duplicate_count", 0)) > 0:
+        stats["validation_status"] = "ok_with_duplicates"
+    return stats
 
 
 def _cached_team_daily(session: Session | None, day: date, team_code: str | None) -> TeamDailyFeature | None:
@@ -1885,7 +1964,34 @@ def _upsert_weather(
                 features["missing_reason"] = None
                 source_status = "available"
         except HttpJsonError as exc:
-            raw_payload = {"error": exc.to_detail()}
+            raw_payload = {
+                "error": _source_error(
+                    source=OPEN_METEO_SOURCE,
+                    table="weather_snapshots",
+                    game_pk=game.external_game_id,
+                    exc=exc,
+                )
+            }
+            source_status = "missing"
+        except (ValueError, KeyError, TypeError) as exc:
+            raw_payload = {
+                "error": _source_error(
+                    source=OPEN_METEO_SOURCE,
+                    table="weather_snapshots",
+                    game_pk=game.external_game_id,
+                    exc=exc,
+                )
+            }
+            source_status = "missing"
+        except Exception as exc:  # defensive: weather source failures should degrade, not 500
+            raw_payload = {
+                "error": _source_error(
+                    source=OPEN_METEO_SOURCE,
+                    table="weather_snapshots",
+                    game_pk=game.external_game_id,
+                    exc=exc,
+                )
+            }
             source_status = "missing"
     row = session.scalar(
         select(WeatherSnapshot)
@@ -2073,6 +2179,13 @@ def _new_sync_stats(day: date, include_modules: set[str] | None) -> dict[str, ob
         "missing_count": 0,
         "error_count": 0,
         "validation_status": "ok",
+        "refresh_schedule": None,
+        "hydration_rows_seen": 0,
+        "hydration_rows_upserted": 0,
+        "hydration_duplicate_count": 0,
+        "hydration_error_count": 0,
+        "hydration_validation_status": "not_run",
+        "hydration_skipped_reason": None,
         "warnings": [],
         "errors": [],
         "tables_written": [],
@@ -2099,6 +2212,22 @@ def _append_error(stats: dict[str, object], error: dict[str, object]) -> None:
     if isinstance(errors, list):
         errors.append(error)
     stats["error_count"] = int(stats.get("error_count", 0)) + 1
+
+
+def _merge_hydration_stats(stats: dict[str, object], hydration: object) -> None:
+    if isinstance(hydration, int):
+        stats["hydration_rows_upserted"] = int(stats.get("hydration_rows_upserted", 0)) + hydration
+        stats["hydration_validation_status"] = "ok"
+        return
+    if not isinstance(hydration, dict):
+        return
+    stats["hydration_rows_seen"] = int(stats.get("hydration_rows_seen", 0)) + int(hydration.get("rows_seen", 0) or 0)
+    stats["hydration_rows_upserted"] = int(stats.get("hydration_rows_upserted", 0)) + int(hydration.get("rows_upserted", 0) or 0)
+    stats["hydration_duplicate_count"] = int(stats.get("hydration_duplicate_count", 0)) + int(hydration.get("duplicate_count", 0) or 0)
+    stats["hydration_error_count"] = int(stats.get("hydration_error_count", 0)) + int(hydration.get("error_count", 0) or 0)
+    stats["hydration_validation_status"] = str(hydration.get("validation_status") or "ok")
+    for warning in hydration.get("warnings", []) if isinstance(hydration.get("warnings"), list) else []:
+        _append_warning(stats, str(warning))
 
 
 def _record_feature_row(stats: dict[str, object], table: str, row: object | None) -> None:
@@ -2221,6 +2350,7 @@ def sync_mlb_features(
     session: Session,
     target_date: date | None = None,
     include_modules: set[str] | None = None,
+    refresh_schedule: bool | None = None,
 ) -> dict[str, object]:
     day = target_date or today_eastern()
     requested_modules = _requested_modules(include_modules)
@@ -2238,17 +2368,32 @@ def sync_mlb_features(
         return stats
 
     errors: list[dict[str, object]] = []
-    if settings.feature_sync_enable_network_sources:
+    games_before_hydration = _target_games(session, day)
+    if refresh_schedule is None:
+        refresh_schedule = len(games_before_hydration) == 0
+    stats["refresh_schedule"] = refresh_schedule
+    if settings.feature_sync_enable_network_sources and refresh_schedule:
         client = MLBStatsClient()
-        schedule_rows = _hydrate_schedule_window(session, day, client=client, errors=errors)
-        if schedule_rows == 0:
+        hydration = _hydrate_schedule_window(session, day, client=client, errors=errors)
+        _merge_hydration_stats(stats, hydration)
+        if int(stats.get("hydration_rows_upserted", 0)) == 0:
             _append_warning(stats, "MLB schedule hydration returned no games.")
+    elif settings.feature_sync_enable_network_sources:
+        stats["hydration_skipped_reason"] = (
+            "target_date_games_exist" if games_before_hydration else "refresh_schedule_false"
+        )
     games = _target_games(session, day)
     captured_at = utc_now()
     upserted = 0
+    snapshot_rows: list[MlbFeatureSnapshot] = []
     stats["games_seen"] = len(games)
     for error in errors:
         _append_error(stats, error)
+    if not pybaseball_available() and requested_modules & {"team", "pitcher", "bullpen"}:
+        _append_warning(
+            stats,
+            "pybaseball is unavailable; advanced public offense/pitching stats are degraded to MLB schedule-derived partial proxies.",
+        )
     for game in games:
         if settings.feature_sync_enable_network_sources:
             error = _hydrate_game_endpoint_if_available(game)
@@ -2281,8 +2426,8 @@ def sync_mlb_features(
         row.source_statuses = features.get("source_statuses")
         row.features = features
         session.add(row)
+        snapshot_rows.append(row)
         upserted += 1
-    session.commit()
     stats["feature_snapshots_upserted"] = upserted
     if int(stats.get("games_seen", 0)) == 0:
         stats["validation_status"] = "degraded_no_games"
@@ -2296,6 +2441,22 @@ def sync_mlb_features(
         stats["validation_status"] = "ok"
     if isinstance(stats.get("tables_written"), list):
         stats["tables_written"] = sorted(stats["tables_written"])
+    if int(stats.get("rows_inserted", 0)) + int(stats.get("rows_updated", 0)) == 0:
+        _append_warning(stats, "No raw feature rows were inserted or updated; inspect validation_status and errors.")
+    sync_status = {
+        "target_date": stats["target_date"],
+        "attempted_at": captured_at.isoformat(),
+        "validation_status": stats["validation_status"],
+        "error_count": stats["error_count"],
+        "errors": stats["errors"],
+        "warnings": stats["warnings"],
+        "hydration_validation_status": stats["hydration_validation_status"],
+        "hydration_error_count": stats["hydration_error_count"],
+        "hydration_duplicate_count": stats["hydration_duplicate_count"],
+    }
+    for row in snapshot_rows:
+        row.features = {**(row.features or {}), "sync_status": sync_status}
+    session.commit()
     return stats
 
 
@@ -2305,34 +2466,62 @@ def _hydrate_game_endpoint_if_available(game: MlbGame) -> dict[str, object] | No
     try:
         payload = MLBStatsClient().get_game_feed(game.external_game_id)
     except HttpJsonError as exc:
-        return {"source": MLB_STATS_SOURCE, "table": "mlb_games_feed", "game_pk": game.external_game_id, "error": exc.to_detail()}
+        return _source_error(source=MLB_STATS_SOURCE, table="mlb_games_feed", game_pk=game.external_game_id, exc=exc)
+    except (ValueError, KeyError, TypeError) as exc:
+        return _source_error(source=MLB_STATS_SOURCE, table="mlb_games_feed", game_pk=game.external_game_id, exc=exc)
+    except Exception as exc:  # defensive: source failures should degrade the sync, not 500
+        return _source_error(source=MLB_STATS_SOURCE, table="mlb_games_feed", game_pk=game.external_game_id, exc=exc)
     if payload:
         _merge_game_payload(game, payload)
     return None
 
 
-def sync_mlb_team_features(session: Session, target_date: date | None = None) -> dict[str, object]:
-    return sync_mlb_features(session, target_date, {"team"})
+def sync_mlb_team_features(
+    session: Session,
+    target_date: date | None = None,
+    refresh_schedule: bool | None = None,
+) -> dict[str, object]:
+    return sync_mlb_features(session, target_date, {"team"}, refresh_schedule)
 
 
-def sync_mlb_pitcher_features(session: Session, target_date: date | None = None) -> dict[str, object]:
-    return sync_mlb_features(session, target_date, {"pitcher"})
+def sync_mlb_pitcher_features(
+    session: Session,
+    target_date: date | None = None,
+    refresh_schedule: bool | None = None,
+) -> dict[str, object]:
+    return sync_mlb_features(session, target_date, {"pitcher"}, refresh_schedule)
 
 
-def sync_mlb_lineups(session: Session, target_date: date | None = None) -> dict[str, object]:
-    return sync_mlb_features(session, target_date, {"lineup"})
+def sync_mlb_lineups(
+    session: Session,
+    target_date: date | None = None,
+    refresh_schedule: bool | None = None,
+) -> dict[str, object]:
+    return sync_mlb_features(session, target_date, {"lineup"}, refresh_schedule)
 
 
-def sync_mlb_bullpen_features(session: Session, target_date: date | None = None) -> dict[str, object]:
-    return sync_mlb_features(session, target_date, {"bullpen"})
+def sync_mlb_bullpen_features(
+    session: Session,
+    target_date: date | None = None,
+    refresh_schedule: bool | None = None,
+) -> dict[str, object]:
+    return sync_mlb_features(session, target_date, {"bullpen"}, refresh_schedule)
 
 
-def sync_weather_features(session: Session, target_date: date | None = None) -> dict[str, object]:
-    return sync_mlb_features(session, target_date, {"weather"})
+def sync_weather_features(
+    session: Session,
+    target_date: date | None = None,
+    refresh_schedule: bool | None = None,
+) -> dict[str, object]:
+    return sync_mlb_features(session, target_date, {"weather"}, refresh_schedule)
 
 
-def sync_travel_schedule_features(session: Session, target_date: date | None = None) -> dict[str, object]:
-    return sync_mlb_features(session, target_date, {"travel"})
+def sync_travel_schedule_features(
+    session: Session,
+    target_date: date | None = None,
+    refresh_schedule: bool | None = None,
+) -> dict[str, object]:
+    return sync_mlb_features(session, target_date, {"travel"}, refresh_schedule)
 
 
 SOURCE_TABLE_MODELS = {
@@ -2377,6 +2566,38 @@ def _table_source_status(session: Session, table_name: str, model) -> dict[str, 
     }
 
 
+def _latest_feature_sync_audit(session: Session) -> dict[str, object]:
+    rows = list(
+        session.scalars(
+            select(MlbFeatureSnapshot)
+            .where(MlbFeatureSnapshot.source == FEATURE_VERSION)
+            .order_by(MlbFeatureSnapshot.captured_at.desc())
+            .limit(50)
+        )
+    )
+    latest_audit: dict[str, object] | None = None
+    latest_errors: list[dict[str, object]] = []
+    for row in rows:
+        row_features = row.features or {}
+        sync_status = row_features.get("sync_status") if isinstance(row_features, dict) else None
+        if not isinstance(sync_status, dict):
+            continue
+        if latest_audit is None:
+            latest_audit = sync_status
+        errors = sync_status.get("errors")
+        if isinstance(errors, list):
+            for error in errors:
+                if isinstance(error, dict):
+                    latest_errors.append(error)
+    last_error = latest_errors[0] if latest_errors else None
+    return {
+        "last_attempted_sync": latest_audit.get("attempted_at") if latest_audit else None,
+        "validation_status": latest_audit.get("validation_status") if latest_audit else None,
+        "last_error": last_error,
+        "latest_errors": latest_errors[:20],
+    }
+
+
 def _secret_configured(value: object) -> bool:
     if value is None:
         return False
@@ -2392,12 +2613,24 @@ def source_status_report(session: Session) -> dict[str, object]:
         table_name: _table_source_status(session, table_name, model)
         for table_name, model in SOURCE_TABLE_MODELS.items()
     }
+    feature_audit = _latest_feature_sync_audit(session)
     last_feature_snapshot = table_status["mlb_feature_snapshots"]["latest_captured_at"]
+    table_errors = {
+        table_name: status["last_error"]
+        for table_name, status in table_status.items()
+        if status["last_error"] is not None
+    }
+    audit_errors = feature_audit["latest_errors"] if isinstance(feature_audit["latest_errors"], list) else []
+    for error in audit_errors:
+        if isinstance(error, dict):
+            table = str(error.get("table") or "feature_sync")
+            table_errors.setdefault(table, error)
     return {
         "feature_sync_enable_network_sources": settings.feature_sync_enable_network_sources,
         "mlb_stats_base_url": settings.mlb_stats_base_url,
         "open_meteo_base_url": settings.open_meteo_base_url,
         "pybaseball_available": pybaseball_available(),
+        "advanced_public_stats_status": "available" if pybaseball_available() else "unavailable_pybaseball_not_installed",
         "public_sources_enabled": settings.feature_sync_enable_network_sources,
         "optional_injury_provider_configured": _secret_configured(settings.injury_provider_api_key),
         "optional_lineup_provider_configured": _secret_configured(settings.lineup_provider_api_key),
@@ -2406,15 +2639,17 @@ def source_status_report(session: Session) -> dict[str, object]:
             table_name: status["last_successful_sync"]
             for table_name, status in table_status.items()
         },
-        "last_error": {
-            table_name: status["last_error"]
-            for table_name, status in table_status.items()
-            if status["last_error"] is not None
-        },
+        "last_attempted_sync": feature_audit["last_attempted_sync"],
+        "validation_status": feature_audit["validation_status"],
+        "last_error": table_errors,
         "last_feature_sync_status": {
             "captured_at": last_feature_snapshot,
             "feature_version": FEATURE_VERSION,
+            "last_attempted_sync": feature_audit["last_attempted_sync"],
+            "validation_status": feature_audit["validation_status"],
+            "last_error": feature_audit["last_error"],
         },
+        "latest_errors": feature_audit["latest_errors"],
         "tables": table_status,
     }
 
