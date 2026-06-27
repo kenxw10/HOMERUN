@@ -10,6 +10,11 @@ from app.services.http_json import get_json
 class MLBStatsClient:
     def __init__(self, base_url: str | None = None) -> None:
         self.base_url = (base_url or get_settings().mlb_stats_base_url).rstrip("/")
+        self.live_feed_base_url = (
+            f"{self.base_url.removesuffix('/api/v1')}/api/v1.1"
+            if self.base_url.endswith("/api/v1")
+            else self.base_url
+        )
 
     def get_schedule(
         self,
@@ -30,7 +35,7 @@ class MLBStatsClient:
         return get_json(f"{self.base_url}/schedule", params=params)
 
     def get_game_feed(self, game_pk: str) -> dict[str, Any]:
-        return get_json(f"{self.base_url}/game/{game_pk}/feed/live", params={})
+        return get_json(f"{self.live_feed_base_url}/game/{game_pk}/feed/live", params={})
 
     def get_boxscore(self, game_pk: str) -> dict[str, Any]:
         return get_json(f"{self.base_url}/game/{game_pk}/boxscore", params={})

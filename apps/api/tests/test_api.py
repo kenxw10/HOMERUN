@@ -50,6 +50,7 @@ from app.services import (
     market_family_discovery,
     market_family_mapping,
     market_sync,
+    mlb_stats_client,
     modeling,
     position_refresh,
 )
@@ -217,6 +218,24 @@ def test_model_sources_status_endpoint_reports_public_sources(monkeypatch) -> No
     assert payload["result"]["public_sources_enabled"] is True
     assert payload["result"]["mlb_stats_base_url"] == "https://statsapi.mlb.com/api/v1"
     assert "weather_snapshots" in payload["result"]["tables"]
+
+
+def test_mlb_stats_client_uses_v1_1_for_live_game_feeds(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_get_json(url: str, **kwargs):
+        captured["url"] = url
+        captured["params"] = kwargs.get("params")
+        return {"ok": True}
+
+    monkeypatch.setattr(mlb_stats_client, "get_json", fake_get_json)
+    client = mlb_stats_client.MLBStatsClient(base_url="https://statsapi.mlb.com/api/v1")
+
+    response = client.get_game_feed("12345")
+
+    assert response == {"ok": True}
+    assert captured["url"] == "https://statsapi.mlb.com/api/v1.1/game/12345/feed/live"
+    assert captured["params"] == {}
 
 
 def test_database_status_does_not_mark_unreachable_database_ready(monkeypatch) -> None:
