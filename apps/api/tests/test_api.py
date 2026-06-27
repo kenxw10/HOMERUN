@@ -1449,6 +1449,41 @@ def test_model_read_endpoints_require_api_key_when_configured(monkeypatch) -> No
     assert dated_predictions_response.status_code == 401
 
 
+def test_active_parameters_endpoint_persists_created_baseline(monkeypatch) -> None:
+    engine = create_engine(
+        "sqlite+pysqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    SessionLocal = sessionmaker(bind=engine)
+
+    monkeypatch.setattr(
+        main_module,
+        "database_status",
+        lambda: {"ready": True, "configured": True, "dialect": "sqlite", "message": "ok"},
+    )
+    monkeypatch.setattr(main_module, "get_session_factory", lambda: SessionLocal)
+    app.dependency_overrides[require_internal_api_key] = lambda: None
+
+    try:
+        response = client.get("/v1/model/parameters/active")
+    finally:
+        app.dependency_overrides.clear()
+
+    with SessionLocal() as session:
+        persisted = session.scalar(
+            select(ModelParameterVersion).where(
+                ModelParameterVersion.version_tag == modeling.BASELINE_PARAMETER_VERSION_TAG
+            )
+        )
+
+    assert response.status_code == 200
+    assert response.json()["result"]["version_tag"] == modeling.BASELINE_PARAMETER_VERSION_TAG
+    assert persisted is not None
+    assert persisted.is_active is True
+
+
 def test_internal_sync_endpoints_fail_closed_in_production_without_api_key(monkeypatch) -> None:
     monkeypatch.setenv("APP_ENV", "production")
     monkeypatch.delenv("BACKEND_API_KEY", raising=False)
@@ -3400,7 +3435,7 @@ def test_travel_feature_uses_current_venue_for_away_team() -> None:
     assert away_travel.features["travel_distance_miles"] > 1000
 
 
-def test_travel_feature_does_not_use_away_home_coordinates_for_unknown_road_venue() -> None:
+def test_travel_feature_uses_home_venue_proxy_for_unknown_road_venue() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
 
@@ -3419,9 +3454,9 @@ def test_travel_feature_does_not_use_away_home_coordinates_for_unknown_road_venu
         )
         current = MlbGame(
             external_game_id="travel-current-sea-at-unknown",
-            home_team="Oakland Athletics",
+            home_team="Pittsburgh Pirates",
             away_team="Seattle Mariners",
-            home_abbreviation="OAK",
+            home_abbreviation="PIT",
             away_abbreviation="SEA",
             scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
             status="scheduled",
@@ -3439,7 +3474,7 @@ def test_travel_feature_does_not_use_away_home_coordinates_for_unknown_road_venu
         )
 
     assert away_travel is not None
-    assert away_travel.features["travel_distance_miles"] is None
+    assert away_travel.features["travel_distance_miles"] > 1000
 
 
 def test_lineup_parser_extracts_starters_and_excludes_substitutes() -> None:

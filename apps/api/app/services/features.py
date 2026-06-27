@@ -443,10 +443,8 @@ def _team_location_for_game(game: MlbGame, team_code: str) -> tuple[float, float
     profile = STADIUM_PROFILES.get(venue_name or "")
     if profile:
         return float(profile["latitude"]), float(profile["longitude"])
-    if team_code == game.home_abbreviation:
-        return TEAM_HOME_COORDINATES.get(team_code)
-    if team_code == game.away_abbreviation:
-        return None
+    if team_code in {game.home_abbreviation, game.away_abbreviation}:
+        return TEAM_HOME_COORDINATES.get(game.home_abbreviation or "")
     return TEAM_HOME_COORDINATES.get(team_code)
 
 

@@ -379,6 +379,7 @@ def model_feature_detail(
 def model_active_parameters(_: None = Depends(require_internal_api_key)) -> RunResponse:
     with _db_session_or_503() as session:
         result = active_parameter_payload(session)
+        session.commit()
     return RunResponse(ok=True, action="model_active_parameters", result=result)
 
 
