@@ -201,6 +201,45 @@ Invoke-RestMethod -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-RAILWAY-API/v
 
 Expected: lineup snapshots where MLB posted lineups, weather rows for stadiums with coordinates, pitcher rows where probable starters are available, partial bullpen proxies when exact reliever data is unavailable, and `data_quality_reason` caps when critical modules remain missing.
 
+PR3c fix4 idempotent feature-ingestion validation:
+
+1. Confirm repeated module syncs return structured JSON, not 500s:
+
+```powershell
+Invoke-RestMethod -Method Post -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-RAILWAY-API/v1/sync/mlb-team-features?target_date=2026-06-27"
+Invoke-RestMethod -Method Post -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-RAILWAY-API/v1/sync/mlb-team-features?target_date=2026-06-27"
+Invoke-RestMethod -Method Post -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-RAILWAY-API/v1/sync/mlb-pitcher-features?target_date=2026-06-27"
+Invoke-RestMethod -Method Post -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-RAILWAY-API/v1/sync/mlb-pitcher-features?target_date=2026-06-27"
+```
+
+Expected: response `ok=true`; `validation_status` is `ok`, `degraded_no_available_public_rows`, or `degraded_with_errors`; no duplicate-key 500; and each response includes `hydration_rows_seen`, `hydration_rows_upserted`, `hydration_duplicate_count`, `hydration_error_count`, `hydration_validation_status`, `refresh_schedule`, and `hydration_skipped_reason`.
+
+2. Confirm `refresh_schedule` behavior:
+
+```powershell
+Invoke-RestMethod -Method Post -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-RAILWAY-API/v1/sync/mlb-team-features?target_date=2026-06-27&refresh_schedule=false"
+Invoke-RestMethod -Method Post -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-RAILWAY-API/v1/sync/mlb-features?target_date=2026-06-27&include_modules=all&refresh_schedule=true"
+```
+
+Expected: module syncs skip schedule hydration when target-date games already exist; forced refresh safely updates existing `mlb_games.external_game_id` rows instead of inserting duplicates.
+
+3. Confirm source diagnostics capture degraded ingestion:
+
+```powershell
+Invoke-RestMethod -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-RAILWAY-API/v1/model/sources/status"
+```
+
+Expected: `last_attempted_sync`, `validation_status`, `last_error`, `latest_errors`, and per-table `status_counts` are present. `pybaseball_available` is only an import diagnostic. Until an adapter actually ingests pybaseball-backed data, `advanced_public_stats_status` should be `not_ingested_pybaseball_adapter_not_implemented` when the package is present or `unavailable_pybaseball_not_installed` when it is absent; team, pitcher, and bullpen rows should remain `partial` schedule-derived proxies, not complete advanced-stat rows.
+
+4. Confirm weather and lineup degraded behavior:
+
+```powershell
+Invoke-RestMethod -Method Post -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-RAILWAY-API/v1/sync/weather?target_date=2026-06-27"
+Invoke-RestMethod -Method Post -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-RAILWAY-API/v1/sync/mlb-lineups?target_date=2026-06-27"
+```
+
+Expected: Open-Meteo/source errors produce missing weather rows with structured raw errors; not-posted lineups produce `LINEUP_NOT_POSTED_YET`; posted/final-game MLB boxscore lineups should parse as available.
+
 PR3c fix2 feature/model validation:
 
 1. Run the complete feature sync for a slate:

@@ -3455,6 +3455,476 @@ def test_network_disabled_returns_skipped_without_raw_writes(monkeypatch) -> Non
     assert lineup_count is None
 
 
+def test_schedule_hydration_deduplicates_game_pk_and_updates_existing() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    def game_payload(game_pk: int, home_name: str = "Pittsburgh Pirates") -> dict[str, object]:
+        return {
+            "gamePk": game_pk,
+            "gameDate": "2026-07-01T23:00:00Z",
+            "venue": {"id": 31, "name": "PNC Park"},
+            "status": {"detailedState": "Scheduled"},
+            "teams": {
+                "home": {"score": 4, "team": {"name": home_name, "abbreviation": "PIT"}},
+                "away": {"score": 2, "team": {"name": "Seattle Mariners", "abbreviation": "SEA"}},
+            },
+        }
+
+    class FakeClient:
+        def get_schedule(self, target_date=None, **kwargs):
+            if kwargs.get("start_date"):
+                return {"dates": []}
+            return {"dates": [{"games": [game_payload(824518), game_payload(824518, "Old Home")]}]}
+
+    with Session(engine) as session:
+        session.add(
+            MlbGame(
+                external_game_id="824518",
+                home_team="Existing Home",
+                away_team="Existing Away",
+                home_abbreviation="EXH",
+                away_abbreviation="EXA",
+                scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+                status="Old",
+                raw_payload={"liveData": {"cached": True}},
+            )
+        )
+        session.commit()
+        errors: list[dict[str, object]] = []
+
+        result = features._hydrate_schedule_window(
+            session,
+            date(2026, 7, 1),
+            client=FakeClient(),
+            errors=errors,
+        )
+        session.commit()
+        rows = list(session.scalars(select(MlbGame)))
+
+    assert len(rows) == 1
+    assert rows[0].external_game_id == "824518"
+    assert rows[0].home_team == "Pittsburgh Pirates"
+    assert rows[0].raw_payload["liveData"] == {"cached": True}
+    assert result["rows_seen"] == 2
+    assert result["duplicate_count"] == 1
+    assert result["rows_upserted"] == 1
+    assert errors == []
+
+
+def test_team_feature_sync_can_run_twice_without_duplicate_games(monkeypatch) -> None:
+    monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "true")
+    get_settings.cache_clear()
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    class FakeClient:
+        def get_schedule(self, target_date=None, **kwargs):
+            if kwargs.get("start_date"):
+                return {"dates": []}
+            return {
+                "dates": [
+                    {
+                        "games": [
+                            {
+                                "gamePk": 824518,
+                                "gameDate": "2026-07-01T23:00:00Z",
+                                "venue": {"id": 31, "name": "PNC Park"},
+                                "status": {"detailedState": "Scheduled"},
+                                "teams": {
+                                    "home": {
+                                        "score": 0,
+                                        "team": {"name": "Pittsburgh Pirates", "abbreviation": "PIT"},
+                                    },
+                                    "away": {
+                                        "score": 0,
+                                        "team": {"name": "Seattle Mariners", "abbreviation": "SEA"},
+                                    },
+                                },
+                            }
+                        ]
+                    }
+                ]
+            }
+
+    monkeypatch.setattr(features, "MLBStatsClient", FakeClient)
+    monkeypatch.setattr(features, "_hydrate_game_endpoint_if_available", lambda *_args, **_kwargs: None)
+    try:
+        with Session(engine) as session:
+            first = features.sync_mlb_team_features(session, date(2026, 7, 1))
+            second = features.sync_mlb_team_features(session, date(2026, 7, 1))
+            games = list(session.scalars(select(MlbGame)))
+            team_rows = list(session.scalars(select(TeamDailyFeature)))
+    finally:
+        get_settings.cache_clear()
+
+    assert first["validation_status"] in {"ok", "degraded_no_available_public_rows"}
+    assert second["refresh_schedule"] is False
+    assert second["hydration_skipped_reason"] == "target_date_games_exist"
+    assert len(games) == 1
+    assert len(team_rows) == 2
+
+
+def test_feature_sync_returns_degraded_and_records_source_error(monkeypatch) -> None:
+    monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "true")
+    get_settings.cache_clear()
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    def broken_hydration(_session: Session, _day: date, **_kwargs) -> dict[str, object]:
+        error = {
+            "source": features.MLB_STATS_SOURCE,
+            "table": "mlb_games",
+            "game_pk": "824518",
+            "error_type": "IntegrityError",
+            "message": "duplicate key value violates unique constraint",
+        }
+        _kwargs["errors"].append(error)
+        return {
+            "rows_seen": 1,
+            "rows_upserted": 0,
+            "duplicate_count": 0,
+            "error_count": 1,
+            "validation_status": "degraded_with_errors",
+            "errors": [error],
+            "warnings": ["test degraded hydration"],
+        }
+
+    monkeypatch.setattr(features, "_hydrate_schedule_window", broken_hydration)
+    monkeypatch.setattr(features, "_hydrate_game_endpoint_if_available", lambda *_args, **_kwargs: None)
+    try:
+        with Session(engine) as session:
+            session.add(
+                MlbGame(
+                    external_game_id="824518",
+                    home_team="Pittsburgh Pirates",
+                    away_team="Seattle Mariners",
+                    home_abbreviation="PIT",
+                    away_abbreviation="SEA",
+                    scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+                    status="scheduled",
+                    raw_payload={"venue": {"id": 31, "name": "PNC Park"}},
+                )
+            )
+            session.commit()
+
+            result = features.sync_mlb_team_features(session, date(2026, 7, 1), refresh_schedule=True)
+            report = features.source_status_report(session)
+    finally:
+        get_settings.cache_clear()
+
+    assert result["validation_status"] == "degraded_with_errors"
+    assert result["hydration_error_count"] == 1
+    assert result["error_count"] == 1
+    assert report["validation_status"] == "degraded_with_errors"
+    assert report["last_error"]["mlb_games"]["error_type"] == "IntegrityError"
+
+
+def test_failed_sync_without_game_snapshots_persists_source_audit(monkeypatch) -> None:
+    monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "true")
+    get_settings.cache_clear()
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    def failed_empty_hydration(_session: Session, _day: date, **kwargs) -> dict[str, object]:
+        error = {
+            "source": features.MLB_STATS_SOURCE,
+            "table": "mlb_games",
+            "error_type": "HttpJsonError",
+            "message": "schedule unavailable",
+        }
+        kwargs["errors"].append(error)
+        return {
+            "rows_seen": 0,
+            "rows_upserted": 0,
+            "duplicate_count": 0,
+            "error_count": 1,
+            "validation_status": "degraded_with_errors",
+            "errors": [error],
+            "warnings": ["schedule unavailable"],
+        }
+
+    monkeypatch.setattr(features, "_hydrate_schedule_window", failed_empty_hydration)
+    try:
+        with Session(engine) as session:
+            result = features.sync_mlb_team_features(session, date(2026, 7, 1), refresh_schedule=True)
+            report = features.source_status_report(session)
+            audit = session.scalar(
+                select(MlbFeatureSnapshot).where(MlbFeatureSnapshot.source == features.FEATURE_SYNC_AUDIT_SOURCE)
+            )
+    finally:
+        get_settings.cache_clear()
+
+    assert result["games_seen"] == 0
+    assert result["feature_snapshots_upserted"] == 0
+    assert result["validation_status"] == "degraded_with_errors"
+    assert audit is not None
+    assert audit.mlb_game_id is None
+    assert report["last_attempted_sync"] is not None
+    assert report["validation_status"] == "degraded_with_errors"
+    assert report["last_error"]["mlb_games"]["message"] == "schedule unavailable"
+    assert report["last_successful_sync"]["mlb_feature_snapshots"] is None
+    assert report["tables"]["mlb_feature_snapshots"]["row_sample_count"] == 0
+
+
+def test_source_status_errors_are_limited_to_latest_sync_attempt() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        session.add_all(
+            [
+                MlbFeatureSnapshot(
+                    mlb_game_id=None,
+                    target_date=date(2026, 7, 1),
+                    source=features.FEATURE_SYNC_AUDIT_SOURCE,
+                    captured_at=datetime(2026, 7, 1, 15, 0, tzinfo=UTC),
+                    data_quality=None,
+                    source_statuses={"sync": "degraded_with_errors"},
+                    features={
+                        "sync_status": {
+                            "target_date": "2026-07-01",
+                            "attempted_at": "2026-07-01T15:00:00+00:00",
+                            "validation_status": "degraded_with_errors",
+                            "error_count": 1,
+                            "errors": [
+                                {
+                                    "source": features.MLB_STATS_SOURCE,
+                                    "table": "mlb_games",
+                                    "error_type": "HttpJsonError",
+                                    "message": "old failure",
+                                }
+                            ],
+                            "warnings": [],
+                        }
+                    },
+                ),
+                MlbFeatureSnapshot(
+                    mlb_game_id=None,
+                    target_date=date(2026, 7, 1),
+                    source=features.FEATURE_SYNC_AUDIT_SOURCE,
+                    captured_at=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
+                    data_quality=None,
+                    source_statuses={"sync": "ok"},
+                    features={
+                        "sync_status": {
+                            "target_date": "2026-07-01",
+                            "attempted_at": "2026-07-01T16:00:00+00:00",
+                            "validation_status": "ok",
+                            "error_count": 0,
+                            "errors": [],
+                            "warnings": [],
+                        }
+                    },
+                ),
+            ]
+        )
+        session.commit()
+
+        report = features.source_status_report(session)
+
+    assert report["validation_status"] == "ok"
+    assert report["latest_errors"] == []
+    assert "mlb_games" not in report["last_error"]
+
+
+def test_refresh_schedule_false_skips_hydration_when_games_exist(monkeypatch) -> None:
+    monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "true")
+    get_settings.cache_clear()
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    called = {"hydration": 0}
+
+    def forbidden_hydration(*_args, **_kwargs):
+        called["hydration"] += 1
+        raise AssertionError("schedule hydration should be skipped")
+
+    monkeypatch.setattr(features, "_hydrate_schedule_window", forbidden_hydration)
+    monkeypatch.setattr(features, "_hydrate_game_endpoint_if_available", lambda *_args, **_kwargs: None)
+    try:
+        with Session(engine) as session:
+            session.add(
+                MlbGame(
+                    external_game_id="refresh-skip-1",
+                    home_team="Pittsburgh Pirates",
+                    away_team="Seattle Mariners",
+                    home_abbreviation="PIT",
+                    away_abbreviation="SEA",
+                    scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+                    status="scheduled",
+                    raw_payload={"venue": {"id": 31, "name": "PNC Park"}},
+                )
+            )
+            session.commit()
+
+            result = features.sync_mlb_team_features(session, date(2026, 7, 1), refresh_schedule=False)
+    finally:
+        get_settings.cache_clear()
+
+    assert called["hydration"] == 0
+    assert result["hydration_validation_status"] == "not_run"
+    assert result["hydration_skipped_reason"] == "target_date_games_exist"
+
+
+def test_full_feature_sync_refreshes_schedule_by_default_with_existing_games(monkeypatch) -> None:
+    monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "true")
+    get_settings.cache_clear()
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    called = {"hydration": 0}
+
+    def tracked_hydration(*_args, **_kwargs):
+        called["hydration"] += 1
+        return {
+            "rows_seen": 0,
+            "rows_upserted": 0,
+            "duplicate_count": 0,
+            "error_count": 0,
+            "validation_status": "ok",
+            "errors": [],
+            "warnings": [],
+        }
+
+    monkeypatch.setattr(features, "_hydrate_schedule_window", tracked_hydration)
+    monkeypatch.setattr(features, "_hydrate_game_endpoint_if_available", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(features, "_fetch_open_meteo", lambda *_args, **_kwargs: {"hourly": {"time": []}})
+    try:
+        with Session(engine) as session:
+            session.add(
+                MlbGame(
+                    external_game_id="full-refresh-default-1",
+                    home_team="Pittsburgh Pirates",
+                    away_team="Seattle Mariners",
+                    home_abbreviation="PIT",
+                    away_abbreviation="SEA",
+                    scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+                    status="scheduled",
+                    raw_payload={"venue": {"id": 31, "name": "PNC Park"}},
+                )
+            )
+            session.commit()
+
+            result = features.sync_mlb_features(session, date(2026, 7, 1))
+    finally:
+        get_settings.cache_clear()
+
+    assert called["hydration"] == 1
+    assert result["refresh_schedule"] is True
+    assert result["hydration_validation_status"] == "ok"
+
+
+def test_pybaseball_unavailable_is_reported_and_advanced_stats_degraded(monkeypatch) -> None:
+    monkeypatch.setattr(features.importlib.util, "find_spec", lambda name: None)
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        report = features.source_status_report(session)
+
+    assert report["pybaseball_available"] is False
+    assert report["advanced_public_stats_status"] == "unavailable_pybaseball_not_installed"
+
+
+def test_pybaseball_presence_does_not_mark_advanced_stats_available(monkeypatch) -> None:
+    monkeypatch.setattr(features.importlib.util, "find_spec", lambda name: object() if name == "pybaseball" else None)
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        report = features.source_status_report(session)
+
+    assert report["pybaseball_available"] is True
+    assert report["advanced_public_stats_status"] == "not_ingested_pybaseball_adapter_not_implemented"
+
+
+def test_weather_sync_handles_open_meteo_failure_without_500(monkeypatch) -> None:
+    monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "true")
+    get_settings.cache_clear()
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    def failing_weather(_profile: dict[str, object], _scheduled_start: datetime) -> dict[str, object]:
+        raise HttpJsonError("weather unavailable", endpoint="https://weather.test", params={})
+
+    monkeypatch.setattr(features, "_hydrate_schedule_window", lambda *_args, **_kwargs: 0)
+    monkeypatch.setattr(features, "_hydrate_game_endpoint_if_available", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(features, "_fetch_open_meteo", failing_weather)
+    try:
+        with Session(engine) as session:
+            session.add(
+                MlbGame(
+                    external_game_id="weather-failure-1",
+                    home_team="Pittsburgh Pirates",
+                    away_team="Seattle Mariners",
+                    home_abbreviation="PIT",
+                    away_abbreviation="SEA",
+                    scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+                    status="scheduled",
+                    raw_payload={"venue": {"id": 31, "name": "PNC Park"}},
+                )
+            )
+            session.commit()
+
+            result = features.sync_weather_features(session, date(2026, 7, 1))
+            weather = session.scalar(select(WeatherSnapshot))
+    finally:
+        get_settings.cache_clear()
+
+    assert result["validation_status"] == "degraded_with_errors"
+    assert result["error_count"] == 1
+    assert result["errors"][0]["source"] == features.OPEN_METEO_SOURCE
+    assert result["errors"][0]["table"] == "weather_snapshots"
+    assert weather is not None
+    assert weather.source_status == "missing"
+    assert weather.raw_payload["error"]["source"] == features.OPEN_METEO_SOURCE
+    assert weather.raw_payload["error"]["error_type"] == "HttpJsonError"
+
+
+def test_lineup_sync_handles_missing_lineup_without_500(monkeypatch) -> None:
+    _stub_public_feature_network(monkeypatch)
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        session.add(
+            MlbGame(
+                external_game_id="lineup-missing-1",
+                home_team="Pittsburgh Pirates",
+                away_team="Seattle Mariners",
+                home_abbreviation="PIT",
+                away_abbreviation="SEA",
+                scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+                status="scheduled",
+                raw_payload={"venue": {"id": 31, "name": "PNC Park"}},
+            )
+        )
+        session.commit()
+
+        result = features.sync_mlb_lineups(session, date(2026, 7, 1))
+        lineup = session.scalar(select(LineupSnapshot).where(LineupSnapshot.team_code == "PIT"))
+
+    assert result["validation_status"] == "degraded_no_available_public_rows"
+    assert lineup is not None
+    assert lineup.source_status == "missing"
+    assert lineup.features["missing_reason"] == "LINEUP_NOT_POSTED_YET"
+
+
+def test_feature_ingestion_scope_excludes_live_execution_team_totals_and_umpires() -> None:
+    searchable = " ".join(
+        [
+            *features.RAW_TABLES_BY_MODULE.keys(),
+            *features.ALL_SYNC_MODULES,
+            *features.CORE_MODULES,
+        ]
+    ).lower()
+
+    assert "team_total" not in searchable
+    assert "team total" not in searchable
+    assert "umpire" not in searchable
+    assert "order" not in searchable
+    assert "execution" not in searchable
+
+
 def test_public_feature_sync_writes_raw_tables_from_fixture_payloads(monkeypatch) -> None:
     monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "true")
     get_settings.cache_clear()
