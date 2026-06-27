@@ -2568,7 +2568,16 @@ SOURCE_TABLE_MODELS = {
 
 
 def _table_source_status(session: Session, table_name: str, model) -> dict[str, object]:
-    rows = list(session.scalars(select(model).order_by(model.captured_at.desc()).limit(200)))
+    statement = select(model).order_by(model.captured_at.desc()).limit(200)
+    if model is MlbFeatureSnapshot:
+        statement = (
+            select(model)
+            .where(MlbFeatureSnapshot.source == FEATURE_VERSION)
+            .where(MlbFeatureSnapshot.mlb_game_id.is_not(None))
+            .order_by(model.captured_at.desc())
+            .limit(200)
+        )
+    rows = list(session.scalars(statement))
     counts: dict[str, int] = {}
     last_success = None
     last_error = None

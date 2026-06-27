@@ -3663,6 +3663,8 @@ def test_failed_sync_without_game_snapshots_persists_source_audit(monkeypatch) -
     assert report["last_attempted_sync"] is not None
     assert report["validation_status"] == "degraded_with_errors"
     assert report["last_error"]["mlb_games"]["message"] == "schedule unavailable"
+    assert report["last_successful_sync"]["mlb_feature_snapshots"] is None
+    assert report["tables"]["mlb_feature_snapshots"]["row_sample_count"] == 0
 
 
 def test_source_status_errors_are_limited_to_latest_sync_attempt() -> None:
