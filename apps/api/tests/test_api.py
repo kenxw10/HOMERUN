@@ -3774,6 +3774,56 @@ def test_open_meteo_request_uses_local_forecast_date(monkeypatch) -> None:
     assert captured["params"]["end_date"] == "2026-07-01"
 
 
+def test_schedule_upsert_preserves_cached_live_payload() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    live_data = {"boxscore": {"teams": {"home": {"batters": [101, 102]}}}}
+
+    with Session(engine) as session:
+        game = MlbGame(
+            external_game_id="12345",
+            home_team="Cached Home",
+            away_team="Cached Away",
+            home_abbreviation="CH",
+            away_abbreviation="CA",
+            scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+            status="scheduled",
+            raw_payload={
+                "gamePk": 12345,
+                "venue": {"id": 1, "name": "Cached Park"},
+                "liveData": live_data,
+            },
+        )
+        session.add(game)
+        session.flush()
+
+        refreshed = features._upsert_game_from_schedule_payload(
+            session,
+            {
+                "gamePk": 12345,
+                "gameDate": "2026-07-01T23:00:00Z",
+                "venue": {"id": 31, "name": "PNC Park"},
+                "status": {"detailedState": "Scheduled"},
+                "teams": {
+                    "home": {
+                        "score": 0,
+                        "team": {"name": "Pittsburgh Pirates", "abbreviation": "PIT"},
+                    },
+                    "away": {
+                        "score": 0,
+                        "team": {"name": "Seattle Mariners", "abbreviation": "SEA"},
+                    },
+                },
+            },
+        )
+
+        assert refreshed is not None
+        assert refreshed.raw_payload["liveData"] == live_data
+        assert refreshed.raw_payload["venue"]["name"] == "PNC Park"
+        assert refreshed.home_abbreviation == "PIT"
+        assert refreshed.away_abbreviation == "SEA"
+
+
 def test_open_meteo_parse_uses_nearest_forecast_hour() -> None:
     parsed = features._parse_open_meteo(
         {

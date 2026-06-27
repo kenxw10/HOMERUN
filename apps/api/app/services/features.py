@@ -634,7 +634,7 @@ def _upsert_game_from_schedule_payload(session: Session, payload: dict[str, obje
     )
     row.home_score = home.get("score")
     row.away_score = away.get("score")
-    row.raw_payload = payload
+    _merge_game_payload(row, payload)
     session.add(row)
     return row
 
