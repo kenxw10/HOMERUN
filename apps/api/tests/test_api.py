@@ -2984,7 +2984,10 @@ def test_dashboard_feature_status_uses_active_feature_source(monkeypatch) -> Non
                     source=features.FEATURE_VERSION,
                     captured_at=captured_at,
                     data_quality=Decimal("0.5000"),
-                    source_statuses={"park_weather": "partial"},
+                    source_statuses={
+                        "lineup": {"home": "available", "away": "available"},
+                        "park_weather": "partial",
+                    },
                     features={},
                 ),
             ]
@@ -2994,6 +2997,7 @@ def test_dashboard_feature_status_uses_active_feature_source(monkeypatch) -> Non
         summary = dashboard.dashboard_summary_from_db(session)
 
     assert summary.model_status.feature_completeness["park_weather"] == {"partial": 1}
+    assert summary.model_status.feature_completeness["lineup"] == {"available": 1}
     assert "PARK_WEATHER MISSING OR DEGRADED" not in summary.model_status.critical_module_warnings
 
 
@@ -3273,6 +3277,48 @@ def test_travel_feature_uses_current_venue_for_away_team() -> None:
     assert away_travel.features["travel_distance_miles"] > 1000
 
 
+def test_travel_feature_does_not_use_away_home_coordinates_for_unknown_road_venue() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        previous = MlbGame(
+            external_game_id="travel-previous-sea-home-unknown-road",
+            home_team="Seattle Mariners",
+            away_team="Boston Red Sox",
+            home_abbreviation="SEA",
+            away_abbreviation="BOS",
+            scheduled_start=datetime(2026, 6, 30, 23, 0, tzinfo=UTC),
+            status="Final",
+            home_score=4,
+            away_score=2,
+            raw_payload={"venue": {"id": 680, "name": "T-Mobile Park"}},
+        )
+        current = MlbGame(
+            external_game_id="travel-current-sea-at-unknown",
+            home_team="Oakland Athletics",
+            away_team="Seattle Mariners",
+            home_abbreviation="OAK",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+            status="scheduled",
+            raw_payload={"venue": {"id": 999, "name": "Unsupported Test Venue"}},
+        )
+        session.add_all([previous, current])
+        session.commit()
+        current_id = current.id
+
+        features.sync_mlb_features(session, date(2026, 7, 1))
+        away_travel = session.scalar(
+            select(TravelScheduleFeature)
+            .where(TravelScheduleFeature.mlb_game_id == current_id)
+            .where(TravelScheduleFeature.team_code == "SEA")
+        )
+
+    assert away_travel is not None
+    assert away_travel.features["travel_distance_miles"] is None
+
+
 def test_lineup_parser_extracts_starters_and_excludes_substitutes() -> None:
     payload = {
         "liveData": {
@@ -3500,6 +3546,24 @@ def test_calibration_applies_global_and_family_offsets() -> None:
 
     assert status == "trained_parameterized"
     assert calibrated == Decimal("0.510000")
+
+
+def test_family_offsets_are_residual_to_global_offset(monkeypatch) -> None:
+    monkeypatch.setenv("MODEL_MIN_FAMILY_SAMPLES_FOR_FAMILY_CALIBRATION", "2")
+    get_settings.cache_clear()
+    rows = [
+        ModelCandidate(
+            probability_calibrated=Decimal("0.950000"),
+            outcome="win",
+            market_family="full_game_winner",
+        )
+        for _index in range(3)
+    ]
+
+    offsets = modeling._fit_probability_offsets(rows)
+
+    assert offsets["__global__"] == Decimal("0.050000")
+    assert offsets["full_game_winner"] == Decimal("0.000000")
 
 
 def test_governance_trains_challenger_when_sample_threshold_met(monkeypatch) -> None:

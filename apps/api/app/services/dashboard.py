@@ -227,6 +227,8 @@ def _feature_status_summary(rows: list[MlbFeatureSnapshot]) -> tuple[dict[str, o
                 values = [str(value) for value in status.values()]
                 if values and all(value == "missing" for value in values):
                     aggregate = "missing"
+                elif values and all(value == "available" for value in values):
+                    aggregate = "available"
                 elif any(value == "available" for value in values):
                     aggregate = "partial"
                 else:

@@ -780,7 +780,8 @@ def _fit_probability_offsets(candidates: list[ModelCandidate]) -> dict[str, Deci
     if not rows:
         return {"__global__": Decimal("0")}
     avg_error = sum(outcome - probability for probability, outcome, _family in rows) / Decimal(len(rows))
-    offsets = {"__global__": _bounded(avg_error, Decimal("-0.075"), Decimal("0.075")).quantize(Decimal("0.000001"))}
+    global_offset = _bounded(avg_error, Decimal("-0.075"), Decimal("0.075")).quantize(Decimal("0.000001"))
+    offsets = {"__global__": global_offset}
     family_groups: dict[str, list[tuple[Decimal, Decimal]]] = {}
     for probability, outcome, family in rows:
         family_groups.setdefault(family, []).append((probability, outcome))
@@ -789,7 +790,8 @@ def _fit_probability_offsets(candidates: list[ModelCandidate]) -> dict[str, Deci
         if len(family_rows) < min_family_samples:
             continue
         family_error = sum(outcome - probability for probability, outcome in family_rows) / Decimal(len(family_rows))
-        offsets[family] = _bounded(family_error, Decimal("-0.050"), Decimal("0.050")).quantize(Decimal("0.000001"))
+        residual_error = family_error - global_offset
+        offsets[family] = _bounded(residual_error, Decimal("-0.050"), Decimal("0.050")).quantize(Decimal("0.000001"))
     return offsets
 
 
