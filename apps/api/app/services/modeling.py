@@ -137,6 +137,15 @@ def _activate_parameter_version(session: Session, version: ModelParameterVersion
 
 
 def get_or_create_active_parameter_version(session: Session) -> ModelParameterVersion:
+    active_version = session.scalar(
+        select(ModelParameterVersion)
+        .where(ModelParameterVersion.is_active.is_(True))
+        .order_by(ModelParameterVersion.promoted_at.desc(), ModelParameterVersion.id.desc())
+    )
+    if active_version is not None:
+        _deactivate_other_parameter_versions(session, active_version.id)
+        return active_version
+
     version = session.scalar(
         select(ModelParameterVersion).where(ModelParameterVersion.version_tag == BASELINE_PARAMETER_VERSION_TAG)
     )
@@ -163,10 +172,7 @@ def get_or_create_active_parameter_version(session: Session) -> ModelParameterVe
         _activate_parameter_version(session, version, now)
         return version
 
-    if not version.is_active:
-        _activate_parameter_version(session, version, utc_now())
-    else:
-        _deactivate_other_parameter_versions(session, version.id)
+    _activate_parameter_version(session, version, utc_now())
     return version
 
 
@@ -569,6 +575,7 @@ def _calibrate_probability(
     calibrated = Decimal("0.500000") + (raw_probability - Decimal("0.500000")) * (Decimal("1.0") - shrink)
     offsets = parameters.get("market_family_probability_offsets")
     if isinstance(offsets, dict):
+        calibrated += _decimal(offsets.get("__global__"), Decimal("0"))
         calibrated += _decimal(offsets.get(market_type), Decimal("0"))
     status = "trained_parameterized" if parameters.get("trained_from_samples") else "baseline_parameterized"
     return _bounded(calibrated, Decimal("0.020000"), Decimal("0.980000")).quantize(Decimal("0.000001")), status

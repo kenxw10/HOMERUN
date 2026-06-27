@@ -3331,6 +3331,71 @@ def test_model_parameter_version_creation() -> None:
     assert "kalshi_price" not in " ".join(version.parameters.keys()).lower()
 
 
+def test_active_parameter_version_preserves_promoted_challenger() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    promoted_at = datetime(2026, 7, 3, 12, 0, tzinfo=UTC)
+
+    with Session(engine) as session:
+        baseline = ModelParameterVersion(
+            version_tag=modeling.BASELINE_PARAMETER_VERSION_TAG,
+            model_family=modeling.MODEL_FAMILY,
+            role="inactive",
+            status="active",
+            is_active=False,
+            trained_at=promoted_at,
+            promoted_at=promoted_at,
+            parameters=modeling.DEFAULT_MODEL_PARAMETERS,
+        )
+        challenger = ModelParameterVersion(
+            version_tag="mature_mlb_run_distribution_v2_challenger_promoted",
+            model_family=modeling.MODEL_FAMILY,
+            role="champion",
+            status="active",
+            is_active=True,
+            trained_at=promoted_at,
+            promoted_at=promoted_at + timedelta(minutes=1),
+            parameters={
+                **modeling.DEFAULT_MODEL_PARAMETERS,
+                "trained_from_samples": True,
+                "market_family_probability_offsets": {"__global__": 0.01},
+            },
+        )
+        session.add_all([baseline, challenger])
+        session.commit()
+
+        active = modeling.get_or_create_active_parameter_version(session)
+        baseline_after = session.scalar(
+            select(ModelParameterVersion).where(
+                ModelParameterVersion.version_tag == modeling.BASELINE_PARAMETER_VERSION_TAG
+            )
+        )
+
+    assert active.version_tag == challenger.version_tag
+    assert active.is_active is True
+    assert baseline_after is not None
+    assert baseline_after.is_active is False
+
+
+def test_calibration_applies_global_and_family_offsets() -> None:
+    calibrated, status = modeling._calibrate_probability(
+        Decimal("0.500000"),
+        Decimal("0.8000"),
+        market_type="full_game_winner",
+        parameters={
+            **modeling.DEFAULT_MODEL_PARAMETERS,
+            "trained_from_samples": True,
+            "market_family_probability_offsets": {
+                "__global__": 0.02,
+                "full_game_winner": -0.01,
+            },
+        },
+    )
+
+    assert status == "trained_parameterized"
+    assert calibrated == Decimal("0.510000")
+
+
 def test_governance_trains_challenger_when_sample_threshold_met(monkeypatch) -> None:
     monkeypatch.setenv("MODEL_MIN_SAMPLES_TRAIN", "3")
     monkeypatch.setenv("MODEL_MIN_SAMPLES_CALIBRATE", "3")
