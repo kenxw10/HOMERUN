@@ -70,6 +70,8 @@ def _add_candidate_mapping(
     **overrides,
 ) -> MarketMapping:
     session.flush()
+    market.updated_at = candidates.utc_now()
+    session.add(market)
     values = {
         "mlb_game_id": game.id,
         "kalshi_market_id": market.id,
@@ -80,6 +82,27 @@ def _add_candidate_mapping(
     mapping = MarketMapping(**values)
     session.add(mapping)
     return mapping
+
+
+def _fixed_model_score(
+    probability: str = "0.800000",
+    *,
+    data_quality: str = "1.0000",
+    push_probability: str = "0.000000",
+) -> modeling.ModelScore:
+    calibrated = Decimal(probability)
+    return modeling.ModelScore(
+        probability=calibrated,
+        fair_value=calibrated.quantize(Decimal("0.0001")),
+        rationale={"test_model": "fixed"},
+        probability_raw=calibrated,
+        probability_calibrated=calibrated,
+        data_quality=Decimal(data_quality),
+        calibration_status="calibrated",
+        training_eligible=True,
+        training_exclusion_reason=None,
+        push_probability=Decimal(push_probability),
+    )
 
 
 def test_health_uses_safe_defaults() -> None:
@@ -242,6 +265,77 @@ def test_candidate_day_bounds_use_dashboard_timezone(monkeypatch) -> None:
     assert end == datetime(2026, 7, 2, 4, 0, tzinfo=UTC)
 
 
+def test_paper_candidate_engine_endpoint_uses_explicit_target_date(monkeypatch) -> None:
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+    monkeypatch.setattr(candidates, "utc_now", lambda: now)
+    engine = create_engine(
+        "sqlite+pysqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    SessionLocal = sessionmaker(bind=engine)
+
+    monkeypatch.setattr(
+        main_module,
+        "database_status",
+        lambda: {"ready": True, "configured": True, "dialect": "sqlite", "message": "ok"},
+    )
+    monkeypatch.setattr(main_module, "get_session_factory", lambda: SessionLocal)
+
+    with SessionLocal() as session:
+        target_game = MlbGame(
+            external_game_id="target-date-game",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 2, 23, 0, tzinfo=UTC),
+            status="scheduled",
+        )
+        other_game = MlbGame(
+            external_game_id="other-date-game",
+            home_team="New York Yankees",
+            away_team="Boston Red Sox",
+            home_abbreviation="NYY",
+            away_abbreviation="BOS",
+            scheduled_start=datetime(2026, 7, 3, 23, 0, tzinfo=UTC),
+            status="scheduled",
+        )
+        target_market = KalshiMarket(
+            kalshi_market_id="KX-TARGET-DATE",
+            ticker="KXMLBGAME-TARGET-DATE-PIT",
+            title="Will Pittsburgh win?",
+            status="open",
+            implied_yes_ask=Decimal("0.4000"),
+        )
+        other_market = KalshiMarket(
+            kalshi_market_id="KX-OTHER-DATE",
+            ticker="KXMLBGAME-OTHER-DATE-NYY",
+            title="Will New York win?",
+            status="open",
+            implied_yes_ask=Decimal("0.4000"),
+        )
+        session.add_all([target_game, other_game, target_market, other_market])
+        _add_candidate_mapping(session, target_game, target_market)
+        _add_candidate_mapping(session, other_game, other_market)
+        session.commit()
+
+    app.dependency_overrides[require_internal_api_key] = lambda: None
+    try:
+        response = client.post("/v1/run/paper-candidate-engine?target_date=2026-07-02")
+        payload = response.json()
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert payload["result"]["date"] == 20260702
+    assert payload["result"]["target_date"] == "2026-07-02"
+    assert payload["result"]["prediction_run_target_date"] == "2026-07-02"
+    assert payload["result"]["evaluated_game_count"] == 1
+    assert payload["result"]["candidates"] == 1
+
+
 def test_generate_candidates_preserves_traded_candidate_snapshot(monkeypatch) -> None:
     now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
     monkeypatch.setattr(candidates, "utc_now", lambda: now)
@@ -271,7 +365,7 @@ def test_generate_candidates_preserves_traded_candidate_snapshot(monkeypatch) ->
         _add_candidate_mapping(session, game, market)
         session.commit()
 
-        first_result = candidates.generate_candidates(session)
+        first_result = candidates.generate_candidates(session, target_date=date(2026, 7, 2))
         trade = session.scalar(select(PaperTrade).where(PaperTrade.market_ticker == "KXMLBGAME-PRESERVE-NYY"))
         assert trade is not None
         traded_candidate = session.get(ModelCandidate, trade.candidate_id)
@@ -280,10 +374,11 @@ def test_generate_candidates_preserves_traded_candidate_snapshot(monkeypatch) ->
         assert traded_candidate.executable_price == Decimal("0.4000")
 
         market.implied_yes_ask = Decimal("0.3500")
+        market.updated_at = now
         session.add(market)
         session.commit()
 
-        second_result = candidates.generate_candidates(session)
+        second_result = candidates.generate_candidates(session, target_date=date(2026, 7, 2))
         all_candidates = list(session.scalars(select(ModelCandidate).order_by(ModelCandidate.id.asc())))
         all_trades = list(session.scalars(select(PaperTrade)))
 
@@ -325,9 +420,12 @@ def test_generate_candidates_avoids_duplicate_open_trade_across_days(monkeypatch
         _add_candidate_mapping(session, game, market)
         session.commit()
 
-        first_result = candidates.generate_candidates(session)
+        first_result = candidates.generate_candidates(session, target_date=date(2026, 7, 3))
         current_time["now"] = datetime(2026, 7, 2, 16, 0, tzinfo=UTC)
-        second_result = candidates.generate_candidates(session)
+        market.updated_at = current_time["now"]
+        session.add(market)
+        session.commit()
+        second_result = candidates.generate_candidates(session, target_date=date(2026, 7, 3))
 
         all_candidates = list(session.scalars(select(ModelCandidate).order_by(ModelCandidate.id.asc())))
         all_trades = list(session.scalars(select(PaperTrade).order_by(PaperTrade.id.asc())))
@@ -374,6 +472,7 @@ def test_generate_candidates_avoids_duplicate_open_trade_across_mappings(monkeyp
             occurrence_datetime=datetime(2026, 7, 2, 18, 5, tzinfo=UTC),
             implied_yes_ask=Decimal("0.4000"),
         )
+        market.updated_at = now
         session.add_all([first_game, second_game, market])
         session.flush()
         session.add_all(
@@ -394,7 +493,7 @@ def test_generate_candidates_avoids_duplicate_open_trade_across_mappings(monkeyp
         )
         session.commit()
 
-        result = candidates.generate_candidates(session)
+        result = candidates.generate_candidates(session, target_date=date(2026, 7, 2))
         all_candidates = list(session.scalars(select(ModelCandidate).order_by(ModelCandidate.id.asc())))
         all_trades = list(session.scalars(select(PaperTrade).order_by(PaperTrade.id.asc())))
 
@@ -436,16 +535,17 @@ def test_generate_candidates_refreshes_existing_open_trade_price(monkeypatch) ->
         _add_candidate_mapping(session, game, market)
         session.commit()
 
-        first_result = candidates.generate_candidates(session)
+        first_result = candidates.generate_candidates(session, target_date=date(2026, 7, 3))
         trade = session.scalar(select(PaperTrade).where(PaperTrade.market_ticker == "KXMLBGAME-REFRESH-NYY"))
         assert trade is not None
         assert trade.current_price == Decimal("0.4000")
 
+        current_time["now"] = datetime(2026, 7, 2, 16, 0, tzinfo=UTC)
         market.implied_yes_ask = Decimal("0.3200")
+        market.updated_at = current_time["now"]
         session.add(market)
         session.commit()
-        current_time["now"] = datetime(2026, 7, 2, 16, 0, tzinfo=UTC)
-        second_result = candidates.generate_candidates(session)
+        second_result = candidates.generate_candidates(session, target_date=date(2026, 7, 3))
 
         refreshed_trade = session.get(PaperTrade, trade.id)
         all_trades = list(session.scalars(select(PaperTrade)))
@@ -564,7 +664,6 @@ def test_generate_candidates_preserves_zero_market_price(monkeypatch) -> None:
             status="open",
             occurrence_datetime=datetime(2026, 7, 1, 23, 10, tzinfo=UTC),
             implied_yes_ask=Decimal("0.0000"),
-            yes_ask=Decimal("0.4000"),
         )
         session.add_all([game, market])
         _add_candidate_mapping(session, game, market)
@@ -574,14 +673,14 @@ def test_generate_candidates_preserves_zero_market_price(monkeypatch) -> None:
         candidate = session.scalar(select(ModelCandidate))
         trade = session.scalar(select(PaperTrade))
 
-    assert result["paper_trades"] == 1
+    assert result["paper_trades"] == 0
     assert candidate is not None
-    assert candidate.executable_price == Decimal("0.0000")
-    assert candidate.expected_value == candidate.model_probability
-    assert candidate.decision == "paper_trade"
-    assert trade is not None
-    assert trade.entry_price == Decimal("0.0000")
-    assert trade.current_price == Decimal("0.0000")
+    assert candidate.market_price == Decimal("0.0000")
+    assert candidate.executable_price is None
+    assert candidate.fee_estimate is None
+    assert candidate.price_status == "non_executable"
+    assert candidate.decision == "no_trade_non_executable_price"
+    assert trade is None
 
 
 def test_generate_candidates_requires_executable_yes_ask(monkeypatch) -> None:
@@ -596,12 +695,14 @@ def test_generate_candidates_requires_executable_yes_ask(monkeypatch) -> None:
             external_game_id="no-ask-1",
             home_team="New York Yankees",
             away_team="Boston Red Sox",
+            home_abbreviation="NYY",
+            away_abbreviation="BOS",
             scheduled_start=datetime(2026, 7, 1, 23, 5, tzinfo=UTC),
             status="scheduled",
         )
         market = KalshiMarket(
             kalshi_market_id="KX-NO-ASK",
-            ticker="KXMLB-NO-ASK",
+            ticker="KXMLBGAME-NO-ASK-NYY",
             title="Will the New York Yankees win the game against the Boston Red Sox?",
             status="open",
             occurrence_datetime=datetime(2026, 7, 1, 23, 10, tzinfo=UTC),
@@ -619,10 +720,191 @@ def test_generate_candidates_requires_executable_yes_ask(monkeypatch) -> None:
 
     assert result["paper_trades"] == 0
     assert candidate is not None
-    assert candidate.market_price is None
+    assert candidate.market_price == Decimal("0.2800")
     assert candidate.executable_price is None
-    assert candidate.decision == "no_trade_missing_price"
+    assert candidate.price_status == "non_executable"
+    assert candidate.decision == "no_trade_non_executable_price"
     assert all_trades == []
+
+
+def test_generate_candidates_uses_yes_ask_before_orderbook_implied_price(monkeypatch) -> None:
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+    monkeypatch.setattr(candidates, "utc_now", lambda: now)
+    monkeypatch.setattr(candidates, "score_mature_candidate", lambda *args, **kwargs: _fixed_model_score("0.900000"))
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        game = MlbGame(
+            external_game_id="yes-ask-source",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+            status="scheduled",
+        )
+        market = KalshiMarket(
+            kalshi_market_id="KX-YES-ASK-SOURCE",
+            ticker="KXMLBGAME-YES-ASK-SOURCE-PIT",
+            title="Will Pittsburgh win?",
+            status="open",
+            yes_ask=Decimal("0.4200"),
+            implied_yes_ask=Decimal("0.3000"),
+        )
+        session.add_all([game, market])
+        _add_candidate_mapping(session, game, market)
+        session.commit()
+
+        candidates.generate_candidates(session)
+        candidate = session.scalar(select(ModelCandidate))
+
+    assert candidate is not None
+    assert candidate.executable_price == Decimal("0.4200")
+    assert candidate.executable_price_source == "yes_ask"
+    assert candidate.price_status == "fresh_executable"
+
+
+def test_generate_candidates_derives_yes_ask_from_best_no_bid(monkeypatch) -> None:
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+    monkeypatch.setattr(candidates, "utc_now", lambda: now)
+    monkeypatch.setattr(candidates, "score_mature_candidate", lambda *args, **kwargs: _fixed_model_score("0.900000"))
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        game = MlbGame(
+            external_game_id="inverse-no-bid",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+            status="scheduled",
+        )
+        market = KalshiMarket(
+            kalshi_market_id="KX-INVERSE-NO-BID",
+            ticker="KXMLBGAME-INVERSE-NO-BID-PIT",
+            title="Will Pittsburgh win?",
+            status="open",
+            best_no_bid=Decimal("0.6100"),
+        )
+        session.add_all([game, market])
+        _add_candidate_mapping(session, game, market)
+        session.commit()
+
+        candidates.generate_candidates(session)
+        candidate = session.scalar(select(ModelCandidate))
+
+    assert candidate is not None
+    assert candidate.executable_price == Decimal("0.3900")
+    assert candidate.executable_price_source == "orderbook_best_no_bid_inverse"
+
+
+def test_generate_candidates_blocks_stale_prices(monkeypatch) -> None:
+    monkeypatch.setenv("PAPER_MAX_PRICE_STALENESS_SECONDS", "900")
+    get_settings.cache_clear()
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+    monkeypatch.setattr(candidates, "utc_now", lambda: now)
+    monkeypatch.setattr(candidates, "score_mature_candidate", lambda *args, **kwargs: _fixed_model_score("0.900000"))
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    try:
+        with Session(engine) as session:
+            game = MlbGame(
+                external_game_id="stale-price",
+                home_team="Pittsburgh Pirates",
+                away_team="Seattle Mariners",
+                home_abbreviation="PIT",
+                away_abbreviation="SEA",
+                scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+                status="scheduled",
+            )
+            market = KalshiMarket(
+                kalshi_market_id="KX-STALE-PRICE",
+                ticker="KXMLBGAME-STALE-PRICE-PIT",
+                title="Will Pittsburgh win?",
+                status="open",
+                implied_yes_ask=Decimal("0.1000"),
+            )
+            session.add_all([game, market])
+            _add_candidate_mapping(session, game, market)
+            market.updated_at = now - timedelta(seconds=901)
+            session.add(market)
+            session.commit()
+
+            result = candidates.generate_candidates(session)
+            candidate = session.scalar(select(ModelCandidate))
+            trade = session.scalar(select(PaperTrade))
+    finally:
+        get_settings.cache_clear()
+
+    assert result["stale_price_count"] == 1
+    assert result["paper_trades"] == 0
+    assert candidate is not None
+    assert candidate.price_status == "stale"
+    assert candidate.decision == "no_trade_stale_price"
+    assert candidate.training_eligible is False
+    assert trade is None
+
+
+def test_generate_candidates_uses_fee_adjusted_ev_before_caps(monkeypatch) -> None:
+    monkeypatch.setenv("PAPER_MIN_NET_EV", "0.0500")
+    monkeypatch.setenv("PAPER_MIN_PROB_EDGE", "0.0300")
+    get_settings.cache_clear()
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+    monkeypatch.setattr(candidates, "utc_now", lambda: now)
+    monkeypatch.setattr(candidates, "score_mature_candidate", lambda *args, **kwargs: _fixed_model_score("0.550000"))
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    try:
+        with Session(engine) as session:
+            game = MlbGame(
+                external_game_id="fee-ev",
+                home_team="Pittsburgh Pirates",
+                away_team="Seattle Mariners",
+                home_abbreviation="PIT",
+                away_abbreviation="SEA",
+                scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+                status="scheduled",
+            )
+            market = KalshiMarket(
+                kalshi_market_id="KX-FEE-EV",
+                ticker="KXMLBGAME-FEE-EV-PIT",
+                title="Will Pittsburgh win?",
+                status="open",
+                implied_yes_ask=Decimal("0.5200"),
+            )
+            session.add_all([game, market])
+            _add_candidate_mapping(session, game, market)
+            session.commit()
+
+            result = candidates.generate_candidates(session)
+            candidate = session.scalar(select(ModelCandidate))
+            output = session.scalar(select(ModelPredictionOutput))
+            trade = session.scalar(select(PaperTrade))
+    finally:
+        get_settings.cache_clear()
+
+    assert result["paper_trades"] == 0
+    assert result["trades_blocked_by_edge_or_fee"] == 1
+    assert candidate is not None
+    assert candidate.expected_value == Decimal("0.030000")
+    assert candidate.fee_estimate is not None
+    assert candidate.fee_estimate > Decimal("0")
+    assert candidate.net_expected_value == candidate.expected_value - candidate.fee_estimate
+    assert candidate.probability_edge == Decimal("0.030000")
+    assert candidate.decision == "no_trade_fee_adjusted_ev_too_low"
+    assert output is not None
+    assert output.fee_estimate == candidate.fee_estimate
+    assert output.expected_value_net == candidate.net_expected_value
+    assert trade is None
 
 
 def test_generate_candidates_blocks_paused_markets(monkeypatch) -> None:
@@ -793,6 +1075,7 @@ def test_generate_candidates_preserves_confirmed_targeted_resolver_mapping(monke
             occurrence_datetime=datetime(2026, 6, 26, 22, 40, tzinfo=UTC),
             implied_yes_ask=Decimal("0.9000"),
         )
+        market.updated_at = now
         session.add_all([game, market])
         session.flush()
         session.add(
@@ -809,7 +1092,7 @@ def test_generate_candidates_preserves_confirmed_targeted_resolver_mapping(monke
         )
         session.commit()
 
-        result = candidates.generate_candidates(session)
+        result = candidates.generate_candidates(session, target_date=date(2026, 6, 26))
         mapping = session.scalar(select(MarketMapping))
         candidate = session.scalar(select(ModelCandidate))
         trade = session.scalar(select(PaperTrade))
@@ -1078,12 +1361,14 @@ def test_model_read_endpoints_require_api_key_when_configured(monkeypatch) -> No
         governance_response = client.get("/v1/model/governance/status")
         coverage_response = client.get("/v1/model/features/coverage?date=2026-07-01")
         predictions_response = client.get("/v1/model/predictions/today")
+        dated_predictions_response = client.get("/v1/model/predictions?date=2026-07-01")
     finally:
         get_settings.cache_clear()
 
     assert governance_response.status_code == 401
     assert coverage_response.status_code == 401
     assert predictions_response.status_code == 401
+    assert dated_predictions_response.status_code == 401
 
 
 def test_internal_sync_endpoints_fail_closed_in_production_without_api_key(monkeypatch) -> None:
@@ -2968,7 +3253,7 @@ def test_first_five_tie_markets_still_obey_normal_trade_gates(monkeypatch) -> No
                 ticker="KXMLBF5-26JUL011900SEAPIT-TIE",
                 title="Will the first five innings end tied?",
                 status="open",
-                implied_yes_ask=Decimal("0.0000"),
+                implied_yes_ask=Decimal("0.1000"),
                 market_family="first_five_winner",
                 market_type="first_five_winner",
                 selection_code="TIE",
@@ -3028,7 +3313,7 @@ def test_pr3c_trade_policy_counts_settled_trades_against_daily_caps(monkeypatch)
                 ticker="KXMLBGAME-SETTLED-CAP-PIT",
                 title="Cheap home winner",
                 status="open",
-                implied_yes_ask=Decimal("0.0000"),
+                implied_yes_ask=Decimal("0.1000"),
             )
             session.add_all([game, market])
             session.flush()
@@ -3075,6 +3360,75 @@ def test_pr3c_trade_policy_counts_settled_trades_against_daily_caps(monkeypatch)
     assert new_trades == []
     assert latest_candidate is not None
     assert latest_candidate.decision == "no_trade_game_cap"
+
+
+def test_line_selection_rejects_correlated_total_lines_before_caps(monkeypatch) -> None:
+    monkeypatch.setenv("PAPER_MAX_TRADES_PER_SLATE", "20")
+    monkeypatch.setenv("PAPER_MAX_TRADES_PER_GAME_FAMILY", "1")
+    monkeypatch.setenv("PAPER_MIN_NET_EV", "0")
+    monkeypatch.setenv("PAPER_MIN_PROB_EDGE", "0")
+    get_settings.cache_clear()
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+    monkeypatch.setattr(candidates, "utc_now", lambda: now)
+    monkeypatch.setattr(candidates, "score_mature_candidate", lambda *args, **kwargs: _fixed_model_score("0.900000"))
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    try:
+        with Session(engine) as session:
+            game = MlbGame(
+                external_game_id="line-selection-game",
+                home_team="Pittsburgh Pirates",
+                away_team="Seattle Mariners",
+                home_abbreviation="PIT",
+                away_abbreviation="SEA",
+                scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+                status="scheduled",
+            )
+            session.add(game)
+            session.flush()
+            for index, line in enumerate((Decimal("7.5000"), Decimal("8.5000"), Decimal("9.5000"))):
+                market = KalshiMarket(
+                    kalshi_market_id=f"KX-LINE-SELECTION-{index}",
+                    ticker=f"KXMLBTOTAL-LINE-SELECTION-{index}-OVER-{line}",
+                    title=f"Game total over {line}",
+                    status="open",
+                    implied_yes_ask=Decimal("0.1000") + (Decimal(index) * Decimal("0.0100")),
+                    market_family="full_game_total",
+                    market_type="full_game_total",
+                    line_value=line,
+                    over_under_side="over",
+                    inning_scope="full_game",
+                    settlement_rule_status="paper_supported",
+                )
+                session.add(market)
+                _add_candidate_mapping(
+                    session,
+                    game,
+                    market,
+                    mapping_status="confirmed",
+                    market_family="full_game_total",
+                    market_type="full_game_total",
+                    line_value=line,
+                    over_under_side="over",
+                    inning_scope="full_game",
+                    settlement_rule_status="paper_supported",
+                )
+            session.commit()
+
+            result = candidates.generate_candidates(session)
+            decisions = [candidate.decision for candidate in session.scalars(select(ModelCandidate))]
+            trades = list(session.scalars(select(PaperTrade)))
+    finally:
+        get_settings.cache_clear()
+
+    assert result["line_selection_groups_considered"] == 1
+    assert result["line_selection_candidates_kept"] == 1
+    assert result["line_selection_candidates_rejected"] == 2
+    assert decisions.count("paper_trade") == 1
+    assert decisions.count("no_trade_line_selection_not_best") == 2
+    assert len(trades) == 1
 
 
 def test_model_predictions_today_filters_by_prediction_run_target_date(monkeypatch) -> None:
@@ -3128,13 +3482,19 @@ def test_model_predictions_today_filters_by_prediction_run_target_date(monkeypat
     app.dependency_overrides[require_internal_api_key] = lambda: None
     try:
         response = client.get("/v1/model/predictions/today")
+        dated_response = client.get("/v1/model/predictions?date=2026-07-01")
         payload = response.json()
+        dated_payload = dated_response.json()
     finally:
         app.dependency_overrides.clear()
 
     assert response.status_code == 200
     assert payload["result"]["count"] == 1
     assert payload["result"]["items"][0]["decision_reason"] == "today"
+    assert dated_response.status_code == 200
+    assert dated_payload["result"]["date"] == "2026-07-01"
+    assert dated_payload["result"]["count"] == 1
+    assert dated_payload["result"]["items"][0]["decision_reason"] == "yesterday"
 
 
 def test_training_eligibility_repair_excludes_pre_pr3c_candidates() -> None:

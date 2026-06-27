@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
-from decimal import Decimal
+from decimal import Decimal, ROUND_CEILING
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -32,7 +32,6 @@ from app.services.modeling import MATURE_MODEL_TAG, get_or_create_mature_model_v
 from app.services.portfolio import create_balance_snapshot
 from app.time_utils import classify_time_bucket, ensure_aware_utc, get_dashboard_zone, utc_now
 
-ACTIVE_SLATE_LOOKAHEAD = timedelta(days=21)
 TRADABLE_MARKET_STATUSES = {"active", "open"}
 PLAYABLE_GAME_STATUSES = {"pre-game", "preview", "scheduled", "warmup"}
 SELECTION_REQUIRED_FAMILIES = {"full_game_winner", "full_game_spread", "first_five_winner", "first_five_spread"}
@@ -48,21 +47,114 @@ class TradeIntent:
     score: Decimal
 
 
-def _candidate_day_bounds(now: datetime) -> tuple[date, datetime, datetime]:
+@dataclass(frozen=True)
+class PriceContext:
+    market_price: Decimal | None
+    executable_price: Decimal | None
+    source: str | None
+    updated_at: datetime | None
+    staleness_seconds: int | None
+    status: str
+
+
+def _candidate_day_bounds(now: datetime, target_date: date | None = None) -> tuple[date, datetime, datetime]:
     dashboard_zone = get_dashboard_zone()
-    day = now.astimezone(dashboard_zone).date()
+    day = target_date or now.astimezone(dashboard_zone).date()
     day_start = ensure_aware_utc(datetime.combine(day, time.min, tzinfo=dashboard_zone))
     return day, day_start, day_start + timedelta(days=1)
 
 
-def _market_yes_price(market: KalshiMarket) -> Decimal | None:
-    for value in (
-        market.implied_yes_ask,
-        market.yes_ask,
-    ):
-        if value is not None:
-            return value
-    return None
+def _eastern_date(value: datetime) -> date:
+    return ensure_aware_utc(value).astimezone(get_dashboard_zone()).date()
+
+
+def _quantized(value: Decimal, places: str = "0.000001") -> Decimal:
+    return value.quantize(Decimal(places))
+
+
+def _is_executable_price(value: Decimal | None) -> bool:
+    return value is not None and Decimal("0") < value < Decimal("1")
+
+
+def _market_price_timestamp(market: KalshiMarket, now: datetime) -> datetime:
+    value = market.updated_at or now
+    return ensure_aware_utc(value)
+
+
+def _market_yes_price(market: KalshiMarket, now: datetime | None = None) -> Decimal | None:
+    return _market_yes_price_context(market, now or utc_now()).executable_price
+
+
+def _market_yes_price_context(market: KalshiMarket, now: datetime) -> PriceContext:
+    settings = get_settings()
+    updated_at = _market_price_timestamp(market, now)
+    staleness = max(0, int((ensure_aware_utc(now) - updated_at).total_seconds()))
+
+    candidates: tuple[tuple[str, Decimal | None], ...] = (
+        ("yes_ask", market.yes_ask),
+        ("orderbook_implied_yes_ask", market.implied_yes_ask),
+        ("orderbook_best_no_bid_inverse", (Decimal("1.0000") - market.best_no_bid) if market.best_no_bid is not None else None),
+    )
+    for source, value in candidates:
+        if value is None:
+            continue
+        price = value.quantize(Decimal("0.0001"))
+        if not _is_executable_price(price):
+            return PriceContext(price, None, source, updated_at, staleness, "non_executable")
+        if staleness > settings.paper_max_price_staleness_seconds:
+            return PriceContext(price, None, source, updated_at, staleness, "stale")
+        return PriceContext(price, price, source, updated_at, staleness, "fresh_executable")
+
+    if market.last_price is not None:
+        price = market.last_price.quantize(Decimal("0.0001"))
+        source = "last_price_fallback"
+        if settings.paper_allow_last_price_fallback_for_trade and _is_executable_price(price):
+            status = "fresh_executable" if staleness <= settings.paper_max_price_staleness_seconds else "stale"
+            executable = price if status == "fresh_executable" else None
+            return PriceContext(price, executable, source, updated_at, staleness, status)
+        return PriceContext(price, None, source, updated_at, staleness, "non_executable")
+
+    return PriceContext(None, None, None, updated_at, staleness, "missing")
+
+
+def _round_up(value: Decimal, step: Decimal) -> Decimal:
+    if value <= Decimal("0"):
+        return Decimal("0.000000")
+    return ((value / step).to_integral_value(rounding=ROUND_CEILING) * step).quantize(Decimal("0.000001"))
+
+
+def _fee_rounding_step() -> Decimal:
+    mode = get_settings().kalshi_fee_rounding_mode.strip().lower()
+    if mode == "cent":
+        return Decimal("0.01")
+    return Decimal("0.0001")
+
+
+def _estimate_trade_fee(price: Decimal | None, quantity: int) -> Decimal | None:
+    settings = get_settings()
+    if not _is_executable_price(price):
+        return None
+    raw_fee = settings.kalshi_trade_fee_rate * Decimal(quantity) * price * (Decimal("1") - price)
+    return _round_up(raw_fee, _fee_rounding_step())
+
+
+def _expected_values(
+    probability: Decimal | None,
+    price: Decimal | None,
+    quantity: int,
+) -> tuple[Decimal | None, Decimal | None, Decimal | None, Decimal | None]:
+    if probability is None or not _is_executable_price(price):
+        return None, None, None, None
+    fee = _estimate_trade_fee(price, quantity)
+    if fee is None:
+        return None, None, None, None
+    qty = Decimal(quantity)
+    # Expanded for auditability: q * (P(win) * payout_profit - P(loss) * stake).
+    gross = qty * ((probability * (Decimal("1") - price)) - ((Decimal("1") - probability) * price))
+    gross = _quantized(gross)
+    edge = _quantized(probability - price)
+    net = _quantized(gross - fee)
+    return gross, fee, net, edge
 
 
 def _market_classification_text(market: KalshiMarket) -> str:
@@ -119,10 +211,14 @@ def _base_decision(
     game: MlbGame,
     market: KalshiMarket,
     market_type: str,
+    target_date: date,
     minutes_to_start: int,
-    price: Decimal | None,
+    price_context: PriceContext,
     probability: Decimal | None,
+    gross_ev: Decimal | None,
+    fee_estimate: Decimal | None,
     net_ev: Decimal | None,
+    probability_edge: Decimal | None,
     data_quality: Decimal | None,
     calibration_status: str | None,
     push_probability: Decimal | None,
@@ -139,8 +235,8 @@ def _base_decision(
         return "no_trade_parse_uncertain"
     if minutes_to_start <= 0:
         return "no_trade_game_started"
-    if price is None:
-        return "no_trade_missing_price"
+    if _eastern_date(game.scheduled_start) != target_date:
+        return "no_trade_wrong_target_date"
     if market.status.strip().lower() not in TRADABLE_MARKET_STATUSES:
         return "no_trade_market_closed"
     selection_code = (mapping.selection_code or market.selection_code or "").upper()
@@ -152,17 +248,26 @@ def _base_decision(
         and not _has_trusted_candidate_selection(mapping, game, market)
     ):
         return "no_trade_untrusted_selection"
+    if price_context.status == "missing":
+        return "no_trade_missing_price"
+    if price_context.status == "stale":
+        return "no_trade_stale_price"
+    if price_context.status != "fresh_executable":
+        return "no_trade_non_executable_price"
     if data_quality is None or data_quality < settings.paper_min_data_quality:
         return "no_trade_low_data_quality"
     if push_probability is not None and push_probability > Decimal("0") and market_type.endswith(("spread", "total")):
         return "no_trade_push_possible"
     if probability is None:
         return "no_trade_missing_probability"
-    probability_edge = probability - price
-    if net_ev is None or net_ev < settings.paper_min_net_ev:
+    if gross_ev is None or gross_ev <= Decimal("0"):
         return "no_trade_edge_too_low"
-    if probability_edge < settings.paper_min_prob_edge:
+    if fee_estimate is None:
+        return "no_trade_missing_fee_estimate"
+    if probability_edge is None or probability_edge < settings.paper_min_prob_edge:
         return "no_trade_probability_edge_low"
+    if net_ev is None or net_ev < settings.paper_min_net_ev:
+        return "no_trade_fee_adjusted_ev_too_low"
     if settings.paper_require_calibrated_for_trade and calibration_status != "calibrated":
         return "no_trade_uncalibrated_probability"
     if not settings.paper_candidate_engine_enabled:
@@ -172,24 +277,32 @@ def _base_decision(
     return "candidate_only"
 
 
-def _today_trade_counts(
+def _slate_trade_counts(
     session: Session,
+    target_date: date,
     start: datetime,
     end: datetime,
 ) -> tuple[int, dict[int, int], dict[str, int], set[tuple[int, str]], set[str]]:
     rows = list(
         session.execute(
-            select(PaperTrade, ModelCandidate)
+            select(PaperTrade, ModelCandidate, MlbGame)
             .outerjoin(ModelCandidate, PaperTrade.candidate_id == ModelCandidate.id)
-            .where(PaperTrade.entry_time >= start)
-            .where(PaperTrade.entry_time < end)
+            .outerjoin(MlbGame, ModelCandidate.mlb_game_id == MlbGame.id)
+            .where(
+                (ModelCandidate.target_date == target_date)
+                | (
+                    (ModelCandidate.target_date.is_(None))
+                    & (MlbGame.scheduled_start >= start)
+                    & (MlbGame.scheduled_start < end)
+                )
+            )
         )
     )
     game_counts: dict[int, int] = {}
     family_counts: dict[str, int] = {}
     game_family_pairs: set[tuple[int, str]] = set()
     market_tickers: set[str] = set()
-    for trade, candidate in rows:
+    for trade, candidate, _game in rows:
         market_tickers.add(trade.market_ticker)
         if candidate and candidate.mlb_game_id is not None:
             game_counts[candidate.mlb_game_id] = game_counts.get(candidate.mlb_game_id, 0) + 1
@@ -211,14 +324,53 @@ def _trade_rank_score(candidate: ModelCandidate) -> Decimal:
     return (ev * Decimal("10")) + data_quality + probability
 
 
+def _apply_line_selection(intents: list[TradeIntent]) -> tuple[list[TradeIntent], dict[str, int]]:
+    settings = get_settings()
+    counts = {
+        "line_selection_groups_considered": 0,
+        "line_selection_candidates_kept": 0,
+        "line_selection_candidates_rejected": 0,
+    }
+    if not intents:
+        return [], counts
+
+    grouped: dict[tuple[date | None, int | None, str], list[TradeIntent]] = {}
+    for intent in intents:
+        family = intent.candidate.market_family or "unknown"
+        key = (intent.candidate.target_date, intent.candidate.mlb_game_id, family)
+        grouped.setdefault(key, []).append(intent)
+
+    selected: list[TradeIntent] = []
+    for group in grouped.values():
+        counts["line_selection_groups_considered"] += 1
+        ranked = sorted(group, key=lambda item: item.score, reverse=True)
+        family = ranked[0].candidate.market_family or "unknown"
+        limit = max(settings.paper_max_trades_per_game_family, 1)
+        if not settings.paper_allow_multiple_lines_per_game_family:
+            limit = 1
+        if family == "first_five_winner" and not settings.paper_allow_multiple_f5_winner_outcomes:
+            limit = 1
+        kept = ranked[:limit]
+        selected.extend(kept)
+        counts["line_selection_candidates_kept"] += len(kept)
+        for rejected in ranked[limit:]:
+            rejected.candidate.decision = "no_trade_line_selection_not_best"
+            counts["line_selection_candidates_rejected"] += 1
+
+    return selected, counts
+
+
 def _apply_trade_caps(
     session: Session,
     intents: list[TradeIntent],
+    target_date: date,
     day_start: datetime,
     day_end: datetime,
 ) -> tuple[list[TradeIntent], dict[str, int]]:
     settings = get_settings()
-    existing_slate, game_counts, family_counts, game_family_pairs, market_tickers = _today_trade_counts(session, day_start, day_end)
+    existing_slate, game_counts, family_counts, game_family_pairs, market_tickers = _slate_trade_counts(
+        session, target_date, day_start, day_end
+    )
     open_positions = _open_position_count(session)
     selected: list[TradeIntent] = []
     cap_counts = {
@@ -261,10 +413,31 @@ def _apply_trade_caps(
     return selected, cap_counts
 
 
-def generate_candidates(session: Session) -> dict[str, object]:
+def _avg_decimal(values: list[Decimal]) -> float | None:
+    if not values:
+        return None
+    return float(sum(values) / Decimal(len(values)))
+
+
+def _max_decimal(values: list[Decimal]) -> float | None:
+    if not values:
+        return None
+    return float(max(values))
+
+
+def _zero_trade_reason(decision_counts: dict[str, int]) -> str | None:
+    if not decision_counts:
+        return "no_candidates_evaluated"
+    blocked = {reason: count for reason, count in decision_counts.items() if reason != "paper_trade"}
+    if not blocked:
+        return None
+    return max(blocked.items(), key=lambda item: item[1])[0]
+
+
+def generate_candidates(session: Session, target_date: date | None = None) -> dict[str, object]:
     settings = get_settings()
     now = utc_now()
-    day, day_start, day_end = _candidate_day_bounds(now)
+    day, day_start, day_end = _candidate_day_bounds(now, target_date)
     created_or_updated = 0
     paper_trades = 0
     model_version = get_or_create_mature_model_version(session)
@@ -278,11 +451,20 @@ def generate_candidates(session: Session) -> dict[str, object]:
             "paper_max_trades_per_slate": settings.paper_max_trades_per_slate,
             "paper_max_trades_per_game": settings.paper_max_trades_per_game,
             "paper_max_trades_per_market_family": settings.paper_max_trades_per_market_family,
+            "paper_max_trades_per_game_family": settings.paper_max_trades_per_game_family,
             "paper_max_open_positions": settings.paper_max_open_positions,
             "paper_min_net_ev": float(settings.paper_min_net_ev),
             "paper_min_prob_edge": float(settings.paper_min_prob_edge),
             "paper_min_data_quality": float(settings.paper_min_data_quality),
             "paper_require_calibrated_for_trade": settings.paper_require_calibrated_for_trade,
+            "paper_max_price_staleness_seconds": settings.paper_max_price_staleness_seconds,
+            "paper_allow_last_price_fallback_for_trade": settings.paper_allow_last_price_fallback_for_trade,
+            "paper_allow_multiple_lines_per_game_family": settings.paper_allow_multiple_lines_per_game_family,
+            "paper_allow_multiple_f5_winner_outcomes": settings.paper_allow_multiple_f5_winner_outcomes,
+            "kalshi_trade_fee_rate": float(settings.kalshi_trade_fee_rate),
+            "kalshi_fee_estimate_mode": settings.kalshi_fee_estimate_mode,
+            "kalshi_fee_rounding_mode": settings.kalshi_fee_rounding_mode,
+            "kalshi_assume_taker": settings.kalshi_assume_taker,
         },
     )
     session.add(prediction_run)
@@ -295,11 +477,15 @@ def generate_candidates(session: Session) -> dict[str, object]:
         .where(MarketMapping.mapping_status.in_(["candidate", "confirmed", "needs_review"]))
         .where(func.lower(MlbGame.status).in_(PLAYABLE_GAME_STATUSES))
         .where(MlbGame.scheduled_start > now)
-        .where(MlbGame.scheduled_start < now + ACTIVE_SLATE_LOOKAHEAD)
+        .where(MlbGame.scheduled_start >= day_start)
+        .where(MlbGame.scheduled_start < day_end)
     ).all()
 
     trade_intents: list[TradeIntent] = []
     evaluated_candidates: list[ModelCandidate] = []
+    outputs_by_candidate_id: dict[int, ModelPredictionOutput] = {}
+    stale_price_count = 0
+    non_executable_price_count = 0
 
     for mapping, game, market in mappings:
         minutes_to_start = int((ensure_aware_utc(game.scheduled_start) - now).total_seconds() / 60)
@@ -309,7 +495,8 @@ def generate_candidates(session: Session) -> dict[str, object]:
             or market.market_type
             or market_type_from_ticker(market.ticker, infer_market_type(_market_classification_text(market)))
         )
-        price = _market_yes_price(market)
+        price_context = _market_yes_price_context(market, now)
+        price = price_context.executable_price
         contract_side = "yes"
         features = build_feature_snapshot(game, market, mapping, session=session, now=now)
         labels = contract_labels(
@@ -326,18 +513,34 @@ def generate_candidates(session: Session) -> dict[str, object]:
         )
         probability = model_score.probability_calibrated or model_score.probability
         fair_value = model_score.fair_value
-        gross_ev = (probability - price).quantize(Decimal("0.000001")) if price is not None else None
-        fee = Decimal("0.000000")
-        net_ev = (gross_ev - fee).quantize(Decimal("0.000001")) if gross_ev is not None else None
+        gross_ev, fee, net_ev, probability_edge = _expected_values(
+            probability, price, settings.default_paper_contracts
+        )
+        if price_context.status == "stale":
+            stale_price_count += 1
+        elif price_context.status not in {"fresh_executable", "missing"}:
+            non_executable_price_count += 1
+        market_context = features.get("market_context")
+        if isinstance(market_context, dict):
+            market_context["executable_price"] = float(price) if price is not None else None
+            market_context["executable_price_source"] = price_context.source
+            market_context["market_price"] = float(price_context.market_price) if price_context.market_price is not None else None
+            market_context["price_status"] = price_context.status
+            market_context["price_staleness_seconds"] = price_context.staleness_seconds
+            market_context["fee_estimate"] = float(fee) if fee is not None else None
         decision = _base_decision(
             mapping,
             game,
             market,
             market_type,
+            day,
             minutes_to_start,
-            price,
+            price_context,
             probability,
+            gross_ev,
+            fee,
             net_ev,
+            probability_edge,
             model_score.data_quality,
             model_score.calibration_status,
             model_score.push_probability,
@@ -348,8 +551,7 @@ def generate_candidates(session: Session) -> dict[str, object]:
                 select(ModelCandidate)
                 .where(ModelCandidate.mapping_id == mapping.id)
                 .where(ModelCandidate.time_bucket == bucket)
-                .where(ModelCandidate.evaluated_at >= day_start)
-                .where(ModelCandidate.evaluated_at < day_end)
+                .where(ModelCandidate.target_date == day)
                 .order_by(ModelCandidate.evaluated_at.desc(), ModelCandidate.id.desc())
             )
         )
@@ -403,11 +605,17 @@ def generate_candidates(session: Session) -> dict[str, object]:
         candidate.probability_raw = model_score.probability_raw
         candidate.probability_calibrated = probability
         candidate.fair_value = fair_value
-        candidate.market_price = price
+        candidate.market_price = price_context.market_price
         candidate.executable_price = price
         candidate.expected_value = gross_ev
         candidate.fee_estimate = fee
         candidate.net_expected_value = net_ev
+        candidate.probability_edge = probability_edge
+        candidate.target_date = day
+        candidate.executable_price_source = price_context.source
+        candidate.market_price_updated_at = price_context.updated_at
+        candidate.price_staleness_seconds = price_context.staleness_seconds
+        candidate.price_status = price_context.status
         candidate.market_type = market_type
         candidate.time_bucket = bucket
         candidate.time_to_start_minutes = minutes_to_start
@@ -417,6 +625,21 @@ def generate_candidates(session: Session) -> dict[str, object]:
         candidate.feature_version = FEATURE_VERSION
         candidate.training_eligible = model_score.training_eligible
         candidate.training_exclusion_reason = model_score.training_exclusion_reason
+        if _eastern_date(game.scheduled_start) != day:
+            candidate.training_eligible = False
+            candidate.training_exclusion_reason = "target_date_mismatch"
+        elif minutes_to_start <= 0:
+            candidate.training_eligible = False
+            candidate.training_exclusion_reason = "candidate_after_game_start"
+        elif price_context.status != "fresh_executable":
+            candidate.training_eligible = False
+            candidate.training_exclusion_reason = f"price_context_{price_context.status}"
+        elif fee is None:
+            candidate.training_eligible = False
+            candidate.training_exclusion_reason = "missing_fee_estimate"
+        elif decision == "no_trade_mapping_uncertain":
+            candidate.training_eligible = False
+            candidate.training_exclusion_reason = "mapping_uncertain"
         candidate.data_quality = model_score.data_quality
         candidate.calibration_status = model_score.calibration_status
         candidate.scoring_rationale = model_score.rationale
@@ -452,12 +675,39 @@ def generate_candidates(session: Session) -> dict[str, object]:
             probability_raw=candidate.probability_raw,
             probability_calibrated=candidate.probability_calibrated,
             fair_value=candidate.fair_value,
+            executable_price=candidate.executable_price,
+            expected_value_gross=candidate.expected_value,
+            fee_estimate=candidate.fee_estimate,
+            expected_value_net=candidate.net_expected_value,
+            probability_edge=candidate.probability_edge,
+            executable_price_source=candidate.executable_price_source,
+            price_status=candidate.price_status,
             data_quality=candidate.data_quality,
             calibration_status=candidate.calibration_status,
             decision_reason=decision,
-            raw_output=model_score.rationale,
+            raw_output={
+                **model_score.rationale,
+                "target_date": day.isoformat(),
+                "price_context": {
+                    "market_price": float(price_context.market_price) if price_context.market_price is not None else None,
+                    "executable_price": float(price) if price is not None else None,
+                    "source": price_context.source,
+                    "updated_at": price_context.updated_at.isoformat() if price_context.updated_at else None,
+                    "staleness_seconds": price_context.staleness_seconds,
+                    "status": price_context.status,
+                },
+                "fee_context": {
+                    "fee_estimate": float(fee) if fee is not None else None,
+                    "fee_rate": float(settings.kalshi_trade_fee_rate),
+                    "fee_estimate_mode": settings.kalshi_fee_estimate_mode,
+                    "fee_rounding_mode": settings.kalshi_fee_rounding_mode,
+                    "assume_taker": settings.kalshi_assume_taker,
+                    "quantity": settings.default_paper_contracts,
+                },
+            },
         )
         session.add(output)
+        outputs_by_candidate_id[candidate.id] = output
 
         if decision == "eligible_for_paper_trade" and price is not None:
             trade_intents.append(
@@ -471,15 +721,18 @@ def generate_candidates(session: Session) -> dict[str, object]:
                 )
             )
 
-    selected_trades, cap_counts = _apply_trade_caps(session, trade_intents, day_start, day_end)
-    session.flush()
+    line_selected_trades, line_selection_counts = _apply_line_selection(trade_intents)
     for intent in trade_intents:
-        output = session.scalar(
-            select(ModelPredictionOutput)
-            .where(ModelPredictionOutput.candidate_id == intent.candidate.id)
-            .where(ModelPredictionOutput.prediction_run_id == prediction_run.id)
-            .limit(1)
-        )
+        output = outputs_by_candidate_id.get(intent.candidate.id)
+        if output is not None:
+            output.decision_reason = intent.candidate.decision
+            session.add(output)
+        session.add(intent.candidate)
+
+    selected_trades, cap_counts = _apply_trade_caps(session, line_selected_trades, day, day_start, day_end)
+    session.flush()
+    for intent in line_selected_trades:
+        output = outputs_by_candidate_id.get(intent.candidate.id)
         if output is not None:
             output.decision_reason = intent.candidate.decision
             session.add(output)
@@ -490,12 +743,7 @@ def generate_candidates(session: Session) -> dict[str, object]:
         if existing_trade is not None:
             candidate.decision = "candidate_only_existing_trade"
             session.add(candidate)
-            output = session.scalar(
-                select(ModelPredictionOutput)
-                .where(ModelPredictionOutput.candidate_id == candidate.id)
-                .where(ModelPredictionOutput.prediction_run_id == prediction_run.id)
-                .limit(1)
-            )
+            output = outputs_by_candidate_id.get(candidate.id)
             if output is not None:
                 output.decision_reason = candidate.decision
                 session.add(output)
@@ -523,12 +771,7 @@ def generate_candidates(session: Session) -> dict[str, object]:
             training_eligible=candidate.training_eligible,
         )
         session.add(trade)
-        output = session.scalar(
-            select(ModelPredictionOutput)
-            .where(ModelPredictionOutput.candidate_id == candidate.id)
-            .where(ModelPredictionOutput.prediction_run_id == prediction_run.id)
-            .limit(1)
-        )
+        output = outputs_by_candidate_id.get(candidate.id)
         if output is not None:
             output.trade_rank = rank
             output.decision_reason = "paper_trade"
@@ -540,6 +783,19 @@ def generate_candidates(session: Session) -> dict[str, object]:
     for candidate in evaluated_candidates:
         decision = candidate.decision or "unknown"
         decision_counts[decision] = decision_counts.get(decision, 0) + 1
+    edge_values = [candidate.probability_edge for candidate in evaluated_candidates if candidate.probability_edge is not None]
+    net_ev_values = [
+        candidate.net_expected_value for candidate in evaluated_candidates if candidate.net_expected_value is not None
+    ]
+    fee_values = [candidate.fee_estimate for candidate in evaluated_candidates if candidate.fee_estimate is not None]
+    edge_or_fee_reasons = {
+        "no_trade_edge_too_low",
+        "no_trade_fee_adjusted_ev_too_low",
+        "no_trade_probability_edge_low",
+        "no_trade_missing_fee_estimate",
+    }
+    trades_blocked_by_edge_or_fee = sum(decision_counts.get(reason, 0) for reason in edge_or_fee_reasons)
+    trades_blocked_by_caps = sum(cap_counts.values())
 
     snapshot = create_balance_snapshot(session, source="candidate_engine")
     prediction_run.completed_at = now
@@ -549,20 +805,53 @@ def generate_candidates(session: Session) -> dict[str, object]:
     prediction_run.summary = {
         "decision_counts": decision_counts,
         "cap_counts": cap_counts,
+        "line_selection": line_selection_counts,
         "eligible_trade_intents": len(trade_intents),
+        "trade_eligible_after_line_selection": len(line_selected_trades),
+        "trade_eligible_before_caps": len(line_selected_trades),
+        "trades_blocked_by_edge_or_fee": trades_blocked_by_edge_or_fee,
+        "trades_blocked_by_line_selection": line_selection_counts["line_selection_candidates_rejected"],
+        "stale_price_count": stale_price_count,
         "paper_trades": paper_trades,
     }
     session.add(prediction_run)
     session.commit()
+    zero_trade_reason = _zero_trade_reason(decision_counts) if paper_trades == 0 else None
     return {
         "date": int(day.strftime("%Y%m%d")),
+        "target_date": day.isoformat(),
+        "current_eastern_date": _eastern_date(now).isoformat(),
         "candidates": created_or_updated,
+        "candidates_evaluated": created_or_updated,
+        "candidate_only_count": sum(count for reason, count in decision_counts.items() if reason.startswith("candidate_only")),
+        "evaluated_game_count": len({game.id for _mapping, game, _market in mappings}),
+        "mappings_considered": len(mappings),
         "paper_trades": paper_trades,
+        "trades_created": paper_trades,
         "model_version": model_version.version_tag,
         "feature_version": FEATURE_VERSION,
         "prediction_run_id": prediction_run.id,
+        "prediction_run_target_date": prediction_run.target_date.isoformat() if prediction_run.target_date else None,
         "snapshot_id": snapshot.id,
         "decision_counts": decision_counts,
         "cap_counts": cap_counts,
+        "trade_eligible_before_caps": len(line_selected_trades),
+        "trade_eligible_after_ev_filters": len(trade_intents),
+        "trade_eligible_after_line_selection": len(line_selected_trades),
+        "trades_blocked_by_caps": trades_blocked_by_caps,
+        "trades_blocked_by_edge_or_fee": trades_blocked_by_edge_or_fee,
+        "trades_blocked_by_line_selection": line_selection_counts["line_selection_candidates_rejected"],
+        "trades_blocked_by_line_selection_or_correlation": line_selection_counts["line_selection_candidates_rejected"]
+        + cap_counts.get("no_trade_correlated_market_cap", 0),
+        "stale_price_count": stale_price_count,
+        "non_executable_price_count": non_executable_price_count,
+        "line_selection_groups_considered": line_selection_counts["line_selection_groups_considered"],
+        "line_selection_candidates_kept": line_selection_counts["line_selection_candidates_kept"],
+        "line_selection_candidates_rejected": line_selection_counts["line_selection_candidates_rejected"],
+        "avg_probability_edge": _avg_decimal(edge_values),
+        "avg_expected_value_net": _avg_decimal(net_ev_values),
+        "max_expected_value_net": _max_decimal(net_ev_values),
+        "fee_estimate_avg": _avg_decimal(fee_values),
+        "zero_trade_reason": zero_trade_reason,
         "trade_policy": prediction_run.trade_policy,
     }

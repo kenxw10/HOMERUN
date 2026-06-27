@@ -43,7 +43,7 @@ From `apps/api`:
 ```powershell
 .\.venv\Scripts\python.exe -m app.jobs.mlb_schedule_sync
 .\.venv\Scripts\python.exe -m app.jobs.kalshi_market_sync
-.\.venv\Scripts\python.exe -m app.jobs.paper_candidate_engine
+.\.venv\Scripts\python.exe -m app.jobs.paper_candidate_engine 2026-06-27
 .\.venv\Scripts\python.exe -m app.jobs.mlb_results_sync
 .\.venv\Scripts\python.exe -m app.jobs.paper_settlement_sync
 .\.venv\Scripts\python.exe -m app.jobs.balance_snapshot
@@ -99,12 +99,13 @@ The backend also exposes these POST endpoints for controlled operational runs:
 - `POST /v1/sync/mlb-schedule`
 - `POST /v1/sync/mlb-results?target_date=YYYY-MM-DD`
 - `POST /v1/sync/kalshi-markets`
-- `POST /v1/run/paper-candidate-engine`
+- `POST /v1/run/paper-candidate-engine?target_date=YYYY-MM-DD`
 - `POST /v1/run/paper-settlement-sync?target_date=YYYY-MM-DD`
 - `POST /v1/run/balance-snapshot`
 - `POST /v1/run/model-governance`
 - `GET /v1/model/governance/status`
 - `GET /v1/model/features/coverage?date=YYYY-MM-DD`
+- `GET /v1/model/predictions?date=YYYY-MM-DD`
 - `GET /v1/model/predictions/today`
 - `POST /v1/sync/mlb-features?target_date=YYYY-MM-DD`
 - `POST /v1/run/model-feature-snapshot-backfill?target_date=YYYY-MM-DD`
@@ -130,7 +131,7 @@ After deploying PR 3c and running `alembic upgrade head`, validate in this order
 5. `GET /v1/kalshi/resolve-preview?date=YYYY-MM-DD` returns attempted `KXMLBGAME` event and market tickers for each MLB game, with `ok=true` even when individual games have no match warnings.
 6. `POST /v1/sync/kalshi-markets` returns a structured summary with `games_considered`, attempted ticker counts, mapping counts, and `errors` when upstream calls fail.
 7. `GET /v1/markets/today` shows mapped markets if matching Kalshi markets exist.
-8. `POST /v1/run/paper-candidate-engine` exits cleanly and creates candidates with `mature_mlb_run_distribution_v1` probabilities.
+8. `POST /v1/run/paper-candidate-engine?target_date=YYYY-MM-DD` exits cleanly, reports the same `target_date` and `prediction_run_target_date`, and creates candidates with `mature_mlb_run_distribution_v1` probabilities.
 9. `POST /v1/sync/mlb-results` updates completed games with scores/final status.
 10. `POST /v1/run/paper-settlement-sync` settles completed supported full-game winner paper trades.
 11. `POST /v1/run/balance-snapshot` creates a snapshot and `/v1/dashboard/summary` uses it for the portfolio chart.
@@ -141,7 +142,25 @@ After deploying PR 3c and running `alembic upgrade head`, validate in this order
 16. `POST /v1/run/market-family-discovery?target_date=YYYY-MM-DD` returns structured `by_family` output, attempted event/market ticker counts, exact/fallback/event-filter attempt counts, no-match counts, request/rate-limit metrics, and persists a finalized `market_family_discovery_runs` row even when no candidate markets are found.
 17. `GET /v1/market-families/discovery?date=YYYY-MM-DD` returns the latest finalized report with `run` not null after the POST succeeds.
 18. `POST /v1/sync/market-family-mappings?target_date=YYYY-MM-DD` promotes only parseable supported families to `paper_supported`; missing line/selection/settlement rows stay `needs_review`.
-19. `POST /v1/run/paper-candidate-engine` applies paper caps and leaves cap-rejected candidates as no-trade decisions.
+19. `POST /v1/run/paper-candidate-engine?target_date=YYYY-MM-DD` applies executable-price freshness, conservative fee-adjusted EV, probability-edge, line-selection, and paper caps in that order. Cap-rejected candidates stay no-trade decisions, and the response should show `trade_eligible_after_ev_filters` far below total candidates before caps are the dominant selector.
+
+PR3c hotfix production validation:
+
+1. Run the candidate engine with an explicit date:
+
+```powershell
+Invoke-RestMethod -Method Post -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-RAILWAY-API/v1/run/paper-candidate-engine?target_date=2026-06-27"
+```
+
+2. Confirm `result.target_date` is `2026-06-27`, `result.date` is `20260627`, and `result.prediction_run_target_date` is `2026-06-27`.
+3. Confirm `fee_estimate_avg`, `avg_expected_value_net`, `trade_eligible_after_ev_filters`, `line_selection_candidates_rejected`, `stale_price_count`, `decision_counts`, and `cap_counts` are present.
+4. Fetch the same slate's predictions:
+
+```powershell
+Invoke-RestMethod -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-RAILWAY-API/v1/model/predictions?date=2026-06-27"
+```
+
+5. Confirm normal executable candidates include `fee_estimate`, `expected_value_net`, `probability_edge`, `executable_price_source`, and `price_status`.
 20. `POST /v1/run/paper-settlement-sync` settles completed supported spread, total, and first-five paper trades when final scores/linescore are available; missing first-five linescore rows are skipped, not closed.
 21. `POST /v1/run/open-position-price-refresh` updates current marks and last mark timestamps for open paper positions only.
 22. The Vercel dashboard shows readable contract labels with the raw Kalshi ticker as secondary text.

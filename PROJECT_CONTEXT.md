@@ -335,7 +335,53 @@ Expected next PR scope:
 - PR3d should add the Railway cron/orchestration layer for the validated one-shot jobs, with stuck-run protection and operator monitoring.
 - PR4 should add only a live-readiness shell and risk controls while keeping live execution off by default.
 
-## 17. PR Change Log
+## 17. PR3c Hotfix - Date-Scoped Fee-Aware Trade Selection
+
+Production validation after PR3c confirmed that feature sync, governance, and mature prediction generation work structurally, but found two production issues:
+
+- `POST /v1/run/paper-candidate-engine?target_date=2026-06-27` could evaluate a future slate while reporting the current Eastern date in the prediction run.
+- Too many predictions could become trade-eligible before caps because EV used a zero fee and line/correlation selection was not strict enough before slate caps.
+
+The PR3c hotfix fixes this without enabling live trading:
+
+- Candidate generation accepts an explicit `target_date`; if omitted, it defaults to today's Eastern date.
+- Candidate generation evaluates only MLB games whose scheduled start falls on the evaluated Eastern target date.
+- `ModelPredictionRun.target_date`, candidate `target_date`, cap accounting, response diagnostics, and prediction-output queries now use the same evaluated slate date.
+- Added protected `GET /v1/model/predictions?date=YYYY-MM-DD`; `/v1/model/predictions/today` remains backward-compatible.
+- Added migration `0008_pr3c_fee_date_scope.py` for candidate and prediction-output diagnostics: target date, probability edge, executable price source, price staleness, price status, gross EV, conservative fee estimate, and net EV.
+- Paper EV now estimates conservative Kalshi fees with `KALSHI_TRADE_FEE_RATE * quantity * price * (1 - price)`, rounded upward by `KALSHI_FEE_ROUNDING_MODE`; this is paper-only until exact live fill fees are available.
+- YES buys use executable YES asks first, then orderbook-implied YES asks from the highest NO bid. Last price is saved as market context but does not allow trading unless explicitly enabled.
+- Zero, one-dollar, missing, stale, or non-executable prices save candidates for audit but block paper trades.
+- Trade eligibility now requires clean mapping/settlement metadata, game not started, matching target date, fresh executable price, data quality, probability edge, fee estimate, fee-adjusted net EV, and push-safe status before line selection or caps.
+- Line-selection now rejects correlated alternate lines before caps. Default policy keeps at most one trade per game/family and does not trade multiple first-five winner outcomes.
+- Slate, game, and family caps are scoped to the evaluated target date. Global open-position cap remains global.
+- Governance excludes stale/non-executable, missing-fee, after-start, and target-date-mismatched candidates from mature resolved sample counts.
+
+New configuration:
+
+- `KALSHI_TRADE_FEE_RATE=0.07`
+- `KALSHI_FEE_ESTIMATE_MODE=conservative`
+- `KALSHI_FEE_ROUNDING_MODE=centicent_or_cent_conservative`
+- `KALSHI_ASSUME_TAKER=true`
+- `PAPER_MAX_PRICE_STALENESS_SECONDS=900`
+- `PAPER_ALLOW_LAST_PRICE_FALLBACK_FOR_TRADE=false`
+- `PAPER_MAX_TRADES_PER_GAME_FAMILY=1`
+- `PAPER_ALLOW_MULTIPLE_LINES_PER_GAME_FAMILY=false`
+- `PAPER_ALLOW_MULTIPLE_F5_WINNER_OUTCOMES=false`
+
+Known limitations:
+
+- Fee modeling is conservative and configurable; it does not call a live order preview endpoint and does not require account credentials.
+- No cron is added in this PR.
+- No live order placement or live execution path is added.
+- No sportsbook, team-total, umpire, admin-page, or calendar work is added.
+
+Expected next PR scope:
+
+- PR3d should focus on paper-ops orchestration/cron only after this target-date and fee-aware selection path validates in production.
+- Continue using explicit target-date validation before enabling any scheduled candidate run.
+
+## 18. PR Change Log
 
 Every future PR must update this section with:
 
@@ -446,3 +492,14 @@ Every future PR must update this section with:
 - Updated the dashboard model quality panel with active model, feature version, calibration status, training samples, data quality, cap usage, and governance state.
 - Kept paper-first safety posture unchanged: no live orders, live trading disabled, kill switch enabled, no production credential requirement, no cron setup.
 - Validation performed: backend Ruff, backend pytest, backend compileall, Alembic head check, frontend lint, frontend typecheck, frontend build, and `git diff --check`.
+
+### PR3c Hotfix - Date-Scoped Fee-Aware Trade Selection
+
+- Added explicit `target_date` support to the paper candidate engine and date-specific prediction reads.
+- Added migration `0008_pr3c_fee_date_scope.py` for fee, edge, executable-price, stale-price, and target-date diagnostics.
+- Replaced zero-fee EV decisions with conservative configurable Kalshi fee estimates and fee-adjusted net EV.
+- Blocked stale, missing, zero, one-dollar, last-price-only, and otherwise non-executable prices from paper trading while still saving prediction/candidate rows for audit and learning.
+- Added pre-cap line/correlation selection so caps are a final guard rather than the primary selector.
+- Scoped slate/game/family caps to the evaluated target date while keeping open-position cap global.
+- Updated docs and validation steps for `POST /v1/run/paper-candidate-engine?target_date=YYYY-MM-DD` and `GET /v1/model/predictions?date=YYYY-MM-DD`.
+- Kept safety posture unchanged: paper trading only, live trading disabled, kill switch enabled, no live orders, no cron, no sportsbook/team-total/umpire/admin/calendar scope.
