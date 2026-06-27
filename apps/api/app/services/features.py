@@ -1567,6 +1567,8 @@ def _upsert_lineup(
         team_code=team_code,
         source=MLB_STATS_SOURCE,
     )
+    if not confirmed and not starters and row.confirmed and row.source_status == "available":
+        return row
     row.captured_at = captured_at
     row.source_status = status
     row.confirmed = confirmed
@@ -1710,6 +1712,12 @@ def _upsert_weather(
         venue_name=venue_name,
         source=OPEN_METEO_SOURCE,
     )
+    if (
+        not settings.feature_sync_enable_network_sources
+        and row.source_status == "available"
+        and row.venue_name == venue_name
+    ):
+        return row
     row.captured_at = captured_at
     row.forecast_time = ensure_aware_utc(game.scheduled_start)
     row.source_status = source_status

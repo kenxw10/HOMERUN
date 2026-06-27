@@ -17,6 +17,7 @@ from app.models import (
     CalibrationRun,
     FeatureSnapshot,
     KalshiMarket,
+    LineupSnapshot,
     MarketFamilyDiscoveryItem,
     MarketFamilyDiscoveryRun,
     MarketMapping,
@@ -32,6 +33,7 @@ from app.models import (
     Settlement,
     TrainingRun,
     TravelScheduleFeature,
+    WeatherSnapshot,
 )
 from app.jobs import market_family_discovery as market_family_discovery_job
 from app.jobs import mlb_feature_sync as mlb_feature_sync_job
@@ -3359,6 +3361,108 @@ def test_feature_sync_hydrates_final_games_for_backfill(monkeypatch) -> None:
         assert snapshot.source_statuses["starter_identity"] == {"home": "available", "away": "available"}
     finally:
         get_settings.cache_clear()
+
+
+def test_lineup_sync_preserves_confirmed_lineup_when_payload_lacks_boxscore() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    captured_at = datetime(2026, 7, 1, 20, 0, tzinfo=UTC)
+
+    players = {
+        f"ID{person_id}": {
+            "person": {"id": person_id, "fullName": f"Starter {slot}"},
+            "battingOrder": str(slot * 100),
+            "batSide": {"code": "R"},
+            "position": {"abbreviation": "CF"},
+        }
+        for slot, person_id in enumerate(range(101, 110), start=1)
+    }
+
+    with Session(engine) as session:
+        game = MlbGame(
+            external_game_id="lineup-preserve-confirmed",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+            status="Final",
+            raw_payload={
+                "venue": {"id": 31, "name": "PNC Park"},
+                "liveData": {"boxscore": {"teams": {"home": {"batters": list(range(101, 110)), "players": players}}}},
+            },
+        )
+        session.add(game)
+        session.flush()
+
+        features._upsert_lineup(session, game, "home", date(2026, 7, 1), captured_at)
+        game.raw_payload = {"venue": {"id": 31, "name": "PNC Park"}}
+        features._upsert_lineup(
+            session,
+            game,
+            "home",
+            date(2026, 7, 1),
+            datetime(2026, 7, 1, 21, 0, tzinfo=UTC),
+        )
+        row = session.scalar(select(LineupSnapshot).where(LineupSnapshot.mlb_game_id == game.id))
+
+    assert row is not None
+    assert row.confirmed is True
+    assert row.source_status == "available"
+    assert row.raw_payload == {"starter_count": 9}
+    assert len(row.features["starters"]) == 9
+
+
+def test_weather_sync_preserves_cached_forecast_when_network_disabled(monkeypatch) -> None:
+    monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "false")
+    get_settings.cache_clear()
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    captured_at = datetime(2026, 7, 1, 20, 0, tzinfo=UTC)
+
+    with Session(engine) as session:
+        game = MlbGame(
+            external_game_id="weather-preserve-cached",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+            status="scheduled",
+            raw_payload={"venue": {"id": 31, "name": "PNC Park"}},
+        )
+        session.add(game)
+        session.flush()
+        session.add(
+            WeatherSnapshot(
+                mlb_game_id=game.id,
+                target_date=date(2026, 7, 1),
+                venue_name="PNC Park",
+                captured_at=captured_at,
+                forecast_time=game.scheduled_start,
+                source=features.OPEN_METEO_SOURCE,
+                source_status="available",
+                confidence=Decimal("0.70"),
+                completeness=Decimal("0.70"),
+                stale=False,
+                features={"temperature_2m": 74, "wind_speed_10m": 8},
+                raw_payload={"cached": True},
+            )
+        )
+        session.flush()
+
+        features._upsert_weather(
+            session,
+            game,
+            date(2026, 7, 1),
+            datetime(2026, 7, 1, 21, 0, tzinfo=UTC),
+        )
+        row = session.scalar(select(WeatherSnapshot).where(WeatherSnapshot.mlb_game_id == game.id))
+
+    assert row is not None
+    assert row.source_status == "available"
+    assert row.features == {"temperature_2m": 74, "wind_speed_10m": 8}
+    assert row.raw_payload == {"cached": True}
 
 
 def test_open_meteo_base_url_tolerates_forecast_suffix(monkeypatch) -> None:
