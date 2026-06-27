@@ -125,9 +125,9 @@ def _round_up(value: Decimal, step: Decimal) -> Decimal:
 
 def _fee_rounding_step() -> Decimal:
     mode = get_settings().kalshi_fee_rounding_mode.strip().lower()
-    if mode == "cent":
-        return Decimal("0.01")
-    return Decimal("0.0001")
+    if mode in {"centicent", "centicent_only", "0.0001"}:
+        return Decimal("0.0001")
+    return Decimal("0.01")
 
 
 def _estimate_trade_fee(price: Decimal | None, quantity: int) -> Decimal | None:

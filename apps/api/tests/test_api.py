@@ -105,6 +105,17 @@ def _fixed_model_score(
     )
 
 
+def test_default_kalshi_fee_rounding_mode_rounds_up_to_cent(monkeypatch) -> None:
+    monkeypatch.delenv("KALSHI_FEE_ROUNDING_MODE", raising=False)
+    get_settings.cache_clear()
+
+    try:
+        assert candidates._fee_rounding_step() == Decimal("0.01")
+        assert candidates._estimate_trade_fee(Decimal("0.5000"), 1) == Decimal("0.020000")
+    finally:
+        get_settings.cache_clear()
+
+
 def test_health_uses_safe_defaults() -> None:
     response = client.get("/health")
 
