@@ -3756,6 +3756,24 @@ def test_open_meteo_base_url_tolerates_forecast_suffix(monkeypatch) -> None:
     assert captured["params"]["wind_speed_unit"] == "mph"
 
 
+def test_open_meteo_request_uses_local_forecast_date(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_get_json(_url: str, **kwargs):
+        captured["params"] = kwargs.get("params")
+        return {"hourly": {"time": []}}
+
+    monkeypatch.setattr(features, "get_json", fake_get_json)
+    features._fetch_open_meteo(
+        {"latitude": 40.4469, "longitude": -80.0057},
+        datetime(2026, 7, 2, 0, 10, tzinfo=UTC),
+    )
+
+    assert captured["params"]["timezone"] == "America/New_York"
+    assert captured["params"]["start_date"] == "2026-07-01"
+    assert captured["params"]["end_date"] == "2026-07-01"
+
+
 def test_open_meteo_parse_uses_nearest_forecast_hour() -> None:
     parsed = features._parse_open_meteo(
         {

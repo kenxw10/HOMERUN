@@ -1918,7 +1918,7 @@ def _upsert_weather(
 
 def _fetch_open_meteo(profile: dict[str, object], scheduled_start: datetime) -> dict[str, object]:
     settings = get_settings()
-    day = ensure_aware_utc(scheduled_start).date().isoformat()
+    day = ensure_aware_utc(scheduled_start).astimezone(get_dashboard_zone()).date().isoformat()
     base_url = settings.open_meteo_base_url.rstrip("/")
     forecast_url = base_url if base_url.endswith("/forecast") else f"{base_url}/forecast"
     return get_json(
