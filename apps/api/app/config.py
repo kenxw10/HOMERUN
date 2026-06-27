@@ -78,7 +78,7 @@ class Settings(BaseSettings):
         default="centicent_or_cent_conservative", alias="KALSHI_FEE_ROUNDING_MODE"
     )
     kalshi_assume_taker: bool = Field(default=True, alias="KALSHI_ASSUME_TAKER")
-    feature_sync_enable_network_sources: bool = Field(default=False, alias="FEATURE_SYNC_ENABLE_NETWORK_SOURCES")
+    feature_sync_enable_network_sources: bool = Field(default=True, alias="FEATURE_SYNC_ENABLE_NETWORK_SOURCES")
     open_meteo_base_url: str = Field(default="https://api.open-meteo.com/v1", alias="OPEN_METEO_BASE_URL")
     injury_provider_api_key: SecretStr | None = Field(default=None, alias="INJURY_PROVIDER_API_KEY")
     lineup_provider_api_key: SecretStr | None = Field(default=None, alias="LINEUP_PROVIDER_API_KEY")

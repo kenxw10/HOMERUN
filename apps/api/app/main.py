@@ -38,6 +38,7 @@ from app.services.market_family_mapping import latest_market_family_mapping_repo
 from app.services.features import (
     feature_coverage,
     feature_detail,
+    source_status_report,
     sync_mlb_bullpen_features,
     sync_mlb_features,
     sync_mlb_lineups,
@@ -110,6 +111,19 @@ def dashboard_summary(closed_date: date | None = Query(default=None)) -> Dashboa
 def system_status() -> SystemStatus:
     db_status = database_status()
     credentials_state = "set_redacted" if settings.kalshi_credentials_configured else "not_set"
+    source_status: dict[str, object] = {
+        "feature_sync_enable_network_sources": settings.feature_sync_enable_network_sources,
+        "public_sources_enabled": settings.feature_sync_enable_network_sources,
+        "mlb_stats_base_url": settings.mlb_stats_base_url,
+        "open_meteo_base_url": settings.open_meteo_base_url,
+    }
+    if db_status["ready"]:
+        try:
+            session_factory = get_session_factory()
+            with session_factory() as session:
+                source_status = source_status_report(session)
+        except Exception:
+            source_status["last_error"] = "source status unavailable"
 
     return SystemStatus(
         backend=BackendStatus(
@@ -127,6 +141,9 @@ def system_status() -> SystemStatus:
             kalshi_market_data_source=settings.kalshi_market_data_source,
             kalshi_market_data_base_kind=settings.kalshi_market_data_base_kind,
             kalshi_credentials=credentials_state,
+            feature_sync_enable_network_sources=settings.feature_sync_enable_network_sources,
+            public_sources_enabled=settings.feature_sync_enable_network_sources,
+            source_status=source_status,
         ),
     )
 
@@ -373,6 +390,13 @@ def model_feature_detail(
     with _db_session_or_503() as session:
         result = feature_detail(session, target_date)
     return RunResponse(ok=True, action="model_feature_detail", result=result)
+
+
+@app.get("/v1/model/sources/status", response_model=RunResponse)
+def model_sources_status(_: None = Depends(require_internal_api_key)) -> RunResponse:
+    with _db_session_or_503() as session:
+        result = source_status_report(session)
+    return RunResponse(ok=True, action="model_sources_status", result=result)
 
 
 @app.get("/v1/model/parameters/active", response_model=RunResponse)

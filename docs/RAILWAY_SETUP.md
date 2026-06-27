@@ -29,7 +29,7 @@ KALSHI_REST_BASE_URL=https://demo-api.kalshi.co/trade-api/v2
 KALSHI_MARKET_DATA_BASE_URL=https://external-api.kalshi.com/trade-api/v2
 KALSHI_WS_BASE_URL=wss://demo-api.kalshi.co/trade-api/ws/v2
 MLB_STATS_BASE_URL=https://statsapi.mlb.com/api/v1
-FEATURE_SYNC_ENABLE_NETWORK_SOURCES=false
+FEATURE_SYNC_ENABLE_NETWORK_SOURCES=true
 OPEN_METEO_BASE_URL=https://api.open-meteo.com/v1
 INJURY_PROVIDER_API_KEY=
 LINEUP_PROVIDER_API_KEY=
@@ -185,5 +185,5 @@ Expected behavior:
 - First-five settlement requires MLB linescore innings. Missing linescore should produce a skipped result and leave the trade open.
 - Discovery uses batched exact ticker queries first, capped fallback offsets second, and `event_ticker` filtering only as a secondary fallback. The result should include `request_count`, `requests_saved_by_batching`, `rate_limited_count`, `retries_attempted`, and `stopped_due_to_rate_limit`.
 - Open-position price refresh updates REST last marks for open paper positions only.
-- PR3c fix2 feature sync records `mature_mlb_features_v2` module statuses and keeps optional network sources disabled unless `FEATURE_SYNC_ENABLE_NETWORK_SOURCES=true`.
+- PR3c fix3 public feature sync requires `FEATURE_SYNC_ENABLE_NETWORK_SOURCES=true` on Railway. When enabled, `/v1/sync/mlb-features` hydrates MLB Stats API schedule/feed data, Open-Meteo weather, raw feature cache tables, and `mature_mlb_features_v2` snapshots. When disabled, network-backed module syncs return `validation_status=skipped_network_disabled` with zero inserted/updated rows.
 - Model governance uses active parameter versions and simulated threshold policies before promotion. It does not enable live orders.

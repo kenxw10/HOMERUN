@@ -1,6 +1,6 @@
 # HOMERUN
 
-HOMERUN is a Kalshi-native MLB paper-trading system and dashboard. The current version includes the deployable PR 1 foundation, PR 2 data layer, PR 2.5 targeted Kalshi MLB resolver, PR 3 paper results/model infrastructure, PR 3a discovery/operator repairs, PR 3b validated market-family paper wiring, PR 3c full MLB model governance, the PR3c hotfix for date-scoped fee-aware trade selection, and PR3c fix2 feature-complete model governance: MLB slate/results ingestion, targeted Kalshi `KXMLBGAME` market resolution, auditable game-to-market mapping, mature paper-only model candidates, paper settlement for validated MLB market families, feature cache modules, trainable parameter governance, market-family discovery audits, portfolio snapshots, and a light trading-terminal dashboard.
+HOMERUN is a Kalshi-native MLB paper-trading system and dashboard. The current version includes the deployable PR 1 foundation, PR 2 data layer, PR 2.5 targeted Kalshi MLB resolver, PR 3 paper results/model infrastructure, PR 3a discovery/operator repairs, PR 3b validated market-family paper wiring, PR 3c full MLB model governance, the PR3c hotfix for date-scoped fee-aware trade selection, PR3c fix2 feature-complete model governance, and PR3c fix3 real public feature ingestion: MLB slate/results ingestion, targeted Kalshi `KXMLBGAME` market resolution, auditable game-to-market mapping, mature paper-only model candidates, paper settlement for validated MLB market families, public MLB/weather feature cache modules, trainable parameter governance, market-family discovery audits, portfolio snapshots, and a light trading-terminal dashboard.
 
 This is not a sportsbook app. It does not use DraftKings, FanDuel, Odds API, or sportsbook odds behavior. Future trading logic should use Kalshi yes/no contract math, account for fees, and assume hold-to-settlement unless a later PR changes that context deliberately.
 
@@ -26,6 +26,7 @@ This is not a sportsbook app. It does not use DraftKings, FanDuel, Odds API, or 
 - Open-position current price is a REST last mark, not a WebSocket live price.
 - `PAPER_STARTING_BALANCE=1000.00` by default.
 - Governance skips training/calibration/promotion until clean resolved-sample thresholds are met.
+- `FEATURE_SYNC_ENABLE_NETWORK_SOURCES=true` enables no-key public MLB Stats API and Open-Meteo feature ingestion by default. Set it to `false` only when you intentionally want source sync endpoints to skip network-backed ingestion.
 
 ## Local Backend
 
@@ -96,6 +97,7 @@ PR 3c exposes these internal API run endpoints:
 - `GET /v1/model/features/coverage?date=YYYY-MM-DD`
 - `GET /v1/model/features/detail?date=YYYY-MM-DD`
 - `GET /v1/model/parameters/active`
+- `GET /v1/model/sources/status`
 - `GET /v1/model/training/latest`
 - `GET /v1/model/predictions?date=YYYY-MM-DD`
 - `GET /v1/model/predictions/today`
@@ -127,7 +129,9 @@ PR3b adds `market_family_mapping_sync`, which consumes the latest finalized disc
 
 Paper settlement supports full-game winner, full-game spread, full-game total, first-five winner, first-five spread, and first-five total when the row is `paper_supported`. First-five settlement requires MLB linescore innings; if missing, the trade stays open with a skipped reason. Paper candidate generation now estimates conservative configurable Kalshi fees before trade selection using `KALSHI_TRADE_FEE_RATE * quantity * price * (1 - price)`, rounded upward per `KALSHI_FEE_ROUNDING_MODE`; this remains a paper-trading estimate until live fill fees are available.
 
-The PR3c fix2 model pipeline uses `mature_mlb_run_distribution_v2`, a transparent paper-only run-distribution model that scores full-game and first-five winner, spread, and total families from `mature_mlb_features_v2` snapshots and additive feature cache tables. Feature snapshots record source availability as `available`, `partial`, `missing`, or `unavailable`; no sportsbook odds, team totals, umpire data, or fake production inputs are introduced. Candidate runs save every supported prediction for learning, but paper trades require fresh executable prices, clean mappings, trusted settlement metadata, data quality, probability edge, fee-adjusted net EV, and line/correlation selection before caps. Model governance creates an active baseline parameter version, records training datasets, fits bounded challenger parameter/calibration offsets only when enough resolved samples exist, and simulates threshold policy changes before promotion.
+The PR3c fix3 feature pipeline uses no-key public MLB and weather sources by default. `FEATURE_SYNC_ENABLE_NETWORK_SOURCES=true` makes feature sync hydrate the MLB Stats API schedule/feed, write raw team, pitcher, bullpen, lineup, weather, park, travel, and final `mature_mlb_features_v2` snapshot rows, and expose `/v1/model/sources/status` diagnostics. If network sync is disabled, network-backed module endpoints return `validation_status=skipped_network_disabled` with zero inserted/updated rows rather than pretending ingestion succeeded. Open-Meteo weather uses `OPEN_METEO_BASE_URL=https://api.open-meteo.com/v1`; optional injury, lineup, and weather provider keys remain optional and are not required for this PR.
+
+The PR3c fix2/fix3 model pipeline uses `mature_mlb_run_distribution_v2`, a transparent paper-only run-distribution model that scores full-game and first-five winner, spread, and total families from `mature_mlb_features_v2` snapshots and additive feature cache tables. Feature snapshots record source availability as `available`, `partial`, `missing`, or `unavailable`; no sportsbook odds, team totals, umpire data, or fake production inputs are introduced. Candidate runs save every supported prediction for learning, but paper trades require fresh executable prices, clean mappings, trusted settlement metadata, data quality, probability edge, fee-adjusted net EV, and line/correlation selection before caps. Model governance creates an active baseline parameter version, records training datasets, fits bounded challenger parameter/calibration offsets only when enough resolved samples exist, and simulates threshold policy changes before promotion.
 
 ## Local Frontend
 

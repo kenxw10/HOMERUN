@@ -82,6 +82,9 @@ class ModelStatus(BaseModel):
     lineup_status: str | None = None
     starter_status: str | None = None
     weather_status: str | None = None
+    network_sources_enabled: bool = False
+    public_sources_enabled: bool = False
+    last_feature_sync_status: dict[str, object] = Field(default_factory=dict)
     governance_status: str | None = None
     notes: str | list[str]
 
@@ -124,6 +127,9 @@ class ConfigStatus(BaseModel):
     kalshi_market_data_source: str
     kalshi_market_data_base_kind: str
     kalshi_credentials: Literal["not_set", "set_redacted"]
+    feature_sync_enable_network_sources: bool = False
+    public_sources_enabled: bool = False
+    source_status: dict[str, object] = Field(default_factory=dict)
 
 
 class SystemStatus(BaseModel):
