@@ -19,6 +19,11 @@ from app.models import (
     PaperTrade,
 )
 from app.services.contracts import (
+    FIRST_FIVE_SPREAD,
+    FIRST_FIVE_TOTAL,
+    FIRST_FIVE_WINNER,
+    FULL_GAME_SPREAD,
+    FULL_GAME_TOTAL,
     FULL_GAME_WINNER,
     PAPER_SUPPORTED_MARKET_FAMILIES,
     contract_labels,
@@ -277,12 +282,20 @@ def _base_decision(
     return "candidate_only"
 
 
+LINE_MARKET_FAMILIES = {
+    FULL_GAME_SPREAD,
+    FULL_GAME_TOTAL,
+    FIRST_FIVE_SPREAD,
+    FIRST_FIVE_TOTAL,
+}
+
+
 def _slate_trade_counts(
     session: Session,
     target_date: date,
     start: datetime,
     end: datetime,
-) -> tuple[int, dict[int, int], dict[str, int], set[tuple[int, str]], set[str]]:
+) -> tuple[int, dict[int, int], dict[str, int], dict[tuple[int, str], int], set[str]]:
     rows = list(
         session.execute(
             select(PaperTrade, ModelCandidate, MlbGame)
@@ -300,7 +313,7 @@ def _slate_trade_counts(
     )
     game_counts: dict[int, int] = {}
     family_counts: dict[str, int] = {}
-    game_family_pairs: set[tuple[int, str]] = set()
+    game_family_counts: dict[tuple[int, str], int] = {}
     market_tickers: set[str] = set()
     for trade, candidate, _game in rows:
         market_tickers.add(trade.market_ticker)
@@ -309,8 +322,9 @@ def _slate_trade_counts(
         family = trade.market_family or (candidate.market_family if candidate else None) or "unknown"
         family_counts[family] = family_counts.get(family, 0) + 1
         if candidate and candidate.mlb_game_id is not None:
-            game_family_pairs.add((candidate.mlb_game_id, family))
-    return len(rows), game_counts, family_counts, game_family_pairs, market_tickers
+            key = (candidate.mlb_game_id, family)
+            game_family_counts[key] = game_family_counts.get(key, 0) + 1
+    return len(rows), game_counts, family_counts, game_family_counts, market_tickers
 
 
 def _open_position_count(session: Session) -> int:
@@ -324,8 +338,17 @@ def _trade_rank_score(candidate: ModelCandidate) -> Decimal:
     return (ev * Decimal("10")) + data_quality + probability
 
 
-def _apply_line_selection(intents: list[TradeIntent]) -> tuple[list[TradeIntent], dict[str, int]]:
+def _game_family_trade_limit(family: str) -> int:
     settings = get_settings()
+    limit = max(settings.paper_max_trades_per_game_family, 1)
+    if family == FIRST_FIVE_WINNER:
+        return limit if settings.paper_allow_multiple_f5_winner_outcomes else 1
+    if family in LINE_MARKET_FAMILIES:
+        return limit if settings.paper_allow_multiple_lines_per_game_family else 1
+    return 1
+
+
+def _apply_line_selection(intents: list[TradeIntent]) -> tuple[list[TradeIntent], dict[str, int]]:
     counts = {
         "line_selection_groups_considered": 0,
         "line_selection_candidates_kept": 0,
@@ -345,11 +368,7 @@ def _apply_line_selection(intents: list[TradeIntent]) -> tuple[list[TradeIntent]
         counts["line_selection_groups_considered"] += 1
         ranked = sorted(group, key=lambda item: item.score, reverse=True)
         family = ranked[0].candidate.market_family or "unknown"
-        limit = max(settings.paper_max_trades_per_game_family, 1)
-        if not settings.paper_allow_multiple_lines_per_game_family:
-            limit = 1
-        if family == "first_five_winner" and not settings.paper_allow_multiple_f5_winner_outcomes:
-            limit = 1
+        limit = _game_family_trade_limit(family)
         kept = ranked[:limit]
         selected.extend(kept)
         counts["line_selection_candidates_kept"] += len(kept)
@@ -368,7 +387,7 @@ def _apply_trade_caps(
     day_end: datetime,
 ) -> tuple[list[TradeIntent], dict[str, int]]:
     settings = get_settings()
-    existing_slate, game_counts, family_counts, game_family_pairs, market_tickers = _slate_trade_counts(
+    existing_slate, game_counts, family_counts, game_family_counts, market_tickers = _slate_trade_counts(
         session, target_date, day_start, day_end
     )
     open_positions = _open_position_count(session)
@@ -379,6 +398,7 @@ def _apply_trade_caps(
         "no_trade_game_cap": 0,
         "no_trade_slate_cap": 0,
         "no_trade_correlated_market_cap": 0,
+        "no_trade_game_family_cap": 0,
         "no_trade_open_position_cap": 0,
     }
 
@@ -396,15 +416,18 @@ def _apply_trade_caps(
             candidate.decision = "no_trade_game_cap"
         elif family_counts.get(family, 0) >= settings.paper_max_trades_per_market_family:
             candidate.decision = "no_trade_market_family_cap"
-        elif game_id is not None and (game_id, family) in game_family_pairs:
-            candidate.decision = "no_trade_correlated_market_cap"
+        elif (
+            game_id is not None
+            and game_family_counts.get((game_id, family), 0) >= _game_family_trade_limit(family)
+        ):
+            candidate.decision = "no_trade_game_family_cap"
         else:
             candidate.decision = "paper_trade"
             selected.append(intent)
             family_counts[family] = family_counts.get(family, 0) + 1
             if game_id is not None:
                 game_counts[game_id] = game_counts.get(game_id, 0) + 1
-                game_family_pairs.add((game_id, family))
+                game_family_counts[(game_id, family)] = game_family_counts.get((game_id, family), 0) + 1
             market_tickers.add(intent.market.ticker)
             continue
         cap_counts[candidate.decision] = cap_counts.get(candidate.decision, 0) + 1

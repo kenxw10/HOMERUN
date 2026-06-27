@@ -3442,6 +3442,79 @@ def test_line_selection_rejects_correlated_total_lines_before_caps(monkeypatch) 
     assert len(trades) == 1
 
 
+def test_trade_caps_allow_configured_multiple_total_lines(monkeypatch) -> None:
+    monkeypatch.setenv("PAPER_ALLOW_MULTIPLE_LINES_PER_GAME_FAMILY", "true")
+    monkeypatch.setenv("PAPER_MAX_TRADES_PER_GAME_FAMILY", "2")
+    monkeypatch.setenv("PAPER_MAX_TRADES_PER_GAME", "3")
+    monkeypatch.setenv("PAPER_MAX_TRADES_PER_MARKET_FAMILY", "8")
+    monkeypatch.setenv("PAPER_MIN_NET_EV", "0")
+    monkeypatch.setenv("PAPER_MIN_PROB_EDGE", "0")
+    get_settings.cache_clear()
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+    monkeypatch.setattr(candidates, "utc_now", lambda: now)
+    monkeypatch.setattr(candidates, "score_mature_candidate", lambda *args, **kwargs: _fixed_model_score("0.900000"))
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    try:
+        with Session(engine) as session:
+            game = MlbGame(
+                external_game_id="multiple-line-cap-game",
+                home_team="Pittsburgh Pirates",
+                away_team="Seattle Mariners",
+                home_abbreviation="PIT",
+                away_abbreviation="SEA",
+                scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+                status="scheduled",
+            )
+            session.add(game)
+            session.flush()
+            for index, line in enumerate((Decimal("7.5000"), Decimal("8.5000"), Decimal("9.5000"))):
+                market = KalshiMarket(
+                    kalshi_market_id=f"KX-MULTI-LINE-CAP-{index}",
+                    ticker=f"KXMLBTOTAL-MULTI-LINE-CAP-{index}-OVER-{line}",
+                    title=f"Game total over {line}",
+                    status="open",
+                    implied_yes_ask=Decimal("0.1000") + (Decimal(index) * Decimal("0.0100")),
+                    market_family="full_game_total",
+                    market_type="full_game_total",
+                    line_value=line,
+                    over_under_side="over",
+                    inning_scope="full_game",
+                    settlement_rule_status="paper_supported",
+                )
+                session.add(market)
+                _add_candidate_mapping(
+                    session,
+                    game,
+                    market,
+                    mapping_status="confirmed",
+                    market_family="full_game_total",
+                    market_type="full_game_total",
+                    line_value=line,
+                    over_under_side="over",
+                    inning_scope="full_game",
+                    settlement_rule_status="paper_supported",
+                )
+            session.commit()
+
+            result = candidates.generate_candidates(session)
+            decisions = [candidate.decision for candidate in session.scalars(select(ModelCandidate))]
+            trades = list(session.scalars(select(PaperTrade)))
+    finally:
+        get_settings.cache_clear()
+
+    assert result["line_selection_candidates_kept"] == 2
+    assert result["line_selection_candidates_rejected"] == 1
+    assert result["paper_trades"] == 2
+    assert result["cap_counts"]["no_trade_correlated_market_cap"] == 0
+    assert result["cap_counts"]["no_trade_game_family_cap"] == 0
+    assert decisions.count("paper_trade") == 2
+    assert decisions.count("no_trade_line_selection_not_best") == 1
+    assert len(trades) == 2
+
+
 def test_model_predictions_today_filters_by_prediction_run_target_date(monkeypatch) -> None:
     engine = create_engine(
         "sqlite+pysqlite://",
