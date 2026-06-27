@@ -3870,7 +3870,10 @@ def test_weather_sync_handles_open_meteo_failure_without_500(monkeypatch) -> Non
     finally:
         get_settings.cache_clear()
 
-    assert result["validation_status"] in {"degraded_no_available_public_rows", "ok"}
+    assert result["validation_status"] == "degraded_with_errors"
+    assert result["error_count"] == 1
+    assert result["errors"][0]["source"] == features.OPEN_METEO_SOURCE
+    assert result["errors"][0]["table"] == "weather_snapshots"
     assert weather is not None
     assert weather.source_status == "missing"
     assert weather.raw_payload["error"]["source"] == features.OPEN_METEO_SOURCE

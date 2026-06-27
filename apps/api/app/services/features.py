@@ -2276,6 +2276,11 @@ def _record_feature_row(stats: dict[str, object], table: str, row: object | None
         stats[bucket_key] = int(stats.get(bucket_key, 0)) + 1
     if isinstance(table_summary, dict):
         table_summary[status] = int(table_summary.get(status, 0)) + 1
+    raw_payload = getattr(row, "raw_payload", None)
+    if isinstance(raw_payload, dict) and isinstance(raw_payload.get("error"), dict):
+        error = dict(raw_payload["error"])
+        error.setdefault("table", table)
+        _append_error(stats, error)
 
 
 def _upsert_feature_sync_audit(
