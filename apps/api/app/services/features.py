@@ -1745,6 +1745,8 @@ def _fetch_open_meteo(profile: dict[str, object], scheduled_start: datetime) -> 
             "start_date": day,
             "end_date": day,
             "timezone": "UTC",
+            "temperature_unit": "fahrenheit",
+            "wind_speed_unit": "mph",
         },
     )
 

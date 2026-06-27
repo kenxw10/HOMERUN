@@ -3362,10 +3362,11 @@ def test_feature_sync_hydrates_final_games_for_backfill(monkeypatch) -> None:
 def test_open_meteo_base_url_tolerates_forecast_suffix(monkeypatch) -> None:
     monkeypatch.setenv("OPEN_METEO_BASE_URL", "https://api.open-meteo.com/v1/forecast")
     get_settings.cache_clear()
-    captured: dict[str, str] = {}
+    captured: dict[str, object] = {}
 
     def fake_get_json(url: str, **_kwargs):
         captured["url"] = url
+        captured["params"] = _kwargs.get("params")
         return {"hourly": {"time": []}}
 
     monkeypatch.setattr(features, "get_json", fake_get_json)
@@ -3378,6 +3379,8 @@ def test_open_meteo_base_url_tolerates_forecast_suffix(monkeypatch) -> None:
         get_settings.cache_clear()
 
     assert captured["url"] == "https://api.open-meteo.com/v1/forecast"
+    assert captured["params"]["temperature_unit"] == "fahrenheit"
+    assert captured["params"]["wind_speed_unit"] == "mph"
 
 
 def test_open_meteo_parse_requires_target_forecast_hour() -> None:
