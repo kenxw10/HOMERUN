@@ -32,7 +32,7 @@ from app.schemas import (
     PositionSummary,
 )
 from app.services.contracts import contract_labels, market_type_from_ticker
-from app.services.features import FEATURE_VERSION
+from app.services.features import FEATURE_VERSION, source_status_report
 from app.services.portfolio import calculate_paper_portfolio
 from app.time_utils import eastern_display, ensure_aware_utc, get_dashboard_zone, to_eastern_iso, today_eastern, utc_now
 
@@ -379,9 +379,16 @@ def dashboard_summary_from_db(session: Session, closed_date: date | None = None)
         )
         or 0
     )
-    avg_data_quality = session.scalar(
+    candidate_avg_data_quality = session.scalar(
         select(func.avg(ModelCandidate.data_quality)).where(ModelCandidate.feature_version == FEATURE_VERSION)
     )
+    feature_avg_data_quality = (
+        sum((row.data_quality or Decimal("0")) for row in today_feature_rows) / Decimal(len(today_feature_rows))
+        if today_feature_rows
+        else None
+    )
+    avg_data_quality = candidate_avg_data_quality if candidate_avg_data_quality is not None else feature_avg_data_quality
+    source_status = source_status_report(session)
     summary.model_status = ModelStatus(
         active_model_version=active_version.version_tag if active_version else None,
         active_parameter_version=active_parameter_version.version_tag if active_parameter_version else None,
@@ -413,6 +420,9 @@ def dashboard_summary_from_db(session: Session, closed_date: date | None = None)
         lineup_status=_module_status(source_statuses, "lineup"),
         starter_status=_module_status(source_statuses, "starter_identity"),
         weather_status=_module_status(source_statuses, "park_weather"),
+        network_sources_enabled=bool(source_status["feature_sync_enable_network_sources"]),
+        public_sources_enabled=bool(source_status["public_sources_enabled"]),
+        last_feature_sync_status=dict(source_status["last_feature_sync_status"]),
         notes=[
             "PR3c fix2 run-distribution model is paper-only.",
             "Parameter promotion remains gated by resolved mature sample thresholds.",

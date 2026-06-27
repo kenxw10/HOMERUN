@@ -14,6 +14,7 @@ from app.database import Base, database_status
 from app.main import _candidate_summary, app
 from app.models import (
     BalanceSnapshot,
+    BullpenDailyFeature,
     CalibrationRun,
     FeatureSnapshot,
     KalshiMarket,
@@ -31,9 +32,12 @@ from app.models import (
     PaperTrade,
     Position,
     Settlement,
+    TeamDailyFeature,
+    TeamRecentFeature,
     TrainingRun,
     TravelScheduleFeature,
     WeatherSnapshot,
+    PitcherDailyFeature,
 )
 from app.jobs import market_family_discovery as market_family_discovery_job
 from app.jobs import mlb_feature_sync as mlb_feature_sync_job
@@ -77,6 +81,14 @@ def _clear_settings_cache_between_tests():
 def _relax_data_quality_gate(monkeypatch) -> None:
     monkeypatch.setenv("PAPER_MIN_DATA_QUALITY", "0")
     get_settings.cache_clear()
+
+
+def _stub_public_feature_network(monkeypatch) -> None:
+    monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "true")
+    get_settings.cache_clear()
+    monkeypatch.setattr(features, "_hydrate_schedule_window", lambda *_args, **_kwargs: 0)
+    monkeypatch.setattr(features, "_hydrate_game_endpoint_if_available", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(features, "_fetch_open_meteo", lambda *_args, **_kwargs: {"hourly": {"time": []}})
 
 
 def _add_candidate_mapping(
@@ -176,6 +188,35 @@ def test_system_status_redacts_secrets_and_allows_missing_database() -> None:
     assert payload["config"]["kalshi_market_data_base_kind"] == "production_public_market_data"
     assert payload["config"]["kalshi_credentials"] == "not_set"
     assert "KALSHI_API_KEY" not in str(payload)
+
+
+def test_model_sources_status_endpoint_reports_public_sources(monkeypatch) -> None:
+    engine = create_engine(
+        "sqlite+pysqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    SessionLocal = sessionmaker(bind=engine)
+    monkeypatch.setattr(
+        main_module,
+        "database_status",
+        lambda: {"ready": True, "configured": True, "dialect": "sqlite", "message": "ok"},
+    )
+    monkeypatch.setattr(main_module, "get_session_factory", lambda: SessionLocal)
+    app.dependency_overrides[require_internal_api_key] = lambda: None
+    try:
+        response = client.get("/v1/model/sources/status")
+        payload = response.json()
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert payload["ok"] is True
+    assert payload["result"]["feature_sync_enable_network_sources"] is True
+    assert payload["result"]["public_sources_enabled"] is True
+    assert payload["result"]["mlb_stats_base_url"] == "https://statsapi.mlb.com/api/v1"
+    assert "weather_snapshots" in payload["result"]["tables"]
 
 
 def test_database_status_does_not_mark_unreachable_database_ready(monkeypatch) -> None:
@@ -3232,7 +3273,8 @@ def test_model_governance_counts_samples_after_settlement_labels_candidates() ->
     assert governance_result["resolved_samples"] == 0
 
 
-def test_pr3c_feature_sync_records_source_statuses_and_no_umpire_fields() -> None:
+def test_pr3c_feature_sync_records_source_statuses_and_no_umpire_fields(monkeypatch) -> None:
+    _stub_public_feature_network(monkeypatch)
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
 
@@ -3303,6 +3345,7 @@ def test_feature_coverage_and_detail_filter_to_active_feature_version() -> None:
 def test_feature_sync_hydrates_final_games_for_backfill(monkeypatch) -> None:
     monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "true")
     get_settings.cache_clear()
+    monkeypatch.setattr(features, "_hydrate_schedule_window", lambda *_args, **_kwargs: 0)
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
 
@@ -3361,6 +3404,230 @@ def test_feature_sync_hydrates_final_games_for_backfill(monkeypatch) -> None:
         assert snapshot.source_statuses["starter_identity"] == {"home": "available", "away": "available"}
     finally:
         get_settings.cache_clear()
+
+
+def test_network_disabled_returns_skipped_without_raw_writes(monkeypatch) -> None:
+    monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "false")
+    get_settings.cache_clear()
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        game = MlbGame(
+            external_game_id="network-disabled-feature-sync",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+            status="scheduled",
+            raw_payload={"venue": {"id": 31, "name": "PNC Park"}},
+        )
+        session.add(game)
+        session.commit()
+
+        result = features.sync_mlb_lineups(session, date(2026, 7, 1))
+        lineup_count = session.scalar(select(LineupSnapshot))
+
+    assert result["network_sources_enabled"] is False
+    assert result["validation_status"] == "skipped_network_disabled"
+    assert result["rows_inserted"] == 0
+    assert result["rows_updated"] == 0
+    assert lineup_count is None
+
+
+def test_public_feature_sync_writes_raw_tables_from_fixture_payloads(monkeypatch) -> None:
+    monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "true")
+    get_settings.cache_clear()
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    def boxscore_team(start_id: int, pitcher_id: int) -> dict[str, object]:
+        batters = list(range(start_id, start_id + 9))
+        players: dict[str, object] = {}
+        for index, person_id in enumerate(batters, start=1):
+            players[f"ID{person_id}"] = {
+                "person": {"id": person_id, "fullName": f"Starter {person_id}"},
+                "battingOrder": str(index * 100),
+                "batSide": {"code": "L" if index % 2 else "R"},
+                "position": {"abbreviation": "C" if index == 9 else "CF"},
+            }
+        players[f"ID{pitcher_id}"] = {
+            "person": {"id": pitcher_id, "fullName": f"Pitcher {pitcher_id}"},
+            "pitchHand": {"code": "R"},
+        }
+        return {"batters": batters, "pitchers": [pitcher_id], "players": players}
+
+    def hydrate_schedule(session: Session, day: date, **_kwargs) -> int:
+        game = MlbGame(
+            external_game_id="12345",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+            status="scheduled",
+            raw_payload={
+                "venue": {"id": 31, "name": "PNC Park"},
+                "teams": {
+                    "home": {"leagueRecord": {"wins": 44, "losses": 39}},
+                    "away": {"leagueRecord": {"wins": 41, "losses": 42}},
+                },
+            },
+        )
+        previous = MlbGame(
+            external_game_id="12344",
+            home_team="Seattle Mariners",
+            away_team="Pittsburgh Pirates",
+            home_abbreviation="SEA",
+            away_abbreviation="PIT",
+            scheduled_start=datetime(2026, 6, 29, 23, 0, tzinfo=UTC),
+            status="Final",
+            home_score=3,
+            away_score=5,
+            raw_payload={"venue": {"id": 680, "name": "T-Mobile Park"}},
+        )
+        session.add_all([game, previous])
+        session.flush()
+        return 2
+
+    def hydrate_feed(game: MlbGame) -> None:
+        game.raw_payload = {
+            **(game.raw_payload or {}),
+            "liveData": {
+                "boxscore": {
+                    "teams": {
+                        "home": boxscore_team(1000, 1999),
+                        "away": boxscore_team(2000, 2999),
+                    }
+                }
+            },
+        }
+
+    def fake_open_meteo(_profile: dict[str, object], _scheduled_start: datetime) -> dict[str, object]:
+        return {
+            "hourly": {
+                "time": ["2026-07-01T19:00"],
+                "temperature_2m": [82],
+                "relative_humidity_2m": [61],
+                "precipitation_probability": [12],
+                "precipitation": [0],
+                "rain": [0],
+                "wind_speed_10m": [9],
+                "wind_direction_10m": [220],
+                "wind_gusts_10m": [15],
+                "cloud_cover": [25],
+            }
+        }
+
+    monkeypatch.setattr(features, "_hydrate_schedule_window", hydrate_schedule)
+    monkeypatch.setattr(features, "_hydrate_game_endpoint_if_available", hydrate_feed)
+    monkeypatch.setattr(features, "_fetch_open_meteo", fake_open_meteo)
+
+    try:
+        with Session(engine) as session:
+            result = features.sync_mlb_features(session, date(2026, 7, 1))
+            team_daily = session.scalar(select(TeamDailyFeature).where(TeamDailyFeature.team_code == "PIT"))
+            team_recent = session.scalar(select(TeamRecentFeature).where(TeamRecentFeature.team_code == "PIT"))
+            pitcher = session.scalar(select(PitcherDailyFeature).where(PitcherDailyFeature.team_code == "PIT"))
+            bullpen = session.scalar(select(BullpenDailyFeature).where(BullpenDailyFeature.team_code == "PIT"))
+            lineup = session.scalar(select(LineupSnapshot).where(LineupSnapshot.team_code == "PIT"))
+            weather = session.scalar(select(WeatherSnapshot))
+            snapshot = session.scalar(select(MlbFeatureSnapshot))
+    finally:
+        get_settings.cache_clear()
+
+    assert result["network_sources_enabled"] is True
+    assert result["validation_status"] == "ok"
+    assert result["rows_inserted"] > 0
+    assert "lineup_snapshots" in result["tables_written"]
+    assert "weather_snapshots" in result["tables_written"]
+    assert team_daily is not None
+    assert team_daily.source_status == "partial"
+    assert team_daily.features["runs_per_game"] == 5.0
+    assert team_recent is not None
+    assert pitcher is not None
+    assert pitcher.source_status == "partial"
+    assert bullpen is not None
+    assert bullpen.source_status == "partial"
+    assert lineup is not None
+    assert lineup.confirmed is True
+    assert lineup.features["starters"][0]["is_starter"] is True
+    assert weather is not None
+    assert weather.source_status == "available"
+    assert weather.features["temperature"] == 82
+    assert snapshot is not None
+    assert snapshot.source_statuses["market_context"] == "missing"
+    assert snapshot.source_statuses["lineup"] == {"home": "available", "away": "available"}
+
+
+def test_source_status_report_exposes_public_source_diagnostics() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    captured_at = datetime(2026, 7, 1, 20, 0, tzinfo=UTC)
+
+    with Session(engine) as session:
+        session.add(
+            WeatherSnapshot(
+                mlb_game_id=1,
+                target_date=date(2026, 7, 1),
+                venue_name="PNC Park",
+                captured_at=captured_at,
+                source=features.OPEN_METEO_SOURCE,
+                source_status="available",
+                confidence=Decimal("0.70"),
+                completeness=Decimal("0.70"),
+                stale=False,
+                features={"temperature": 80},
+                raw_payload={"ok": True},
+            )
+        )
+        session.commit()
+        report = features.source_status_report(session)
+
+    assert report["feature_sync_enable_network_sources"] is True
+    assert report["public_sources_enabled"] is True
+    assert report["optional_weather_provider_configured"] is False
+    assert report["last_successful_sync"]["weather_snapshots"] == captured_at.isoformat()
+    assert "weather_snapshots" in report["tables"]
+
+
+def test_static_stadium_table_covers_current_mlb_venues() -> None:
+    required_venues = {
+        "American Family Field",
+        "Angel Stadium",
+        "Busch Stadium",
+        "Chase Field",
+        "Citi Field",
+        "Citizens Bank Park",
+        "Comerica Park",
+        "Coors Field",
+        "Daikin Park",
+        "Dodger Stadium",
+        "Fenway Park",
+        "George M. Steinbrenner Field",
+        "Globe Life Field",
+        "Great American Ball Park",
+        "Kauffman Stadium",
+        "loanDepot park",
+        "Nationals Park",
+        "Oracle Park",
+        "Oriole Park at Camden Yards",
+        "Petco Park",
+        "PNC Park",
+        "Progressive Field",
+        "Rate Field",
+        "Rogers Centre",
+        "Sutter Health Park",
+        "Target Field",
+        "T-Mobile Park",
+        "Truist Park",
+        "Wrigley Field",
+        "Yankee Stadium",
+    }
+
+    assert required_venues <= set(features.STADIUM_PROFILES)
+    assert features.TEAM_HOME_VENUES["ATH"] == "Sutter Health Park"
 
 
 def test_lineup_sync_preserves_confirmed_lineup_when_payload_lacks_boxscore() -> None:
@@ -3489,7 +3756,7 @@ def test_open_meteo_base_url_tolerates_forecast_suffix(monkeypatch) -> None:
     assert captured["params"]["wind_speed_unit"] == "mph"
 
 
-def test_open_meteo_parse_requires_target_forecast_hour() -> None:
+def test_open_meteo_parse_uses_nearest_forecast_hour() -> None:
     parsed = features._parse_open_meteo(
         {
             "hourly": {
@@ -3501,10 +3768,14 @@ def test_open_meteo_parse_requires_target_forecast_hour() -> None:
         datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
     )
 
-    assert parsed is None
+    assert parsed is not None
+    assert parsed["forecast_time"] == "2026-07-01T18:00"
+    assert parsed["temperature"] == 91
+    assert parsed["wind_speed"] == 12
 
 
-def test_feature_sync_keeps_unknown_park_weather_missing() -> None:
+def test_feature_sync_keeps_unknown_park_weather_missing(monkeypatch) -> None:
+    _stub_public_feature_network(monkeypatch)
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
 
@@ -3530,7 +3801,8 @@ def test_feature_sync_keeps_unknown_park_weather_missing() -> None:
     assert snapshot.features["park_weather"]["source_status"] == "missing"
 
 
-def test_travel_feature_uses_current_venue_for_away_team() -> None:
+def test_travel_feature_uses_current_venue_for_away_team(monkeypatch) -> None:
+    _stub_public_feature_network(monkeypatch)
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
 
@@ -3572,7 +3844,8 @@ def test_travel_feature_uses_current_venue_for_away_team() -> None:
     assert away_travel.features["travel_distance_miles"] > 1000
 
 
-def test_travel_feature_uses_home_venue_proxy_for_unknown_road_venue() -> None:
+def test_travel_feature_uses_home_venue_proxy_for_unknown_road_venue(monkeypatch) -> None:
+    _stub_public_feature_network(monkeypatch)
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
 
@@ -3685,7 +3958,9 @@ def test_probable_pitcher_adapter_uses_boxscore_fallback() -> None:
     assert pitcher == {
         "id": "99",
         "name": "Fallback Starter",
+        "pitcher_name": "Fallback Starter",
         "handedness": "L",
+        "note": None,
         "source_path": "game.liveData.boxscore.teams.away.pitchers[0]",
     }
 

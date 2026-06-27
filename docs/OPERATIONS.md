@@ -74,7 +74,7 @@ The jobs currently cover:
 - Targeted Kalshi MLB market resolution for the empirically observed `KXMLBGAME` full-game winner family.
 - Orderbook snapshots for targeted relevant markets only.
 - Auditable MLB game to Kalshi market mapping.
-- Candidate scoring with the `mature_mlb_run_distribution_v1` paper model.
+- Candidate scoring with the `mature_mlb_run_distribution_v2` paper model.
 - Conservative paper-trade simulation.
 - MLB results updates for completed games.
 - Full-game winner paper settlement and hold-to-settlement P/L.
@@ -107,6 +107,7 @@ The backend also exposes these POST endpoints for controlled operational runs:
 - `GET /v1/model/features/coverage?date=YYYY-MM-DD`
 - `GET /v1/model/features/detail?date=YYYY-MM-DD`
 - `GET /v1/model/parameters/active`
+- `GET /v1/model/sources/status`
 - `GET /v1/model/training/latest`
 - `GET /v1/model/predictions?date=YYYY-MM-DD`
 - `GET /v1/model/predictions/today`
@@ -141,7 +142,7 @@ After deploying PR 3c and running `alembic upgrade head`, validate in this order
 5. `GET /v1/kalshi/resolve-preview?date=YYYY-MM-DD` returns attempted `KXMLBGAME` event and market tickers for each MLB game, with `ok=true` even when individual games have no match warnings.
 6. `POST /v1/sync/kalshi-markets` returns a structured summary with `games_considered`, attempted ticker counts, mapping counts, and `errors` when upstream calls fail.
 7. `GET /v1/markets/today` shows mapped markets if matching Kalshi markets exist.
-8. `POST /v1/run/paper-candidate-engine?target_date=YYYY-MM-DD` exits cleanly, reports the same `target_date` and `prediction_run_target_date`, and creates candidates with `mature_mlb_run_distribution_v1` probabilities.
+8. `POST /v1/run/paper-candidate-engine?target_date=YYYY-MM-DD` exits cleanly, reports the same `target_date` and `prediction_run_target_date`, and creates candidates with `mature_mlb_run_distribution_v2` probabilities.
 9. `POST /v1/sync/mlb-results` updates completed games with scores/final status.
 10. `POST /v1/run/paper-settlement-sync` settles completed supported full-game winner paper trades.
 11. `POST /v1/run/balance-snapshot` creates a snapshot and `/v1/dashboard/summary` uses it for the portfolio chart.
@@ -171,6 +172,34 @@ Invoke-RestMethod -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-RAILWAY-API/v
 ```
 
 5. Confirm normal executable candidates include `fee_estimate`, `expected_value_net`, `probability_edge`, `executable_price_source`, and `price_status`.
+
+PR3c fix3 public feature-ingestion validation:
+
+1. Confirm source diagnostics are enabled and do not expose secrets:
+
+```powershell
+Invoke-RestMethod -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-RAILWAY-API/v1/model/sources/status"
+Invoke-RestMethod "https://YOUR-RAILWAY-API/v1/system/status"
+```
+
+Expected: `feature_sync_enable_network_sources=true`, `public_sources_enabled=true`, `mlb_stats_base_url=https://statsapi.mlb.com/api/v1`, and `open_meteo_base_url=https://api.open-meteo.com/v1`.
+
+2. Run public feature ingestion for a slate:
+
+```powershell
+Invoke-RestMethod -Method Post -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-RAILWAY-API/v1/sync/mlb-features?target_date=2026-06-27&include_modules=all"
+```
+
+Expected: `network_sources_enabled=true`, nonzero `games_seen`, raw `tables_written`, and `validation_status=ok` or a degraded status with explicit warnings/errors. If `FEATURE_SYNC_ENABLE_NETWORK_SOURCES=false`, expected output is `validation_status=skipped_network_disabled`, `rows_inserted=0`, and `rows_updated=0`.
+
+3. Validate raw tables and composed snapshots:
+
+```powershell
+Invoke-RestMethod -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-RAILWAY-API/v1/model/features/coverage?date=2026-06-27"
+Invoke-RestMethod -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-RAILWAY-API/v1/model/features/detail?date=2026-06-27"
+```
+
+Expected: lineup snapshots where MLB posted lineups, weather rows for stadiums with coordinates, pitcher rows where probable starters are available, partial bullpen proxies when exact reliever data is unavailable, and `data_quality_reason` caps when critical modules remain missing.
 
 PR3c fix2 feature/model validation:
 

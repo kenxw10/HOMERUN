@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from math import atan2, cos, radians, sin, sqrt
@@ -34,7 +35,9 @@ from app.services.contracts import (
     selected_team_from_ticker,
 )
 from app.services.http_json import HttpJsonError, get_json
-from app.time_utils import ensure_aware_utc, get_dashboard_zone, today_eastern, utc_now
+from app.services.kalshi_mlb_resolver import normalize_team_abbreviation
+from app.services.mlb_stats_client import MLBStatsClient
+from app.time_utils import ensure_aware_utc, get_dashboard_zone, parse_datetime, today_eastern, utc_now
 
 FEATURE_VERSION = "mature_mlb_features_v2"
 MATURE_FEATURE_VERSION = FEATURE_VERSION
@@ -45,6 +48,17 @@ STATIC_SOURCE = "static_mlb_reference_v1"
 MLB_STATS_SOURCE = "mlb_stats_api"
 OPEN_METEO_SOURCE = "open_meteo"
 DERIVED_SOURCE = "derived_homerun_v2"
+NETWORK_SOURCE_MODULES = {"team", "pitcher", "bullpen", "lineup", "weather"}
+ALL_SYNC_MODULES = NETWORK_SOURCE_MODULES | {"injuries", "travel"}
+RAW_TABLES_BY_MODULE = {
+    "team": ("team_daily_features", "team_recent_features"),
+    "pitcher": ("pitcher_daily_features",),
+    "bullpen": ("bullpen_daily_features",),
+    "lineup": ("lineup_snapshots",),
+    "injuries": ("injury_snapshots",),
+    "weather": ("weather_snapshots", "park_factor_snapshots"),
+    "travel": ("travel_schedule_features",),
+}
 
 CORE_MODULES = (
     "game_context",
@@ -132,65 +146,103 @@ QUALITY_WEIGHTS[FULL_GAME_SPREAD] = QUALITY_WEIGHTS[FULL_GAME_WINNER]
 QUALITY_WEIGHTS[FIRST_FIVE_SPREAD] = QUALITY_WEIGHTS[FIRST_FIVE_WINNER]
 QUALITY_WEIGHTS[FIRST_FIVE_TOTAL] = QUALITY_WEIGHTS[FIRST_FIVE_WINNER]
 
+def _park(
+    latitude: float,
+    longitude: float,
+    altitude_ft: int,
+    roof_type: str,
+    park_factor: float,
+    run_factor: float,
+    hr_factor: float,
+    orientation_degrees: int,
+) -> dict[str, object]:
+    return {
+        "latitude": latitude,
+        "longitude": longitude,
+        "altitude_ft": altitude_ft,
+        "roof_type": roof_type,
+        "park_factor": park_factor,
+        "run_factor": run_factor,
+        "hr_factor": hr_factor,
+        "orientation_degrees": orientation_degrees,
+    }
+
+
 STADIUM_PROFILES: dict[str, dict[str, object]] = {
-    "PNC Park": {
-        "latitude": 40.4469,
-        "longitude": -80.0057,
-        "altitude_ft": 730,
-        "roof_type": "open",
-        "park_factor": 0.98,
-        "run_factor": 0.99,
-        "hr_factor": 0.95,
-        "orientation_degrees": 115,
-    },
-    "T-Mobile Park": {
-        "latitude": 47.5914,
-        "longitude": -122.3325,
-        "altitude_ft": 10,
-        "roof_type": "retractable",
-        "park_factor": 0.92,
-        "run_factor": 0.91,
-        "hr_factor": 0.90,
-        "orientation_degrees": 130,
-    },
-    "Coors Field": {
-        "latitude": 39.7561,
-        "longitude": -104.9942,
-        "altitude_ft": 5200,
-        "roof_type": "open",
-        "park_factor": 1.19,
-        "run_factor": 1.22,
-        "hr_factor": 1.15,
-        "orientation_degrees": 35,
-    },
-    "Fenway Park": {
-        "latitude": 42.3467,
-        "longitude": -71.0972,
-        "altitude_ft": 20,
-        "roof_type": "open",
-        "park_factor": 1.05,
-        "run_factor": 1.06,
-        "hr_factor": 0.97,
-        "orientation_degrees": 45,
-    },
-    "Great American Ball Park": {
-        "latitude": 39.0979,
-        "longitude": -84.5082,
-        "altitude_ft": 482,
-        "roof_type": "open",
-        "park_factor": 1.08,
-        "run_factor": 1.07,
-        "hr_factor": 1.18,
-        "orientation_degrees": 130,
-    },
+    "American Family Field": _park(43.0280, -87.9712, 602, "retractable", 1.00, 1.00, 1.05, 70),
+    "Angel Stadium": _park(33.8003, -117.8827, 160, "open", 0.99, 0.99, 1.00, 65),
+    "Busch Stadium": _park(38.6226, -90.1928, 466, "open", 0.98, 0.98, 0.94, 62),
+    "Chase Field": _park(33.4455, -112.0667, 1086, "retractable", 1.01, 1.01, 1.02, 60),
+    "Citi Field": _park(40.7571, -73.8458, 13, "open", 0.98, 0.98, 0.96, 67),
+    "Citizens Bank Park": _park(39.9061, -75.1665, 20, "open", 1.03, 1.02, 1.13, 70),
+    "Comerica Park": _park(42.3390, -83.0485, 600, "open", 0.99, 1.00, 0.92, 150),
+    "Coors Field": _park(39.7561, -104.9942, 5200, "open", 1.19, 1.22, 1.15, 35),
+    "Daikin Park": _park(29.7573, -95.3555, 50, "retractable", 1.01, 1.01, 1.04, 80),
+    "Dodger Stadium": _park(34.0739, -118.2400, 522, "open", 1.00, 1.00, 1.02, 36),
+    "Fenway Park": _park(42.3467, -71.0972, 20, "open", 1.05, 1.06, 0.97, 45),
+    "George M. Steinbrenner Field": _park(27.9803, -82.5067, 45, "open", 1.00, 1.00, 1.00, 55),
+    "Globe Life Field": _park(32.7473, -97.0842, 600, "retractable", 1.01, 1.01, 1.02, 30),
+    "Great American Ball Park": _park(39.0979, -84.5082, 482, "open", 1.08, 1.07, 1.18, 130),
+    "Guaranteed Rate Field": _park(41.8299, -87.6338, 594, "open", 1.00, 1.00, 1.03, 127),
+    "Kauffman Stadium": _park(39.0517, -94.4803, 750, "open", 0.99, 1.00, 0.93, 65),
+    "Las Vegas Ballpark": _park(36.1596, -115.3320, 2960, "open", 1.02, 1.02, 1.06, 62),
+    "loanDepot park": _park(25.7781, -80.2197, 10, "retractable", 0.96, 0.96, 0.88, 73),
+    "Nationals Park": _park(38.8730, -77.0074, 25, "open", 1.00, 1.00, 1.02, 60),
+    "Oracle Park": _park(37.7786, -122.3893, 63, "open", 0.93, 0.94, 0.78, 85),
+    "Oriole Park at Camden Yards": _park(39.2839, -76.6217, 33, "open", 0.99, 0.99, 0.93, 60),
+    "Petco Park": _park(32.7073, -117.1573, 62, "open", 0.94, 0.95, 0.88, 80),
+    "PNC Park": _park(40.4469, -80.0057, 730, "open", 0.98, 0.99, 0.95, 115),
+    "Progressive Field": _park(41.4962, -81.6852, 653, "open", 0.99, 0.99, 0.98, 60),
+    "Rate Field": _park(41.8299, -87.6338, 594, "open", 1.00, 1.00, 1.03, 127),
+    "Rogers Centre": _park(43.6414, -79.3894, 250, "retractable", 1.01, 1.01, 1.05, 45),
+    "Sutter Health Park": _park(38.5804, -121.5139, 23, "open", 1.03, 1.03, 1.08, 55),
+    "Target Field": _park(44.9817, -93.2776, 840, "open", 0.99, 0.99, 1.00, 100),
+    "T-Mobile Park": _park(47.5914, -122.3325, 10, "retractable", 0.92, 0.91, 0.90, 130),
+    "Truist Park": _park(33.8908, -84.4678, 1050, "open", 1.01, 1.01, 1.04, 145),
+    "Wrigley Field": _park(41.9484, -87.6553, 600, "open", 1.02, 1.02, 1.05, 50),
+    "Yankee Stadium": _park(40.8296, -73.9262, 55, "open", 1.02, 1.01, 1.10, 75),
+}
+
+TEAM_HOME_VENUES: dict[str, str] = {
+    "ARI": "Chase Field",
+    "ATH": "Sutter Health Park",
+    "ATL": "Truist Park",
+    "BAL": "Oriole Park at Camden Yards",
+    "BOS": "Fenway Park",
+    "CHC": "Wrigley Field",
+    "CIN": "Great American Ball Park",
+    "CLE": "Progressive Field",
+    "COL": "Coors Field",
+    "CWS": "Rate Field",
+    "DET": "Comerica Park",
+    "HOU": "Daikin Park",
+    "KC": "Kauffman Stadium",
+    "LAA": "Angel Stadium",
+    "LAD": "Dodger Stadium",
+    "MIA": "loanDepot park",
+    "MIL": "American Family Field",
+    "MIN": "Target Field",
+    "NYM": "Citi Field",
+    "NYY": "Yankee Stadium",
+    "OAK": "Sutter Health Park",
+    "PHI": "Citizens Bank Park",
+    "PIT": "PNC Park",
+    "SD": "Petco Park",
+    "SEA": "T-Mobile Park",
+    "SF": "Oracle Park",
+    "STL": "Busch Stadium",
+    "TB": "George M. Steinbrenner Field",
+    "TEX": "Globe Life Field",
+    "TOR": "Rogers Centre",
+    "WSH": "Nationals Park",
 }
 
 TEAM_HOME_COORDINATES: dict[str, tuple[float, float]] = {
-    "PIT": (40.4469, -80.0057),
-    "SEA": (47.5914, -122.3325),
-    "CIN": (39.0979, -84.5082),
-    "BOS": (42.3467, -71.0972),
-    "COL": (39.7561, -104.9942),
+    team_code: (
+        float(STADIUM_PROFILES[venue_name]["latitude"]),
+        float(STADIUM_PROFILES[venue_name]["longitude"]),
+    )
+    for team_code, venue_name in TEAM_HOME_VENUES.items()
 }
 
 
@@ -480,11 +532,15 @@ def parse_starting_lineup_from_game_payload(payload: dict[str, object], side: st
         starters.append(
             {
                 "person_id": str(person.get("id") or person_id),
+                "full_name": person.get("fullName") or player.get("fullName"),
                 "name": person.get("fullName") or player.get("fullName"),
                 "batting_order": batting_order,
                 "batting_order_slot": batting_order // 100,
+                "handedness": batting_side.get("code") or batting_side.get("description"),
                 "bat_side": batting_side.get("code") or batting_side.get("description"),
                 "position": primary_position.get("abbreviation") or primary_position.get("code"),
+                "is_starter": True,
+                "is_catcher": (primary_position.get("abbreviation") or primary_position.get("code")) == "C",
             }
         )
     return sorted(starters, key=lambda item: int(item["batting_order"]))
@@ -506,7 +562,9 @@ def probable_pitcher_from_payload(payload: dict[str, object], side: str) -> dict
             return {
                 "id": str(person.get("id") or pitcher_id),
                 "name": person.get("fullName") or player.get("fullName"),
+                "pitcher_name": person.get("fullName") or player.get("fullName"),
                 "handedness": pitch_hand.get("code") or pitch_hand.get("description"),
+                "note": player.get("note"),
                 "source_path": f"game.liveData.boxscore.teams.{side}.pitchers[0]",
             }
 
@@ -517,7 +575,9 @@ def probable_pitcher_from_payload(payload: dict[str, object], side: str) -> dict
         return {
             "id": str(pitcher.get("id")),
             "name": pitcher.get("fullName"),
+            "pitcher_name": pitcher.get("fullName"),
             "handedness": None,
+            "note": pitcher.get("note"),
             "source_path": f"schedule.teams.{side}.probablePitcher",
         }
     return None
@@ -530,6 +590,96 @@ def _game_endpoint_url(game_pk: str) -> str:
 
 def fetch_game_endpoint(game_pk: str) -> dict[str, object]:
     return get_json(_game_endpoint_url(game_pk), params={})
+
+
+def pybaseball_available() -> bool:
+    return importlib.util.find_spec("pybaseball") is not None
+
+
+def _merge_game_payload(game: MlbGame, payload: dict[str, object]) -> None:
+    merged = dict(game.raw_payload or {})
+    merged.update(payload)
+    game.raw_payload = merged
+
+
+def _upsert_game_from_schedule_payload(session: Session, payload: dict[str, object]) -> MlbGame | None:
+    game_pk = str(payload.get("gamePk") or "")
+    scheduled_start = parse_datetime(payload.get("gameDate"))
+    if not game_pk or scheduled_start is None:
+        return None
+    teams = payload.get("teams") if isinstance(payload.get("teams"), dict) else {}
+    home = teams.get("home") if isinstance(teams, dict) and isinstance(teams.get("home"), dict) else {}
+    away = teams.get("away") if isinstance(teams, dict) and isinstance(teams.get("away"), dict) else {}
+    home_team_payload = home.get("team") if isinstance(home.get("team"), dict) else {}
+    away_team_payload = away.get("team") if isinstance(away.get("team"), dict) else {}
+    status_payload = payload.get("status") if isinstance(payload.get("status"), dict) else {}
+    row = session.scalar(select(MlbGame).where(MlbGame.external_game_id == game_pk))
+    row = row or MlbGame(external_game_id=game_pk)
+    row.home_team = str(home_team_payload.get("name") or "UNKNOWN HOME")
+    row.away_team = str(away_team_payload.get("name") or "UNKNOWN AWAY")
+    row.home_abbreviation = normalize_team_abbreviation(
+        row.home_team,
+        home_team_payload.get("abbreviation"),
+    )
+    row.away_abbreviation = normalize_team_abbreviation(
+        row.away_team,
+        away_team_payload.get("abbreviation"),
+    )
+    row.scheduled_start = scheduled_start
+    row.status = (
+        status_payload.get("detailedState")
+        or status_payload.get("abstractGameState")
+        or row.status
+        or "scheduled"
+    )
+    row.home_score = home.get("score")
+    row.away_score = away.get("score")
+    row.raw_payload = payload
+    session.add(row)
+    return row
+
+
+def _schedule_games_from_payload(payload: dict[str, object]) -> list[dict[str, object]]:
+    games: list[dict[str, object]] = []
+    dates = payload.get("dates") if isinstance(payload, dict) else None
+    if not isinstance(dates, list):
+        return games
+    for schedule_date in dates:
+        day_games = schedule_date.get("games") if isinstance(schedule_date, dict) else None
+        if isinstance(day_games, list):
+            games.extend(game for game in day_games if isinstance(game, dict))
+    return games
+
+
+def _hydrate_schedule_window(
+    session: Session,
+    day: date,
+    *,
+    client: MLBStatsClient,
+    errors: list[dict[str, object]],
+) -> int:
+    upserted = 0
+    try:
+        current_payload = client.get_schedule(day)
+        for game_payload in _schedule_games_from_payload(current_payload):
+            if _upsert_game_from_schedule_payload(session, game_payload) is not None:
+                upserted += 1
+    except HttpJsonError as exc:
+        errors.append({"source": MLB_STATS_SOURCE, "table": "mlb_games", "error": exc.to_detail()})
+
+    try:
+        history_payload = client.get_schedule(
+            start_date=day - timedelta(days=45),
+            end_date=day - timedelta(days=1),
+            hydrate="team,venue,linescore",
+        )
+        for game_payload in _schedule_games_from_payload(history_payload):
+            if _upsert_game_from_schedule_payload(session, game_payload) is not None:
+                upserted += 1
+    except HttpJsonError as exc:
+        errors.append({"source": MLB_STATS_SOURCE, "table": "mlb_games_history", "error": exc.to_detail()})
+    session.flush()
+    return upserted
 
 
 def _cached_team_daily(session: Session | None, day: date, team_code: str | None) -> TeamDailyFeature | None:
@@ -839,6 +989,53 @@ def build_feature_snapshot(
         InjurySnapshot.target_date == target_date,
         InjurySnapshot.team_code == away_code,
     )
+    market_context_values = {
+        "market_family": market_family,
+        "ticker": market.ticker,
+        "event_ticker": market.event_ticker,
+        "side": "yes",
+        "line_value": _float(mapping.line_value if mapping.line_value is not None else market.line_value),
+        "selection_code": selected,
+        "over_under_side": mapping.over_under_side or market.over_under_side,
+        "inning_scope": mapping.inning_scope or market.inning_scope,
+        "executable_price": None,
+        "executable_price_source": None,
+        "yes_bid": _float(market.yes_bid),
+        "yes_ask": _float(market.yes_ask),
+        "no_bid": _float(market.no_bid),
+        "no_ask": _float(market.no_ask),
+        "best_yes_bid": _float(market.best_yes_bid),
+        "best_no_bid": _float(market.best_no_bid),
+        "implied_yes_ask": _float(market.implied_yes_ask),
+        "implied_no_ask": _float(market.implied_no_ask),
+        "last_mark_timestamp": market.market_price_updated_at.isoformat()
+        if market.market_price_updated_at
+        else None,
+        "time_to_start_minutes": minutes_to_start,
+        "time_bucket": _time_bucket(minutes_to_start),
+        "fee_estimate": 0.0,
+        "mapping_confidence": _float(mapping.confidence),
+        "settlement_rule_status": mapping.settlement_rule_status or market.settlement_rule_status,
+        "price_freshness": None,
+    }
+    if mapping.mapping_status == "feature_sync":
+        market_context = _module(
+            "market_context",
+            "missing",
+            "feature-only sync has no real Kalshi market context",
+            captured_at=captured_at,
+            source="feature_sync_placeholder",
+            values=market_context_values,
+        )
+    else:
+        market_context = _available(
+            "market_context",
+            market_context_values,
+            captured_at=captured_at,
+            source="kalshi_public_market_data",
+            confidence="0.90",
+            completeness="0.85",
+        )
 
     features: dict[str, object] = {
         "feature_version": FEATURE_VERSION,
@@ -867,42 +1064,7 @@ def build_feature_snapshot(
             confidence="0.90",
             completeness="0.90",
         ),
-        "market_context": _available(
-            "market_context",
-            {
-                "market_family": market_family,
-                "ticker": market.ticker,
-                "event_ticker": market.event_ticker,
-                "side": "yes",
-                "line_value": _float(mapping.line_value if mapping.line_value is not None else market.line_value),
-                "selection_code": selected,
-                "over_under_side": mapping.over_under_side or market.over_under_side,
-                "inning_scope": mapping.inning_scope or market.inning_scope,
-                "executable_price": None,
-                "executable_price_source": None,
-                "yes_bid": _float(market.yes_bid),
-                "yes_ask": _float(market.yes_ask),
-                "no_bid": _float(market.no_bid),
-                "no_ask": _float(market.no_ask),
-                "best_yes_bid": _float(market.best_yes_bid),
-                "best_no_bid": _float(market.best_no_bid),
-                "implied_yes_ask": _float(market.implied_yes_ask),
-                "implied_no_ask": _float(market.implied_no_ask),
-                "last_mark_timestamp": market.market_price_updated_at.isoformat()
-                if market.market_price_updated_at
-                else None,
-                "time_to_start_minutes": minutes_to_start,
-                "time_bucket": _time_bucket(minutes_to_start),
-                "fee_estimate": 0.0,
-                "mapping_confidence": _float(mapping.confidence),
-                "settlement_rule_status": mapping.settlement_rule_status or market.settlement_rule_status,
-                "price_freshness": None,
-            },
-            captured_at=captured_at,
-            source="kalshi_public_market_data",
-            confidence="0.90",
-            completeness="0.85",
-        ),
+        "market_context": market_context,
         "team_strength_prior": _team_strength_module(
             home_daily,
             away_daily,
@@ -1318,6 +1480,10 @@ def _upsert_team_daily(
     scored, allowed, sample_size = _team_run_totals(previous_games, team_code)
     record = _team_record(game, side)
     pythagorean = _pythagorean(scored, allowed)
+    runs_index = (scored / LEAGUE_AVG_FULL_GAME_RUNS).quantize(Decimal("0.0001")) if scored else None
+    wrc_plus_proxy = int((runs_index or Decimal("1.0000")) * Decimal("100")) if sample_size >= 10 else None
+    woba_proxy = (Decimal("0.320") * (runs_index or Decimal("1.0000"))).quantize(Decimal("0.0001")) if sample_size >= 10 else None
+    iso_proxy = (Decimal("0.160") * (runs_index or Decimal("1.0000"))).quantize(Decimal("0.0001")) if sample_size >= 10 else None
     source_status = "partial" if sample_size or record else "missing"
     completeness = Decimal("0.45") if sample_size else Decimal("0.25") if record else Decimal("0")
     features = {
@@ -1333,11 +1499,14 @@ def _upsert_team_daily(
         "league_average_baseline": 0.5000,
         "obp": None,
         "slg": None,
-        "iso": None,
+        "iso": _float(iso_proxy),
         "k_rate": None,
         "bb_rate": None,
         "hr_rate": None,
         "babip": None,
+        "wrc_plus_proxy": wrc_plus_proxy,
+        "woba_proxy": _float(woba_proxy),
+        "xwoba_proxy": None,
         "hard_hit_pct": None,
         "barrel_pct": None,
         "average_exit_velocity": None,
@@ -1374,17 +1543,20 @@ def _upsert_team_recent(
     team_code = (game.home_abbreviation if side == "home" else game.away_abbreviation) or "UNK"
     previous_games = _team_games(session, game, team_code, days=window_days)
     scored, allowed, sample_size = _team_run_totals(previous_games, team_code)
+    runs_index = (scored / LEAGUE_AVG_FULL_GAME_RUNS).quantize(Decimal("0.0001")) if scored else None
+    woba_proxy = (Decimal("0.320") * (runs_index or Decimal("1.0000"))).quantize(Decimal("0.0001")) if sample_size >= 3 else None
+    iso_proxy = (Decimal("0.160") * (runs_index or Decimal("1.0000"))).quantize(Decimal("0.0001")) if sample_size >= 3 else None
     source_status = "partial" if sample_size else "missing"
     features = {
         "window_days": window_days,
         "runs_per_game": _float(scored),
         "runs_allowed_per_game": _float(allowed),
         "wrc_plus_proxy": None,
-        "woba_proxy": None,
+        "woba_proxy": _float(woba_proxy),
         "xwoba_proxy": None,
         "k_rate": None,
         "bb_rate": None,
-        "iso": None,
+        "iso": _float(iso_proxy),
         "hard_hit_pct": None,
         "barrel_pct": None,
         "contact_quality_proxy": None,
@@ -1499,6 +1671,14 @@ def _upsert_bullpen(
     captured_at: datetime,
 ) -> BullpenDailyFeature:
     team_code = (game.home_abbreviation if side == "home" else game.away_abbreviation) or "UNK"
+    recent_games = _team_games(session, game, team_code, days=14)
+    one_day_games = _team_games(session, game, team_code, days=1)
+    two_day_games = _team_games(session, game, team_code, days=2)
+    three_day_games = _team_games(session, game, team_code, days=3)
+    _scored, allowed, sample_size = _team_run_totals(recent_games, team_code)
+    workload_3 = len(three_day_games)
+    fatigue_score = min(1.0, (len(one_day_games) * 0.45) + (len(two_day_games) * 0.20) + (workload_3 * 0.10))
+    source_status = "partial" if sample_size else "missing"
     row = session.scalar(
         select(BullpenDailyFeature)
         .where(BullpenDailyFeature.target_date == day)
@@ -1507,12 +1687,13 @@ def _upsert_bullpen(
     )
     row = row or BullpenDailyFeature(target_date=day, team_code=team_code, source=DERIVED_SOURCE)
     row.captured_at = captured_at
-    row.source_status = "missing"
-    row.confidence = Decimal("0")
-    row.completeness = Decimal("0")
+    row.source_status = source_status
+    row.confidence = Decimal("0.40") if sample_size else Decimal("0")
+    row.completeness = Decimal("0.35") if sample_size else Decimal("0")
     row.stale = False
     row.features = {
-        "era": None,
+        "sample_size": sample_size,
+        "era": _float(allowed),
         "fip_proxy": None,
         "xfip_proxy": None,
         "whip": None,
@@ -1520,25 +1701,25 @@ def _upsert_bullpen(
         "bb_rate": None,
         "k_minus_bb_rate": None,
         "hr_per_9": None,
-        "leverage_neutral_run_prevention": None,
-        "expected_bullpen_innings": None,
+        "leverage_neutral_run_prevention": _float(allowed),
+        "expected_bullpen_innings": 3.5 if sample_size else None,
         "recent_workload": {
-            "innings_last_1_days": None,
-            "innings_last_2_days": None,
-            "innings_last_3_days": None,
-            "appearances_last_1_days": None,
-            "appearances_last_2_days": None,
-            "appearances_last_3_days": None,
+            "innings_last_1_days": len(one_day_games) * 3,
+            "innings_last_2_days": len(two_day_games) * 3,
+            "innings_last_3_days": workload_3 * 3,
+            "appearances_last_1_days": len(one_day_games),
+            "appearances_last_2_days": len(two_day_games),
+            "appearances_last_3_days": workload_3,
             "pitches_last_1_days": None,
             "pitches_last_2_days": None,
             "pitches_last_3_days": None,
-            "last_7_day_performance": None,
-            "last_14_day_performance": None,
+            "last_7_day_performance": _float(_team_run_totals(_team_games(session, game, team_code, days=7), team_code)[1]),
+            "last_14_day_performance": _float(allowed),
             "high_leverage_availability_proxy": None,
-            "expected_bullpen_fatigue_score": None,
+            "expected_bullpen_fatigue_score": fatigue_score if sample_size else None,
         },
     }
-    row.raw_payload = None
+    row.raw_payload = {"recent_game_count": sample_size, "source": "team_game_log_proxy"}
     session.add(row)
     return row
 
@@ -1579,6 +1760,7 @@ def _upsert_lineup(
         "confirmed_lineup": confirmed,
         "starters": starters,
         "projected_lineup_fallback": not confirmed,
+        "missing_reason": None if confirmed else "LINEUP_NOT_POSTED_YET",
         "lineup_quality_aggregate": None,
         "top_9_wrc_plus_proxy": None,
         "top_9_woba_proxy": None,
@@ -1680,12 +1862,15 @@ def _upsert_weather(
         "relative_humidity_2m": None,
         "precipitation_probability": None,
         "precipitation": None,
+        "rain": None,
         "wind_speed_10m": None,
         "wind_direction_10m": None,
         "wind_gusts_10m": None,
         "cloud_cover": None,
         "wind_orientation_status": "missing",
         "delay_postponement_risk_proxy": None,
+        "missing_reason": "WEATHER_UNAVAILABLE" if profile else "STADIUM_COORDINATES_MISSING",
+        "roof_or_dome": (profile or {}).get("roof_type") in {"dome", "retractable"} if profile else None,
         "roof_dome_weather_override": (profile or {}).get("roof_type") in {"dome", "retractable"}
         if profile
         else None,
@@ -1697,6 +1882,7 @@ def _upsert_weather(
             parsed = _parse_open_meteo(raw_payload, game.scheduled_start)
             if parsed:
                 features.update(parsed)
+                features["missing_reason"] = None
                 source_status = "available"
         except HttpJsonError as exc:
             raw_payload = {"error": exc.to_detail()}
@@ -1745,6 +1931,7 @@ def _fetch_open_meteo(profile: dict[str, object], scheduled_start: datetime) -> 
                 "relative_humidity_2m",
                 "precipitation_probability",
                 "precipitation",
+                "rain",
                 "wind_speed_10m",
                 "wind_direction_10m",
                 "wind_gusts_10m",
@@ -1752,7 +1939,7 @@ def _fetch_open_meteo(profile: dict[str, object], scheduled_start: datetime) -> 
             ],
             "start_date": day,
             "end_date": day,
-            "timezone": "UTC",
+            "timezone": "America/New_York",
             "temperature_unit": "fahrenheit",
             "wind_speed_unit": "mph",
         },
@@ -1766,12 +1953,27 @@ def _parse_open_meteo(payload: dict[str, object], scheduled_start: datetime) -> 
     times = hourly.get("time")
     if not isinstance(times, list) or not times:
         return None
-    target_hour = ensure_aware_utc(scheduled_start).replace(minute=0, second=0, microsecond=0)
+    target_hour = ensure_aware_utc(scheduled_start).astimezone(get_dashboard_zone()).replace(
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
     index = None
+    nearest_delta: float | None = None
     for candidate_index, value in enumerate(times):
-        if str(value).startswith(target_hour.strftime("%Y-%m-%dT%H")):
+        try:
+            candidate_time = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            if str(value).startswith(target_hour.strftime("%Y-%m-%dT%H")):
+                index = candidate_index
+                break
+            continue
+        if candidate_time.tzinfo is None:
+            candidate_time = candidate_time.replace(tzinfo=get_dashboard_zone())
+        delta = abs((ensure_aware_utc(candidate_time) - ensure_aware_utc(target_hour)).total_seconds())
+        if nearest_delta is None or delta < nearest_delta:
             index = candidate_index
-            break
+            nearest_delta = delta
     if index is None:
         return None
 
@@ -1781,13 +1983,23 @@ def _parse_open_meteo(payload: dict[str, object], scheduled_start: datetime) -> 
             return values[index]
         return None
 
+    temperature = at("temperature_2m")
+    humidity = at("relative_humidity_2m")
+    wind_speed = at("wind_speed_10m")
     return {
-        "temperature_2m": at("temperature_2m"),
-        "relative_humidity_2m": at("relative_humidity_2m"),
+        "forecast_time": str(times[index]),
+        "temperature": temperature,
+        "temperature_2m": temperature,
+        "humidity": humidity,
+        "relative_humidity_2m": humidity,
         "precipitation_probability": at("precipitation_probability"),
         "precipitation": at("precipitation"),
-        "wind_speed_10m": at("wind_speed_10m"),
+        "rain": at("rain"),
+        "wind_speed": wind_speed,
+        "wind_speed_10m": wind_speed,
+        "wind_direction": at("wind_direction_10m"),
         "wind_direction_10m": at("wind_direction_10m"),
+        "wind_gusts": at("wind_gusts_10m"),
         "wind_gusts_10m": at("wind_gusts_10m"),
         "cloud_cover": at("cloud_cover"),
     }
@@ -1847,36 +2059,148 @@ def _upsert_travel(
     return row
 
 
+def _new_sync_stats(day: date, include_modules: set[str] | None) -> dict[str, object]:
+    modules = sorted(include_modules) if include_modules else ["all"]
+    return {
+        "target_date": day.isoformat(),
+        "network_sources_enabled": get_settings().feature_sync_enable_network_sources,
+        "games_seen": 0,
+        "rows_attempted": 0,
+        "rows_inserted": 0,
+        "rows_updated": 0,
+        "available_count": 0,
+        "partial_count": 0,
+        "missing_count": 0,
+        "error_count": 0,
+        "validation_status": "ok",
+        "warnings": [],
+        "errors": [],
+        "tables_written": [],
+        "source_summary": {},
+        "feature_snapshots_upserted": 0,
+        "feature_version": FEATURE_VERSION,
+        "source": FEATURE_VERSION,
+        "include_modules": modules,
+    }
+
+
+def _requested_modules(include_modules: set[str] | None) -> set[str]:
+    return set(include_modules) if include_modules else set(ALL_SYNC_MODULES)
+
+
+def _append_warning(stats: dict[str, object], warning: str) -> None:
+    warnings = stats.setdefault("warnings", [])
+    if isinstance(warnings, list) and warning not in warnings:
+        warnings.append(warning)
+
+
+def _append_error(stats: dict[str, object], error: dict[str, object]) -> None:
+    errors = stats.setdefault("errors", [])
+    if isinstance(errors, list):
+        errors.append(error)
+    stats["error_count"] = int(stats.get("error_count", 0)) + 1
+
+
+def _record_feature_row(stats: dict[str, object], table: str, row: object | None) -> None:
+    stats["rows_attempted"] = int(stats.get("rows_attempted", 0)) + 1
+    source_summary = stats.setdefault("source_summary", {})
+    if not isinstance(source_summary, dict):
+        source_summary = {}
+        stats["source_summary"] = source_summary
+    table_summary = source_summary.setdefault(
+        table,
+        {"attempted": 0, "inserted": 0, "updated": 0, "available": 0, "partial": 0, "missing": 0},
+    )
+    if isinstance(table_summary, dict):
+        table_summary["attempted"] = int(table_summary.get("attempted", 0)) + 1
+
+    if row is None:
+        stats["missing_count"] = int(stats.get("missing_count", 0)) + 1
+        if isinstance(table_summary, dict):
+            table_summary["missing"] = int(table_summary.get("missing", 0)) + 1
+        return
+
+    is_insert = getattr(row, "id", None) is None
+    if is_insert:
+        stats["rows_inserted"] = int(stats.get("rows_inserted", 0)) + 1
+        if isinstance(table_summary, dict):
+            table_summary["inserted"] = int(table_summary.get("inserted", 0)) + 1
+    else:
+        stats["rows_updated"] = int(stats.get("rows_updated", 0)) + 1
+        if isinstance(table_summary, dict):
+            table_summary["updated"] = int(table_summary.get("updated", 0)) + 1
+
+    tables_written = stats.setdefault("tables_written", [])
+    if isinstance(tables_written, list) and table not in tables_written:
+        tables_written.append(table)
+
+    status = str(getattr(row, "source_status", "missing") or "missing")
+    bucket_key = f"{status}_count"
+    if bucket_key in stats:
+        stats[bucket_key] = int(stats.get(bucket_key, 0)) + 1
+    if isinstance(table_summary, dict):
+        table_summary[status] = int(table_summary.get(status, 0)) + 1
+
+
 def _sync_game_feature_modules(
     session: Session,
     game: MlbGame,
     day: date,
     captured_at: datetime,
     include_modules: set[str] | None,
+    stats: dict[str, object],
 ) -> None:
     if include_modules is None or "team" in include_modules:
         for side in ("home", "away"):
-            _upsert_team_daily(session, game, side, day, captured_at)
+            _record_feature_row(
+                stats,
+                "team_daily_features",
+                _upsert_team_daily(session, game, side, day, captured_at),
+            )
             for window in (7, 14, 30):
-                _upsert_team_recent(session, game, side, day, captured_at, window)
+                _record_feature_row(
+                    stats,
+                    "team_recent_features",
+                    _upsert_team_recent(session, game, side, day, captured_at, window),
+                )
     if include_modules is None or "pitcher" in include_modules:
         for side in ("home", "away"):
-            _upsert_pitcher(session, game, side, day, captured_at)
+            _record_feature_row(
+                stats,
+                "pitcher_daily_features",
+                _upsert_pitcher(session, game, side, day, captured_at),
+            )
     if include_modules is None or "bullpen" in include_modules:
         for side in ("home", "away"):
-            _upsert_bullpen(session, game, side, day, captured_at)
+            _record_feature_row(
+                stats,
+                "bullpen_daily_features",
+                _upsert_bullpen(session, game, side, day, captured_at),
+            )
     if include_modules is None or "lineup" in include_modules:
         for side in ("home", "away"):
-            _upsert_lineup(session, game, side, day, captured_at)
+            _record_feature_row(
+                stats,
+                "lineup_snapshots",
+                _upsert_lineup(session, game, side, day, captured_at),
+            )
     if include_modules is None or "injuries" in include_modules:
         for side in ("home", "away"):
-            _upsert_injuries(session, game, side, day, captured_at)
+            _record_feature_row(
+                stats,
+                "injury_snapshots",
+                _upsert_injuries(session, game, side, day, captured_at),
+            )
     if include_modules is None or "weather" in include_modules:
-        _upsert_park_factor(session, game, captured_at)
-        _upsert_weather(session, game, day, captured_at)
+        _record_feature_row(stats, "park_factor_snapshots", _upsert_park_factor(session, game, captured_at))
+        _record_feature_row(stats, "weather_snapshots", _upsert_weather(session, game, day, captured_at))
     if include_modules is None or "travel" in include_modules:
         for side in ("home", "away"):
-            _upsert_travel(session, game, side, day, captured_at)
+            _record_feature_row(
+                stats,
+                "travel_schedule_features",
+                _upsert_travel(session, game, side, day, captured_at),
+            )
 
 
 def _target_games(session: Session, day: date) -> list[MlbGame]:
@@ -1899,13 +2223,38 @@ def sync_mlb_features(
     include_modules: set[str] | None = None,
 ) -> dict[str, object]:
     day = target_date or today_eastern()
+    requested_modules = _requested_modules(include_modules)
+    stats = _new_sync_stats(day, include_modules)
+    settings = get_settings()
+    if not settings.feature_sync_enable_network_sources and requested_modules & NETWORK_SOURCE_MODULES:
+        games = _target_games(session, day)
+        stats["games_seen"] = len(games)
+        stats["validation_status"] = "skipped_network_disabled"
+        stats["network_sources_enabled"] = False
+        _append_warning(
+            stats,
+            "FEATURE_SYNC_ENABLE_NETWORK_SOURCES=false; public source ingestion was skipped.",
+        )
+        return stats
+
+    errors: list[dict[str, object]] = []
+    if settings.feature_sync_enable_network_sources:
+        client = MLBStatsClient()
+        schedule_rows = _hydrate_schedule_window(session, day, client=client, errors=errors)
+        if schedule_rows == 0:
+            _append_warning(stats, "MLB schedule hydration returned no games.")
     games = _target_games(session, day)
     captured_at = utc_now()
     upserted = 0
+    stats["games_seen"] = len(games)
+    for error in errors:
+        _append_error(stats, error)
     for game in games:
-        if get_settings().feature_sync_enable_network_sources:
-            _hydrate_game_endpoint_if_available(game)
-        _sync_game_feature_modules(session, game, day, captured_at, include_modules)
+        if settings.feature_sync_enable_network_sources:
+            error = _hydrate_game_endpoint_if_available(game)
+            if error:
+                _append_error(stats, error)
+        _sync_game_feature_modules(session, game, day, captured_at, include_modules, stats)
         session.flush()
         mapping = MarketMapping(
             mlb_game_id=game.id or 0,
@@ -1934,28 +2283,32 @@ def sync_mlb_features(
         session.add(row)
         upserted += 1
     session.commit()
-    return {
-        "date": day.isoformat(),
-        "games_seen": len(games),
-        "feature_snapshots_upserted": upserted,
-        "feature_version": FEATURE_VERSION,
-        "source": FEATURE_VERSION,
-        "include_modules": sorted(include_modules) if include_modules else ["all"],
-        "network_sources_enabled": get_settings().feature_sync_enable_network_sources,
-    }
+    stats["feature_snapshots_upserted"] = upserted
+    if int(stats.get("games_seen", 0)) == 0:
+        stats["validation_status"] = "degraded_no_games"
+    elif int(stats.get("error_count", 0)) > 0:
+        stats["validation_status"] = "degraded_with_errors"
+    elif int(stats.get("rows_inserted", 0)) + int(stats.get("rows_updated", 0)) == 0:
+        stats["validation_status"] = "degraded_no_rows_written"
+    elif int(stats.get("available_count", 0)) == 0 and requested_modules & NETWORK_SOURCE_MODULES:
+        stats["validation_status"] = "degraded_no_available_public_rows"
+    else:
+        stats["validation_status"] = "ok"
+    if isinstance(stats.get("tables_written"), list):
+        stats["tables_written"] = sorted(stats["tables_written"])
+    return stats
 
 
-def _hydrate_game_endpoint_if_available(game: MlbGame) -> None:
-    if not game.external_game_id:
-        return
+def _hydrate_game_endpoint_if_available(game: MlbGame) -> dict[str, object] | None:
+    if not game.external_game_id or not str(game.external_game_id).isdigit():
+        return None
     try:
-        payload = fetch_game_endpoint(game.external_game_id)
-    except HttpJsonError:
-        return
+        payload = MLBStatsClient().get_game_feed(game.external_game_id)
+    except HttpJsonError as exc:
+        return {"source": MLB_STATS_SOURCE, "table": "mlb_games_feed", "game_pk": game.external_game_id, "error": exc.to_detail()}
     if payload:
-        merged = dict(game.raw_payload or {})
-        merged.update(payload)
-        game.raw_payload = merged
+        _merge_game_payload(game, payload)
+    return None
 
 
 def sync_mlb_team_features(session: Session, target_date: date | None = None) -> dict[str, object]:
@@ -1980,6 +2333,90 @@ def sync_weather_features(session: Session, target_date: date | None = None) -> 
 
 def sync_travel_schedule_features(session: Session, target_date: date | None = None) -> dict[str, object]:
     return sync_mlb_features(session, target_date, {"travel"})
+
+
+SOURCE_TABLE_MODELS = {
+    "team_daily_features": TeamDailyFeature,
+    "team_recent_features": TeamRecentFeature,
+    "pitcher_daily_features": PitcherDailyFeature,
+    "bullpen_daily_features": BullpenDailyFeature,
+    "lineup_snapshots": LineupSnapshot,
+    "injury_snapshots": InjurySnapshot,
+    "weather_snapshots": WeatherSnapshot,
+    "park_factor_snapshots": ParkFactorSnapshot,
+    "travel_schedule_features": TravelScheduleFeature,
+    "mlb_feature_snapshots": MlbFeatureSnapshot,
+}
+
+
+def _table_source_status(session: Session, table_name: str, model) -> dict[str, object]:
+    rows = list(session.scalars(select(model).order_by(model.captured_at.desc()).limit(200)))
+    counts: dict[str, int] = {}
+    last_success = None
+    last_error = None
+
+    def timestamp(value: object) -> str | None:
+        return ensure_aware_utc(value).isoformat() if isinstance(value, datetime) else None
+
+    for row in rows:
+        status = str(getattr(row, "source_status", None) or "available")
+        counts[status] = counts.get(status, 0) + 1
+        captured_at = getattr(row, "captured_at", None)
+        if last_success is None and status in {"available", "partial"} and captured_at is not None:
+            last_success = timestamp(captured_at)
+        raw_payload = getattr(row, "raw_payload", None)
+        if last_error is None and isinstance(raw_payload, dict) and raw_payload.get("error"):
+            last_error = raw_payload.get("error")
+    return {
+        "table": table_name,
+        "row_sample_count": len(rows),
+        "latest_captured_at": timestamp(rows[0].captured_at) if rows else None,
+        "last_successful_sync": last_success,
+        "last_error": last_error,
+        "status_counts": counts,
+    }
+
+
+def _secret_configured(value: object) -> bool:
+    if value is None:
+        return False
+    get_secret_value = getattr(value, "get_secret_value", None)
+    if callable(get_secret_value):
+        return bool(get_secret_value())
+    return bool(value)
+
+
+def source_status_report(session: Session) -> dict[str, object]:
+    settings = get_settings()
+    table_status = {
+        table_name: _table_source_status(session, table_name, model)
+        for table_name, model in SOURCE_TABLE_MODELS.items()
+    }
+    last_feature_snapshot = table_status["mlb_feature_snapshots"]["latest_captured_at"]
+    return {
+        "feature_sync_enable_network_sources": settings.feature_sync_enable_network_sources,
+        "mlb_stats_base_url": settings.mlb_stats_base_url,
+        "open_meteo_base_url": settings.open_meteo_base_url,
+        "pybaseball_available": pybaseball_available(),
+        "public_sources_enabled": settings.feature_sync_enable_network_sources,
+        "optional_injury_provider_configured": _secret_configured(settings.injury_provider_api_key),
+        "optional_lineup_provider_configured": _secret_configured(settings.lineup_provider_api_key),
+        "optional_weather_provider_configured": _secret_configured(settings.weather_provider_api_key),
+        "last_successful_sync": {
+            table_name: status["last_successful_sync"]
+            for table_name, status in table_status.items()
+        },
+        "last_error": {
+            table_name: status["last_error"]
+            for table_name, status in table_status.items()
+            if status["last_error"] is not None
+        },
+        "last_feature_sync_status": {
+            "captured_at": last_feature_snapshot,
+            "feature_version": FEATURE_VERSION,
+        },
+        "tables": table_status,
+    }
 
 
 def feature_coverage(session: Session, target_date: date | None = None) -> dict[str, object]:
