@@ -3766,6 +3766,53 @@ def test_refresh_schedule_false_skips_hydration_when_games_exist(monkeypatch) ->
     assert result["hydration_skipped_reason"] == "target_date_games_exist"
 
 
+def test_full_feature_sync_refreshes_schedule_by_default_with_existing_games(monkeypatch) -> None:
+    monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "true")
+    get_settings.cache_clear()
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    called = {"hydration": 0}
+
+    def tracked_hydration(*_args, **_kwargs):
+        called["hydration"] += 1
+        return {
+            "rows_seen": 0,
+            "rows_upserted": 0,
+            "duplicate_count": 0,
+            "error_count": 0,
+            "validation_status": "ok",
+            "errors": [],
+            "warnings": [],
+        }
+
+    monkeypatch.setattr(features, "_hydrate_schedule_window", tracked_hydration)
+    monkeypatch.setattr(features, "_hydrate_game_endpoint_if_available", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(features, "_fetch_open_meteo", lambda *_args, **_kwargs: {"hourly": {"time": []}})
+    try:
+        with Session(engine) as session:
+            session.add(
+                MlbGame(
+                    external_game_id="full-refresh-default-1",
+                    home_team="Pittsburgh Pirates",
+                    away_team="Seattle Mariners",
+                    home_abbreviation="PIT",
+                    away_abbreviation="SEA",
+                    scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+                    status="scheduled",
+                    raw_payload={"venue": {"id": 31, "name": "PNC Park"}},
+                )
+            )
+            session.commit()
+
+            result = features.sync_mlb_features(session, date(2026, 7, 1))
+    finally:
+        get_settings.cache_clear()
+
+    assert called["hydration"] == 1
+    assert result["refresh_schedule"] is True
+    assert result["hydration_validation_status"] == "ok"
+
+
 def test_pybaseball_unavailable_is_reported_and_advanced_stats_degraded(monkeypatch) -> None:
     monkeypatch.setattr(features.importlib.util, "find_spec", lambda name: None)
     engine = create_engine("sqlite+pysqlite:///:memory:")
@@ -3776,6 +3823,18 @@ def test_pybaseball_unavailable_is_reported_and_advanced_stats_degraded(monkeypa
 
     assert report["pybaseball_available"] is False
     assert report["advanced_public_stats_status"] == "unavailable_pybaseball_not_installed"
+
+
+def test_pybaseball_presence_does_not_mark_advanced_stats_available(monkeypatch) -> None:
+    monkeypatch.setattr(features.importlib.util, "find_spec", lambda name: object() if name == "pybaseball" else None)
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        report = features.source_status_report(session)
+
+    assert report["pybaseball_available"] is True
+    assert report["advanced_public_stats_status"] == "not_ingested_pybaseball_adapter_not_implemented"
 
 
 def test_weather_sync_handles_open_meteo_failure_without_500(monkeypatch) -> None:

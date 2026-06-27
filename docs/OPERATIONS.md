@@ -229,7 +229,7 @@ Expected: module syncs skip schedule hydration when target-date games already ex
 Invoke-RestMethod -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-RAILWAY-API/v1/model/sources/status"
 ```
 
-Expected: `last_attempted_sync`, `validation_status`, `last_error`, `latest_errors`, and per-table `status_counts` are present. `pybaseball_available=false` is acceptable only when paired with `advanced_public_stats_status=unavailable_pybaseball_not_installed`; in that mode team, pitcher, and bullpen rows should remain `partial` schedule-derived proxies, not complete advanced-stat rows.
+Expected: `last_attempted_sync`, `validation_status`, `last_error`, `latest_errors`, and per-table `status_counts` are present. `pybaseball_available` is only an import diagnostic. Until an adapter actually ingests pybaseball-backed data, `advanced_public_stats_status` should be `not_ingested_pybaseball_adapter_not_implemented` when the package is present or `unavailable_pybaseball_not_installed` when it is absent; team, pitcher, and bullpen rows should remain `partial` schedule-derived proxies, not complete advanced-stat rows.
 
 4. Confirm weather and lineup degraded behavior:
 

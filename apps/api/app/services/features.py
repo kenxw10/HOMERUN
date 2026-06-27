@@ -598,6 +598,12 @@ def pybaseball_available() -> bool:
     return importlib.util.find_spec("pybaseball") is not None
 
 
+def advanced_public_stats_status() -> str:
+    if pybaseball_available():
+        return "not_ingested_pybaseball_adapter_not_implemented"
+    return "unavailable_pybaseball_not_installed"
+
+
 def _merge_game_payload(game: MlbGame, payload: dict[str, object]) -> None:
     merged = dict(game.raw_payload or {})
     merged.update(payload)
@@ -2398,7 +2404,7 @@ def sync_mlb_features(
     errors: list[dict[str, object]] = []
     games_before_hydration = _target_games(session, day)
     if refresh_schedule is None:
-        refresh_schedule = len(games_before_hydration) == 0
+        refresh_schedule = include_modules is None or len(games_before_hydration) == 0
     stats["refresh_schedule"] = refresh_schedule
     if settings.feature_sync_enable_network_sources and refresh_schedule:
         client = MLBStatsClient()
@@ -2678,7 +2684,7 @@ def source_status_report(session: Session) -> dict[str, object]:
         "mlb_stats_base_url": settings.mlb_stats_base_url,
         "open_meteo_base_url": settings.open_meteo_base_url,
         "pybaseball_available": pybaseball_available(),
-        "advanced_public_stats_status": "available" if pybaseball_available() else "unavailable_pybaseball_not_installed",
+        "advanced_public_stats_status": advanced_public_stats_status(),
         "public_sources_enabled": settings.feature_sync_enable_network_sources,
         "optional_injury_provider_configured": _secret_configured(settings.injury_provider_api_key),
         "optional_lineup_provider_configured": _secret_configured(settings.lineup_provider_api_key),
