@@ -3047,6 +3047,8 @@ def test_dashboard_feature_status_uses_active_feature_source(monkeypatch) -> Non
     assert summary.model_status.feature_completeness["lineup"] == {"available": 1, "missing": 1}
     assert summary.model_status.lineup_status == "partial"
     assert summary.model_status.weather_status == "partial"
+    assert "LINEUP MISSING OR DEGRADED" in summary.model_status.critical_module_warnings
+    assert "PARK_WEATHER MISSING OR DEGRADED" in summary.model_status.critical_module_warnings
 
 
 def test_generate_candidates_uses_heuristic_probability_and_feature_snapshot(monkeypatch) -> None:
@@ -3761,6 +3763,24 @@ def test_family_offsets_are_residual_to_global_offset(monkeypatch) -> None:
 
     assert offsets["__global__"] == Decimal("0.050000")
     assert offsets["full_game_winner"] == Decimal("0.000000")
+
+
+def test_challenger_offsets_preserve_active_parameter_offsets() -> None:
+    combined = modeling._combine_probability_offsets(
+        {
+            "market_family_probability_offsets": {
+                "__global__": 0.02,
+                "full_game_winner": -0.01,
+            }
+        },
+        {
+            "__global__": Decimal("0.030000"),
+            "full_game_winner": Decimal("0.020000"),
+        },
+    )
+
+    assert combined["__global__"] == Decimal("0.050000")
+    assert combined["full_game_winner"] == Decimal("0.010000")
 
 
 def test_governance_trains_challenger_when_sample_threshold_met(monkeypatch) -> None:

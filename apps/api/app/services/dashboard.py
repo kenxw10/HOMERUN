@@ -238,7 +238,7 @@ def _feature_status_summary(rows: list[MlbFeatureSnapshot]) -> tuple[dict[str, o
 
     for module_name in ("offense_season", "offense_recent", "starter_identity", "lineup", "park_weather"):
         counts = module_counts.get(module_name, {})
-        if counts.get("missing", 0) > 0 and counts.get("available", 0) == 0:
+        if counts and _aggregate_module_status(counts) != "available":
             warnings.add(f"{module_name.upper()} MISSING OR DEGRADED")
 
     for module_name, counts in module_counts.items():

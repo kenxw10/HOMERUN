@@ -799,6 +799,30 @@ def _offsets_to_json(offsets: dict[str, Decimal]) -> dict[str, float]:
     return {key: float(value) for key, value in offsets.items()}
 
 
+def _parameter_offsets(parameters: dict[str, object] | None) -> dict[str, Decimal]:
+    offsets = (parameters or {}).get("market_family_probability_offsets") if parameters else None
+    if not isinstance(offsets, dict):
+        return {}
+    return {
+        str(key): _decimal(value, Decimal("0")).quantize(Decimal("0.000001"))
+        for key, value in offsets.items()
+    }
+
+
+def _combine_probability_offsets(
+    parameters: dict[str, object] | None,
+    residual_offsets: dict[str, Decimal],
+) -> dict[str, Decimal]:
+    existing_offsets = _parameter_offsets(parameters)
+    keys = set(existing_offsets) | set(residual_offsets)
+    return {
+        key: (existing_offsets.get(key, Decimal("0")) + residual_offsets.get(key, Decimal("0"))).quantize(
+            Decimal("0.000001")
+        )
+        for key in keys
+    }
+
+
 def run_model_governance(session: Session, now: datetime | None = None) -> dict[str, object]:
     settings = get_settings()
     started = now or utc_now()
@@ -873,9 +897,10 @@ def run_model_governance(session: Session, now: datetime | None = None) -> dict[
         promoted = False
     else:
         offsets = _fit_probability_offsets(train_rows)
+        combined_offsets = _combine_probability_offsets(active_parameters.parameters, offsets)
         challenger_parameters = {
             **(active_parameters.parameters or DEFAULT_MODEL_PARAMETERS),
-            "market_family_probability_offsets": _offsets_to_json(offsets),
+            "market_family_probability_offsets": _offsets_to_json(combined_offsets),
             "trained_from_samples": True,
             "training_sample_count": len(train_rows),
             "holdout_sample_count": len(holdout_rows),
@@ -896,7 +921,8 @@ def run_model_governance(session: Session, now: datetime | None = None) -> dict[
                 "holdout_sample_count": len(holdout_rows),
                 "baseline_holdout": holdout_metrics,
                 "challenger_holdout": challenger_metrics,
-                "offsets": _offsets_to_json(offsets),
+                "residual_offsets": _offsets_to_json(offsets),
+                "combined_offsets": _offsets_to_json(combined_offsets),
             },
         )
         session.add(challenger)
