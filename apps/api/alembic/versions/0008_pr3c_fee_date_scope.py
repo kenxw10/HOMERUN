@@ -26,6 +26,8 @@ def _set_fast_postgres_timeouts() -> None:
 def upgrade() -> None:
     _set_fast_postgres_timeouts()
 
+    op.add_column("kalshi_markets", sa.Column("market_price_updated_at", sa.DateTime(timezone=True)))
+
     op.add_column("model_candidates", sa.Column("probability_edge", sa.Numeric(10, 6)))
     op.add_column("model_candidates", sa.Column("target_date", sa.Date()))
     op.add_column("model_candidates", sa.Column("executable_price_source", sa.String(length=80)))
@@ -59,3 +61,5 @@ def downgrade() -> None:
     op.drop_column("model_candidates", "executable_price_source")
     op.drop_column("model_candidates", "target_date")
     op.drop_column("model_candidates", "probability_edge")
+
+    op.drop_column("kalshi_markets", "market_price_updated_at")

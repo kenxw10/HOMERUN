@@ -82,7 +82,7 @@ def _is_executable_price(value: Decimal | None) -> bool:
 
 
 def _market_price_timestamp(market: KalshiMarket, now: datetime) -> datetime:
-    value = market.updated_at or now
+    value = market.market_price_updated_at or market.updated_at or now
     return ensure_aware_utc(value)
 
 

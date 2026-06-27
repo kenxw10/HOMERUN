@@ -70,7 +70,7 @@ def _add_candidate_mapping(
     **overrides,
 ) -> MarketMapping:
     session.flush()
-    market.updated_at = candidates.utc_now()
+    market.market_price_updated_at = candidates.utc_now()
     session.add(market)
     values = {
         "mlb_game_id": game.id,
@@ -385,7 +385,7 @@ def test_generate_candidates_preserves_traded_candidate_snapshot(monkeypatch) ->
         assert traded_candidate.executable_price == Decimal("0.4000")
 
         market.implied_yes_ask = Decimal("0.3500")
-        market.updated_at = now
+        market.market_price_updated_at = now
         session.add(market)
         session.commit()
 
@@ -433,7 +433,7 @@ def test_generate_candidates_avoids_duplicate_open_trade_across_days(monkeypatch
 
         first_result = candidates.generate_candidates(session, target_date=date(2026, 7, 3))
         current_time["now"] = datetime(2026, 7, 2, 16, 0, tzinfo=UTC)
-        market.updated_at = current_time["now"]
+        market.market_price_updated_at = current_time["now"]
         session.add(market)
         session.commit()
         second_result = candidates.generate_candidates(session, target_date=date(2026, 7, 3))
@@ -483,7 +483,7 @@ def test_generate_candidates_avoids_duplicate_open_trade_across_mappings(monkeyp
             occurrence_datetime=datetime(2026, 7, 2, 18, 5, tzinfo=UTC),
             implied_yes_ask=Decimal("0.4000"),
         )
-        market.updated_at = now
+        market.market_price_updated_at = now
         session.add_all([first_game, second_game, market])
         session.flush()
         session.add_all(
@@ -553,7 +553,7 @@ def test_generate_candidates_refreshes_existing_open_trade_price(monkeypatch) ->
 
         current_time["now"] = datetime(2026, 7, 2, 16, 0, tzinfo=UTC)
         market.implied_yes_ask = Decimal("0.3200")
-        market.updated_at = current_time["now"]
+        market.market_price_updated_at = current_time["now"]
         session.add(market)
         session.commit()
         second_result = candidates.generate_candidates(session, target_date=date(2026, 7, 3))
@@ -844,7 +844,7 @@ def test_generate_candidates_blocks_stale_prices(monkeypatch) -> None:
             )
             session.add_all([game, market])
             _add_candidate_mapping(session, game, market)
-            market.updated_at = now - timedelta(seconds=901)
+            market.market_price_updated_at = now - timedelta(seconds=901)
             session.add(market)
             session.commit()
 
@@ -861,6 +861,55 @@ def test_generate_candidates_blocks_stale_prices(monkeypatch) -> None:
     assert candidate.decision == "no_trade_stale_price"
     assert candidate.training_eligible is False
     assert trade is None
+
+
+def test_generate_candidates_uses_market_price_observation_timestamp(monkeypatch) -> None:
+    monkeypatch.setenv("PAPER_MAX_PRICE_STALENESS_SECONDS", "900")
+    get_settings.cache_clear()
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+    monkeypatch.setattr(candidates, "utc_now", lambda: now)
+    monkeypatch.setattr(candidates, "score_mature_candidate", lambda *args, **kwargs: _fixed_model_score("0.900000"))
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    try:
+        with Session(engine) as session:
+            game = MlbGame(
+                external_game_id="fresh-observed-price",
+                home_team="Pittsburgh Pirates",
+                away_team="Seattle Mariners",
+                home_abbreviation="PIT",
+                away_abbreviation="SEA",
+                scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+                status="scheduled",
+            )
+            market = KalshiMarket(
+                kalshi_market_id="KX-FRESH-OBSERVED-PRICE",
+                ticker="KXMLBGAME-FRESH-OBSERVED-PRICE-PIT",
+                title="Will Pittsburgh win?",
+                status="open",
+                implied_yes_ask=Decimal("0.1000"),
+            )
+            session.add_all([game, market])
+            _add_candidate_mapping(session, game, market)
+            market.updated_at = now - timedelta(seconds=901)
+            market.market_price_updated_at = now
+            session.add(market)
+            session.commit()
+
+            result = candidates.generate_candidates(session)
+            candidate = session.scalar(select(ModelCandidate))
+            trade = session.scalar(select(PaperTrade))
+    finally:
+        get_settings.cache_clear()
+
+    assert result["stale_price_count"] == 0
+    assert result["paper_trades"] == 1
+    assert candidate is not None
+    assert candidate.price_status == "fresh_executable"
+    assert candidate.price_staleness_seconds == 0
+    assert trade is not None
 
 
 def test_generate_candidates_uses_fee_adjusted_ev_before_caps(monkeypatch) -> None:
@@ -1086,7 +1135,7 @@ def test_generate_candidates_preserves_confirmed_targeted_resolver_mapping(monke
             occurrence_datetime=datetime(2026, 6, 26, 22, 40, tzinfo=UTC),
             implied_yes_ask=Decimal("0.9000"),
         )
-        market.updated_at = now
+        market.market_price_updated_at = now
         session.add_all([game, market])
         session.flush()
         session.add(
@@ -1482,6 +1531,38 @@ def test_candidate_event_ticker_generation_uses_fixed_eastern_timezone(monkeypat
         get_settings.cache_clear()
 
     assert events[0] == "KXMLBGAME-26JUN261840HOUDET"
+
+
+def test_market_sync_records_quote_observation_timestamp_when_prices_are_unchanged(monkeypatch) -> None:
+    now = datetime(2026, 6, 25, 12, 0, tzinfo=UTC)
+    stale = now - timedelta(hours=2)
+    monkeypatch.setattr(market_sync, "utc_now", lambda: now)
+
+    market = KalshiMarket(
+        kalshi_market_id="KX-UNCHANGED-QUOTE",
+        ticker="KXMLBGAME-UNCHANGED-QUOTE-PIT",
+        title="Will Pittsburgh win?",
+        status="open",
+        yes_ask=Decimal("0.4000"),
+    )
+    market.updated_at = stale
+    market.market_price_updated_at = stale
+
+    market_sync._update_market_fields(
+        market,
+        {
+            "id": "KX-UNCHANGED-QUOTE",
+            "ticker": "KXMLBGAME-UNCHANGED-QUOTE-PIT",
+            "title": "Will Pittsburgh win?",
+            "status": "open",
+            "yes_ask_dollars": "0.4000",
+        },
+        market.ticker,
+        "open",
+    )
+
+    assert market.yes_ask == Decimal("0.4000")
+    assert market.market_price_updated_at == now
 
 
 def test_market_sync_uses_targeted_resolver_and_skips_broad_by_default(monkeypatch) -> None:

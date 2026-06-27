@@ -78,6 +78,7 @@ class KalshiMarket(TimestampMixin, Base):
     best_no_bid: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
     implied_yes_ask: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
     implied_no_ask: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
+    market_price_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     status: Mapped[str] = mapped_column(String(40), default="untracked", nullable=False)
     raw_status: Mapped[str | None] = mapped_column(String(40))
     open_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
