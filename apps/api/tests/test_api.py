@@ -3620,6 +3620,112 @@ def test_feature_sync_returns_degraded_and_records_source_error(monkeypatch) -> 
     assert report["last_error"]["mlb_games"]["error_type"] == "IntegrityError"
 
 
+def test_failed_sync_without_game_snapshots_persists_source_audit(monkeypatch) -> None:
+    monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "true")
+    get_settings.cache_clear()
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    def failed_empty_hydration(_session: Session, _day: date, **kwargs) -> dict[str, object]:
+        error = {
+            "source": features.MLB_STATS_SOURCE,
+            "table": "mlb_games",
+            "error_type": "HttpJsonError",
+            "message": "schedule unavailable",
+        }
+        kwargs["errors"].append(error)
+        return {
+            "rows_seen": 0,
+            "rows_upserted": 0,
+            "duplicate_count": 0,
+            "error_count": 1,
+            "validation_status": "degraded_with_errors",
+            "errors": [error],
+            "warnings": ["schedule unavailable"],
+        }
+
+    monkeypatch.setattr(features, "_hydrate_schedule_window", failed_empty_hydration)
+    try:
+        with Session(engine) as session:
+            result = features.sync_mlb_team_features(session, date(2026, 7, 1), refresh_schedule=True)
+            report = features.source_status_report(session)
+            audit = session.scalar(
+                select(MlbFeatureSnapshot).where(MlbFeatureSnapshot.source == features.FEATURE_SYNC_AUDIT_SOURCE)
+            )
+    finally:
+        get_settings.cache_clear()
+
+    assert result["games_seen"] == 0
+    assert result["feature_snapshots_upserted"] == 0
+    assert result["validation_status"] == "degraded_with_errors"
+    assert audit is not None
+    assert audit.mlb_game_id is None
+    assert report["last_attempted_sync"] is not None
+    assert report["validation_status"] == "degraded_with_errors"
+    assert report["last_error"]["mlb_games"]["message"] == "schedule unavailable"
+
+
+def test_source_status_errors_are_limited_to_latest_sync_attempt() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        session.add_all(
+            [
+                MlbFeatureSnapshot(
+                    mlb_game_id=None,
+                    target_date=date(2026, 7, 1),
+                    source=features.FEATURE_SYNC_AUDIT_SOURCE,
+                    captured_at=datetime(2026, 7, 1, 15, 0, tzinfo=UTC),
+                    data_quality=None,
+                    source_statuses={"sync": "degraded_with_errors"},
+                    features={
+                        "sync_status": {
+                            "target_date": "2026-07-01",
+                            "attempted_at": "2026-07-01T15:00:00+00:00",
+                            "validation_status": "degraded_with_errors",
+                            "error_count": 1,
+                            "errors": [
+                                {
+                                    "source": features.MLB_STATS_SOURCE,
+                                    "table": "mlb_games",
+                                    "error_type": "HttpJsonError",
+                                    "message": "old failure",
+                                }
+                            ],
+                            "warnings": [],
+                        }
+                    },
+                ),
+                MlbFeatureSnapshot(
+                    mlb_game_id=None,
+                    target_date=date(2026, 7, 1),
+                    source=features.FEATURE_SYNC_AUDIT_SOURCE,
+                    captured_at=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
+                    data_quality=None,
+                    source_statuses={"sync": "ok"},
+                    features={
+                        "sync_status": {
+                            "target_date": "2026-07-01",
+                            "attempted_at": "2026-07-01T16:00:00+00:00",
+                            "validation_status": "ok",
+                            "error_count": 0,
+                            "errors": [],
+                            "warnings": [],
+                        }
+                    },
+                ),
+            ]
+        )
+        session.commit()
+
+        report = features.source_status_report(session)
+
+    assert report["validation_status"] == "ok"
+    assert report["latest_errors"] == []
+    assert "mlb_games" not in report["last_error"]
+
+
 def test_refresh_schedule_false_skips_hydration_when_games_exist(monkeypatch) -> None:
     monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "true")
     get_settings.cache_clear()

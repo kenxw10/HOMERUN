@@ -42,6 +42,7 @@ from app.time_utils import ensure_aware_utc, get_dashboard_zone, parse_datetime,
 
 FEATURE_VERSION = "mature_mlb_features_v2"
 MATURE_FEATURE_VERSION = FEATURE_VERSION
+FEATURE_SYNC_AUDIT_SOURCE = f"{FEATURE_VERSION}_sync_audit"
 LEAGUE_AVG_FULL_GAME_RUNS = Decimal("4.35")
 LEAGUE_AVG_FIRST_FIVE_RUNS = Decimal("2.15")
 EARTH_RADIUS_MILES = Decimal("3958.8")
@@ -2271,6 +2272,33 @@ def _record_feature_row(stats: dict[str, object], table: str, row: object | None
         table_summary[status] = int(table_summary.get(status, 0)) + 1
 
 
+def _upsert_feature_sync_audit(
+    session: Session,
+    day: date,
+    captured_at: datetime,
+    sync_status: dict[str, object],
+) -> MlbFeatureSnapshot:
+    row = session.scalar(
+        select(MlbFeatureSnapshot)
+        .where(MlbFeatureSnapshot.mlb_game_id.is_(None))
+        .where(MlbFeatureSnapshot.target_date == day)
+        .where(MlbFeatureSnapshot.source == FEATURE_SYNC_AUDIT_SOURCE)
+        .order_by(MlbFeatureSnapshot.id.desc())
+        .limit(1)
+    )
+    row = row or MlbFeatureSnapshot(
+        mlb_game_id=None,
+        target_date=day,
+        source=FEATURE_SYNC_AUDIT_SOURCE,
+    )
+    row.captured_at = captured_at
+    row.data_quality = None
+    row.source_statuses = {"sync": sync_status.get("validation_status")}
+    row.features = {"sync_status": sync_status}
+    session.add(row)
+    return row
+
+
 def _sync_game_feature_modules(
     session: Session,
     game: MlbGame,
@@ -2429,10 +2457,10 @@ def sync_mlb_features(
         snapshot_rows.append(row)
         upserted += 1
     stats["feature_snapshots_upserted"] = upserted
-    if int(stats.get("games_seen", 0)) == 0:
-        stats["validation_status"] = "degraded_no_games"
-    elif int(stats.get("error_count", 0)) > 0:
+    if int(stats.get("error_count", 0)) > 0:
         stats["validation_status"] = "degraded_with_errors"
+    elif int(stats.get("games_seen", 0)) == 0:
+        stats["validation_status"] = "degraded_no_games"
     elif int(stats.get("rows_inserted", 0)) + int(stats.get("rows_updated", 0)) == 0:
         stats["validation_status"] = "degraded_no_rows_written"
     elif int(stats.get("available_count", 0)) == 0 and requested_modules & NETWORK_SOURCE_MODULES:
@@ -2456,6 +2484,7 @@ def sync_mlb_features(
     }
     for row in snapshot_rows:
         row.features = {**(row.features or {}), "sync_status": sync_status}
+    _upsert_feature_sync_audit(session, day, captured_at, sync_status)
     session.commit()
     return stats
 
@@ -2570,24 +2599,34 @@ def _latest_feature_sync_audit(session: Session) -> dict[str, object]:
     rows = list(
         session.scalars(
             select(MlbFeatureSnapshot)
-            .where(MlbFeatureSnapshot.source == FEATURE_VERSION)
-            .order_by(MlbFeatureSnapshot.captured_at.desc())
+            .where(MlbFeatureSnapshot.source.in_([FEATURE_VERSION, FEATURE_SYNC_AUDIT_SOURCE]))
+            .order_by(MlbFeatureSnapshot.captured_at.desc(), MlbFeatureSnapshot.id.desc())
             .limit(50)
         )
     )
     latest_audit: dict[str, object] | None = None
     latest_errors: list[dict[str, object]] = []
+    latest_attempted_at = None
+    seen_error_keys: set[str] = set()
     for row in rows:
         row_features = row.features or {}
         sync_status = row_features.get("sync_status") if isinstance(row_features, dict) else None
         if not isinstance(sync_status, dict):
             continue
+        attempted_at = sync_status.get("attempted_at")
         if latest_audit is None:
             latest_audit = sync_status
+            latest_attempted_at = attempted_at
+        if attempted_at != latest_attempted_at:
+            continue
         errors = sync_status.get("errors")
         if isinstance(errors, list):
             for error in errors:
                 if isinstance(error, dict):
+                    error_key = repr(sorted(error.items()))
+                    if error_key in seen_error_keys:
+                        continue
+                    seen_error_keys.add(error_key)
                     latest_errors.append(error)
     last_error = latest_errors[0] if latest_errors else None
     return {
