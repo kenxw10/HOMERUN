@@ -10,7 +10,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
-from app.models import CalibrationRun, ModelCandidate, ModelGovernanceEvent, ModelVersion, TrainingRun
+from app.models import CalibrationRun, MlbGame, ModelCandidate, ModelGovernanceEvent, ModelVersion, TrainingRun
 from app.services.contracts import (
     FIRST_FIVE_SPREAD,
     FIRST_FIVE_TOTAL,
@@ -21,7 +21,7 @@ from app.services.contracts import (
     PAPER_SUPPORTED_MARKET_FAMILIES,
 )
 from app.services.features import FEATURE_VERSION, LEAGUE_AVG_FULL_GAME_RUNS
-from app.time_utils import utc_now
+from app.time_utils import ensure_aware_utc, get_dashboard_zone, utc_now
 
 HEURISTIC_MODEL_TAG = "heuristic_full_game_winner_v1"
 MATURE_MODEL_TAG = "mature_mlb_run_distribution_v1"
@@ -398,17 +398,30 @@ def _candidate_outcome_value(candidate: ModelCandidate) -> int | None:
     return None
 
 
+def _candidate_target_date_matches_game(candidate: ModelCandidate, game: MlbGame | None) -> bool:
+    if candidate.target_date is None or game is None:
+        return False
+    game_day = ensure_aware_utc(game.scheduled_start).astimezone(get_dashboard_zone()).date()
+    return candidate.target_date == game_day
+
+
 def _resolved_mature_candidates(session: Session) -> list[ModelCandidate]:
-    return list(
-        session.scalars(
-            select(ModelCandidate)
+    rows = list(
+        session.execute(
+            select(ModelCandidate, MlbGame)
+            .outerjoin(MlbGame, ModelCandidate.mlb_game_id == MlbGame.id)
             .where(ModelCandidate.outcome.in_(["win", "loss"]))
             .where(ModelCandidate.training_eligible.is_(True))
             .where(ModelCandidate.feature_version == FEATURE_VERSION)
             .where(ModelCandidate.market_family.in_(PAPER_SUPPORTED_MARKET_FAMILIES))
+            .where(ModelCandidate.fee_estimate.is_not(None))
+            .where(ModelCandidate.price_status == "fresh_executable")
+            .where(ModelCandidate.time_to_start_minutes.is_not(None))
+            .where(ModelCandidate.time_to_start_minutes > 0)
             .order_by(ModelCandidate.resolved_at.asc().nullslast(), ModelCandidate.evaluated_at.asc())
         )
     )
+    return [candidate for candidate, game in rows if _candidate_target_date_matches_game(candidate, game)]
 
 
 def _metrics(candidates: list[ModelCandidate]) -> dict[str, object]:

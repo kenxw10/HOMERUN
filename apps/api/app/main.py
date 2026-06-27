@@ -275,9 +275,12 @@ def kalshi_resolve_preview(
 
 
 @app.post("/v1/run/paper-candidate-engine", response_model=RunResponse)
-def run_paper_candidate_engine(_: None = Depends(require_internal_api_key)) -> RunResponse:
+def run_paper_candidate_engine(
+    target_date: date | None = Query(default=None),
+    _: None = Depends(require_internal_api_key),
+) -> RunResponse:
     with _db_session_or_503() as session:
-        result = generate_candidates(session)
+        result = generate_candidates(session, target_date)
     return RunResponse(ok=True, action="paper_candidate_engine", result=result)
 
 
@@ -346,36 +349,57 @@ def model_feature_coverage(
     return RunResponse(ok=True, action="model_feature_coverage", result=result)
 
 
-@app.get("/v1/model/predictions/today", response_model=RunResponse)
-def model_predictions_today(_: None = Depends(require_internal_api_key)) -> RunResponse:
+def _model_predictions_for_date(target_date: date) -> dict[str, object]:
     with _db_session_or_503() as session:
         rows = list(
             session.execute(
-                select(ModelPredictionOutput, ModelCandidate, KalshiMarket)
+                select(ModelPredictionOutput, ModelCandidate, KalshiMarket, ModelPredictionRun)
                 .join(ModelPredictionRun, ModelPredictionOutput.prediction_run_id == ModelPredictionRun.id)
                 .outerjoin(ModelCandidate, ModelPredictionOutput.candidate_id == ModelCandidate.id)
                 .outerjoin(KalshiMarket, ModelCandidate.kalshi_market_id == KalshiMarket.id)
-                .where(ModelPredictionRun.target_date == today_eastern())
+                .where(ModelPredictionRun.target_date == target_date)
                 .order_by(ModelPredictionOutput.id.desc())
                 .limit(500)
             )
         )
         items = [
             {
+                "prediction_run_id": run.id,
+                "prediction_run_target_date": run.target_date.isoformat() if run.target_date else None,
                 "candidate_id": candidate.id if candidate else None,
                 "market_ticker": market.ticker if market else None,
                 "market_family": output.market_family,
                 "probability_raw": _decimal_float(output.probability_raw),
                 "probability_calibrated": _decimal_float(output.probability_calibrated),
                 "fair_value": _decimal_float(output.fair_value),
+                "executable_price": _decimal_float(output.executable_price),
+                "expected_value_gross": _decimal_float(output.expected_value_gross),
+                "fee_estimate": _decimal_float(output.fee_estimate),
+                "expected_value_net": _decimal_float(output.expected_value_net),
+                "probability_edge": _decimal_float(output.probability_edge),
+                "executable_price_source": output.executable_price_source,
+                "price_status": output.price_status,
                 "data_quality": _decimal_float(output.data_quality),
                 "calibration_status": output.calibration_status,
                 "trade_rank": output.trade_rank,
                 "decision_reason": output.decision_reason,
             }
-            for output, candidate, market in rows
+            for output, candidate, market, run in rows
         ]
-    return RunResponse(ok=True, action="model_predictions_today", result={"items": items, "count": len(items)})
+    return {"date": target_date.isoformat(), "items": items, "count": len(items)}
+
+
+@app.get("/v1/model/predictions", response_model=RunResponse)
+def model_predictions_by_date(
+    target_date: date = Query(..., alias="date"),
+    _: None = Depends(require_internal_api_key),
+) -> RunResponse:
+    return RunResponse(ok=True, action="model_predictions", result=_model_predictions_for_date(target_date))
+
+
+@app.get("/v1/model/predictions/today", response_model=RunResponse)
+def model_predictions_today(_: None = Depends(require_internal_api_key)) -> RunResponse:
+    return RunResponse(ok=True, action="model_predictions_today", result=_model_predictions_for_date(today_eastern()))
 
 
 @app.post("/v1/sync/mlb-features", response_model=RunResponse)

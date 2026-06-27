@@ -55,12 +55,29 @@ class Settings(BaseSettings):
     paper_max_trades_per_slate: int = Field(default=20, alias="PAPER_MAX_TRADES_PER_SLATE")
     paper_max_trades_per_game: int = Field(default=3, alias="PAPER_MAX_TRADES_PER_GAME")
     paper_max_trades_per_market_family: int = Field(default=8, alias="PAPER_MAX_TRADES_PER_MARKET_FAMILY")
+    paper_max_trades_per_game_family: int = Field(default=1, alias="PAPER_MAX_TRADES_PER_GAME_FAMILY")
+    paper_allow_multiple_lines_per_game_family: bool = Field(
+        default=False, alias="PAPER_ALLOW_MULTIPLE_LINES_PER_GAME_FAMILY"
+    )
+    paper_allow_multiple_f5_winner_outcomes: bool = Field(
+        default=False, alias="PAPER_ALLOW_MULTIPLE_F5_WINNER_OUTCOMES"
+    )
     paper_max_open_positions: int = Field(default=50, alias="PAPER_MAX_OPEN_POSITIONS")
     paper_min_net_ev: Decimal = Field(default=Decimal("0.05"), alias="PAPER_MIN_NET_EV")
     paper_min_prob_edge: Decimal = Field(default=Decimal("0.03"), alias="PAPER_MIN_PROB_EDGE")
     paper_min_data_quality: Decimal = Field(default=Decimal("0.60"), alias="PAPER_MIN_DATA_QUALITY")
     paper_require_calibrated_for_trade: bool = Field(default=False, alias="PAPER_REQUIRE_CALIBRATED_FOR_TRADE")
+    paper_max_price_staleness_seconds: int = Field(default=900, alias="PAPER_MAX_PRICE_STALENESS_SECONDS")
+    paper_allow_last_price_fallback_for_trade: bool = Field(
+        default=False, alias="PAPER_ALLOW_LAST_PRICE_FALLBACK_FOR_TRADE"
+    )
     paper_starting_balance: Decimal = Field(default=Decimal("1000.00"), alias="PAPER_STARTING_BALANCE")
+    kalshi_trade_fee_rate: Decimal = Field(default=Decimal("0.07"), alias="KALSHI_TRADE_FEE_RATE")
+    kalshi_fee_estimate_mode: str = Field(default="conservative", alias="KALSHI_FEE_ESTIMATE_MODE")
+    kalshi_fee_rounding_mode: str = Field(
+        default="centicent_or_cent_conservative", alias="KALSHI_FEE_ROUNDING_MODE"
+    )
+    kalshi_assume_taker: bool = Field(default=True, alias="KALSHI_ASSUME_TAKER")
     model_training_min_samples: int = Field(default=100, alias="MODEL_TRAINING_MIN_SAMPLES")
     model_min_samples_train: int = Field(default=250, alias="MODEL_MIN_SAMPLES_TRAIN")
     model_min_samples_calibrate: int = Field(default=250, alias="MODEL_MIN_SAMPLES_CALIBRATE")
@@ -122,7 +139,9 @@ class Settings(BaseSettings):
         "paper_max_trades_per_slate",
         "paper_max_trades_per_game",
         "paper_max_trades_per_market_family",
+        "paper_max_trades_per_game_family",
         "paper_max_open_positions",
+        "paper_max_price_staleness_seconds",
         "model_min_samples_train",
         "model_min_samples_calibrate",
         "model_min_samples_promote",
@@ -135,6 +154,7 @@ class Settings(BaseSettings):
         "paper_min_net_ev",
         "paper_min_prob_edge",
         "paper_min_data_quality",
+        "kalshi_trade_fee_rate",
         "model_promotion_min_logloss_improvement",
         "model_promotion_max_ece",
     )

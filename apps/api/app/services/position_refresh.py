@@ -20,6 +20,7 @@ def _mark_from_orderbook(orderbook: dict[str, object], market: KalshiMarket | No
         market.best_no_bid = derived["best_no_bid"]
         market.implied_yes_ask = derived["implied_yes_ask"]
         market.implied_no_ask = derived["implied_no_ask"]
+        market.market_price_updated_at = utc_now()
         market.orderbook_raw = orderbook
 
     if trade.contract_side.lower() == "yes":
@@ -122,6 +123,7 @@ def refresh_open_position_prices(
                     title=str(payload.get("title") or trade.market_ticker),
                 )
             _update_market_fields(market, payload, trade.market_ticker, _market_status(payload))
+            market.market_price_updated_at = now
             mark = _mark_from_market(market, trade)
         if mark is None and hasattr(kalshi_client, "get_orderbook"):
             try:
@@ -142,6 +144,9 @@ def refresh_open_position_prices(
             skipped += 1
             continue
 
+        if market is not None:
+            market.market_price_updated_at = now
+            session.add(market)
         trade.current_price = mark
         trade.current_price_updated_at = now
         session.add(trade)

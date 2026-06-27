@@ -49,12 +49,21 @@ DEFAULT_PAPER_CONTRACTS=1
 PAPER_MAX_TRADES_PER_SLATE=20
 PAPER_MAX_TRADES_PER_GAME=3
 PAPER_MAX_TRADES_PER_MARKET_FAMILY=8
+PAPER_MAX_TRADES_PER_GAME_FAMILY=1
+PAPER_ALLOW_MULTIPLE_LINES_PER_GAME_FAMILY=false
+PAPER_ALLOW_MULTIPLE_F5_WINNER_OUTCOMES=false
 PAPER_MAX_OPEN_POSITIONS=50
 PAPER_MIN_NET_EV=0.05
 PAPER_MIN_PROB_EDGE=0.03
 PAPER_MIN_DATA_QUALITY=0.60
 PAPER_REQUIRE_CALIBRATED_FOR_TRADE=false
+PAPER_MAX_PRICE_STALENESS_SECONDS=900
+PAPER_ALLOW_LAST_PRICE_FALLBACK_FOR_TRADE=false
 PAPER_STARTING_BALANCE=1000.00
+KALSHI_TRADE_FEE_RATE=0.07
+KALSHI_FEE_ESTIMATE_MODE=conservative
+KALSHI_FEE_ROUNDING_MODE=centicent_or_cent_conservative
+KALSHI_ASSUME_TAKER=true
 MODEL_TRAINING_MIN_SAMPLES=100
 MODEL_MIN_SAMPLES_TRAIN=250
 MODEL_MIN_SAMPLES_CALIBRATE=250
@@ -105,7 +114,7 @@ Run these from the Railway backend service shell after migrations succeed:
 ```powershell
 python -m app.jobs.mlb_schedule_sync
 python -m app.jobs.kalshi_market_sync
-python -m app.jobs.paper_candidate_engine
+python -m app.jobs.paper_candidate_engine 2026-06-27
 python -m app.jobs.mlb_results_sync
 python -m app.jobs.paper_settlement_sync
 python -m app.jobs.balance_snapshot
@@ -134,7 +143,8 @@ After migrations and deploy, validate with the internal API key:
 Invoke-RestMethod -Method Post -Headers @{"X-API-Key"="YOUR_KEY"} https://YOUR-RAILWAY-API/v1/sync/mlb-schedule
 Invoke-RestMethod -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-RAILWAY-API/v1/kalshi/resolve-preview?date=2026-06-26"
 Invoke-RestMethod -Method Post -Headers @{"X-API-Key"="YOUR_KEY"} https://YOUR-RAILWAY-API/v1/sync/kalshi-markets
-Invoke-RestMethod -Method Post -Headers @{"X-API-Key"="YOUR_KEY"} https://YOUR-RAILWAY-API/v1/run/paper-candidate-engine
+Invoke-RestMethod -Method Post -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-RAILWAY-API/v1/run/paper-candidate-engine?target_date=2026-06-27"
+Invoke-RestMethod -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-RAILWAY-API/v1/model/predictions?date=2026-06-27"
 Invoke-RestMethod -Method Post -Headers @{"X-API-Key"="YOUR_KEY"} https://YOUR-RAILWAY-API/v1/sync/mlb-results
 Invoke-RestMethod -Method Post -Headers @{"X-API-Key"="YOUR_KEY"} https://YOUR-RAILWAY-API/v1/run/paper-settlement-sync
 Invoke-RestMethod -Method Post -Headers @{"X-API-Key"="YOUR_KEY"} https://YOUR-RAILWAY-API/v1/run/balance-snapshot
@@ -155,7 +165,7 @@ Expected behavior:
 - Resolve preview returns `ok=true` with per-game warnings/partial errors when only some games miss.
 - Kalshi sync returns a structured summary with mapping counts and actionable error details if Kalshi upstream calls fail.
 - Missing matching Kalshi markets should produce a clean summary, not a blank 502.
-- Paper candidate engine creates candidates with `mature_mlb_run_distribution_v1` probabilities only after validated paper-supported mappings exist.
+- Paper candidate engine creates candidates with `mature_mlb_run_distribution_v1` probabilities only for the requested Eastern `target_date`, records fee/edge/executable-price diagnostics, and creates paper trades only after fee-adjusted EV, freshness, line-selection, and cap filters pass.
 - MLB results sync updates final scores/status.
 - Paper settlement sync settles completed supported full-game winner paper trades.
 - Balance snapshots populate `/v1/dashboard/summary`.
