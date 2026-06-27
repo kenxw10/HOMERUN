@@ -343,6 +343,7 @@ def dashboard_summary_from_db(session: Session, closed_date: date | None = None)
         session.scalars(
             select(MlbFeatureSnapshot)
             .where(MlbFeatureSnapshot.target_date == today_eastern())
+            .where(MlbFeatureSnapshot.source == FEATURE_VERSION)
             .order_by(MlbFeatureSnapshot.captured_at.desc())
             .limit(100)
         )

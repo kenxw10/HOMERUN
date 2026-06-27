@@ -440,8 +440,8 @@ def _distance_between_points(
 
 def _team_location_for_game(game: MlbGame, team_code: str) -> tuple[float, float] | None:
     venue_name = _venue_name(game)
-    if team_code == game.home_abbreviation and venue_name in STADIUM_PROFILES:
-        profile = STADIUM_PROFILES[venue_name]
+    profile = STADIUM_PROFILES.get(venue_name or "")
+    if profile:
         return float(profile["latitude"]), float(profile["longitude"])
     return TEAM_HOME_COORDINATES.get(team_code)
 
@@ -1256,7 +1256,11 @@ def _park_weather_module(
 ) -> dict[str, object]:
     venue_name = _venue_name(game)
     static_profile = STADIUM_PROFILES.get(venue_name or "")
-    park_values = park.features if park is not None else static_profile
+    park_values = (
+        park.features
+        if park is not None and park.source_status == "available"
+        else static_profile
+    )
     weather_values = weather.features if weather is not None and weather.source_status == "available" else None
     if park_values and weather_values:
         return _available(

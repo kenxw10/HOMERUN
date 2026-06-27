@@ -31,6 +31,7 @@ from app.models import (
     Position,
     Settlement,
     TrainingRun,
+    TravelScheduleFeature,
 )
 from app.jobs import market_family_discovery as market_family_discovery_job
 from app.jobs import mlb_feature_sync as mlb_feature_sync_job
@@ -2959,6 +2960,43 @@ def test_dashboard_trade_caps_use_today_prediction_run(monkeypatch) -> None:
     assert summary_after_today_run.model_status.trade_caps_used == {"no_trade_slate_cap": 1, "paper_trades": 2}
 
 
+def test_dashboard_feature_status_uses_active_feature_source(monkeypatch) -> None:
+    monkeypatch.setattr(dashboard, "today_eastern", lambda: date(2026, 7, 1))
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    captured_at = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+
+    with Session(engine) as session:
+        session.add_all(
+            [
+                MlbFeatureSnapshot(
+                    mlb_game_id=1,
+                    target_date=date(2026, 7, 1),
+                    source="mature_mlb_features_v1",
+                    captured_at=captured_at + timedelta(minutes=5),
+                    data_quality=Decimal("0.1000"),
+                    source_statuses={"park_weather": "missing"},
+                    features={},
+                ),
+                MlbFeatureSnapshot(
+                    mlb_game_id=1,
+                    target_date=date(2026, 7, 1),
+                    source=features.FEATURE_VERSION,
+                    captured_at=captured_at,
+                    data_quality=Decimal("0.5000"),
+                    source_statuses={"park_weather": "partial"},
+                    features={},
+                ),
+            ]
+        )
+        session.commit()
+
+        summary = dashboard.dashboard_summary_from_db(session)
+
+    assert summary.model_status.feature_completeness["park_weather"] == {"partial": 1}
+    assert "PARK_WEATHER MISSING OR DEGRADED" not in summary.model_status.critical_module_warnings
+
+
 def test_generate_candidates_uses_heuristic_probability_and_feature_snapshot(monkeypatch) -> None:
     now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
     monkeypatch.setattr(candidates, "utc_now", lambda: now)
@@ -3165,6 +3203,74 @@ def test_pr3c_feature_sync_records_source_statuses_and_no_umpire_fields() -> Non
     assert snapshot.source_statuses["park_weather"] == "partial"
     assert snapshot.features["park_weather"]["park"]["park_factor"] == 0.98
     assert "umpire" not in " ".join(snapshot.features.keys()).lower()
+
+
+def test_feature_sync_keeps_unknown_park_weather_missing() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        game = MlbGame(
+            external_game_id="feature-sync-unknown-park",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+            status="scheduled",
+            raw_payload={"venue": {"id": 999, "name": "Unlisted Test Park"}},
+        )
+        session.add(game)
+        session.commit()
+
+        features.sync_mlb_features(session, date(2026, 7, 1))
+        snapshot = session.scalar(select(MlbFeatureSnapshot))
+
+    assert snapshot is not None
+    assert snapshot.source_statuses["park_weather"] == "missing"
+    assert snapshot.features["park_weather"]["source_status"] == "missing"
+
+
+def test_travel_feature_uses_current_venue_for_away_team() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        previous = MlbGame(
+            external_game_id="travel-previous-sea-home",
+            home_team="Seattle Mariners",
+            away_team="Boston Red Sox",
+            home_abbreviation="SEA",
+            away_abbreviation="BOS",
+            scheduled_start=datetime(2026, 6, 30, 23, 0, tzinfo=UTC),
+            status="Final",
+            home_score=4,
+            away_score=2,
+            raw_payload={"venue": {"id": 680, "name": "T-Mobile Park"}},
+        )
+        current = MlbGame(
+            external_game_id="travel-current-sea-at-pit",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+            status="scheduled",
+            raw_payload={"venue": {"id": 31, "name": "PNC Park"}},
+        )
+        session.add_all([previous, current])
+        session.commit()
+        current_id = current.id
+
+        features.sync_mlb_features(session, date(2026, 7, 1))
+        away_travel = session.scalar(
+            select(TravelScheduleFeature)
+            .where(TravelScheduleFeature.mlb_game_id == current_id)
+            .where(TravelScheduleFeature.team_code == "SEA")
+        )
+
+    assert away_travel is not None
+    assert away_travel.features["travel_distance_miles"] > 1000
 
 
 def test_lineup_parser_extracts_starters_and_excludes_substitutes() -> None:
