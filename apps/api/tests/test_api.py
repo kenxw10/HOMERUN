@@ -3209,6 +3209,66 @@ def test_pr3c_feature_sync_records_source_statuses_and_no_umpire_fields() -> Non
     assert "umpire" not in " ".join(snapshot.features.keys()).lower()
 
 
+def test_feature_coverage_and_detail_filter_to_active_feature_version() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    captured_at = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+
+    with Session(engine) as session:
+        session.add_all(
+            [
+                MlbFeatureSnapshot(
+                    mlb_game_id=1,
+                    target_date=date(2026, 7, 1),
+                    source="mature_mlb_features_v1",
+                    captured_at=captured_at,
+                    data_quality=Decimal("0.1000"),
+                    source_statuses={"park_weather": "missing"},
+                    features={"feature_version": "mature_mlb_features_v1"},
+                ),
+                MlbFeatureSnapshot(
+                    mlb_game_id=1,
+                    target_date=date(2026, 7, 1),
+                    source=features.FEATURE_VERSION,
+                    captured_at=captured_at,
+                    data_quality=Decimal("0.5000"),
+                    source_statuses={"park_weather": "partial"},
+                    features={"feature_version": features.FEATURE_VERSION},
+                ),
+            ]
+        )
+        session.commit()
+
+        coverage = features.feature_coverage(session, date(2026, 7, 1))
+        detail = features.feature_detail(session, date(2026, 7, 1))
+
+    assert coverage["snapshot_count"] == 1
+    assert coverage["items"][0]["source"] == features.FEATURE_VERSION
+    assert detail["count"] == 1
+    assert detail["items"][0]["source"] == features.FEATURE_VERSION
+
+
+def test_open_meteo_base_url_tolerates_forecast_suffix(monkeypatch) -> None:
+    monkeypatch.setenv("OPEN_METEO_BASE_URL", "https://api.open-meteo.com/v1/forecast")
+    get_settings.cache_clear()
+    captured: dict[str, str] = {}
+
+    def fake_get_json(url: str, **_kwargs):
+        captured["url"] = url
+        return {"hourly": {"time": []}}
+
+    monkeypatch.setattr(features, "get_json", fake_get_json)
+    try:
+        features._fetch_open_meteo(
+            {"latitude": 40.4469, "longitude": -80.0057},
+            datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+        )
+    finally:
+        get_settings.cache_clear()
+
+    assert captured["url"] == "https://api.open-meteo.com/v1/forecast"
+
+
 def test_feature_sync_keeps_unknown_park_weather_missing() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)

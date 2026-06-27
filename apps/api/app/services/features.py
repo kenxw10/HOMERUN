@@ -1727,8 +1727,10 @@ def _upsert_weather(
 def _fetch_open_meteo(profile: dict[str, object], scheduled_start: datetime) -> dict[str, object]:
     settings = get_settings()
     day = ensure_aware_utc(scheduled_start).date().isoformat()
+    base_url = settings.open_meteo_base_url.rstrip("/")
+    forecast_url = base_url if base_url.endswith("/forecast") else f"{base_url}/forecast"
     return get_json(
-        f"{settings.open_meteo_base_url.rstrip('/')}/forecast",
+        forecast_url,
         params={
             "latitude": profile["latitude"],
             "longitude": profile["longitude"],
@@ -1976,6 +1978,7 @@ def feature_coverage(session: Session, target_date: date | None = None) -> dict[
         session.scalars(
             select(MlbFeatureSnapshot)
             .where(MlbFeatureSnapshot.target_date == day)
+            .where(MlbFeatureSnapshot.source == FEATURE_VERSION)
             .order_by(MlbFeatureSnapshot.id.asc())
         )
     )
@@ -2018,6 +2021,7 @@ def feature_detail(session: Session, target_date: date | None = None) -> dict[st
         session.scalars(
             select(MlbFeatureSnapshot)
             .where(MlbFeatureSnapshot.target_date == day)
+            .where(MlbFeatureSnapshot.source == FEATURE_VERSION)
             .order_by(MlbFeatureSnapshot.id.asc())
             .limit(100)
         )
