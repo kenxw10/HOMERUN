@@ -13,8 +13,11 @@ from app.models import (
     KalshiMarket,
     MarketMapping,
     MlbGame,
+    MlbFeatureSnapshot,
     ModelCandidate,
+    ModelParameterVersion,
     ModelPredictionRun,
+    ModelThresholdVersion,
     ModelVersion,
     PaperTrade,
     Position,
@@ -29,6 +32,7 @@ from app.schemas import (
     PositionSummary,
 )
 from app.services.contracts import contract_labels, market_type_from_ticker
+from app.services.features import FEATURE_VERSION
 from app.services.portfolio import calculate_paper_portfolio
 from app.time_utils import eastern_display, ensure_aware_utc, get_dashboard_zone, to_eastern_iso, today_eastern, utc_now
 
@@ -54,6 +58,8 @@ def empty_dashboard_summary(closed_date: date | None = None) -> DashboardSummary
         ),
         model_status=ModelStatus(
             active_model_version=None,
+            active_parameter_version=None,
+            active_calibration_version=None,
             feature_version=None,
             calibration_status="not_run",
             last_training_run=None,
@@ -62,9 +68,17 @@ def empty_dashboard_summary(closed_date: date | None = None) -> DashboardSummary
             resolved_mature_samples=0,
             training_eligible_count=0,
             last_governance_status="not_run",
+            governance_status="not_run",
             trade_policy={},
             trade_caps_used={},
+            trade_threshold_policy={},
             data_quality_summary={},
+            feature_completeness={},
+            source_statuses={},
+            critical_module_warnings=[],
+            lineup_status="missing",
+            starter_status="missing",
+            weather_status="missing",
             notes=["No mature model run has been recorded yet."],
         ),
         paper_starting_balance=float(settings.paper_starting_balance),
@@ -200,6 +214,47 @@ def _date_bounds(day: date) -> tuple[datetime, datetime]:
     return start, start + timedelta(days=1)
 
 
+def _feature_status_summary(rows: list[MlbFeatureSnapshot]) -> tuple[dict[str, object], dict[str, object], list[str]]:
+    source_statuses: dict[str, object] = {}
+    module_counts: dict[str, dict[str, int]] = {}
+    warnings: set[str] = set()
+    for row in rows:
+        statuses = row.source_statuses or {}
+        for module_name, status in statuses.items():
+            source_statuses[module_name] = status
+            bucket = module_counts.setdefault(module_name, {})
+            if isinstance(status, dict):
+                values = [str(value) for value in status.values()]
+                if values and all(value == "missing" for value in values):
+                    aggregate = "missing"
+                elif any(value == "available" for value in values):
+                    aggregate = "partial"
+                else:
+                    aggregate = "partial"
+            else:
+                aggregate = str(status)
+            bucket[aggregate] = bucket.get(aggregate, 0) + 1
+
+    for module_name in ("offense_season", "offense_recent", "starter_identity", "lineup", "park_weather"):
+        counts = module_counts.get(module_name, {})
+        if counts.get("missing", 0) > 0 and counts.get("available", 0) == 0:
+            warnings.add(f"{module_name.upper()} MISSING OR DEGRADED")
+
+    return module_counts, source_statuses, sorted(warnings)
+
+
+def _module_status(source_statuses: dict[str, object], module_name: str) -> str:
+    value = source_statuses.get(module_name)
+    if isinstance(value, dict):
+        statuses = {str(item) for item in value.values()}
+        if "available" in statuses:
+            return "available"
+        if "partial" in statuses:
+            return "partial"
+        return "missing"
+    return str(value or "missing")
+
+
 def dashboard_summary_from_db(session: Session, closed_date: date | None = None) -> DashboardSummary:
     selected_closed_date = closed_date or today_eastern()
     summary = empty_dashboard_summary(selected_closed_date)
@@ -273,13 +328,26 @@ def dashboard_summary_from_db(session: Session, closed_date: date | None = None)
     summary.closed_positions_count = len(summary.closed_positions)
 
     active_version = session.scalar(select(ModelVersion).where(ModelVersion.is_active.is_(True)))
+    active_parameter_version = session.scalar(
+        select(ModelParameterVersion).where(ModelParameterVersion.is_active.is_(True))
+    )
     last_training = session.scalar(select(TrainingRun).order_by(TrainingRun.started_at.desc()))
     last_calibration = session.scalar(select(CalibrationRun).order_by(CalibrationRun.started_at.desc()))
+    last_threshold = session.scalar(select(ModelThresholdVersion).order_by(ModelThresholdVersion.created_at.desc()))
     last_prediction = session.scalar(
         select(ModelPredictionRun)
         .where(ModelPredictionRun.target_date == today_eastern())
         .order_by(ModelPredictionRun.started_at.desc())
     )
+    today_feature_rows = list(
+        session.scalars(
+            select(MlbFeatureSnapshot)
+            .where(MlbFeatureSnapshot.target_date == today_eastern())
+            .order_by(MlbFeatureSnapshot.captured_at.desc())
+            .limit(100)
+        )
+    )
+    feature_completeness, source_statuses, critical_warnings = _feature_status_summary(today_feature_rows)
     candidate_count = session.scalar(select(func.count(ModelCandidate.id))) or 0
     training_eligible_count = (
         session.scalar(select(func.count(ModelCandidate.id)).where(ModelCandidate.training_eligible.is_(True))) or 0
@@ -289,15 +357,17 @@ def dashboard_summary_from_db(session: Session, closed_date: date | None = None)
             select(func.count(ModelCandidate.id))
             .where(ModelCandidate.training_eligible.is_(True))
             .where(ModelCandidate.outcome.in_(["win", "loss"]))
-            .where(ModelCandidate.feature_version == "mature_mlb_features_v1")
+            .where(ModelCandidate.feature_version == FEATURE_VERSION)
         )
         or 0
     )
     avg_data_quality = session.scalar(
-        select(func.avg(ModelCandidate.data_quality)).where(ModelCandidate.feature_version == "mature_mlb_features_v1")
+        select(func.avg(ModelCandidate.data_quality)).where(ModelCandidate.feature_version == FEATURE_VERSION)
     )
     summary.model_status = ModelStatus(
         active_model_version=active_version.version_tag if active_version else None,
+        active_parameter_version=active_parameter_version.version_tag if active_parameter_version else None,
+        active_calibration_version=active_parameter_version.version_tag if active_parameter_version else None,
         feature_version=active_version.feature_version if active_version else None,
         calibration_status=last_calibration.status if last_calibration else "not_run",
         last_training_run=last_training.started_at if last_training else None,
@@ -306,6 +376,7 @@ def dashboard_summary_from_db(session: Session, closed_date: date | None = None)
         resolved_mature_samples=int(resolved_mature_samples),
         training_eligible_count=int(training_eligible_count),
         last_governance_status=last_training.status if last_training else "not_run",
+        governance_status=last_training.status if last_training else "not_run",
         trade_policy=last_prediction.trade_policy if last_prediction and last_prediction.trade_policy else {},
         trade_caps_used=(
             {
@@ -313,13 +384,20 @@ def dashboard_summary_from_db(session: Session, closed_date: date | None = None)
                 "paper_trades": last_prediction.trades_created if last_prediction else 0,
             }
         ),
+        trade_threshold_policy=last_threshold.thresholds if last_threshold else {},
         data_quality_summary={
             "avg": float(avg_data_quality) if avg_data_quality is not None else None,
             "feature_version": active_version.feature_version if active_version else None,
         },
+        feature_completeness=feature_completeness,
+        source_statuses=source_statuses,
+        critical_module_warnings=critical_warnings,
+        lineup_status=_module_status(source_statuses, "lineup"),
+        starter_status=_module_status(source_statuses, "starter_identity"),
+        weather_status=_module_status(source_statuses, "park_weather"),
         notes=[
-            "PR3c mature run-distribution model is paper-only.",
-            "Calibration remains conservative until resolved mature sample thresholds are met.",
+            "PR3c fix2 run-distribution model is paper-only.",
+            "Parameter promotion remains gated by resolved mature sample thresholds.",
         ],
     )
     summary.last_update = to_eastern_iso(utc_now())

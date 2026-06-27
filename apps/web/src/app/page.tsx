@@ -62,6 +62,8 @@ type DashboardSummary = {
   };
   model_status: {
     active_model_version: string | null;
+    active_parameter_version: string | null;
+    active_calibration_version: string | null;
     feature_version: string | null;
     calibration_status: string | null;
     last_training_run: string | null;
@@ -72,10 +74,18 @@ type DashboardSummary = {
     last_governance_status: string | null;
     trade_policy: Record<string, unknown>;
     trade_caps_used: Record<string, unknown>;
+    trade_threshold_policy: Record<string, unknown>;
     data_quality_summary: {
       avg?: number | null;
       feature_version?: string | null;
     };
+    feature_completeness: Record<string, unknown>;
+    source_statuses: Record<string, unknown>;
+    critical_module_warnings: string[];
+    lineup_status: string | null;
+    starter_status: string | null;
+    weather_status: string | null;
+    governance_status: string | null;
     notes: string | string[];
   };
 };
@@ -165,7 +175,17 @@ const emptySummary: DashboardSummary = {
     last_governance_status: "not_run",
     trade_policy: {},
     trade_caps_used: {},
+    trade_threshold_policy: {},
     data_quality_summary: {},
+    feature_completeness: {},
+    source_statuses: {},
+    critical_module_warnings: [],
+    active_parameter_version: null,
+    active_calibration_version: null,
+    lineup_status: "missing",
+    starter_status: "missing",
+    weather_status: "missing",
+    governance_status: "not_run",
     notes: ["No mature model has been trained yet."],
   },
 };
@@ -239,6 +259,22 @@ function formatUnknown(value: unknown): string {
     return value.toUpperCase();
   }
   return "N/A";
+}
+
+function featureCompletenessLabel(value: Record<string, unknown>): string {
+  const keys = Object.keys(value);
+  if (!keys.length) {
+    return "N/A";
+  }
+  const available = keys.filter((key) => {
+    const counts = value[key];
+    if (typeof counts !== "object" || counts === null || !("available" in counts)) {
+      return false;
+    }
+    const availableCount = (counts as Record<string, unknown>).available;
+    return typeof availableCount === "number" && availableCount > 0;
+  }).length;
+  return `${available}/${keys.length}`;
 }
 
 function formatPrice(value: number | null | undefined): string {
@@ -795,7 +831,23 @@ export default function DashboardPage() {
 
   const modelRows: StatusRow[] = [
     { label: "ACTIVE MODEL VERSION", value: summary.model_status.active_model_version ?? "NONE" },
+    { label: "ACTIVE PARAMETER VERSION", value: summary.model_status.active_parameter_version ?? "NONE" },
     { label: "FEATURE VERSION", value: summary.model_status.feature_version ?? "NONE" },
+    {
+      label: "FEATURE COMPLETENESS",
+      value: featureCompletenessLabel(summary.model_status.feature_completeness),
+      tone: summary.model_status.critical_module_warnings.length ? "amber" : "green",
+    },
+    {
+      label: "CRITICAL MODULE WARNINGS",
+      value: summary.model_status.critical_module_warnings.length
+        ? String(summary.model_status.critical_module_warnings.length)
+        : "0",
+      tone: summary.model_status.critical_module_warnings.length ? "amber" : "green",
+    },
+    { label: "LINEUP STATUS", value: (summary.model_status.lineup_status ?? "MISSING").toUpperCase() },
+    { label: "STARTER STATUS", value: (summary.model_status.starter_status ?? "MISSING").toUpperCase() },
+    { label: "WEATHER STATUS", value: (summary.model_status.weather_status ?? "MISSING").toUpperCase() },
     {
       label: "CALIBRATION STATUS",
       value: summary.model_status.calibration_status ?? "NOT RUN",
@@ -811,6 +863,7 @@ export default function DashboardPage() {
         summary.model_status.trade_policy.paper_max_trades_per_slate,
       )}`,
     },
+    { label: "GOVERNANCE STATUS", value: summary.model_status.governance_status ?? "NOT RUN" },
     { label: "LAST GOVERNANCE", value: summary.model_status.last_governance_status ?? "NOT RUN" },
     { label: "LAST TRAINING", value: formatEastern(summary.model_status.last_training_run) },
     { label: "LAST CALIBRATION", value: formatEastern(summary.model_status.last_calibration_run) },

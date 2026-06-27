@@ -33,7 +33,12 @@ from app.services.contracts import (
 )
 from app.services.features import FEATURE_VERSION, build_feature_snapshot
 from app.services.mapping import infer_market_type
-from app.services.modeling import MATURE_MODEL_TAG, get_or_create_mature_model_version, score_mature_candidate
+from app.services.modeling import (
+    MATURE_MODEL_TAG,
+    get_or_create_active_parameter_version,
+    get_or_create_mature_model_version,
+    score_mature_candidate,
+)
 from app.services.portfolio import create_balance_snapshot
 from app.time_utils import classify_time_bucket, ensure_aware_utc, get_dashboard_zone, utc_now
 
@@ -472,6 +477,7 @@ def generate_candidates(session: Session, target_date: date | None = None) -> di
     created_or_updated = 0
     paper_trades = 0
     model_version = get_or_create_mature_model_version(session)
+    parameter_version = get_or_create_active_parameter_version(session)
     prediction_run = ModelPredictionRun(
         started_at=now,
         target_date=day,
@@ -541,6 +547,8 @@ def generate_candidates(session: Session, target_date: date | None = None) -> di
             features,
             market_type=market_type,
             settlement_status=_settlement_status(mapping, market),
+            parameters=parameter_version.parameters,
+            parameter_version_tag=parameter_version.version_tag,
         )
         probability = model_score.probability_calibrated or model_score.probability
         fair_value = model_score.fair_value
@@ -860,6 +868,7 @@ def generate_candidates(session: Session, target_date: date | None = None) -> di
         "paper_trades": paper_trades,
         "trades_created": paper_trades,
         "model_version": model_version.version_tag,
+        "parameter_version": parameter_version.version_tag,
         "feature_version": FEATURE_VERSION,
         "prediction_run_id": prediction_run.id,
         "prediction_run_target_date": prediction_run.target_date.isoformat() if prediction_run.target_date else None,

@@ -325,6 +325,213 @@ class MlbFeatureSnapshot(TimestampMixin, Base):
     features: Mapped[dict[str, object]] = mapped_column(JSON, default=dict, nullable=False)
 
 
+class TeamDailyFeature(TimestampMixin, Base):
+    __tablename__ = "team_daily_features"
+    __table_args__ = (UniqueConstraint("target_date", "team_code", "source", name="uq_team_daily_date_team_source"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    target_date: Mapped[date] = mapped_column(Date, nullable=False)
+    team_code: Mapped[str] = mapped_column(String(12), nullable=False)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    source: Mapped[str] = mapped_column(String(80), nullable=False)
+    source_status: Mapped[str] = mapped_column(String(40), nullable=False)
+    confidence: Mapped[Decimal | None] = mapped_column(Numeric(6, 4))
+    completeness: Mapped[Decimal | None] = mapped_column(Numeric(6, 4))
+    stale: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    features: Mapped[dict[str, object]] = mapped_column(JSON, default=dict, nullable=False)
+    raw_payload: Mapped[dict[str, object] | None] = mapped_column(JSON)
+
+
+class TeamRecentFeature(TimestampMixin, Base):
+    __tablename__ = "team_recent_features"
+    __table_args__ = (UniqueConstraint("target_date", "team_code", "window_days", "source", name="uq_team_recent_date_team_window_source"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    target_date: Mapped[date] = mapped_column(Date, nullable=False)
+    team_code: Mapped[str] = mapped_column(String(12), nullable=False)
+    window_days: Mapped[int] = mapped_column(Integer, nullable=False)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    source: Mapped[str] = mapped_column(String(80), nullable=False)
+    source_status: Mapped[str] = mapped_column(String(40), nullable=False)
+    sample_size: Mapped[int | None] = mapped_column(Integer)
+    confidence: Mapped[Decimal | None] = mapped_column(Numeric(6, 4))
+    completeness: Mapped[Decimal | None] = mapped_column(Numeric(6, 4))
+    stale: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    features: Mapped[dict[str, object]] = mapped_column(JSON, default=dict, nullable=False)
+    raw_payload: Mapped[dict[str, object] | None] = mapped_column(JSON)
+
+
+class PitcherDailyFeature(TimestampMixin, Base):
+    __tablename__ = "pitcher_daily_features"
+    __table_args__ = (UniqueConstraint("target_date", "team_code", "pitcher_id", "source", name="uq_pitcher_daily_date_team_player_source"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    target_date: Mapped[date] = mapped_column(Date, nullable=False)
+    team_code: Mapped[str] = mapped_column(String(12), nullable=False)
+    pitcher_id: Mapped[str] = mapped_column(String(40), nullable=False)
+    pitcher_name: Mapped[str | None] = mapped_column(String(120))
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    source: Mapped[str] = mapped_column(String(80), nullable=False)
+    source_status: Mapped[str] = mapped_column(String(40), nullable=False)
+    sample_size: Mapped[int | None] = mapped_column(Integer)
+    confidence: Mapped[Decimal | None] = mapped_column(Numeric(6, 4))
+    completeness: Mapped[Decimal | None] = mapped_column(Numeric(6, 4))
+    stale: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    features: Mapped[dict[str, object]] = mapped_column(JSON, default=dict, nullable=False)
+    raw_payload: Mapped[dict[str, object] | None] = mapped_column(JSON)
+
+
+class BullpenDailyFeature(TimestampMixin, Base):
+    __tablename__ = "bullpen_daily_features"
+    __table_args__ = (UniqueConstraint("target_date", "team_code", "source", name="uq_bullpen_daily_date_team_source"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    target_date: Mapped[date] = mapped_column(Date, nullable=False)
+    team_code: Mapped[str] = mapped_column(String(12), nullable=False)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    source: Mapped[str] = mapped_column(String(80), nullable=False)
+    source_status: Mapped[str] = mapped_column(String(40), nullable=False)
+    confidence: Mapped[Decimal | None] = mapped_column(Numeric(6, 4))
+    completeness: Mapped[Decimal | None] = mapped_column(Numeric(6, 4))
+    stale: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    features: Mapped[dict[str, object]] = mapped_column(JSON, default=dict, nullable=False)
+    raw_payload: Mapped[dict[str, object] | None] = mapped_column(JSON)
+
+
+class LineupSnapshot(TimestampMixin, Base):
+    __tablename__ = "lineup_snapshots"
+    __table_args__ = (UniqueConstraint("mlb_game_id", "team_code", "source", name="uq_lineup_game_team_source"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    mlb_game_id: Mapped[int | None] = mapped_column(ForeignKey("mlb_games.id"))
+    target_date: Mapped[date] = mapped_column(Date, nullable=False)
+    team_code: Mapped[str] = mapped_column(String(12), nullable=False)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    lineup_posted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    source: Mapped[str] = mapped_column(String(80), nullable=False)
+    source_status: Mapped[str] = mapped_column(String(40), nullable=False)
+    confirmed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    confidence: Mapped[Decimal | None] = mapped_column(Numeric(6, 4))
+    completeness: Mapped[Decimal | None] = mapped_column(Numeric(6, 4))
+    stale: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    features: Mapped[dict[str, object]] = mapped_column(JSON, default=dict, nullable=False)
+    raw_payload: Mapped[dict[str, object] | None] = mapped_column(JSON)
+
+
+class InjurySnapshot(TimestampMixin, Base):
+    __tablename__ = "injury_snapshots"
+    __table_args__ = (UniqueConstraint("target_date", "team_code", "source", name="uq_injury_date_team_source"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    target_date: Mapped[date] = mapped_column(Date, nullable=False)
+    team_code: Mapped[str] = mapped_column(String(12), nullable=False)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    source: Mapped[str] = mapped_column(String(80), nullable=False)
+    source_status: Mapped[str] = mapped_column(String(40), nullable=False)
+    confidence: Mapped[Decimal | None] = mapped_column(Numeric(6, 4))
+    completeness: Mapped[Decimal | None] = mapped_column(Numeric(6, 4))
+    stale: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    features: Mapped[dict[str, object]] = mapped_column(JSON, default=dict, nullable=False)
+    raw_payload: Mapped[dict[str, object] | None] = mapped_column(JSON)
+
+
+class WeatherSnapshot(TimestampMixin, Base):
+    __tablename__ = "weather_snapshots"
+    __table_args__ = (UniqueConstraint("mlb_game_id", "source", name="uq_weather_game_source"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    mlb_game_id: Mapped[int | None] = mapped_column(ForeignKey("mlb_games.id"))
+    target_date: Mapped[date] = mapped_column(Date, nullable=False)
+    venue_name: Mapped[str | None] = mapped_column(String(120))
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    forecast_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    source: Mapped[str] = mapped_column(String(80), nullable=False)
+    source_status: Mapped[str] = mapped_column(String(40), nullable=False)
+    confidence: Mapped[Decimal | None] = mapped_column(Numeric(6, 4))
+    completeness: Mapped[Decimal | None] = mapped_column(Numeric(6, 4))
+    stale: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    features: Mapped[dict[str, object]] = mapped_column(JSON, default=dict, nullable=False)
+    raw_payload: Mapped[dict[str, object] | None] = mapped_column(JSON)
+
+
+class ParkFactorSnapshot(TimestampMixin, Base):
+    __tablename__ = "park_factor_snapshots"
+    __table_args__ = (UniqueConstraint("venue_name", "source", name="uq_park_factor_venue_source"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    venue_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    source: Mapped[str] = mapped_column(String(80), nullable=False)
+    source_status: Mapped[str] = mapped_column(String(40), nullable=False)
+    confidence: Mapped[Decimal | None] = mapped_column(Numeric(6, 4))
+    completeness: Mapped[Decimal | None] = mapped_column(Numeric(6, 4))
+    stale: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    features: Mapped[dict[str, object]] = mapped_column(JSON, default=dict, nullable=False)
+    raw_payload: Mapped[dict[str, object] | None] = mapped_column(JSON)
+
+
+class TravelScheduleFeature(TimestampMixin, Base):
+    __tablename__ = "travel_schedule_features"
+    __table_args__ = (UniqueConstraint("mlb_game_id", "team_code", "source", name="uq_travel_game_team_source"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    mlb_game_id: Mapped[int | None] = mapped_column(ForeignKey("mlb_games.id"))
+    target_date: Mapped[date] = mapped_column(Date, nullable=False)
+    team_code: Mapped[str] = mapped_column(String(12), nullable=False)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    source: Mapped[str] = mapped_column(String(80), nullable=False)
+    source_status: Mapped[str] = mapped_column(String(40), nullable=False)
+    confidence: Mapped[Decimal | None] = mapped_column(Numeric(6, 4))
+    completeness: Mapped[Decimal | None] = mapped_column(Numeric(6, 4))
+    stale: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    features: Mapped[dict[str, object]] = mapped_column(JSON, default=dict, nullable=False)
+    raw_payload: Mapped[dict[str, object] | None] = mapped_column(JSON)
+
+
+class ModelParameterVersion(TimestampMixin, Base):
+    __tablename__ = "model_parameter_versions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    version_tag: Mapped[str] = mapped_column(String(120), unique=True, nullable=False)
+    model_family: Mapped[str] = mapped_column(String(80), nullable=False)
+    role: Mapped[str] = mapped_column(String(40), default="challenger", nullable=False)
+    status: Mapped[str] = mapped_column(String(40), default="created", nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    created_reason: Mapped[str | None] = mapped_column(Text)
+    trained_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    promoted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    source_training_run_id: Mapped[int | None] = mapped_column(ForeignKey("training_runs.id"))
+    parameters: Mapped[dict[str, object]] = mapped_column(JSON, default=dict, nullable=False)
+    metrics: Mapped[dict[str, object] | None] = mapped_column(JSON)
+
+
+class ModelTrainingDataset(TimestampMixin, Base):
+    __tablename__ = "model_training_datasets"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    training_run_id: Mapped[int | None] = mapped_column(ForeignKey("training_runs.id"))
+    created_at_snapshot: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    feature_version: Mapped[str] = mapped_column(String(80), nullable=False)
+    sample_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    split_policy: Mapped[str] = mapped_column(String(80), nullable=False)
+    filters: Mapped[dict[str, object] | None] = mapped_column(JSON)
+    candidate_ids: Mapped[list[object] | None] = mapped_column(JSON)
+
+
+class ModelThresholdVersion(TimestampMixin, Base):
+    __tablename__ = "model_threshold_versions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    version_tag: Mapped[str] = mapped_column(String(120), unique=True, nullable=False)
+    role: Mapped[str] = mapped_column(String(40), default="evaluation", nullable=False)
+    status: Mapped[str] = mapped_column(String(40), default="recorded", nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    created_at_snapshot: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    source_training_run_id: Mapped[int | None] = mapped_column(ForeignKey("training_runs.id"))
+    thresholds: Mapped[dict[str, object]] = mapped_column(JSON, default=dict, nullable=False)
+    metrics: Mapped[dict[str, object] | None] = mapped_column(JSON)
+
+
 class ModelPredictionRun(TimestampMixin, Base):
     __tablename__ = "model_prediction_runs"
 

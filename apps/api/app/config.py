@@ -78,6 +78,11 @@ class Settings(BaseSettings):
         default="centicent_or_cent_conservative", alias="KALSHI_FEE_ROUNDING_MODE"
     )
     kalshi_assume_taker: bool = Field(default=True, alias="KALSHI_ASSUME_TAKER")
+    feature_sync_enable_network_sources: bool = Field(default=False, alias="FEATURE_SYNC_ENABLE_NETWORK_SOURCES")
+    open_meteo_base_url: str = Field(default="https://api.open-meteo.com/v1", alias="OPEN_METEO_BASE_URL")
+    injury_provider_api_key: SecretStr | None = Field(default=None, alias="INJURY_PROVIDER_API_KEY")
+    lineup_provider_api_key: SecretStr | None = Field(default=None, alias="LINEUP_PROVIDER_API_KEY")
+    weather_provider_api_key: SecretStr | None = Field(default=None, alias="WEATHER_PROVIDER_API_KEY")
     model_training_min_samples: int = Field(default=100, alias="MODEL_TRAINING_MIN_SAMPLES")
     model_min_samples_train: int = Field(default=250, alias="MODEL_MIN_SAMPLES_TRAIN")
     model_min_samples_calibrate: int = Field(default=250, alias="MODEL_MIN_SAMPLES_CALIBRATE")
@@ -85,7 +90,11 @@ class Settings(BaseSettings):
     model_promotion_min_logloss_improvement: Decimal = Field(
         default=Decimal("0.01"), alias="MODEL_PROMOTION_MIN_LOGLOSS_IMPROVEMENT"
     )
-    model_promotion_max_ece: Decimal = Field(default=Decimal("0.05"), alias="MODEL_PROMOTION_MAX_ECE")
+    model_promotion_max_ece: Decimal = Field(default=Decimal("0.08"), alias="MODEL_PROMOTION_MAX_ECE")
+    model_min_family_samples_for_family_calibration: int = Field(
+        default=75, alias="MODEL_MIN_FAMILY_SAMPLES_FOR_FAMILY_CALIBRATION"
+    )
+    model_min_samples_for_isotonic: int = Field(default=1000, alias="MODEL_MIN_SAMPLES_FOR_ISOTONIC")
     dashboard_timezone: str = Field(default="America/New_York", alias="DASHBOARD_TIMEZONE")
     backend_api_key: SecretStr | None = Field(default=None, alias="BACKEND_API_KEY")
 
@@ -145,6 +154,8 @@ class Settings(BaseSettings):
         "model_min_samples_train",
         "model_min_samples_calibrate",
         "model_min_samples_promote",
+        "model_min_family_samples_for_family_calibration",
+        "model_min_samples_for_isotonic",
     )
     @classmethod
     def validate_positive_ints(cls, value: int) -> int:

@@ -35,8 +35,24 @@ from app.services.market_family_discovery import (
     run_market_family_discovery,
 )
 from app.services.market_family_mapping import latest_market_family_mapping_report, sync_market_family_mappings
-from app.services.features import feature_coverage, sync_mlb_features
-from app.services.modeling import governance_status, repair_training_eligibility, run_model_governance
+from app.services.features import (
+    feature_coverage,
+    feature_detail,
+    sync_mlb_bullpen_features,
+    sync_mlb_features,
+    sync_mlb_lineups,
+    sync_mlb_pitcher_features,
+    sync_mlb_team_features,
+    sync_travel_schedule_features,
+    sync_weather_features,
+)
+from app.services.modeling import (
+    active_parameter_payload,
+    governance_status,
+    latest_training_summary,
+    repair_training_eligibility,
+    run_model_governance,
+)
 from app.services.market_sync import resolve_preview_for_date, sync_kalshi_markets
 from app.services.mlb import sync_results, sync_schedule
 from app.services.position_refresh import refresh_open_position_prices
@@ -349,6 +365,30 @@ def model_feature_coverage(
     return RunResponse(ok=True, action="model_feature_coverage", result=result)
 
 
+@app.get("/v1/model/features/detail", response_model=RunResponse)
+def model_feature_detail(
+    target_date: date | None = Query(default=None, alias="date"),
+    _: None = Depends(require_internal_api_key),
+) -> RunResponse:
+    with _db_session_or_503() as session:
+        result = feature_detail(session, target_date)
+    return RunResponse(ok=True, action="model_feature_detail", result=result)
+
+
+@app.get("/v1/model/parameters/active", response_model=RunResponse)
+def model_active_parameters(_: None = Depends(require_internal_api_key)) -> RunResponse:
+    with _db_session_or_503() as session:
+        result = active_parameter_payload(session)
+    return RunResponse(ok=True, action="model_active_parameters", result=result)
+
+
+@app.get("/v1/model/training/latest", response_model=RunResponse)
+def model_training_latest(_: None = Depends(require_internal_api_key)) -> RunResponse:
+    with _db_session_or_503() as session:
+        result = latest_training_summary(session)
+    return RunResponse(ok=True, action="model_training_latest", result=result)
+
+
 def _model_predictions_for_date(target_date: date) -> dict[str, object]:
     with _db_session_or_503() as session:
         rows = list(
@@ -405,11 +445,73 @@ def model_predictions_today(_: None = Depends(require_internal_api_key)) -> RunR
 @app.post("/v1/sync/mlb-features", response_model=RunResponse)
 def run_mlb_feature_sync(
     target_date: date | None = Query(default=None),
+    include_modules: str | None = Query(default=None),
     _: None = Depends(require_internal_api_key),
 ) -> RunResponse:
     with _db_session_or_503() as session:
-        result = sync_mlb_features(session, target_date)
+        modules = None if not include_modules or include_modules == "all" else set(include_modules.split(","))
+        result = sync_mlb_features(session, target_date, modules)
     return RunResponse(ok=True, action="mlb_feature_sync", result=result)
+
+
+@app.post("/v1/sync/mlb-team-features", response_model=RunResponse)
+def run_mlb_team_feature_sync(
+    target_date: date | None = Query(default=None),
+    _: None = Depends(require_internal_api_key),
+) -> RunResponse:
+    with _db_session_or_503() as session:
+        result = sync_mlb_team_features(session, target_date)
+    return RunResponse(ok=True, action="mlb_team_feature_sync", result=result)
+
+
+@app.post("/v1/sync/mlb-pitcher-features", response_model=RunResponse)
+def run_mlb_pitcher_feature_sync(
+    target_date: date | None = Query(default=None),
+    _: None = Depends(require_internal_api_key),
+) -> RunResponse:
+    with _db_session_or_503() as session:
+        result = sync_mlb_pitcher_features(session, target_date)
+    return RunResponse(ok=True, action="mlb_pitcher_feature_sync", result=result)
+
+
+@app.post("/v1/sync/mlb-lineups", response_model=RunResponse)
+def run_mlb_lineup_sync(
+    target_date: date | None = Query(default=None),
+    _: None = Depends(require_internal_api_key),
+) -> RunResponse:
+    with _db_session_or_503() as session:
+        result = sync_mlb_lineups(session, target_date)
+    return RunResponse(ok=True, action="mlb_lineup_sync", result=result)
+
+
+@app.post("/v1/sync/mlb-bullpen-features", response_model=RunResponse)
+def run_mlb_bullpen_feature_sync(
+    target_date: date | None = Query(default=None),
+    _: None = Depends(require_internal_api_key),
+) -> RunResponse:
+    with _db_session_or_503() as session:
+        result = sync_mlb_bullpen_features(session, target_date)
+    return RunResponse(ok=True, action="mlb_bullpen_feature_sync", result=result)
+
+
+@app.post("/v1/sync/weather", response_model=RunResponse)
+def run_weather_feature_sync(
+    target_date: date | None = Query(default=None),
+    _: None = Depends(require_internal_api_key),
+) -> RunResponse:
+    with _db_session_or_503() as session:
+        result = sync_weather_features(session, target_date)
+    return RunResponse(ok=True, action="weather_feature_sync", result=result)
+
+
+@app.post("/v1/sync/travel-schedule", response_model=RunResponse)
+def run_travel_schedule_feature_sync(
+    target_date: date | None = Query(default=None),
+    _: None = Depends(require_internal_api_key),
+) -> RunResponse:
+    with _db_session_or_503() as session:
+        result = sync_travel_schedule_features(session, target_date)
+    return RunResponse(ok=True, action="travel_schedule_feature_sync", result=result)
 
 
 @app.post("/v1/run/model-feature-snapshot-backfill", response_model=RunResponse)

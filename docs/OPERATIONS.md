@@ -105,9 +105,19 @@ The backend also exposes these POST endpoints for controlled operational runs:
 - `POST /v1/run/model-governance`
 - `GET /v1/model/governance/status`
 - `GET /v1/model/features/coverage?date=YYYY-MM-DD`
+- `GET /v1/model/features/detail?date=YYYY-MM-DD`
+- `GET /v1/model/parameters/active`
+- `GET /v1/model/training/latest`
 - `GET /v1/model/predictions?date=YYYY-MM-DD`
 - `GET /v1/model/predictions/today`
 - `POST /v1/sync/mlb-features?target_date=YYYY-MM-DD`
+- `POST /v1/sync/mlb-features?target_date=YYYY-MM-DD&include_modules=all`
+- `POST /v1/sync/mlb-team-features?target_date=YYYY-MM-DD`
+- `POST /v1/sync/mlb-pitcher-features?target_date=YYYY-MM-DD`
+- `POST /v1/sync/mlb-lineups?target_date=YYYY-MM-DD`
+- `POST /v1/sync/mlb-bullpen-features?target_date=YYYY-MM-DD`
+- `POST /v1/sync/weather?target_date=YYYY-MM-DD`
+- `POST /v1/sync/travel-schedule?target_date=YYYY-MM-DD`
 - `POST /v1/run/model-feature-snapshot-backfill?target_date=YYYY-MM-DD`
 - `POST /v1/run/training-eligibility-repair`
 - `POST /v1/run/open-position-price-refresh`
@@ -126,7 +136,7 @@ After deploying PR 3c and running `alembic upgrade head`, validate in this order
 
 1. `GET /health` returns `status: "ok"`.
 2. `GET /v1/system/status` reports `database.ready: true` and does not expose secrets.
-3. Alembic reports head revision `0007_pr3c_model_governance`.
+3. Alembic reports head revision `0009_pr3c_fix2_features`.
 4. `POST /v1/sync/mlb-schedule` returns a games count.
 5. `GET /v1/kalshi/resolve-preview?date=YYYY-MM-DD` returns attempted `KXMLBGAME` event and market tickers for each MLB game, with `ok=true` even when individual games have no match warnings.
 6. `POST /v1/sync/kalshi-markets` returns a structured summary with `games_considered`, attempted ticker counts, mapping counts, and `errors` when upstream calls fail.
@@ -161,6 +171,30 @@ Invoke-RestMethod -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-RAILWAY-API/v
 ```
 
 5. Confirm normal executable candidates include `fee_estimate`, `expected_value_net`, `probability_edge`, `executable_price_source`, and `price_status`.
+
+PR3c fix2 feature/model validation:
+
+1. Run the complete feature sync for a slate:
+
+```powershell
+Invoke-RestMethod -Method Post -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-RAILWAY-API/v1/sync/mlb-features?target_date=2026-06-27&include_modules=all"
+```
+
+2. Confirm the response includes module counts for team, pitcher, bullpen, lineup, weather, park, and travel features. Missing optional provider data should be reported as `missing` or `unavailable`, not silently faked.
+3. Fetch feature detail:
+
+```powershell
+Invoke-RestMethod -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-RAILWAY-API/v1/model/features/detail?date=2026-06-27"
+```
+
+4. Confirm `feature_version` is `mature_mlb_features_v2`, critical module warnings are explicit, and static park/travel features are separate from optional network weather/provider inputs.
+5. Fetch active model parameters:
+
+```powershell
+Invoke-RestMethod -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-RAILWAY-API/v1/model/parameters/active"
+```
+
+6. Confirm the active parameter version exists and does not require live trading or production Kalshi credentials.
 20. `POST /v1/run/paper-settlement-sync` settles completed supported spread, total, and first-five paper trades when final scores/linescore are available; missing first-five linescore rows are skipped, not closed.
 21. `POST /v1/run/open-position-price-refresh` updates current marks and last mark timestamps for open paper positions only.
 22. The Vercel dashboard shows readable contract labels with the raw Kalshi ticker as secondary text.

@@ -62,6 +62,8 @@ class BotMode(BaseModel):
 
 class ModelStatus(BaseModel):
     active_model_version: str | None
+    active_parameter_version: str | None = None
+    active_calibration_version: str | None = None
     feature_version: str | None = None
     calibration_status: str | None = None
     last_training_run: datetime | None
@@ -72,7 +74,15 @@ class ModelStatus(BaseModel):
     last_governance_status: str | None = None
     trade_policy: dict[str, object] = Field(default_factory=dict)
     trade_caps_used: dict[str, object] = Field(default_factory=dict)
+    trade_threshold_policy: dict[str, object] = Field(default_factory=dict)
     data_quality_summary: dict[str, object] = Field(default_factory=dict)
+    feature_completeness: dict[str, object] = Field(default_factory=dict)
+    source_statuses: dict[str, object] = Field(default_factory=dict)
+    critical_module_warnings: list[str] = Field(default_factory=list)
+    lineup_status: str | None = None
+    starter_status: str | None = None
+    weather_status: str | None = None
+    governance_status: str | None = None
     notes: str | list[str]
 
 
