@@ -3025,15 +3025,28 @@ def test_dashboard_feature_status_uses_active_feature_source(monkeypatch) -> Non
                     },
                     features={},
                 ),
+                MlbFeatureSnapshot(
+                    mlb_game_id=2,
+                    target_date=date(2026, 7, 1),
+                    source=features.FEATURE_VERSION,
+                    captured_at=captured_at + timedelta(minutes=1),
+                    data_quality=Decimal("0.3000"),
+                    source_statuses={
+                        "lineup": {"home": "missing", "away": "missing"},
+                        "park_weather": "missing",
+                    },
+                    features={},
+                ),
             ]
         )
         session.commit()
 
         summary = dashboard.dashboard_summary_from_db(session)
 
-    assert summary.model_status.feature_completeness["park_weather"] == {"partial": 1}
-    assert summary.model_status.feature_completeness["lineup"] == {"available": 1}
-    assert "PARK_WEATHER MISSING OR DEGRADED" not in summary.model_status.critical_module_warnings
+    assert summary.model_status.feature_completeness["park_weather"] == {"partial": 1, "missing": 1}
+    assert summary.model_status.feature_completeness["lineup"] == {"available": 1, "missing": 1}
+    assert summary.model_status.lineup_status == "partial"
+    assert summary.model_status.weather_status == "partial"
 
 
 def test_generate_candidates_uses_heuristic_probability_and_feature_snapshot(monkeypatch) -> None:
@@ -3367,6 +3380,21 @@ def test_open_meteo_base_url_tolerates_forecast_suffix(monkeypatch) -> None:
     assert captured["url"] == "https://api.open-meteo.com/v1/forecast"
 
 
+def test_open_meteo_parse_requires_target_forecast_hour() -> None:
+    parsed = features._parse_open_meteo(
+        {
+            "hourly": {
+                "time": ["2026-07-01T18:00"],
+                "temperature_2m": [91],
+                "wind_speed_10m": [12],
+            }
+        },
+        datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+    )
+
+    assert parsed is None
+
+
 def test_feature_sync_keeps_unknown_park_weather_missing() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
@@ -3518,6 +3546,14 @@ def test_lineup_parser_extracts_starters_and_excludes_substitutes() -> None:
 
 def test_probable_pitcher_adapter_uses_boxscore_fallback() -> None:
     payload = {
+        "teams": {
+            "away": {
+                "probablePitcher": {
+                    "id": 88,
+                    "fullName": "Stale Probable",
+                }
+            }
+        },
         "liveData": {
             "boxscore": {
                 "teams": {

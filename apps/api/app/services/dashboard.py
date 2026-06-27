@@ -221,7 +221,6 @@ def _feature_status_summary(rows: list[MlbFeatureSnapshot]) -> tuple[dict[str, o
     for row in rows:
         statuses = row.source_statuses or {}
         for module_name, status in statuses.items():
-            source_statuses[module_name] = status
             bucket = module_counts.setdefault(module_name, {})
             if isinstance(status, dict):
                 values = [str(value) for value in status.values()]
@@ -242,7 +241,23 @@ def _feature_status_summary(rows: list[MlbFeatureSnapshot]) -> tuple[dict[str, o
         if counts.get("missing", 0) > 0 and counts.get("available", 0) == 0:
             warnings.add(f"{module_name.upper()} MISSING OR DEGRADED")
 
+    for module_name, counts in module_counts.items():
+        source_statuses[module_name] = _aggregate_module_status(counts)
+
     return module_counts, source_statuses, sorted(warnings)
+
+
+def _aggregate_module_status(counts: dict[str, int]) -> str:
+    total = sum(counts.values())
+    if total == 0:
+        return "missing"
+    if counts.get("missing", 0) == total:
+        return "missing"
+    if counts.get("missing", 0) > 0 or counts.get("partial", 0) > 0:
+        return "partial"
+    if counts.get("available", 0) > 0:
+        return "available"
+    return "partial"
 
 
 def _module_status(source_statuses: dict[str, object], module_name: str) -> str:

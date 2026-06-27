@@ -491,17 +491,6 @@ def parse_starting_lineup_from_game_payload(payload: dict[str, object], side: st
 
 
 def probable_pitcher_from_payload(payload: dict[str, object], side: str) -> dict[str, object] | None:
-    teams = payload.get("teams") if isinstance(payload, dict) else None
-    team = teams.get(side) if isinstance(teams, dict) else None
-    pitcher = team.get("probablePitcher") if isinstance(team, dict) else None
-    if isinstance(pitcher, dict) and pitcher.get("id"):
-        return {
-            "id": str(pitcher.get("id")),
-            "name": pitcher.get("fullName"),
-            "handedness": None,
-            "source_path": f"schedule.teams.{side}.probablePitcher",
-        }
-
     live_data = payload.get("liveData") if isinstance(payload, dict) else None
     boxscore = live_data.get("boxscore") if isinstance(live_data, dict) else None
     box_teams = boxscore.get("teams") if isinstance(boxscore, dict) else None
@@ -520,6 +509,17 @@ def probable_pitcher_from_payload(payload: dict[str, object], side: str) -> dict
                 "handedness": pitch_hand.get("code") or pitch_hand.get("description"),
                 "source_path": f"game.liveData.boxscore.teams.{side}.pitchers[0]",
             }
+
+    teams = payload.get("teams") if isinstance(payload, dict) else None
+    team = teams.get(side) if isinstance(teams, dict) else None
+    pitcher = team.get("probablePitcher") if isinstance(team, dict) else None
+    if isinstance(pitcher, dict) and pitcher.get("id"):
+        return {
+            "id": str(pitcher.get("id")),
+            "name": pitcher.get("fullName"),
+            "handedness": None,
+            "source_path": f"schedule.teams.{side}.probablePitcher",
+        }
     return None
 
 
@@ -1757,11 +1757,13 @@ def _parse_open_meteo(payload: dict[str, object], scheduled_start: datetime) -> 
     if not isinstance(times, list) or not times:
         return None
     target_hour = ensure_aware_utc(scheduled_start).replace(minute=0, second=0, microsecond=0)
-    index = 0
+    index = None
     for candidate_index, value in enumerate(times):
         if str(value).startswith(target_hour.strftime("%Y-%m-%dT%H")):
             index = candidate_index
             break
+    if index is None:
+        return None
 
     def at(key: str) -> object:
         values = hourly.get(key)
