@@ -1893,7 +1893,7 @@ def sync_mlb_features(
     captured_at = utc_now()
     upserted = 0
     for game in games:
-        if get_settings().feature_sync_enable_network_sources and _game_phase(game) != "final":
+        if get_settings().feature_sync_enable_network_sources:
             _hydrate_game_endpoint_if_available(game)
         _sync_game_feature_modules(session, game, day, captured_at, include_modules)
         session.flush()

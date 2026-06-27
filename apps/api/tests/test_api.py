@@ -3248,6 +3248,69 @@ def test_feature_coverage_and_detail_filter_to_active_feature_version() -> None:
     assert detail["items"][0]["source"] == features.FEATURE_VERSION
 
 
+def test_feature_sync_hydrates_final_games_for_backfill(monkeypatch) -> None:
+    monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "true")
+    get_settings.cache_clear()
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    def boxscore_team(start_id: int, pitcher_id: int) -> dict[str, object]:
+        batters = list(range(start_id, start_id + 9))
+        players: dict[str, object] = {}
+        for index, person_id in enumerate(batters, start=1):
+            players[f"ID{person_id}"] = {
+                "person": {"id": person_id, "fullName": f"Starter {person_id}"},
+                "battingOrder": str(index * 100),
+                "batSide": {"code": "R"},
+                "position": {"abbreviation": "C" if index == 9 else "CF"},
+            }
+        players[f"ID{pitcher_id}"] = {
+            "person": {"id": pitcher_id, "fullName": f"Pitcher {pitcher_id}"},
+            "pitchHand": {"code": "R"},
+        }
+        return {"batters": batters, "pitchers": [pitcher_id], "players": players}
+
+    def hydrate_final_game(game: MlbGame) -> None:
+        game.raw_payload = {
+            **(game.raw_payload or {}),
+            "liveData": {
+                "boxscore": {
+                    "teams": {
+                        "home": boxscore_team(1000, 1999),
+                        "away": boxscore_team(2000, 2999),
+                    }
+                }
+            },
+        }
+
+    monkeypatch.setattr(features, "_hydrate_game_endpoint_if_available", hydrate_final_game)
+    try:
+        with Session(engine) as session:
+            game = MlbGame(
+                external_game_id="feature-sync-final-backfill",
+                home_team="Pittsburgh Pirates",
+                away_team="Seattle Mariners",
+                home_abbreviation="PIT",
+                away_abbreviation="SEA",
+                scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+                status="Final",
+                home_score=5,
+                away_score=3,
+                raw_payload={"venue": {"id": 31, "name": "PNC Park"}},
+            )
+            session.add(game)
+            session.commit()
+
+            features.sync_mlb_features(session, date(2026, 7, 1))
+            snapshot = session.scalar(select(MlbFeatureSnapshot))
+
+        assert snapshot is not None
+        assert snapshot.source_statuses["lineup"] == {"home": "available", "away": "available"}
+        assert snapshot.source_statuses["starter_identity"] == {"home": "available", "away": "available"}
+    finally:
+        get_settings.cache_clear()
+
+
 def test_open_meteo_base_url_tolerates_forecast_suffix(monkeypatch) -> None:
     monkeypatch.setenv("OPEN_METEO_BASE_URL", "https://api.open-meteo.com/v1/forecast")
     get_settings.cache_clear()
