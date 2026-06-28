@@ -4703,6 +4703,117 @@ def test_mlb_primary_team_recent_uses_calendar_window(monkeypatch) -> None:
     assert recent_14.features["hitting"]["game_count"] == 3
 
 
+def test_bullpen_only_sync_skips_mlb_primary_team_fetches(monkeypatch) -> None:
+    monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "true")
+    get_settings.cache_clear()
+    _stub_pybaseball_unavailable(monkeypatch)
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    class FailingTeamStatsClient:
+        def get_team_season_stats(self, *_args, **_kwargs):
+            raise AssertionError("bullpen-only sync should not fetch team season stats")
+
+        def get_team_game_log_stats(self, *_args, **_kwargs):
+            raise AssertionError("bullpen-only sync should not fetch team game logs")
+
+        def get_team_stat_splits(self, *_args, **_kwargs):
+            raise AssertionError("bullpen-only sync should not fetch team stat splits")
+
+        def get_game_feed(self, *_args, **_kwargs):
+            return {}
+
+    monkeypatch.setattr(features, "MLBStatsClient", FailingTeamStatsClient)
+    monkeypatch.setattr(features, "_hydrate_game_endpoint_if_available", lambda *_args, **_kwargs: None)
+
+    try:
+        with Session(engine) as session:
+            session.add(
+                MlbGame(
+                    external_game_id="bullpen-only-primary-skip",
+                    home_team="Pittsburgh Pirates",
+                    away_team="Seattle Mariners",
+                    home_abbreviation="PIT",
+                    away_abbreviation="SEA",
+                    scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+                    status="scheduled",
+                    raw_payload={
+                        "teams": {
+                            "home": {"team": {"id": 134, "name": "Pittsburgh Pirates"}},
+                            "away": {"team": {"id": 136, "name": "Seattle Mariners"}},
+                        }
+                    },
+                )
+            )
+            session.commit()
+
+            result = features.sync_mlb_bullpen_features(session, date(2026, 7, 1), refresh_schedule=False)
+            bullpen_rows = list(session.scalars(select(BullpenDailyFeature)))
+    finally:
+        get_settings.cache_clear()
+
+    assert result["validation_status"] in {"ok", "degraded_no_available_public_rows"}
+    assert result["error_count"] == 0
+    assert len(bullpen_rows) == 2
+
+
+def test_mlb_primary_team_fetch_timeout_degrades_sync(monkeypatch) -> None:
+    monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "true")
+    get_settings.cache_clear()
+    _stub_pybaseball_unavailable(monkeypatch)
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    class TimeoutTeamStatsClient:
+        def get_team_season_stats(self, *_args, **_kwargs):
+            raise TimeoutError("team stats timed out")
+
+        def get_team_game_log_stats(self, *_args, **_kwargs):
+            return {"stats": [{"splits": []}]}
+
+        def get_team_stat_splits(self, *_args, **_kwargs):
+            return {"stats": [{"splits": []}]}
+
+        def get_game_feed(self, *_args, **_kwargs):
+            return {}
+
+    monkeypatch.setattr(features, "MLBStatsClient", TimeoutTeamStatsClient)
+    monkeypatch.setattr(features, "_hydrate_game_endpoint_if_available", lambda *_args, **_kwargs: None)
+
+    try:
+        with Session(engine) as session:
+            session.add(
+                MlbGame(
+                    external_game_id="team-primary-timeout",
+                    home_team="Pittsburgh Pirates",
+                    away_team="Seattle Mariners",
+                    home_abbreviation="PIT",
+                    away_abbreviation="SEA",
+                    scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+                    status="scheduled",
+                    raw_payload={
+                        "teams": {
+                            "home": {"team": {"id": 134, "name": "Pittsburgh Pirates"}},
+                            "away": {"team": {"id": 136, "name": "Seattle Mariners"}},
+                        }
+                    },
+                )
+            )
+            session.commit()
+
+            result = features.sync_mlb_team_features(session, date(2026, 7, 1), refresh_schedule=False)
+    finally:
+        get_settings.cache_clear()
+
+    assert result["validation_status"] == "degraded_with_errors"
+    assert result["error_count"] == 2
+    assert {error["table"] for error in result["errors"]} == {
+        "team_season_hitting",
+        "team_season_pitching",
+    }
+    assert all(error["error_type"] == "TimeoutError" for error in result["errors"])
+
+
 def test_statcast_team_rows_use_pybaseball_team_aliases(monkeypatch) -> None:
     monkeypatch.setattr(
         features.pybaseball_client,

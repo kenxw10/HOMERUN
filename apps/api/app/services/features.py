@@ -1111,20 +1111,20 @@ def _mlb_primary_fetch_context(
         "pitcher_season_by_id": {},
         "pitcher_game_logs_by_id": {},
     }
-    if not (requested_modules & {"team", "pitcher", "bullpen", "lineup"}):
+    if not (requested_modules & {"team", "pitcher"}):
         return context
 
     client = MLBStatsClient()
     season = day.year
-    if requested_modules & {"team", "bullpen"}:
+    if requested_modules & {"team"}:
         if hasattr(client, "get_team_season_stats"):
             try:
                 context["team_season_hitting_by_id"] = _team_stats_map(client.get_team_season_stats("hitting", season))
-            except (HttpJsonError, ValueError, KeyError, TypeError) as exc:
+            except Exception as exc:
                 _record_mlb_source_error(stats, table="team_season_hitting", exc=exc)
             try:
                 context["team_season_pitching_by_id"] = _team_stats_map(client.get_team_season_stats("pitching", season))
-            except (HttpJsonError, ValueError, KeyError, TypeError) as exc:
+            except Exception as exc:
                 _record_mlb_source_error(stats, table="team_season_pitching", exc=exc)
 
         team_ids = sorted(
@@ -1140,20 +1140,20 @@ def _mlb_primary_fetch_context(
             if hasattr(client, "get_team_game_log_stats"):
                 try:
                     context["team_hitting_logs_by_id"][team_id] = client.get_team_game_log_stats(team_id, "hitting", season)
-                except (HttpJsonError, ValueError, KeyError, TypeError) as exc:
+                except Exception as exc:
                     _record_mlb_source_error(stats, table="team_hitting_game_log", exc=exc)
                 try:
                     context["team_pitching_logs_by_id"][team_id] = client.get_team_game_log_stats(team_id, "pitching", season)
-                except (HttpJsonError, ValueError, KeyError, TypeError) as exc:
+                except Exception as exc:
                     _record_mlb_source_error(stats, table="team_pitching_game_log", exc=exc)
             if hasattr(client, "get_team_stat_splits"):
                 try:
                     context["team_hitting_splits_by_id"][team_id] = client.get_team_stat_splits(team_id, "hitting", season)
-                except (HttpJsonError, ValueError, KeyError, TypeError) as exc:
+                except Exception as exc:
                     _record_mlb_source_error(stats, table="team_hitting_stat_splits", exc=exc)
                 try:
                     context["team_pitching_splits_by_id"][team_id] = client.get_team_stat_splits(team_id, "pitching", season)
-                except (HttpJsonError, ValueError, KeyError, TypeError) as exc:
+                except Exception as exc:
                     _record_mlb_source_error(stats, table="team_pitching_stat_splits", exc=exc)
 
     if requested_modules & {"pitcher"}:
@@ -1171,12 +1171,12 @@ def _mlb_primary_fetch_context(
             if hasattr(client, "get_pitcher_season_stats"):
                 try:
                     context["pitcher_season_by_id"][pitcher_id] = client.get_pitcher_season_stats(pitcher_id, season)
-                except (HttpJsonError, ValueError, KeyError, TypeError) as exc:
+                except Exception as exc:
                     _record_mlb_source_error(stats, table="pitcher_season_stats", exc=exc)
             if hasattr(client, "get_pitcher_game_log_stats"):
                 try:
                     context["pitcher_game_logs_by_id"][pitcher_id] = client.get_pitcher_game_log_stats(pitcher_id, season)
-                except (HttpJsonError, ValueError, KeyError, TypeError) as exc:
+                except Exception as exc:
                     _record_mlb_source_error(stats, table="pitcher_game_log_stats", exc=exc)
     return context
 
