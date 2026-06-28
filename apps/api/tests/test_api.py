@@ -4453,7 +4453,7 @@ def test_mlb_stats_primary_hydrates_feed_before_collecting_pitcher_ids(monkeypat
                     {
                         "splits": [
                             {
-                                "date": f"2026-06-{23 - index:02d}",
+                                "date": f"2026-06-{22 - index:02d}",
                                 "stat": {
                                     "inningsPitched": "6.0",
                                     "gamesStarted": 1,
@@ -4467,6 +4467,22 @@ def test_mlb_stats_primary_hydrates_feed_before_collecting_pitcher_ids(monkeypat
                                 },
                             }
                             for index in range(5)
+                        ]
+                        + [
+                            {
+                                "date": "2026-06-23",
+                                "stat": {
+                                    "inningsPitched": "1.0",
+                                    "gamesStarted": 0,
+                                    "strikeOuts": 1,
+                                    "baseOnBalls": 0,
+                                    "hits": 1,
+                                    "homeRuns": 0,
+                                    "runs": 0,
+                                    "earnedRuns": 0,
+                                    "numberOfPitches": 14,
+                                },
+                            }
                         ]
                     }
                 ]
@@ -4534,7 +4550,123 @@ def test_mlb_stats_primary_hydrates_feed_before_collecting_pitcher_ids(monkeypat
     assert pitcher_log_calls == ["1999", "2999"]
     assert pitcher is not None
     assert pitcher.features["recent"]["source_status"] == "available"
+    assert pitcher.features["recent"]["last_5_starts"]["sample"]["last_date"] == "2026-06-22"
     assert pitcher.features["workload"]["source_status"] == "available"
+
+
+def test_mlb_primary_team_recent_uses_calendar_window(monkeypatch) -> None:
+    monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "true")
+    get_settings.cache_clear()
+    _stub_pybaseball_unavailable(monkeypatch)
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    def game_log_row(date_value: str, runs: int, hits: int, home_runs: int, earned_runs: int) -> dict[str, object]:
+        return {
+            "date": date_value,
+            "stat": {
+                "runs": runs,
+                "hits": hits,
+                "homeRuns": home_runs,
+                "baseOnBalls": 3,
+                "strikeOuts": 6,
+                "atBats": 32,
+                "plateAppearances": 36,
+                "totalBases": hits + (home_runs * 3),
+                "inningsPitched": "9.0",
+                "earnedRuns": earned_runs,
+                "battersFaced": 36,
+                "numberOfPitches": 140,
+            },
+        }
+
+    def game_log_rows() -> list[dict[str, object]]:
+        return [
+            game_log_row("2026-06-30", runs=5, hits=8, home_runs=1, earned_runs=3),
+            game_log_row("2026-06-25", runs=4, hits=7, home_runs=0, earned_runs=2),
+            game_log_row("2026-06-20", runs=8, hits=11, home_runs=3, earned_runs=6),
+        ]
+
+    class FakeMLBStatsClient:
+        def get_team_season_stats(self, *_args, **_kwargs):
+            return {"stats": [{"splits": []}]}
+
+        def get_team_game_log_stats(self, *_args, **_kwargs):
+            return {"stats": [{"splits": game_log_rows()}]}
+
+        def get_team_stat_splits(self, *_args, **_kwargs):
+            return {"stats": [{"splits": []}]}
+
+    monkeypatch.setattr(features, "MLBStatsClient", FakeMLBStatsClient)
+    monkeypatch.setattr(features, "_hydrate_game_endpoint_if_available", lambda *_args, **_kwargs: None)
+
+    try:
+        with Session(engine) as session:
+            session.add(
+                MlbGame(
+                    external_game_id="calendar-window-team-recent",
+                    home_team="Pittsburgh Pirates",
+                    away_team="Seattle Mariners",
+                    home_abbreviation="PIT",
+                    away_abbreviation="SEA",
+                    scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+                    status="scheduled",
+                    raw_payload={
+                        "teams": {
+                            "home": {"team": {"id": 134, "name": "Pittsburgh Pirates"}},
+                            "away": {"team": {"id": 136, "name": "Seattle Mariners"}},
+                        }
+                    },
+                )
+            )
+            session.commit()
+
+            result = features.sync_mlb_team_features(session, date(2026, 7, 1), refresh_schedule=False)
+            recent_7 = session.scalar(
+                select(TeamRecentFeature)
+                .where(TeamRecentFeature.source == features.MLB_STATS_SOURCE)
+                .where(TeamRecentFeature.team_code == "PIT")
+                .where(TeamRecentFeature.window_days == 7)
+            )
+            recent_14 = session.scalar(
+                select(TeamRecentFeature)
+                .where(TeamRecentFeature.source == features.MLB_STATS_SOURCE)
+                .where(TeamRecentFeature.team_code == "PIT")
+                .where(TeamRecentFeature.window_days == 14)
+            )
+    finally:
+        get_settings.cache_clear()
+
+    assert result["validation_status"] == "ok"
+    assert recent_7 is not None
+    assert recent_7.features["hitting"]["game_count"] == 2
+    assert recent_14 is not None
+    assert recent_14.features["hitting"]["game_count"] == 3
+
+
+def test_statcast_team_rows_use_pybaseball_team_aliases(monkeypatch) -> None:
+    monkeypatch.setattr(
+        features.pybaseball_client,
+        "import_status",
+        lambda: {"available": True, "version": "2.2.7", "module_path": "mocked", "import_error": None},
+    )
+    monkeypatch.setattr(
+        features.pybaseball_client,
+        "get_statcast_range",
+        lambda *_args, **_kwargs: {
+            "rows": [
+                {"bat_team": "CHW", "launch_speed": 96, "launch_angle": 18, "estimated_woba_using_speedangle": 0.360}
+                for _ in range(30)
+            ]
+        },
+    )
+
+    stats = features._new_sync_stats(date(2026, 6, 24), {"team"})
+    context = features._statcast_fetch_context([], date(2026, 6, 24), {"team"}, stats)
+
+    assert "CWS" in context["team_contact_by_code"]
+    assert "CHW" not in context["team_contact_by_code"]
+    assert context["team_contact_by_code"]["CWS"]["batted_ball_events_count"] == 30
 
 
 def test_weather_sync_handles_open_meteo_failure_without_500(monkeypatch) -> None:

@@ -339,12 +339,17 @@ def _game_log_date(split: dict[str, object]) -> str | None:
     return None
 
 
-def _game_log_splits_before(payload: dict[str, object] | None, cutoff_day: date) -> list[dict[str, object]]:
+def _game_log_splits_before(
+    payload: dict[str, object] | None,
+    cutoff_day: date,
+    start_day: date | None = None,
+) -> list[dict[str, object]]:
     cutoff = cutoff_day.isoformat()
+    start = start_day.isoformat() if start_day is not None else None
     splits = []
     for split in _stats_splits(payload):
         log_date = _game_log_date(split)
-        if log_date and log_date < cutoff:
+        if log_date and log_date < cutoff and (start is None or log_date >= start):
             splits.append(split)
     return sorted(splits, key=lambda split: _game_log_date(split) or "", reverse=True)
 
@@ -727,6 +732,18 @@ PYBASEBALL_TEAM_ALIASES = {
 }
 
 
+def _canonical_public_team_code(value: object) -> str | None:
+    if value is None:
+        return None
+    raw = re.sub(r"[^A-Za-z0-9]", "", str(value)).upper()
+    if not raw:
+        return None
+    if raw in PYBASEBALL_TEAM_ALIASES:
+        return PYBASEBALL_TEAM_ALIASES[raw]
+    normalized = normalize_team_abbreviation(str(value), raw)
+    return PYBASEBALL_TEAM_ALIASES.get(normalized, normalized)
+
+
 def _row_value(row: dict[str, object], *names: str) -> object | None:
     lower_lookup = {str(key).lower(): value for key, value in row.items()}
     for name in names:
@@ -766,13 +783,7 @@ def _normalized_player_name(value: object) -> str:
 
 def _pybaseball_team_code(row: dict[str, object]) -> str | None:
     value = _row_value(row, "Team", "Tm", "team", "team_code", "Squad")
-    if value is None:
-        return None
-    raw = re.sub(r"[^A-Za-z0-9]", "", str(value)).upper()
-    if raw in PYBASEBALL_TEAM_ALIASES:
-        return PYBASEBALL_TEAM_ALIASES[raw]
-    normalized = normalize_team_abbreviation(str(value), raw)
-    return PYBASEBALL_TEAM_ALIASES.get(normalized, normalized)
+    return _canonical_public_team_code(value)
 
 
 def _stat_weight(row: dict[str, object]) -> Decimal:
@@ -1265,8 +1276,8 @@ def _statcast_fetch_context(
             by_team: dict[str, list[dict[str, object]]] = {}
             for row in rows:
                 team_code = row.get("bat_team")
-                if team_code:
-                    normalized = normalize_team_abbreviation(str(team_code), str(team_code))
+                normalized = _canonical_public_team_code(team_code)
+                if normalized:
                     by_team.setdefault(normalized, []).append(row)
             context["team_contact_by_code"] = {
                 team_code: {**_aggregate_statcast_contact(team_rows), "date_range": {"start": start.isoformat(), "end": end.isoformat()}}
@@ -2480,12 +2491,13 @@ def _upsert_mlb_primary_team_recent(
         return None
     hitting_payload = mlb_context.get("team_hitting_logs_by_id", {}).get(team_id) if isinstance(mlb_context.get("team_hitting_logs_by_id"), dict) else None
     pitching_payload = mlb_context.get("team_pitching_logs_by_id", {}).get(team_id) if isinstance(mlb_context.get("team_pitching_logs_by_id"), dict) else None
-    hitting_splits = _game_log_splits_before(hitting_payload if isinstance(hitting_payload, dict) else None, day)
-    pitching_splits = _game_log_splits_before(pitching_payload if isinstance(pitching_payload, dict) else None, day)
+    window_start = day - timedelta(days=window_days)
+    hitting_splits = _game_log_splits_before(hitting_payload if isinstance(hitting_payload, dict) else None, day, window_start)
+    pitching_splits = _game_log_splits_before(pitching_payload if isinstance(pitching_payload, dict) else None, day, window_start)
     if not hitting_splits and not pitching_splits:
         return None
-    hitting = _aggregate_team_hitting_logs(hitting_splits, window_days)
-    pitching = _aggregate_team_pitching_logs(pitching_splits, window_days)
+    hitting = _aggregate_team_hitting_logs(hitting_splits, len(hitting_splits))
+    pitching = _aggregate_team_pitching_logs(pitching_splits, len(pitching_splits))
     contact = statcast_context.get("team_contact_by_code", {}).get(team_code) if isinstance(statcast_context.get("team_contact_by_code"), dict) else None
     status = "available" if hitting["game_count"] and pitching["game_count"] else "partial"
     features = {
@@ -2680,6 +2692,15 @@ def _aggregate_pitcher_logs(splits: list[dict[str, object]], limit: int) -> dict
     }
 
 
+def _pitcher_start_splits(splits: list[dict[str, object]]) -> list[dict[str, object]]:
+    starts = []
+    for split in splits:
+        stat = split.get("stat") if isinstance(split.get("stat"), dict) else {}
+        if (_mlb_stat_decimal(stat, "gamesStarted") or Decimal("0")) > 0:
+            starts.append(split)
+    return starts
+
+
 def _upsert_mlb_primary_pitcher(
     session: Session,
     game: MlbGame,
@@ -2698,7 +2719,7 @@ def _upsert_mlb_primary_pitcher(
     season_payload = mlb_context.get("pitcher_season_by_id", {}).get(pitcher_id) if isinstance(mlb_context.get("pitcher_season_by_id"), dict) else None
     log_payload = mlb_context.get("pitcher_game_logs_by_id", {}).get(pitcher_id) if isinstance(mlb_context.get("pitcher_game_logs_by_id"), dict) else None
     season_stat = _first_stat(season_payload if isinstance(season_payload, dict) else None)
-    log_splits = _game_log_splits_before(log_payload if isinstance(log_payload, dict) else None, day)
+    log_splits = _pitcher_start_splits(_game_log_splits_before(log_payload if isinstance(log_payload, dict) else None, day))
     if season_stat is None and not log_splits:
         return None
     innings = _baseball_innings((season_stat or {}).get("inningsPitched"))
