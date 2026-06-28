@@ -41,7 +41,14 @@ class Settings(BaseSettings):
         default=True, alias="KALSHI_DISCOVERY_ENABLE_FALLBACK_TIME_OFFSETS"
     )
     kalshi_discovery_max_fallback_offsets: int = Field(default=6, alias="KALSHI_DISCOVERY_MAX_FALLBACK_OFFSETS")
-    kalshi_discovery_max_429_errors: int = Field(default=5, alias="KALSHI_DISCOVERY_MAX_429_ERRORS")
+    kalshi_discovery_max_batch_size: int = Field(default=20, alias="KALSHI_DISCOVERY_MAX_BATCH_SIZE")
+    kalshi_discovery_request_spacing_ms: int = Field(default=750, alias="KALSHI_DISCOVERY_REQUEST_SPACING_MS")
+    kalshi_discovery_max_429_errors: int = Field(default=3, alias="KALSHI_DISCOVERY_MAX_429_ERRORS")
+    kalshi_discovery_cooldown_seconds: int = Field(default=300, alias="KALSHI_DISCOVERY_COOLDOWN_SECONDS")
+    kalshi_discovery_use_cache_first: bool = Field(default=True, alias="KALSHI_DISCOVERY_USE_CACHE_FIRST")
+    kalshi_discovery_skip_if_recent_minutes: int = Field(
+        default=60, alias="KALSHI_DISCOVERY_SKIP_IF_RECENT_MINUTES"
+    )
     kalshi_market_data_min_request_interval_ms: int = Field(
         default=500, alias="KALSHI_MARKET_DATA_MIN_REQUEST_INTERVAL_MS"
     )
@@ -118,10 +125,24 @@ class Settings(BaseSettings):
     def validate_kalshi_discovery_max_fallback_offsets(cls, value: int) -> int:
         return min(max(value, 0), 6)
 
+    @field_validator("kalshi_discovery_max_batch_size")
+    @classmethod
+    def validate_kalshi_discovery_max_batch_size(cls, value: int) -> int:
+        return min(max(value, 1), 50)
+
     @field_validator("kalshi_discovery_max_429_errors")
     @classmethod
     def validate_kalshi_discovery_max_429_errors(cls, value: int) -> int:
         return max(value, 1)
+
+    @field_validator(
+        "kalshi_discovery_request_spacing_ms",
+        "kalshi_discovery_cooldown_seconds",
+        "kalshi_discovery_skip_if_recent_minutes",
+    )
+    @classmethod
+    def validate_kalshi_discovery_nonnegative_ints(cls, value: int) -> int:
+        return max(value, 0)
 
     @field_validator("kalshi_market_data_min_request_interval_ms")
     @classmethod

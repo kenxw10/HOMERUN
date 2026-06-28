@@ -517,6 +517,9 @@ def generate_candidates(session: Session, target_date: date | None = None) -> di
         .where(MlbGame.scheduled_start >= day_start)
         .where(MlbGame.scheduled_start < day_end)
     ).all()
+    warnings: list[str] = []
+    if not mappings:
+        warnings.append("no_candidates_missing_mappings: run Kalshi market discovery and mapping sync for this target date.")
 
     trade_intents: list[TradeIntent] = []
     evaluated_candidates: list[ModelCandidate] = []
@@ -845,6 +848,7 @@ def generate_candidates(session: Session, target_date: date | None = None) -> di
         "decision_counts": decision_counts,
         "cap_counts": cap_counts,
         "line_selection": line_selection_counts,
+        "warnings": warnings,
         "eligible_trade_intents": len(trade_intents),
         "trade_eligible_after_line_selection": len(line_selected_trades),
         "trade_eligible_before_caps": len(line_selected_trades),
@@ -855,7 +859,11 @@ def generate_candidates(session: Session, target_date: date | None = None) -> di
     }
     session.add(prediction_run)
     session.commit()
-    zero_trade_reason = _zero_trade_reason(decision_counts) if paper_trades == 0 else None
+    zero_trade_reason = (
+        "no_candidates_missing_mappings"
+        if not mappings and paper_trades == 0
+        else _zero_trade_reason(decision_counts) if paper_trades == 0 else None
+    )
     return {
         "date": int(day.strftime("%Y%m%d")),
         "target_date": day.isoformat(),
@@ -893,5 +901,6 @@ def generate_candidates(session: Session, target_date: date | None = None) -> di
         "max_expected_value_net": _max_decimal(net_ev_values),
         "fee_estimate_avg": _avg_decimal(fee_values),
         "zero_trade_reason": zero_trade_reason,
+        "warnings": warnings,
         "trade_policy": prediction_run.trade_policy,
     }

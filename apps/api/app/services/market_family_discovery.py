@@ -42,6 +42,7 @@ EXACT_OFFSETS_MINUTES = (0,)
 FALLBACK_OFFSETS_MINUTES = (-1, 1, -5, 5, -10, 10)
 TICKER_BATCH_SIZE = 50
 STALE_RUNNING_AFTER = timedelta(minutes=10)
+CACHEABLE_DISCOVERY_STATUSES = {"completed", "partial_error", "partial_rate_limited"}
 
 FULL_REGISTRY: dict[str, dict[str, object]] = {
     "full_game_winner": {
@@ -124,6 +125,8 @@ class DiscoveryMetrics:
     retries_attempted: int = 0
     requests_saved_by_batching: int = 0
     stopped_due_to_rate_limit: bool = False
+    retry_after_seconds: float | None = None
+    cooldown_until: datetime | None = None
 
 
 def _date_bounds(target_date: date) -> tuple[datetime, datetime]:
@@ -740,6 +743,30 @@ def _merge_client_metrics(metrics: DiscoveryMetrics, client: KalshiClient) -> No
     metrics.retries_attempted = max(metrics.retries_attempted, _client_stat(client, "retries_attempted"))
 
 
+def _retry_after_seconds(exc: Exception) -> float | None:
+    if not isinstance(exc, KalshiAPIError):
+        return None
+    value = exc.source.response_headers.get("Retry-After") or exc.source.response_headers.get("retry-after")
+    if not value:
+        return None
+    try:
+        return max(float(value), 0.0)
+    except ValueError:
+        return None
+
+
+def _record_rate_limit(metrics: DiscoveryMetrics, settings, exc: Exception) -> None:
+    metrics.rate_limited_count += 1
+    retry_after = _retry_after_seconds(exc)
+    if retry_after is not None:
+        metrics.retry_after_seconds = retry_after
+    cooldown_seconds = max(settings.kalshi_discovery_cooldown_seconds, int(retry_after or 0))
+    if cooldown_seconds > 0:
+        cooldown_until = utc_now() + timedelta(seconds=cooldown_seconds)
+        if metrics.cooldown_until is None or cooldown_until > metrics.cooldown_until:
+            metrics.cooldown_until = cooldown_until
+
+
 def _fallback_offsets(settings) -> tuple[int, ...]:
     if not settings.kalshi_discovery_enable_fallback_time_offsets:
         return ()
@@ -787,6 +814,7 @@ def _batch_lookup_markets(
     *,
     client: KalshiClient,
     probe_entries: list[tuple[DiscoveryProbe, MlbGame]],
+    settings,
     warnings: list[object],
     errors: list[object],
     probe_attempts: list[dict[str, object]],
@@ -802,7 +830,8 @@ def _batch_lookup_markets(
     if not entry_by_ticker:
         return found
 
-    for chunk in _chunked([entry[0] for entry in entry_by_ticker.values()], TICKER_BATCH_SIZE):
+    batch_size = settings.kalshi_discovery_max_batch_size or TICKER_BATCH_SIZE
+    for chunk in _chunked([entry[0] for entry in entry_by_ticker.values()], batch_size):
         if metrics.rate_limited_count >= max_429_errors:
             metrics.stopped_due_to_rate_limit = True
             break
@@ -813,7 +842,9 @@ def _batch_lookup_markets(
             payload = client.get_markets_by_tickers(tickers)
         except Exception as exc:
             if _is_rate_limit_error(exc):
-                metrics.rate_limited_count += 1
+                _record_rate_limit(metrics, settings, exc)
+                if metrics.rate_limited_count >= max_429_errors:
+                    metrics.stopped_due_to_rate_limit = True
             _merge_client_metrics(metrics, client)
             for probe in chunk:
                 game = entry_by_ticker[str(probe.candidate_market_ticker or "").upper()][1]
@@ -851,6 +882,7 @@ def _event_filter_lookup_markets(
     *,
     client: KalshiClient,
     probe_entries: list[tuple[DiscoveryProbe, MlbGame]],
+    settings,
     warnings: list[object],
     errors: list[object],
     probe_attempts: list[dict[str, object]],
@@ -882,7 +914,9 @@ def _event_filter_lookup_markets(
             found.extend((probe, game, market) for market in markets)
         except Exception as exc:
             if _is_rate_limit_error(exc):
-                metrics.rate_limited_count += 1
+                _record_rate_limit(metrics, settings, exc)
+                if metrics.rate_limited_count >= max_429_errors:
+                    metrics.stopped_due_to_rate_limit = True
             _merge_client_metrics(metrics, client)
             _record_probe_exception(
                 game=game,
@@ -977,6 +1011,7 @@ def _discover_markets_low_request(
     exact_found = _batch_lookup_markets(
         client=client,
         probe_entries=exact_entries,
+        settings=settings,
         warnings=warnings,
         errors=errors,
         probe_attempts=probe_attempts,
@@ -1000,6 +1035,7 @@ def _discover_markets_low_request(
         fallback_found = _batch_lookup_markets(
             client=client,
             probe_entries=fallback_entries,
+            settings=settings,
             warnings=warnings,
             errors=errors,
             probe_attempts=probe_attempts,
@@ -1015,6 +1051,7 @@ def _discover_markets_low_request(
         event_found = _event_filter_lookup_markets(
             client=client,
             probe_entries=event_entries,
+            settings=settings,
             warnings=warnings,
             errors=errors,
             probe_attempts=probe_attempts,
@@ -1037,16 +1074,114 @@ def _discover_markets_low_request(
     return found, metrics
 
 
+def _parse_summary_datetime(value: object) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return ensure_aware_utc(datetime.fromisoformat(str(value)))
+    except ValueError:
+        return None
+
+
+def _latest_cacheable_discovery_run(session: Session, day: date) -> MarketFamilyDiscoveryRun | None:
+    runs = list(
+        session.scalars(
+            select(MarketFamilyDiscoveryRun)
+            .where(MarketFamilyDiscoveryRun.target_date == day)
+            .where(MarketFamilyDiscoveryRun.status.in_(CACHEABLE_DISCOVERY_STATUSES))
+            .order_by(MarketFamilyDiscoveryRun.started_at.desc(), MarketFamilyDiscoveryRun.id.desc())
+            .limit(20)
+        )
+    )
+    return next(
+        (
+            run
+            for run in runs
+            if (run.raw_summary or {}).get("resolver_mode") == RESOLVER_MODE
+        ),
+        None,
+    )
+
+
+def _cached_discovery_result(
+    run: MarketFamilyDiscoveryRun,
+    *,
+    reason: str,
+    stale_runs_finalized: int,
+) -> dict[str, object]:
+    result = dict(run.raw_summary or {})
+    if not result:
+        result = {
+            "run_id": run.id,
+            "date": run.target_date.isoformat(),
+            "resolver_mode": RESOLVER_MODE,
+            "status": run.status,
+            "markets_found": run.markets_found,
+            "warnings": run.warnings or [],
+            "errors": run.errors or [],
+        }
+    result["served_from_cache"] = True
+    result["network_skipped_reason"] = reason
+    result["cached_run_id"] = run.id
+    result["cached_run_status"] = run.status
+    result["stale_runs_finalized"] = stale_runs_finalized
+    return result
+
+
+def _maybe_cached_discovery_result(
+    session: Session,
+    day: date,
+    *,
+    settings,
+    now: datetime,
+    force_refresh: bool,
+    stale_runs_finalized: int,
+) -> dict[str, object] | None:
+    if force_refresh or not settings.kalshi_discovery_use_cache_first:
+        return None
+    run = _latest_cacheable_discovery_run(session, day)
+    if run is None:
+        return None
+    raw_summary = run.raw_summary or {}
+    cooldown_until = _parse_summary_datetime(raw_summary.get("cooldown_until"))
+    if cooldown_until is not None and cooldown_until > now:
+        return _cached_discovery_result(
+            run,
+            reason="discovery_cooldown_active",
+            stale_runs_finalized=stale_runs_finalized,
+        )
+    completed_at = run.completed_at or run.started_at
+    recent_after = now - timedelta(minutes=settings.kalshi_discovery_skip_if_recent_minutes)
+    if run.markets_found > 0 and completed_at is not None and ensure_aware_utc(completed_at) >= recent_after:
+        return _cached_discovery_result(
+            run,
+            reason="recent_cached_discovery",
+            stale_runs_finalized=stale_runs_finalized,
+        )
+    return None
+
+
 def run_market_family_discovery(
     session: Session,
     target_date: date | None = None,
     *,
     client: KalshiClient | None = None,
+    force_refresh: bool = False,
 ) -> dict[str, object]:
     settings = get_settings()
     day = target_date or today_eastern()
     started = utc_now()
     stale_runs_finalized = _finalize_stale_running_runs(session, started)
+    cached_result = _maybe_cached_discovery_result(
+        session,
+        day,
+        settings=settings,
+        now=started,
+        force_refresh=force_refresh,
+        stale_runs_finalized=stale_runs_finalized,
+    )
+    if cached_result is not None:
+        return cached_result
     families = TARGET_FAMILIES
     games = _games_for_date(session, day)
     errors: list[object] = []
@@ -1110,6 +1245,11 @@ def run_market_family_discovery(
 
     try:
         kalshi_client = client or KalshiClient.from_market_data_settings()
+        if hasattr(kalshi_client, "min_request_interval_ms"):
+            kalshi_client.min_request_interval_ms = max(
+                int(getattr(kalshi_client, "min_request_interval_ms", 0) or 0),
+                settings.kalshi_discovery_request_spacing_ms,
+            )
         seen: set[tuple[object, ...]] = set()
 
         discovered, metrics = _discover_markets_low_request(
@@ -1154,12 +1294,18 @@ def run_market_family_discovery(
             audit,
             metrics,
         )
-        status_value = "partial_error" if errors or metrics.stopped_due_to_rate_limit else "completed"
+        status_value = (
+            "partial_rate_limited"
+            if metrics.stopped_due_to_rate_limit
+            else "partial_error" if errors else "completed"
+        )
         result = {
             "run_id": run.id,
             "date": day.isoformat(),
             "resolver_mode": RESOLVER_MODE,
             "status": status_value,
+            "served_from_cache": False,
+            "force_refresh": force_refresh,
             "games_considered": len(games),
             "families_considered": len(families),
             **audit,
@@ -1174,6 +1320,15 @@ def run_market_family_discovery(
             "rate_limited_count": metrics.rate_limited_count,
             "retries_attempted": metrics.retries_attempted,
             "stopped_due_to_rate_limit": metrics.stopped_due_to_rate_limit,
+            "retry_after_seconds": metrics.retry_after_seconds,
+            "cooldown_until": metrics.cooldown_until.isoformat() if metrics.cooldown_until else None,
+            "discovery_batch_size": settings.kalshi_discovery_max_batch_size,
+            "discovery_request_spacing_ms": settings.kalshi_discovery_request_spacing_ms,
+            "cache_policy": {
+                "use_cache_first": settings.kalshi_discovery_use_cache_first,
+                "skip_if_recent_minutes": settings.kalshi_discovery_skip_if_recent_minutes,
+                "cooldown_seconds": settings.kalshi_discovery_cooldown_seconds,
+            },
             "stale_runs_finalized": stale_runs_finalized,
             "retired_legacy_prefixes_not_used": RETIRED_LEGACY_PREFIXES_NOT_USED,
         }
@@ -1210,6 +1365,10 @@ def run_market_family_discovery(
             "rate_limited_count": metrics.rate_limited_count,
             "retries_attempted": metrics.retries_attempted,
             "stopped_due_to_rate_limit": metrics.stopped_due_to_rate_limit,
+            "retry_after_seconds": metrics.retry_after_seconds,
+            "cooldown_until": metrics.cooldown_until.isoformat() if metrics.cooldown_until else None,
+            "served_from_cache": False,
+            "force_refresh": force_refresh,
             "stale_runs_finalized": stale_runs_finalized,
             "retired_legacy_prefixes_not_used": RETIRED_LEGACY_PREFIXES_NOT_USED,
         }
@@ -1262,6 +1421,8 @@ def latest_market_family_discovery(session: Session, target_date: date | None = 
             "rate_limited_count": 0,
             "retries_attempted": 0,
             "stopped_due_to_rate_limit": False,
+            "retry_after_seconds": None,
+            "cooldown_until": None,
             "retired_legacy_prefixes_not_used": RETIRED_LEGACY_PREFIXES_NOT_USED,
             "items": [],
         }
@@ -1300,6 +1461,10 @@ def latest_market_family_discovery(session: Session, target_date: date | None = 
         "rate_limited_count": raw_summary.get("rate_limited_count", 0),
         "retries_attempted": raw_summary.get("retries_attempted", 0),
         "stopped_due_to_rate_limit": raw_summary.get("stopped_due_to_rate_limit", False),
+        "retry_after_seconds": raw_summary.get("retry_after_seconds"),
+        "cooldown_until": raw_summary.get("cooldown_until"),
+        "served_from_cache": raw_summary.get("served_from_cache", False),
+        "cache_policy": raw_summary.get("cache_policy", {}),
         "retired_legacy_prefixes_not_used": raw_summary.get(
             "retired_legacy_prefixes_not_used",
             RETIRED_LEGACY_PREFIXES_NOT_USED,

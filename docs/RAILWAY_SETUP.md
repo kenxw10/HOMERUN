@@ -42,7 +42,12 @@ MARKET_FAMILY_DISCOVERY_ENABLED=true
 MARKET_FAMILY_DISCOVERY_MAX_PAGES=2
 KALSHI_DISCOVERY_ENABLE_FALLBACK_TIME_OFFSETS=true
 KALSHI_DISCOVERY_MAX_FALLBACK_OFFSETS=6
-KALSHI_DISCOVERY_MAX_429_ERRORS=5
+KALSHI_DISCOVERY_MAX_BATCH_SIZE=20
+KALSHI_DISCOVERY_REQUEST_SPACING_MS=750
+KALSHI_DISCOVERY_MAX_429_ERRORS=3
+KALSHI_DISCOVERY_COOLDOWN_SECONDS=300
+KALSHI_DISCOVERY_USE_CACHE_FIRST=true
+KALSHI_DISCOVERY_SKIP_IF_RECENT_MINUTES=60
 KALSHI_MARKET_DATA_MIN_REQUEST_INTERVAL_MS=500
 KALSHI_MARKET_DATA_MAX_RETRIES=2
 KALSHI_MARKET_DATA_BACKOFF_BASE_MS=1000
@@ -183,9 +188,9 @@ Expected behavior:
 - Candidate generation can paper trade supported spread, total, and first-five mappings only when the market is open, the ask is executable, the edge threshold clears, and the safety posture remains paper-only.
 - Candidate generation applies slate, game, market-family, open-position, and correlated game/family caps before creating paper trades.
 - First-five settlement requires MLB linescore innings. Missing linescore should produce a skipped result and leave the trade open.
-- Discovery uses batched exact ticker queries first, capped fallback offsets second, and `event_ticker` filtering only as a secondary fallback. The result should include `request_count`, `requests_saved_by_batching`, `rate_limited_count`, `retries_attempted`, and `stopped_due_to_rate_limit`.
+- Discovery uses batched exact ticker queries first, capped fallback offsets second, and `event_ticker` filtering only as a secondary fallback. Normal runs should call `POST /v1/run/market-family-discovery?target_date=YYYY-MM-DD&force_refresh=false`, which reuses recent cached runs and honors active cooldowns. The result should include `request_count`, `requests_saved_by_batching`, `rate_limited_count`, `retries_attempted`, `stopped_due_to_rate_limit`, `served_from_cache`, and `cooldown_until`.
 - Open-position price refresh updates REST last marks for open paper positions only.
-- PR3c fix3 public feature sync requires `FEATURE_SYNC_ENABLE_NETWORK_SOURCES=true` on Railway. When enabled, `/v1/sync/mlb-features` hydrates MLB Stats API schedule/feed data, Open-Meteo weather, raw feature cache tables, and `mature_mlb_features_v2` snapshots. When disabled, network-backed module syncs return `validation_status=skipped_network_disabled` with zero inserted/updated rows.
+- PR3c fix3/fix5 public feature sync requires `FEATURE_SYNC_ENABLE_NETWORK_SOURCES=true` on Railway. When enabled, `/v1/sync/mlb-features` hydrates MLB Stats API schedule/feed data, Open-Meteo weather, pybaseball season batting/pitching data, raw feature cache tables, and `mature_mlb_features_v2` snapshots. Railway installs `pybaseball==2.2.7` from `apps/api/requirements.txt`; do not manually install it in PowerShell. When disabled, network-backed module syncs return `validation_status=skipped_network_disabled` with zero inserted/updated rows.
 - PR3c fix4 makes public feature sync idempotent. Re-running `/v1/sync/mlb-team-features`, `/v1/sync/mlb-pitcher-features`, or `/v1/sync/mlb-features` for the same `target_date` should update existing `mlb_games.external_game_id` rows instead of raising duplicate-key errors. Responses include hydration counters and should return `validation_status=degraded_with_errors` with structured `errors[]` for source problems instead of unhandled 500s.
 - Feature endpoints accept `refresh_schedule=true/false`. Module-specific syncs skip schedule hydration by default when target-date games already exist; force `refresh_schedule=true` only when validating schedule refresh behavior.
 - `pybaseball` is optional in the current backend requirements. `/v1/model/sources/status` reports `pybaseball_available` as an import diagnostic and `advanced_public_stats_status` as actual ingestion status. Until a pybaseball-backed adapter is implemented, advanced public stat modules should be treated as degraded partial proxies even if the package is present.

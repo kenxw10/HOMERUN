@@ -150,7 +150,7 @@ After deploying PR 3c and running `alembic upgrade head`, validate in this order
 13. `GET /v1/model/governance/status` returns active model, feature version, calibration status, thresholds, and latest governance status.
 14. `POST /v1/sync/mlb-features?target_date=YYYY-MM-DD` records feature snapshots with explicit source statuses.
 15. `GET /v1/model/features/coverage?date=YYYY-MM-DD` reports coverage without inventing missing lineup, weather, injury, umpire, team-total, or sportsbook data.
-16. `POST /v1/run/market-family-discovery?target_date=YYYY-MM-DD` returns structured `by_family` output, attempted event/market ticker counts, exact/fallback/event-filter attempt counts, no-match counts, request/rate-limit metrics, and persists a finalized `market_family_discovery_runs` row even when no candidate markets are found.
+16. `POST /v1/run/market-family-discovery?target_date=YYYY-MM-DD&force_refresh=false` returns structured `by_family` output, attempted event/market ticker counts, exact/fallback/event-filter attempt counts, no-match counts, request/rate-limit metrics, and persists a finalized `market_family_discovery_runs` row even when no candidate markets are found. Leave `force_refresh=false` for normal operations so a recent usable run or active cooldown is reused instead of repeatedly calling Kalshi.
 17. `GET /v1/market-families/discovery?date=YYYY-MM-DD` returns the latest finalized report with `run` not null after the POST succeeds.
 18. `POST /v1/sync/market-family-mappings?target_date=YYYY-MM-DD` promotes only parseable supported families to `paper_supported`; missing line/selection/settlement rows stay `needs_review`.
 19. `POST /v1/run/paper-candidate-engine?target_date=YYYY-MM-DD` applies executable-price freshness, conservative fee-adjusted EV, probability-edge, line-selection, and paper caps in that order. Cap-rejected candidates stay no-trade decisions, and the response should show `trade_eligible_after_ev_filters` far below total candidates before caps are the dominant selector.
@@ -229,7 +229,7 @@ Expected: module syncs skip schedule hydration when target-date games already ex
 Invoke-RestMethod -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-RAILWAY-API/v1/model/sources/status"
 ```
 
-Expected: `last_attempted_sync`, `validation_status`, `last_error`, `latest_errors`, and per-table `status_counts` are present. `pybaseball_available` is only an import diagnostic. Until an adapter actually ingests pybaseball-backed data, `advanced_public_stats_status` should be `not_ingested_pybaseball_adapter_not_implemented` when the package is present or `unavailable_pybaseball_not_installed` when it is absent; team, pitcher, and bullpen rows should remain `partial` schedule-derived proxies, not complete advanced-stat rows.
+Expected: `last_attempted_sync`, `validation_status`, `last_error`, `latest_errors`, and per-table `status_counts` are present. `pybaseball_available`, `pybaseball_version`, `pybaseball_module_path`, import errors, attempted functions, DB cache status, and `advanced_stats_status` should be visible. When pybaseball succeeds and rows match, team/pitcher/bullpen rows should include `source=pybaseball_public_stats_v1`; when it fails, the response should expose the source error and fall back to partial derived rows instead of returning a blank 500.
 
 4. Confirm weather and lineup degraded behavior:
 
@@ -290,7 +290,21 @@ Validate the hotfix after deploy:
 7. Confirm active registry prefixes are only `KXMLBGAME`, `KXMLBSPREAD`, `KXMLBTOTAL`, `KXMLBF5`, `KXMLBF5SPREAD`, and `KXMLBF5TOTAL`; guessed legacy prefixes and `KXMLBTEAMTOTAL` must not be probed.
 8. Confirm spread, total, and first-five families create paper candidates/trades only after `market_family_mapping_sync` marks the mapping `paper_supported`.
 9. Confirm known exact `KXMLBGAME` full-game winner resolver matches remain `confirmed_for_paper` with confidence around `0.9700`, zero or near-zero time delta, and team match score `1.0`.
-10. Confirm `request_count` is materially lower than the previous event-filter-heavy validation run, and that repeated 429s produce `partial_error` with `stopped_due_to_rate_limit=true` rather than leaving a run in `running`.
+10. Confirm `request_count` is materially lower than the previous event-filter-heavy validation run, and that repeated 429s produce `partial_rate_limited`, `stopped_due_to_rate_limit=true`, and `cooldown_until` rather than leaving a run in `running`.
+11. Re-run with `force_refresh=false` and confirm `served_from_cache=true` when a recent usable run or cooldown exists. Use `force_refresh=true` only for deliberate validation.
+
+PR3c fix5 pybaseball validation:
+
+1. Deploy with `pybaseball==2.2.7` installed from `apps/api/requirements.txt`; no manual PowerShell install should be needed.
+2. Confirm source diagnostics:
+
+```powershell
+Invoke-RestMethod -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-RAILWAY-API/v1/model/sources/status"
+```
+
+3. Confirm `pybaseball_available=true`, `pybaseball_import_error=$null`, and `pybaseball_version` or `pybaseball_module_path` is present.
+4. Run team/pitcher feature sync and check `pybaseball_functions_attempted`, `pybaseball_rows_seen`, `pybaseball_rows_matched`, `advanced_available_count`, and `advanced_partial_count`.
+5. If pybaseball calls fail, treat `advanced_stats_status` and `pybaseball_last_error` as the source of truth; the system should degrade to derived partial rows, not return a blank 500.
 
 ## Required Context Updates
 
