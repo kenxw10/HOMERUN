@@ -90,9 +90,36 @@ def _stub_public_feature_network(monkeypatch) -> None:
     monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "true")
     get_settings.cache_clear()
     _stub_pybaseball_unavailable(monkeypatch)
+    _stub_mlb_primary_stats_empty(monkeypatch)
+
+    monkeypatch.setattr(features.pybaseball_client, "get_statcast_range", lambda *_args, **_kwargs: {"rows": []})
+    monkeypatch.setattr(features.pybaseball_client, "get_pitcher_statcast_range", lambda *_args, **_kwargs: {"rows": []})
     monkeypatch.setattr(features, "_hydrate_schedule_window", lambda *_args, **_kwargs: 0)
     monkeypatch.setattr(features, "_hydrate_game_endpoint_if_available", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(features, "_fetch_open_meteo", lambda *_args, **_kwargs: {"hourly": {"time": []}})
+
+
+def _stub_mlb_primary_stats_empty(monkeypatch) -> None:
+    class EmptyMLBStatsClient:
+        def get_team_season_stats(self, *_args, **_kwargs):
+            return {"stats": [{"splits": []}]}
+
+        def get_team_game_log_stats(self, *_args, **_kwargs):
+            return {"stats": [{"splits": []}]}
+
+        def get_team_stat_splits(self, *_args, **_kwargs):
+            return {"stats": [{"splits": []}]}
+
+        def get_pitcher_season_stats(self, *_args, **_kwargs):
+            return {"stats": [{"splits": []}]}
+
+        def get_pitcher_game_log_stats(self, *_args, **_kwargs):
+            return {"stats": [{"splits": []}]}
+
+        def get_game_feed(self, *_args, **_kwargs):
+            return {}
+
+    monkeypatch.setattr(features, "MLBStatsClient", EmptyMLBStatsClient)
 
 
 def _stub_pybaseball_unavailable(monkeypatch) -> None:
@@ -3537,6 +3564,7 @@ def test_team_feature_sync_can_run_twice_without_duplicate_games(monkeypatch) ->
     monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "true")
     get_settings.cache_clear()
     _stub_pybaseball_unavailable(monkeypatch)
+    _stub_mlb_primary_stats_empty(monkeypatch)
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
 
@@ -3591,6 +3619,7 @@ def test_feature_sync_returns_degraded_and_records_source_error(monkeypatch) -> 
     monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "true")
     get_settings.cache_clear()
     _stub_pybaseball_unavailable(monkeypatch)
+    _stub_mlb_primary_stats_empty(monkeypatch)
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
 
@@ -3647,6 +3676,7 @@ def test_failed_sync_without_game_snapshots_persists_source_audit(monkeypatch) -
     monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "true")
     get_settings.cache_clear()
     _stub_pybaseball_unavailable(monkeypatch)
+    _stub_mlb_primary_stats_empty(monkeypatch)
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
 
@@ -4025,6 +4055,29 @@ def test_pybaseball_ingestion_writes_available_advanced_rows_and_snapshots(monke
         },
     )
 
+    class EmptyMLBStatsClient:
+        def get_team_season_stats(self, *_args, **_kwargs):
+            return {"stats": [{"splits": []}]}
+
+        def get_team_game_log_stats(self, *_args, **_kwargs):
+            return {"stats": [{"splits": []}]}
+
+        def get_team_stat_splits(self, *_args, **_kwargs):
+            return {"stats": [{"splits": []}]}
+
+        def get_pitcher_season_stats(self, *_args, **_kwargs):
+            return {"stats": [{"splits": []}]}
+
+        def get_pitcher_game_log_stats(self, *_args, **_kwargs):
+            return {"stats": [{"splits": []}]}
+
+        def get_game_feed(self, *_args, **_kwargs):
+            return {}
+
+    monkeypatch.setattr(features, "MLBStatsClient", EmptyMLBStatsClient)
+    monkeypatch.setattr(features.pybaseball_client, "get_statcast_range", lambda *_args, **_kwargs: {"rows": []})
+    monkeypatch.setattr(features.pybaseball_client, "get_pitcher_statcast_range", lambda *_args, **_kwargs: {"rows": []})
+
     def hydrate_schedule(session: Session, day: date, **_kwargs) -> int:
         session.add(
             MlbGame(
@@ -4108,6 +4161,255 @@ def test_pybaseball_ingestion_writes_available_advanced_rows_and_snapshots(monke
     assert report["pybaseball_available"] is True
     assert report["pybaseball_version"] == "2.2.7"
     assert report["advanced_stats_status"] == "available"
+
+
+def test_mlb_stats_primary_populates_features_when_fangraphs_403(monkeypatch) -> None:
+    monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "true")
+    get_settings.cache_clear()
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    def team_split(team_id: int, stat: dict[str, object]) -> dict[str, object]:
+        return {"team": {"id": team_id}, "stat": stat}
+
+    class FakeMLBStatsClient:
+        def get_team_season_stats(self, group: str, season: int):
+            if group == "hitting":
+                stat = {
+                    "gamesPlayed": 70,
+                    "runs": 350,
+                    "hits": 620,
+                    "homeRuns": 90,
+                    "strikeOuts": 510,
+                    "baseOnBalls": 220,
+                    "atBats": 2400,
+                    "plateAppearances": 2700,
+                    "avg": ".258",
+                    "obp": ".329",
+                    "slg": ".431",
+                    "ops": ".760",
+                    "stolenBases": 44,
+                    "babip": ".302",
+                }
+            else:
+                stat = {
+                    "gamesPlayed": 70,
+                    "wins": 38,
+                    "losses": 32,
+                    "era": "3.91",
+                    "whip": "1.24",
+                    "inningsPitched": "625.1",
+                    "strikeOuts": 610,
+                    "baseOnBalls": 210,
+                    "hits": 570,
+                    "homeRuns": 72,
+                    "runs": 305,
+                    "earnedRuns": 272,
+                    "saves": 20,
+                    "blownSaves": 7,
+                }
+            return {"stats": [{"splits": [team_split(134, stat), team_split(136, stat)]}]}
+
+        def get_team_game_log_stats(self, team_id: str, group: str, season: int):
+            rows = []
+            for index in range(1, 16):
+                if group == "hitting":
+                    stat = {
+                        "runs": 4 + index % 3,
+                        "hits": 8 + index % 4,
+                        "homeRuns": index % 2,
+                        "baseOnBalls": 3,
+                        "strikeOuts": 7,
+                        "atBats": 34,
+                        "plateAppearances": 38,
+                        "totalBases": 14,
+                    }
+                else:
+                    stat = {
+                        "inningsPitched": "9.0",
+                        "runs": 3,
+                        "earnedRuns": 3,
+                        "hits": 7,
+                        "homeRuns": 1,
+                        "baseOnBalls": 2,
+                        "strikeOuts": 8,
+                        "battersFaced": 36,
+                        "numberOfPitches": 142,
+                        "saves": 1,
+                        "holds": 1,
+                        "blownSaves": 0,
+                        "saveOpportunities": 1,
+                        "gamesFinished": 1,
+                    }
+                rows.append({"date": f"2026-06-{24 - index:02d}", "stat": stat})
+            return {"stats": [{"splits": rows}]}
+
+        def get_team_stat_splits(self, team_id: str, group: str, season: int, sitCodes: str = "vl,vr"):
+            return {
+                "stats": [
+                    {
+                        "splits": [
+                            {"split": {"code": "vl", "description": "vs Left"}, "stat": {"avg": ".260", "obp": ".330", "slg": ".420", "ops": ".750"}},
+                            {"split": {"code": "vr", "description": "vs Right"}, "stat": {"avg": ".255", "obp": ".325", "slg": ".435", "ops": ".760"}},
+                        ]
+                    }
+                ]
+            }
+
+        def get_pitcher_season_stats(self, person_id: str, season: int):
+            return {
+                "stats": [
+                    {
+                        "splits": [
+                            {
+                                "stat": {
+                                    "wins": 7,
+                                    "losses": 4,
+                                    "era": "3.40",
+                                    "whip": "1.10",
+                                    "inningsPitched": "72.1",
+                                    "strikeOuts": 82,
+                                    "baseOnBalls": 20,
+                                    "hits": 60,
+                                    "homeRuns": 8,
+                                    "gamesStarted": 12,
+                                    "battersFaced": 290,
+                                }
+                            }
+                        ]
+                    }
+                ]
+            }
+
+        def get_pitcher_game_log_stats(self, person_id: str, season: int):
+            return {
+                "stats": [
+                    {
+                        "splits": [
+                            {
+                                "date": f"2026-06-{23 - index:02d}",
+                                "stat": {
+                                    "inningsPitched": "6.0",
+                                    "gamesStarted": 1,
+                                    "strikeOuts": 7,
+                                    "baseOnBalls": 2,
+                                    "hits": 5,
+                                    "homeRuns": 1,
+                                    "runs": 2,
+                                    "earnedRuns": 2,
+                                    "numberOfPitches": 91,
+                                },
+                            }
+                            for index in range(5)
+                        ]
+                    }
+                ]
+            }
+
+        def get_game_feed(self, *_args, **_kwargs):
+            return {}
+
+    monkeypatch.setattr(features, "MLBStatsClient", FakeMLBStatsClient)
+    monkeypatch.setattr(
+        features.pybaseball_client,
+        "import_status",
+        lambda: {"available": True, "version": "2.2.7", "module_path": "mocked", "import_error": None},
+    )
+    monkeypatch.setattr(features.pybaseball_client, "get_batting_stats", lambda *_args, **_kwargs: (_ for _ in ()).throw(Exception("HTTP 403")))
+    monkeypatch.setattr(features.pybaseball_client, "get_pitching_stats", lambda *_args, **_kwargs: (_ for _ in ()).throw(Exception("HTTP 403")))
+    monkeypatch.setattr(
+        features.pybaseball_client,
+        "get_statcast_range",
+        lambda *_args, **_kwargs: {
+            "rows": [
+                {
+                    "bat_team": team,
+                    "launch_speed": 96,
+                    "launch_angle": 18,
+                    "estimated_woba_using_speedangle": 0.360,
+                    "estimated_ba_using_speedangle": 0.280,
+                    "woba_value": 0.350,
+                    "iso_value": 0.180,
+                    "babip_value": 0.310,
+                    "bb_type": "line_drive",
+                    "launch_speed_angle": "6",
+                }
+                for team in ["PIT", "SEA"]
+                for _ in range(30)
+            ],
+            "columns": ["bat_team", "launch_speed", "launch_angle", "estimated_woba_using_speedangle"],
+        },
+    )
+    monkeypatch.setattr(
+        features.pybaseball_client,
+        "get_pitcher_statcast_range",
+        lambda *_args, **_kwargs: {
+            "rows": [
+                {"launch_speed": 88, "launch_angle": 12, "estimated_woba_using_speedangle": 0.300, "release_speed": 94}
+                for _ in range(30)
+            ],
+            "columns": ["launch_speed", "launch_angle", "estimated_woba_using_speedangle", "release_speed"],
+        },
+    )
+    monkeypatch.setattr(features, "_hydrate_game_endpoint_if_available", lambda *_args, **_kwargs: None)
+
+    def hydrate_schedule(session: Session, day: date, **_kwargs) -> int:
+        session.add(
+            MlbGame(
+                external_game_id="mlb-primary-1",
+                home_team="Pittsburgh Pirates",
+                away_team="Seattle Mariners",
+                home_abbreviation="PIT",
+                away_abbreviation="SEA",
+                scheduled_start=datetime(2026, 6, 24, 23, 0, tzinfo=UTC),
+                status="scheduled",
+                raw_payload={
+                    "teams": {
+                        "home": {"team": {"id": 134, "name": "Pittsburgh Pirates"}, "probablePitcher": {"id": 1999, "fullName": "Pitcher 1999"}},
+                        "away": {"team": {"id": 136, "name": "Seattle Mariners"}, "probablePitcher": {"id": 2999, "fullName": "Pitcher 2999"}},
+                    },
+                    "venue": {"id": 31, "name": "PNC Park"},
+                },
+            )
+        )
+        session.flush()
+        return 1
+
+    monkeypatch.setattr(features, "_hydrate_schedule_window", hydrate_schedule)
+
+    try:
+        with Session(engine) as session:
+            result = features.sync_mlb_features(session, date(2026, 6, 24))
+            team = session.scalar(select(TeamDailyFeature).where(TeamDailyFeature.source == features.MLB_STATS_SOURCE))
+            pitcher = session.scalar(
+                select(PitcherDailyFeature)
+                .where(PitcherDailyFeature.source == features.MLB_STATS_SOURCE)
+                .where(PitcherDailyFeature.pitcher_id == "1999")
+            )
+            snapshot = session.scalar(select(MlbFeatureSnapshot).where(MlbFeatureSnapshot.source == features.FEATURE_VERSION))
+    finally:
+        get_settings.cache_clear()
+
+    assert result["pybaseball_fangraphs_status"] == "unavailable_http_403"
+    assert result["player_mapping_failed_count"] == 0
+    assert result["mlb_stats_api_primary_available_count"] > 0
+    assert result["pitcher_season_stats_available_count"] > 0
+    assert result["starter_recent_available_count"] > 0
+    assert result["starter_workload_available_count"] > 0
+    assert result["statcast_rows_seen"] > 0
+    assert result["statcast_pitcher_rows_seen"] > 0
+    assert team is not None
+    assert team.source_status == "available"
+    assert team.features["contact_quality_status"] == "available"
+    assert pitcher is not None
+    assert pitcher.source_status == "available"
+    assert pitcher.features["recent"]["source_status"] == "available"
+    assert pitcher.features["workload"]["expected_innings_projection"] >= 6.0
+    assert snapshot is not None
+    assert snapshot.features["offense_season"]["home"]["source"] == features.MLB_STATS_SOURCE
+    assert snapshot.features["starter_recent"]["home"]["source_status"] == "available"
+    assert snapshot.features["starter_workload"]["home"]["source_status"] == "available"
+    assert snapshot.features["handedness_platoon"]["source_status"] == "available"
 
 
 def test_weather_sync_handles_open_meteo_failure_without_500(monkeypatch) -> None:
@@ -4203,6 +4505,7 @@ def test_public_feature_sync_writes_raw_tables_from_fixture_payloads(monkeypatch
     monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "true")
     get_settings.cache_clear()
     _stub_pybaseball_unavailable(monkeypatch)
+    _stub_mlb_primary_stats_empty(monkeypatch)
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
 
@@ -5735,7 +6038,9 @@ def test_resolve_game_markets_exact_kxmlb_match_stays_confirmed_for_paper(
     assert "TEAM_MATCH_SCORE:1.00" in match.rationale
 
 
-def test_market_family_discovery_persists_structured_by_family_and_excludes_mve() -> None:
+def test_market_family_discovery_persists_structured_by_family_and_excludes_mve(monkeypatch) -> None:
+    monkeypatch.setenv("KALSHI_DISCOVERY_ENABLE_FALLBACK_TIME_OFFSETS", "false")
+    get_settings.cache_clear()
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
 
@@ -5760,24 +6065,23 @@ def test_market_family_discovery_persists_structured_by_family_and_excludes_mve(
 
         def get_markets_by_tickers(self, tickers: list[str]):
             self.ticker_batches.append(tickers)
-            markets = []
-            if "KXMLBSPREAD-26JUL011900SEAPIT" in tickers:
-                markets.append(spread_market)
-            if "KXMLBTOTAL-26JUL011900SEAPIT" in tickers:
-                markets.append(
-                    {
-                        "ticker": "KXMLBTOTAL-26JUL011900SEAPIT",
-                        "event_ticker": "KXMLBTOTAL-26JUL011900SEAPIT",
-                        "title": "Multivariate combo",
-                        "mve_selected_legs": [{"ticker": "LEG"}],
-                    }
-                )
-            return {"markets": markets}
+            return {"markets": []}
 
         def get_markets_by_event_ticker(self, event_ticker: str):
             self.event_tickers.append(event_ticker)
-            if event_ticker.startswith("KXMLBSPREAD-"):
-                raise AssertionError("event filter should not run for a family already found by exact batch")
+            if event_ticker == "KXMLBSPREAD-26JUL011900SEAPIT":
+                return {"markets": [spread_market]}
+            if event_ticker == "KXMLBTOTAL-26JUL011900SEAPIT":
+                return {
+                    "markets": [
+                        {
+                            "ticker": "KXMLBTOTAL-26JUL011900SEAPIT-OVER-8",
+                            "event_ticker": "KXMLBTOTAL-26JUL011900SEAPIT",
+                            "title": "Multivariate combo",
+                            "mve_selected_legs": [{"ticker": "LEG"}],
+                        }
+                    ]
+                }
             return {"markets": []}
 
     fake_client = FakeDiscoveryClient()
@@ -5812,15 +6116,16 @@ def test_market_family_discovery_persists_structured_by_family_and_excludes_mve(
     assert run.raw_summary["markets_found"] == 1
     assert len(items) == 1
     assert items[0].family_key == "full_game_spread"
-    assert items[0].candidate_market_ticker == "KXMLBSPREAD-26JUL011900SEAPIT"
+    assert items[0].candidate_market_ticker is None
     assert items[0].line_value == Decimal("-1.5000")
-    assert any("KXMLBSPREAD-26JUL011900SEAPIT" in batch for batch in fake_client.ticker_batches)
-    assert "KXMLBSPREAD-26JUL011900SEAPIT" not in fake_client.event_tickers
-    assert all(not ticker.startswith("KXMLBGAME-") for batch in fake_client.ticker_batches for ticker in batch)
+    assert all("KXMLBSPREAD-26JUL011900SEAPIT" not in batch for batch in fake_client.ticker_batches)
+    assert "KXMLBSPREAD-26JUL011900SEAPIT" in fake_client.event_tickers
+    assert result["lookup_strategy_counts"]["event_ticker"] > 0
+    assert result["lookup_strategy_counts"]["guessed_market_ticker"] == 0
     assert result["request_count"] > 0
-    assert result["requests_saved_by_batching"] > 0
     assert result["attempted_event_tickers_count"] > 0
-    assert result["attempted_market_tickers_count"] > 0
+    assert result["event_ticker_request_count"] > 0
+    assert result["guessed_market_ticker_request_count"] == 0
     assert "KXMLBTEAMTOTAL" not in result["retired_legacy_prefixes_not_used"]
 
 
@@ -6316,16 +6621,16 @@ def test_market_family_discovery_records_non_404_errors_and_continues() -> None:
     assert item.returned_ticker == "KXMLBSPREAD-26JUL011900SEAPIT-PIT-1.5"
 
 
-def test_market_family_discovery_handles_batched_exact_market_response() -> None:
+def test_market_family_discovery_handles_batched_winner_market_response() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
 
-    spread_market = {
-        "ticker": "KXMLBSPREAD-26JUL011900SEAPIT",
-        "event_ticker": "KXMLBSPREAD-26JUL011900SEAPIT",
-        "title": "Pittsburgh Pirates spread -1.5 vs Seattle Mariners",
+    winner_market = {
+        "ticker": "KXMLBF5-26JUL011900SEAPIT-TIE",
+        "event_ticker": "KXMLBF5-26JUL011900SEAPIT",
+        "title": "Seattle Mariners vs Pittsburgh Pirates first five innings tie",
+        "yes_sub_title": "Tie after five innings",
         "status": "open",
-        "functional_strike": "-1.5",
     }
 
     class FakeBatchedExactClient:
@@ -6337,13 +6642,13 @@ def test_market_family_discovery_handles_batched_exact_market_response() -> None
 
         def get_markets_by_tickers(self, tickers: list[str]):
             self.ticker_batches.append(tickers)
-            if "KXMLBSPREAD-26JUL011900SEAPIT" in tickers:
-                return {"markets": [spread_market]}
+            if "KXMLBF5-26JUL011900SEAPIT-TIE" in tickers:
+                return {"markets": [winner_market]}
             return {"markets": []}
 
         def get_markets_by_event_ticker(self, event_ticker: str):
-            if event_ticker == "KXMLBSPREAD-26JUL011900SEAPIT":
-                raise AssertionError("event filter should not run after exact batch finds the family")
+            if event_ticker == "KXMLBF5-26JUL011900SEAPIT":
+                raise AssertionError("winner families should use direct ticker lookup")
             return {"markets": []}
 
     with Session(engine) as session:
@@ -6374,10 +6679,10 @@ def test_market_family_discovery_handles_batched_exact_market_response() -> None
     assert run is not None
     assert run.status == "completed"
     assert item is not None
-    assert item.family_key == "full_game_spread"
-    assert item.returned_ticker == "KXMLBSPREAD-26JUL011900SEAPIT"
-    assert item.source_strategy == "batched_exact_ticker"
-    assert item.candidate_market_ticker == "KXMLBSPREAD-26JUL011900SEAPIT"
+    assert item.family_key == "first_five_winner"
+    assert item.returned_ticker == "KXMLBF5-26JUL011900SEAPIT-TIE"
+    assert item.source_strategy == "direct_ticker"
+    assert item.candidate_market_ticker == "KXMLBF5-26JUL011900SEAPIT-TIE"
     assert len(fake_client.ticker_batches) < result["attempted_market_tickers_count"]
     assert result["requests_saved_by_batching"] > 0
 
@@ -6480,11 +6785,11 @@ def test_market_family_discovery_skips_event_filter_for_exact_found_family() -> 
     Base.metadata.create_all(engine)
 
     exact_market = {
-        "ticker": "KXMLBSPREAD-26JUL011900SEAPIT",
-        "event_ticker": "KXMLBSPREAD-26JUL011900SEAPIT",
-        "title": "Pittsburgh Pirates spread -1.5 vs Seattle Mariners",
+        "ticker": "KXMLBF5-26JUL011900SEAPIT-TIE",
+        "event_ticker": "KXMLBF5-26JUL011900SEAPIT",
+        "title": "Seattle Mariners vs Pittsburgh Pirates first five innings tie",
+        "yes_sub_title": "Tie after five innings",
         "status": "open",
-        "functional_strike": "-1.5",
     }
 
     class FakeExactFoundClient:
@@ -6495,13 +6800,13 @@ def test_market_family_discovery_skips_event_filter_for_exact_found_family() -> 
             raise AssertionError("discovery should use batched ticker lookup, not one request per ticker")
 
         def get_markets_by_tickers(self, tickers: list[str]):
-            if "KXMLBSPREAD-26JUL011900SEAPIT" in tickers:
+            if "KXMLBF5-26JUL011900SEAPIT-TIE" in tickers:
                 return {"markets": [exact_market]}
             return {"markets": []}
 
         def get_markets_by_event_ticker(self, event_ticker: str):
-            if event_ticker == "KXMLBSPREAD-26JUL011900SEAPIT":
-                raise AssertionError("event filter should not run after exact batch finds the family")
+            if event_ticker == "KXMLBF5-26JUL011900SEAPIT":
+                raise AssertionError("winner families should not use event filter after exact batch finds the family")
             self.event_tickers.append(event_ticker)
             return {"markets": []}
 
@@ -6527,8 +6832,8 @@ def test_market_family_discovery_skips_event_filter_for_exact_found_family() -> 
         items = list(session.scalars(select(MarketFamilyDiscoveryItem)))
 
     assert result["markets_found"] == 1
-    assert result["by_family"]["full_game_spread"]["market_count"] == 1
-    assert result["by_family"]["full_game_spread"]["event_filter_attempts"] == 0
+    assert result["by_family"]["first_five_winner"]["market_count"] == 1
+    assert result["by_family"]["first_five_winner"]["event_filter_attempts"] == 0
     assert len(items) == 1
     assert items[0].returned_ticker == exact_market["ticker"]
 
@@ -6545,7 +6850,7 @@ def test_market_family_discovery_does_not_suppress_fallback_after_discarded_exac
     }
     fallback_market = {
         "ticker": "KXMLBSPREAD-26JUL011900SEAPIT-PIT-1.5",
-        "event_ticker": "KXMLBSPREAD-26JUL011900SEAPIT",
+        "event_ticker": "KXMLBSPREAD-26JUL011901SEAPIT",
         "title": "Pittsburgh Pirates spread -1.5 vs Seattle Mariners",
         "status": "open",
         "functional_strike": "-1.5",
@@ -6559,13 +6864,13 @@ def test_market_family_discovery_does_not_suppress_fallback_after_discarded_exac
             raise AssertionError("discovery should use batched ticker lookup, not one request per ticker")
 
         def get_markets_by_tickers(self, tickers: list[str]):
-            if "KXMLBSPREAD-26JUL011900SEAPIT" in tickers:
-                return {"markets": [mve_market]}
             return {"markets": []}
 
         def get_markets_by_event_ticker(self, event_ticker: str):
             self.event_tickers.append(event_ticker)
             if event_ticker == "KXMLBSPREAD-26JUL011900SEAPIT":
+                return {"markets": [mve_market]}
+            if event_ticker == "KXMLBSPREAD-26JUL011901SEAPIT":
                 return {"markets": [fallback_market]}
             return {"markets": []}
 
@@ -6642,13 +6947,13 @@ def test_market_family_discovery_uses_observed_prefix_registry_only() -> None:
     assert "KXMLBTEAMTOTAL" not in active_prefixes
     assert set(market_family_discovery.RETIRED_LEGACY_PREFIXES_NOT_USED).isdisjoint(active_prefixes)
     assert market_family_discovery.DISCOVERY_QUERY_FAMILIES == [
+        "full_game_winner",
         "full_game_spread",
         "full_game_total",
         "first_five_winner",
         "first_five_spread",
         "first_five_total",
     ]
-    assert "full_game_winner" not in market_family_discovery.DISCOVERY_QUERY_FAMILIES
     assert market_family_discovery._direct_market_ticker_candidates(
         game,
         "full_game_winner",
@@ -6670,7 +6975,7 @@ def test_market_family_discovery_uses_observed_prefix_registry_only() -> None:
         game,
         "full_game_spread",
         "KXMLBSPREAD-26JUL011900SEAPIT",
-    ) == ["KXMLBSPREAD-26JUL011900SEAPIT"]
+    ) == []
 
 
 def test_market_family_discovery_first_five_winner_can_represent_tie() -> None:

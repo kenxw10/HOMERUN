@@ -48,10 +48,11 @@ LEAGUE_AVG_FULL_GAME_RUNS = Decimal("4.35")
 LEAGUE_AVG_FIRST_FIVE_RUNS = Decimal("2.15")
 EARTH_RADIUS_MILES = Decimal("3958.8")
 STATIC_SOURCE = "static_mlb_reference_v1"
-MLB_STATS_SOURCE = "mlb_stats_api"
+MLB_STATS_SOURCE = "mlb_stats_api_primary_v1"
 OPEN_METEO_SOURCE = "open_meteo"
 DERIVED_SOURCE = "derived_homerun_v2"
 PYBASEBALL_SOURCE = "pybaseball_public_stats_v1"
+STATCAST_SOURCE = "statcast_savant_secondary_v1"
 NETWORK_SOURCE_MODULES = {"team", "pitcher", "bullpen", "lineup", "weather"}
 ALL_SYNC_MODULES = NETWORK_SOURCE_MODULES | {"injuries", "travel"}
 RAW_TABLES_BY_MODULE = {
@@ -268,6 +269,84 @@ def _int(value: object) -> int | None:
 
 def _float(value: Decimal | float | int | None) -> float | None:
     return float(value) if value is not None else None
+
+
+def _ratio(numerator: Decimal | int | float | None, denominator: Decimal | int | float | None, places: str = "0.0001") -> Decimal | None:
+    if numerator is None or denominator is None:
+        return None
+    parsed_denominator = Decimal(str(denominator))
+    if parsed_denominator == 0:
+        return None
+    return (Decimal(str(numerator)) / parsed_denominator).quantize(Decimal(places))
+
+
+def _baseball_innings(value: object) -> Decimal | None:
+    if value is None or value == "":
+        return None
+    raw = str(value).strip()
+    if "." not in raw:
+        return _decimal(raw)
+    whole_part, decimal_part = raw.split(".", 1)
+    whole = _decimal(whole_part)
+    if whole is None:
+        return None
+    if decimal_part == "1":
+        return (whole + Decimal("0.3333")).quantize(Decimal("0.0001"))
+    if decimal_part == "2":
+        return (whole + Decimal("0.6667")).quantize(Decimal("0.0001"))
+    if decimal_part in {"", "0"}:
+        return whole
+    return _decimal(raw)
+
+
+def _stats_splits(payload: dict[str, object] | None) -> list[dict[str, object]]:
+    stats = payload.get("stats") if isinstance(payload, dict) else None
+    if not isinstance(stats, list) or not stats:
+        return []
+    splits = stats[0].get("splits") if isinstance(stats[0], dict) else None
+    return [split for split in splits if isinstance(split, dict)] if isinstance(splits, list) else []
+
+
+def _first_stat(payload: dict[str, object] | None) -> dict[str, object] | None:
+    for split in _stats_splits(payload):
+        stat = split.get("stat")
+        if isinstance(stat, dict):
+            return stat
+    return None
+
+
+def _team_id(game: MlbGame, side: str) -> str | None:
+    team = _team_payload(game, side).get("team")
+    if isinstance(team, dict) and team.get("id") is not None:
+        return str(team["id"])
+    return None
+
+
+def _team_stats_map(payload: dict[str, object] | None) -> dict[str, dict[str, object]]:
+    mapped: dict[str, dict[str, object]] = {}
+    for split in _stats_splits(payload):
+        team = split.get("team") if isinstance(split.get("team"), dict) else None
+        stat = split.get("stat") if isinstance(split.get("stat"), dict) else None
+        if team and stat and team.get("id") is not None:
+            mapped[str(team["id"])] = stat
+    return mapped
+
+
+def _game_log_date(split: dict[str, object]) -> str | None:
+    for value in (split.get("date"), (split.get("game") or {}).get("gameDate") if isinstance(split.get("game"), dict) else None):
+        if value:
+            return str(value)[:10]
+    return None
+
+
+def _game_log_splits_before(payload: dict[str, object] | None, cutoff_day: date) -> list[dict[str, object]]:
+    cutoff = cutoff_day.isoformat()
+    splits = []
+    for split in _stats_splits(payload):
+        log_date = _game_log_date(split)
+        if log_date and log_date < cutoff:
+            splits.append(split)
+    return sorted(splits, key=lambda split: _game_log_date(split) or "", reverse=True)
 
 
 def _module(
@@ -875,11 +954,15 @@ def _record_pybaseball_source_call(stats: dict[str, object], result: dict[str, o
     functions = stats.setdefault("pybaseball_functions_attempted", [])
     if function_name and isinstance(functions, list) and function_name not in functions:
         functions.append(function_name)
+    if function_name in {"batting_stats", "pitching_stats"}:
+        stats["pybaseball_fangraphs_status"] = "available"
     stats["pybaseball_rows_seen"] = int(stats.get("pybaseball_rows_seen", 0)) + len(_pybaseball_rows(result))
 
 
 def _record_pybaseball_source_error(stats: dict[str, object], function_name: str, exc: BaseException) -> None:
     stats["pybaseball_error_count"] = int(stats.get("pybaseball_error_count", 0)) + 1
+    if function_name in {"batting_stats", "pitching_stats"}:
+        stats["pybaseball_fangraphs_status"] = "unavailable_http_403" if "403" in str(exc) else "unavailable_error"
     _append_error(stats, _pybaseball_error(function_name, exc))
 
 
@@ -989,6 +1072,236 @@ def _source_error(
     if isinstance(exc, HttpJsonError):
         error["detail"] = exc.to_detail()
     return error
+
+
+def _record_mlb_source_error(
+    stats: dict[str, object],
+    *,
+    table: str,
+    exc: BaseException,
+    game_pk: object | None = None,
+) -> None:
+    _append_error(stats, _source_error(source=MLB_STATS_SOURCE, table=table, exc=exc, game_pk=game_pk))
+
+
+def _mlb_primary_fetch_context(
+    games: list[MlbGame],
+    day: date,
+    requested_modules: set[str],
+    stats: dict[str, object],
+) -> dict[str, object]:
+    context: dict[str, object] = {
+        "team_season_hitting_by_id": {},
+        "team_season_pitching_by_id": {},
+        "team_hitting_logs_by_id": {},
+        "team_pitching_logs_by_id": {},
+        "team_hitting_splits_by_id": {},
+        "team_pitching_splits_by_id": {},
+        "pitcher_season_by_id": {},
+        "pitcher_game_logs_by_id": {},
+    }
+    if not (requested_modules & {"team", "pitcher", "bullpen", "lineup"}):
+        return context
+
+    client = MLBStatsClient()
+    season = day.year
+    if requested_modules & {"team", "bullpen"}:
+        if hasattr(client, "get_team_season_stats"):
+            try:
+                context["team_season_hitting_by_id"] = _team_stats_map(client.get_team_season_stats("hitting", season))
+            except (HttpJsonError, ValueError, KeyError, TypeError) as exc:
+                _record_mlb_source_error(stats, table="team_season_hitting", exc=exc)
+            try:
+                context["team_season_pitching_by_id"] = _team_stats_map(client.get_team_season_stats("pitching", season))
+            except (HttpJsonError, ValueError, KeyError, TypeError) as exc:
+                _record_mlb_source_error(stats, table="team_season_pitching", exc=exc)
+
+        team_ids = sorted(
+            {
+                team_id
+                for game in games
+                for side in ("home", "away")
+                for team_id in [_team_id(game, side)]
+                if team_id is not None
+            }
+        )
+        for team_id in team_ids:
+            if hasattr(client, "get_team_game_log_stats"):
+                try:
+                    context["team_hitting_logs_by_id"][team_id] = client.get_team_game_log_stats(team_id, "hitting", season)
+                except (HttpJsonError, ValueError, KeyError, TypeError) as exc:
+                    _record_mlb_source_error(stats, table="team_hitting_game_log", exc=exc)
+                try:
+                    context["team_pitching_logs_by_id"][team_id] = client.get_team_game_log_stats(team_id, "pitching", season)
+                except (HttpJsonError, ValueError, KeyError, TypeError) as exc:
+                    _record_mlb_source_error(stats, table="team_pitching_game_log", exc=exc)
+            if hasattr(client, "get_team_stat_splits"):
+                try:
+                    context["team_hitting_splits_by_id"][team_id] = client.get_team_stat_splits(team_id, "hitting", season)
+                except (HttpJsonError, ValueError, KeyError, TypeError) as exc:
+                    _record_mlb_source_error(stats, table="team_hitting_stat_splits", exc=exc)
+                try:
+                    context["team_pitching_splits_by_id"][team_id] = client.get_team_stat_splits(team_id, "pitching", season)
+                except (HttpJsonError, ValueError, KeyError, TypeError) as exc:
+                    _record_mlb_source_error(stats, table="team_pitching_stat_splits", exc=exc)
+
+    if requested_modules & {"pitcher"}:
+        pitcher_ids = sorted(
+            {
+                str(identity["id"])
+                for game in games
+                for side in ("home", "away")
+                for identity in [probable_pitcher_from_payload(game.raw_payload or {}, side)]
+                if identity and identity.get("id")
+            }
+        )
+        stats["probable_starters_seen"] = len(pitcher_ids)
+        for pitcher_id in pitcher_ids:
+            if hasattr(client, "get_pitcher_season_stats"):
+                try:
+                    context["pitcher_season_by_id"][pitcher_id] = client.get_pitcher_season_stats(pitcher_id, season)
+                except (HttpJsonError, ValueError, KeyError, TypeError) as exc:
+                    _record_mlb_source_error(stats, table="pitcher_season_stats", exc=exc)
+            if hasattr(client, "get_pitcher_game_log_stats"):
+                try:
+                    context["pitcher_game_logs_by_id"][pitcher_id] = client.get_pitcher_game_log_stats(pitcher_id, season)
+                except (HttpJsonError, ValueError, KeyError, TypeError) as exc:
+                    _record_mlb_source_error(stats, table="pitcher_game_log_stats", exc=exc)
+    return context
+
+
+def _statcast_rows(result: dict[str, object] | None) -> list[dict[str, object]]:
+    return _pybaseball_rows(result)
+
+
+def _statcast_date_range(day: date) -> tuple[date, date] | None:
+    end = min(day - timedelta(days=1), today_eastern() - timedelta(days=1))
+    if end >= day:
+        return None
+    start = max(date(end.year, 3, 1), end - timedelta(days=120))
+    if start > end:
+        return None
+    return start, end
+
+
+def _aggregate_statcast_contact(rows: list[dict[str, object]]) -> dict[str, object]:
+    bbe_rows = [row for row in rows if _decimal_stat(row, "launch_speed") is not None or _decimal_stat(row, "launch_angle") is not None]
+    bbe_count = len(bbe_rows)
+
+    def average(*names: str) -> float | None:
+        values = [_decimal_stat(row, *names) for row in bbe_rows]
+        present = [value for value in values if value is not None]
+        if not present:
+            return None
+        return _float((sum(present) / Decimal(len(present))).quantize(Decimal("0.0001")))
+
+    hard_hit_count = sum(1 for row in bbe_rows if (_decimal_stat(row, "launch_speed") or Decimal("0")) >= Decimal("95"))
+    barrel_count = 0
+    bb_mix = {"ground_ball": 0, "fly_ball": 0, "line_drive": 0, "popup": 0}
+    for row in bbe_rows:
+        launch_speed_angle = str(row.get("launch_speed_angle") or "").lower()
+        if launch_speed_angle in {"6", "barrel", "barrels"}:
+            barrel_count += 1
+        bb_type = str(row.get("bb_type") or "").lower()
+        if bb_type in {"ground_ball", "fly_ball", "line_drive", "popup"}:
+            bb_mix[bb_type] += 1
+    return {
+        "source": STATCAST_SOURCE,
+        "row_count": len(rows),
+        "batted_ball_events_count": bbe_count,
+        "average_exit_velocity": average("launch_speed"),
+        "average_launch_angle": average("launch_angle"),
+        "hard_hit_count": hard_hit_count,
+        "hard_hit_pct": _float(_ratio(hard_hit_count, bbe_count)),
+        "barrel_count": barrel_count,
+        "barrel_pct": _float(_ratio(barrel_count, bbe_count)),
+        "estimated_woba_contact": average("estimated_woba_using_speedangle"),
+        "xba_proxy": average("estimated_ba_using_speedangle"),
+        "woba_observed": average("woba_value"),
+        "iso_allowed_proxy": average("iso_value"),
+        "babip_value": average("babip_value"),
+        "sweet_spot_pct": _float(_ratio(sum(1 for row in bbe_rows if Decimal("8") <= (_decimal_stat(row, "launch_angle") or Decimal("-999")) <= Decimal("32")), bbe_count)),
+        "batted_ball_mix": bb_mix,
+        "average_release_speed": average("release_speed"),
+        "source_columns_seen": sorted({str(key) for row in rows for key in row}),
+    }
+
+
+def _statcast_status(contact: dict[str, object] | None) -> str:
+    if not contact:
+        return "missing"
+    bbe_count = int(contact.get("batted_ball_events_count") or 0)
+    if bbe_count >= 25:
+        return "available"
+    if bbe_count > 0:
+        return "partial"
+    return "missing"
+
+
+def _statcast_fetch_context(
+    games: list[MlbGame],
+    day: date,
+    requested_modules: set[str],
+    stats: dict[str, object],
+) -> dict[str, object]:
+    context: dict[str, object] = {"team_contact_by_code": {}, "pitcher_contact_by_id": {}}
+    if not (requested_modules & {"team", "pitcher"}):
+        return context
+    date_range = _statcast_date_range(day)
+    if date_range is None:
+        stats["statcast_source_status"] = "skipped_future_window"
+        _append_warning(stats, "Statcast/Savant skipped because no completed date range exists for the target date.")
+        return context
+    start, end = date_range
+    if not pybaseball_available():
+        stats["statcast_source_status"] = "unavailable_pybaseball_not_installed"
+        return context
+
+    if requested_modules & {"team"}:
+        try:
+            result = pybaseball_client.get_statcast_range(start, end)
+            rows = _statcast_rows(result)
+            stats["statcast_rows_seen"] = int(stats.get("statcast_rows_seen", 0)) + len(rows)
+            by_team: dict[str, list[dict[str, object]]] = {}
+            for row in rows:
+                team_code = row.get("bat_team")
+                if team_code:
+                    normalized = normalize_team_abbreviation(str(team_code), str(team_code))
+                    by_team.setdefault(normalized, []).append(row)
+            context["team_contact_by_code"] = {
+                team_code: {**_aggregate_statcast_contact(team_rows), "date_range": {"start": start.isoformat(), "end": end.isoformat()}}
+                for team_code, team_rows in by_team.items()
+            }
+            stats["statcast_rows_matched"] = int(stats.get("statcast_rows_matched", 0)) + sum(len(rows) for rows in by_team.values())
+        except Exception as exc:
+            stats["statcast_error_count"] = int(stats.get("statcast_error_count", 0)) + 1
+            _append_error(stats, _source_error(source=STATCAST_SOURCE, table="statcast_team_contact", exc=exc))
+
+    if requested_modules & {"pitcher"}:
+        pitcher_ids = sorted(
+            {
+                str(identity["id"])
+                for game in games
+                for side in ("home", "away")
+                for identity in [probable_pitcher_from_payload(game.raw_payload or {}, side)]
+                if identity and identity.get("id")
+            }
+        )
+        for pitcher_id in pitcher_ids:
+            try:
+                result = pybaseball_client.get_pitcher_statcast_range(pitcher_id, start, end)
+                rows = _statcast_rows(result)
+                stats["statcast_pitcher_rows_seen"] = int(stats.get("statcast_pitcher_rows_seen", 0)) + len(rows)
+                if rows:
+                    context["pitcher_contact_by_id"][pitcher_id] = {
+                        **_aggregate_statcast_contact(rows),
+                        "date_range": {"start": start.isoformat(), "end": end.isoformat()},
+                    }
+                    stats["statcast_pitcher_rows_matched"] = int(stats.get("statcast_pitcher_rows_matched", 0)) + len(rows)
+            except Exception as exc:
+                stats["statcast_error_count"] = int(stats.get("statcast_error_count", 0)) + 1
+                _append_error(stats, _source_error(source=STATCAST_SOURCE, table="statcast_pitcher_contact", exc=exc))
+    return context
 
 
 def _hydrate_schedule_window(
@@ -1120,7 +1433,7 @@ def _feature_row_priority(row: object) -> tuple[int, int, datetime]:
     status = str(getattr(row, "source_status", "") or "").lower()
     source = str(getattr(row, "source", "") or "")
     status_priority = {"available": 3, "partial": 2, "missing": 1}.get(status, 0)
-    source_priority = {PYBASEBALL_SOURCE: 3, MLB_STATS_SOURCE: 2, DERIVED_SOURCE: 1}.get(source, 0)
+    source_priority = {MLB_STATS_SOURCE: 4, STATCAST_SOURCE: 3, PYBASEBALL_SOURCE: 2, DERIVED_SOURCE: 1}.get(source, 0)
     updated_at = getattr(row, "updated_at", None) or getattr(row, "captured_at", None) or datetime.min
     if isinstance(updated_at, datetime) and updated_at.tzinfo is not None:
         updated_at = updated_at.replace(tzinfo=None)
@@ -1495,6 +1808,8 @@ def build_feature_snapshot(
             away_lineup,
             home_identity,
             away_identity,
+            home_daily,
+            away_daily,
             captured_at,
         ),
         "starter_identity": {
@@ -1788,16 +2103,31 @@ def _handedness_module(
     away_lineup: LineupSnapshot | None,
     home_starter: dict[str, object] | None,
     away_starter: dict[str, object] | None,
+    home_daily: TeamDailyFeature | None,
+    away_daily: TeamDailyFeature | None,
     captured_at: datetime,
 ) -> dict[str, object]:
+    home_splits = home_daily.features.get("handedness_splits") if home_daily is not None and isinstance(home_daily.features, dict) else None
+    away_splits = away_daily.features.get("handedness_splits") if away_daily is not None and isinstance(away_daily.features, dict) else None
     home_mix = home_lineup.features.get("handedness_mix") if home_lineup else None
     away_mix = away_lineup.features.get("handedness_mix") if away_lineup else None
     values = {
+        "home_team_stat_splits": home_splits,
+        "away_team_stat_splits": away_splits,
         "home_lineup_handedness_mix": home_mix,
         "away_lineup_handedness_mix": away_mix,
         "home_opposing_starter_handedness": away_starter.get("handedness") if away_starter else None,
         "away_opposing_starter_handedness": home_starter.get("handedness") if home_starter else None,
     }
+    if home_splits or away_splits:
+        return _available(
+            "handedness_platoon",
+            values,
+            captured_at=captured_at,
+            source=MLB_STATS_SOURCE,
+            confidence="0.75",
+            completeness="0.70",
+        )
     if home_mix or away_mix or home_starter or away_starter:
         return _partial(
             "handedness_platoon",
@@ -1926,6 +2256,274 @@ def _travel_module(
     return _missing(f"{side}_travel_schedule", "travel schedule cache missing", captured_at)
 
 
+def _mlb_stat_decimal(stat: dict[str, object] | None, *names: str) -> Decimal | None:
+    return _decimal_stat(stat or {}, *names)
+
+
+def _mlb_stat_int(stat: dict[str, object] | None, *names: str) -> int | None:
+    return _int_stat(stat or {}, *names)
+
+
+def _aggregate_team_hitting_logs(splits: list[dict[str, object]], limit: int) -> dict[str, object]:
+    sample = splits[:limit]
+    totals = {key: Decimal("0") for key in ("runs", "hits", "homeRuns", "baseOnBalls", "strikeOuts", "atBats", "plateAppearances", "totalBases")}
+    for split in sample:
+        stat = split.get("stat") if isinstance(split.get("stat"), dict) else {}
+        for key in totals:
+            totals[key] += _mlb_stat_decimal(stat, key, "walks" if key == "baseOnBalls" else key) or Decimal("0")
+    games = len(sample)
+    avg = _ratio(totals["hits"], totals["atBats"])
+    obp = _ratio(totals["hits"] + totals["baseOnBalls"], totals["atBats"] + totals["baseOnBalls"])
+    slg = _ratio(totals["totalBases"], totals["atBats"])
+    return {
+        "game_count": games,
+        "last_date": _game_log_date(sample[0]) if sample else None,
+        "runs": _float(totals["runs"]) if games else None,
+        "runs_per_game": _float(_ratio(totals["runs"], games)) if games else None,
+        "hits": _float(totals["hits"]) if games else None,
+        "hits_per_game": _float(_ratio(totals["hits"], games)) if games else None,
+        "home_runs": _float(totals["homeRuns"]) if games else None,
+        "home_runs_per_game": _float(_ratio(totals["homeRuns"], games)) if games else None,
+        "walks": _float(totals["baseOnBalls"]) if games else None,
+        "walks_per_game": _float(_ratio(totals["baseOnBalls"], games)) if games else None,
+        "strikeouts": _float(totals["strikeOuts"]) if games else None,
+        "strikeouts_per_game": _float(_ratio(totals["strikeOuts"], games)) if games else None,
+        "at_bats": _float(totals["atBats"]) if games else None,
+        "plate_appearances": _float(totals["plateAppearances"]) if games else None,
+        "batting_average": _float(avg),
+        "on_base_percentage": _float(obp),
+        "slugging_percentage": _float(slg),
+        "ops": _float((obp + slg).quantize(Decimal("0.0001")) if obp is not None and slg is not None else None),
+    }
+
+
+def _aggregate_team_pitching_logs(splits: list[dict[str, object]], limit: int) -> dict[str, object]:
+    sample = splits[:limit]
+    innings = Decimal("0")
+    totals = {key: Decimal("0") for key in ("runs", "earnedRuns", "hits", "homeRuns", "baseOnBalls", "strikeOuts", "battersFaced", "numberOfPitches", "saves", "holds", "blownSaves", "saveOpportunities", "gamesFinished")}
+    for split in sample:
+        stat = split.get("stat") if isinstance(split.get("stat"), dict) else {}
+        innings += _baseball_innings(stat.get("inningsPitched")) or Decimal("0")
+        for key in totals:
+            totals[key] += _mlb_stat_decimal(stat, key) or Decimal("0")
+    games = len(sample)
+    return {
+        "game_count": games,
+        "last_date": _game_log_date(sample[0]) if sample else None,
+        "innings_pitched": _float(innings) if games else None,
+        "innings_per_game": _float(_ratio(innings, games)) if games else None,
+        "runs": _float(totals["runs"]) if games else None,
+        "runs_per_game": _float(_ratio(totals["runs"], games)) if games else None,
+        "earned_runs": _float(totals["earnedRuns"]) if games else None,
+        "era": _float(_ratio(totals["earnedRuns"] * Decimal("9"), innings)),
+        "hits": _float(totals["hits"]) if games else None,
+        "home_runs": _float(totals["homeRuns"]) if games else None,
+        "walks": _float(totals["baseOnBalls"]) if games else None,
+        "strikeouts": _float(totals["strikeOuts"]) if games else None,
+        "k_minus_bb_per_inning": _float(_ratio(totals["strikeOuts"] - totals["baseOnBalls"], innings)),
+        "whip": _float(_ratio(totals["baseOnBalls"] + totals["hits"], innings)),
+        "batters_faced": _float(totals["battersFaced"]) if games else None,
+        "pitches": _float(totals["numberOfPitches"]) if games else None,
+        "pitches_per_game": _float(_ratio(totals["numberOfPitches"], games)) if games else None,
+        "saves": _float(totals["saves"]) if games else None,
+        "holds": _float(totals["holds"]) if games else None,
+        "blown_saves": _float(totals["blownSaves"]) if games else None,
+        "save_opportunities": _float(totals["saveOpportunities"]) if games else None,
+        "save_conversion_rate": _float(_ratio(totals["saves"], totals["saveOpportunities"])),
+        "games_finished": _float(totals["gamesFinished"]) if games else None,
+    }
+
+
+def _map_handedness_splits(payload: dict[str, object] | None, group: str) -> dict[str, object]:
+    mapped: dict[str, object] = {"source": MLB_STATS_SOURCE, "basis": group, "vsLeft": None, "vsRight": None}
+    for split in _stats_splits(payload):
+        stat = split.get("stat") if isinstance(split.get("stat"), dict) else {}
+        split_meta = split.get("split") if isinstance(split.get("split"), dict) else {}
+        code = str(split_meta.get("code") or "")
+        row = {
+            "code": code,
+            "description": split_meta.get("description"),
+            "games_played": _mlb_stat_int(stat, "gamesPlayed"),
+            "at_bats": _mlb_stat_int(stat, "atBats"),
+            "plate_appearances": _mlb_stat_int(stat, "plateAppearances"),
+            "hits": _mlb_stat_int(stat, "hits"),
+            "home_runs": _mlb_stat_int(stat, "homeRuns"),
+            "walks": _mlb_stat_int(stat, "baseOnBalls"),
+            "strikeouts": _mlb_stat_int(stat, "strikeOuts"),
+            "avg": _float(_mlb_stat_decimal(stat, "avg")),
+            "obp": _float(_mlb_stat_decimal(stat, "obp")),
+            "slg": _float(_mlb_stat_decimal(stat, "slg")),
+            "ops": _float(_mlb_stat_decimal(stat, "ops")),
+        }
+        if group == "pitching":
+            row["innings_pitched"] = _float(_baseball_innings(stat.get("inningsPitched")))
+            row["whip"] = _float(_mlb_stat_decimal(stat, "whip"))
+        if code == "vl":
+            mapped["vsLeft"] = row
+        elif code == "vr":
+            mapped["vsRight"] = row
+    return mapped
+
+
+def _upsert_mlb_primary_team_daily(
+    session: Session,
+    game: MlbGame,
+    side: str,
+    day: date,
+    captured_at: datetime,
+    mlb_context: dict[str, object],
+    statcast_context: dict[str, object],
+) -> TeamDailyFeature | None:
+    team_code = (game.home_abbreviation if side == "home" else game.away_abbreviation) or "UNK"
+    team_id = _team_id(game, side)
+    if team_id is None:
+        return None
+    hitting = mlb_context.get("team_season_hitting_by_id", {}).get(team_id) if isinstance(mlb_context.get("team_season_hitting_by_id"), dict) else None
+    pitching = mlb_context.get("team_season_pitching_by_id", {}).get(team_id) if isinstance(mlb_context.get("team_season_pitching_by_id"), dict) else None
+    if not isinstance(hitting, dict) and not isinstance(pitching, dict):
+        return None
+    hitting = hitting if isinstance(hitting, dict) else {}
+    pitching = pitching if isinstance(pitching, dict) else {}
+    games_played = _mlb_stat_int(hitting, "gamesPlayed") or _mlb_stat_int(pitching, "gamesPlayed")
+    runs = _mlb_stat_decimal(hitting, "runs")
+    runs_allowed = _mlb_stat_decimal(pitching, "runs")
+    plate_appearances = _mlb_stat_decimal(hitting, "plateAppearances")
+    at_bats = _mlb_stat_decimal(hitting, "atBats")
+    strikeouts = _mlb_stat_decimal(hitting, "strikeOuts")
+    walks = _mlb_stat_decimal(hitting, "baseOnBalls")
+    innings = _baseball_innings(pitching.get("inningsPitched"))
+    contact = statcast_context.get("team_contact_by_code", {}).get(team_code) if isinstance(statcast_context.get("team_contact_by_code"), dict) else None
+    status = "available" if hitting.get("runs") is not None and pitching.get("runs") is not None else "partial"
+    features = {
+        **_team_record(game, side),
+        "sample_size": games_played,
+        "team_id": team_id,
+        "games_played": games_played,
+        "runs": _float(runs),
+        "runs_per_game": _float(_ratio(runs, games_played)),
+        "hits": _mlb_stat_int(hitting, "hits"),
+        "home_runs": _mlb_stat_int(hitting, "homeRuns"),
+        "home_runs_per_game": _float(_ratio(_mlb_stat_decimal(hitting, "homeRuns"), games_played)),
+        "strikeouts": _float(strikeouts),
+        "base_on_balls": _float(walks),
+        "avg": _float(_mlb_stat_decimal(hitting, "avg")),
+        "obp": _float(_mlb_stat_decimal(hitting, "obp")),
+        "slg": _float(_mlb_stat_decimal(hitting, "slg")),
+        "ops": _float(_mlb_stat_decimal(hitting, "ops")),
+        "stolen_bases": _mlb_stat_int(hitting, "stolenBases"),
+        "babip": _float(_mlb_stat_decimal(hitting, "babip")),
+        "iso": _float((_mlb_stat_decimal(hitting, "slg") - _mlb_stat_decimal(hitting, "avg")).quantize(Decimal("0.0001")) if _mlb_stat_decimal(hitting, "slg") is not None and _mlb_stat_decimal(hitting, "avg") is not None else None),
+        "k_rate": _float(_ratio(strikeouts, plate_appearances or at_bats)),
+        "bb_rate": _float(_ratio(walks, plate_appearances or at_bats)),
+        "proxy_basis": "plateAppearances" if plate_appearances is not None else "atBats" if at_bats is not None else None,
+        "pitching_games_played": _mlb_stat_int(pitching, "gamesPlayed"),
+        "wins": _mlb_stat_int(pitching, "wins"),
+        "losses": _mlb_stat_int(pitching, "losses"),
+        "era": _float(_mlb_stat_decimal(pitching, "era")),
+        "whip": _float(_mlb_stat_decimal(pitching, "whip")),
+        "innings_pitched": _float(innings),
+        "pitching_strikeouts": _mlb_stat_int(pitching, "strikeOuts"),
+        "pitching_walks": _mlb_stat_int(pitching, "baseOnBalls"),
+        "pitching_hits": _mlb_stat_int(pitching, "hits"),
+        "pitching_home_runs": _mlb_stat_int(pitching, "homeRuns"),
+        "runs_allowed": _float(runs_allowed),
+        "earned_runs": _mlb_stat_int(pitching, "earnedRuns"),
+        "saves": _mlb_stat_int(pitching, "saves"),
+        "blown_saves": _mlb_stat_int(pitching, "blownSaves"),
+        "k_minus_bb_per_inning": _float(_ratio((_mlb_stat_decimal(pitching, "strikeOuts") or Decimal("0")) - (_mlb_stat_decimal(pitching, "baseOnBalls") or Decimal("0")), innings)),
+        "hr_per_9_proxy": _float(_ratio((_mlb_stat_decimal(pitching, "homeRuns") or Decimal("0")) * Decimal("9"), innings)),
+        "runs_allowed_per_game": _float(_ratio(runs_allowed, games_played)),
+        "run_differential_per_game": _float(_ratio((runs or Decimal("0")) - (runs_allowed or Decimal("0")), games_played)) if runs is not None and runs_allowed is not None else None,
+        "contact_quality": contact,
+        "contact_quality_status": _statcast_status(contact if isinstance(contact, dict) else None),
+        "wrc_plus_status": "missing",
+        "xfip_status": "missing",
+        "platoon_split_status": "available"
+        if _map_handedness_splits(mlb_context.get("team_hitting_splits_by_id", {}).get(team_id) if isinstance(mlb_context.get("team_hitting_splits_by_id"), dict) else None, "hitting").get("vsLeft")
+        else "missing",
+        "handedness_splits": {
+            "hitting": _map_handedness_splits(mlb_context.get("team_hitting_splits_by_id", {}).get(team_id) if isinstance(mlb_context.get("team_hitting_splits_by_id"), dict) else None, "hitting"),
+            "pitching": _map_handedness_splits(mlb_context.get("team_pitching_splits_by_id", {}).get(team_id) if isinstance(mlb_context.get("team_pitching_splits_by_id"), dict) else None, "pitching"),
+        },
+    }
+    row = session.scalar(
+        select(TeamDailyFeature)
+        .where(TeamDailyFeature.target_date == day)
+        .where(TeamDailyFeature.team_code == team_code)
+        .where(TeamDailyFeature.source == MLB_STATS_SOURCE)
+    )
+    row = row or TeamDailyFeature(target_date=day, team_code=team_code, source=MLB_STATS_SOURCE)
+    row.captured_at = captured_at
+    row.source_status = status
+    row.confidence = Decimal("0.85") if status == "available" else Decimal("0.45")
+    row.completeness = Decimal("0.80") if status == "available" else Decimal("0.45")
+    row.stale = False
+    row.features = features
+    row.raw_payload = {"team_id": team_id, "hitting": hitting, "pitching": pitching}
+    session.add(row)
+    return row
+
+
+def _upsert_mlb_primary_team_recent(
+    session: Session,
+    game: MlbGame,
+    side: str,
+    day: date,
+    captured_at: datetime,
+    window_days: int,
+    mlb_context: dict[str, object],
+    statcast_context: dict[str, object],
+) -> TeamRecentFeature | None:
+    team_code = (game.home_abbreviation if side == "home" else game.away_abbreviation) or "UNK"
+    team_id = _team_id(game, side)
+    if team_id is None:
+        return None
+    hitting_payload = mlb_context.get("team_hitting_logs_by_id", {}).get(team_id) if isinstance(mlb_context.get("team_hitting_logs_by_id"), dict) else None
+    pitching_payload = mlb_context.get("team_pitching_logs_by_id", {}).get(team_id) if isinstance(mlb_context.get("team_pitching_logs_by_id"), dict) else None
+    hitting_splits = _game_log_splits_before(hitting_payload if isinstance(hitting_payload, dict) else None, day)
+    pitching_splits = _game_log_splits_before(pitching_payload if isinstance(pitching_payload, dict) else None, day)
+    if not hitting_splits and not pitching_splits:
+        return None
+    hitting = _aggregate_team_hitting_logs(hitting_splits, window_days)
+    pitching = _aggregate_team_pitching_logs(pitching_splits, window_days)
+    contact = statcast_context.get("team_contact_by_code", {}).get(team_code) if isinstance(statcast_context.get("team_contact_by_code"), dict) else None
+    status = "available" if hitting["game_count"] and pitching["game_count"] else "partial"
+    features = {
+        "window_days": window_days,
+        "hitting": hitting,
+        "pitching": pitching,
+        "runs_per_game": hitting.get("runs_per_game"),
+        "runs_allowed_per_game": pitching.get("runs_per_game"),
+        "woba_proxy": contact.get("woba_observed") if isinstance(contact, dict) else None,
+        "xwoba_proxy": contact.get("estimated_woba_contact") if isinstance(contact, dict) else None,
+        "k_rate": _float(_ratio(hitting.get("strikeouts"), hitting.get("plate_appearances"))),
+        "bb_rate": _float(_ratio(hitting.get("walks"), hitting.get("plate_appearances"))),
+        "iso": None,
+        "hard_hit_pct": contact.get("hard_hit_pct") if isinstance(contact, dict) else None,
+        "barrel_pct": contact.get("barrel_pct") if isinstance(contact, dict) else None,
+        "contact_quality": contact,
+        "contact_quality_status": _statcast_status(contact if isinstance(contact, dict) else None),
+    }
+    row = session.scalar(
+        select(TeamRecentFeature)
+        .where(TeamRecentFeature.target_date == day)
+        .where(TeamRecentFeature.team_code == team_code)
+        .where(TeamRecentFeature.window_days == window_days)
+        .where(TeamRecentFeature.source == MLB_STATS_SOURCE)
+    )
+    row = row or TeamRecentFeature(target_date=day, team_code=team_code, window_days=window_days, source=MLB_STATS_SOURCE)
+    row.captured_at = captured_at
+    row.source_status = status
+    row.sample_size = int(max(int(hitting.get("game_count") or 0), int(pitching.get("game_count") or 0)))
+    row.confidence = Decimal("0.80") if status == "available" else Decimal("0.45")
+    row.completeness = Decimal("0.75") if status == "available" else Decimal("0.40")
+    row.stale = False
+    row.features = features
+    row.raw_payload = {"team_id": team_id, "hitting_rows": len(hitting_splits), "pitching_rows": len(pitching_splits)}
+    session.add(row)
+    return row
+
+
 def _upsert_team_daily(
     session: Session,
     game: MlbGame,
@@ -2045,6 +2643,169 @@ def _upsert_team_recent(
     return row
 
 
+def _aggregate_pitcher_logs(splits: list[dict[str, object]], limit: int) -> dict[str, object] | None:
+    sample = splits[:limit]
+    if not sample:
+        return None
+    innings = Decimal("0")
+    totals = {key: Decimal("0") for key in ("strikeOuts", "baseOnBalls", "hits", "homeRuns", "runs", "earnedRuns", "gamesStarted", "numberOfPitches")}
+    for split in sample:
+        stat = split.get("stat") if isinstance(split.get("stat"), dict) else {}
+        innings += _baseball_innings(stat.get("inningsPitched")) or Decimal("0")
+        for key in totals:
+            totals[key] += _mlb_stat_decimal(stat, key) or Decimal("0")
+    starts = totals["gamesStarted"] if totals["gamesStarted"] > 0 else Decimal(len(sample))
+    return {
+        "appearance_count": len(sample),
+        "games_started": _float(totals["gamesStarted"]),
+        "innings_pitched": _float(innings),
+        "innings_per_appearance": _float(_ratio(innings, len(sample))),
+        "innings_per_start": _float(_ratio(innings, starts)),
+        "era": _float(_ratio(totals["earnedRuns"] * Decimal("9"), innings)),
+        "whip": _float(_ratio(totals["hits"] + totals["baseOnBalls"], innings)),
+        "strikeouts": _float(totals["strikeOuts"]),
+        "base_on_balls": _float(totals["baseOnBalls"]),
+        "hits": _float(totals["hits"]),
+        "home_runs": _float(totals["homeRuns"]),
+        "runs": _float(totals["runs"]),
+        "earned_runs": _float(totals["earnedRuns"]),
+        "k_minus_bb_per_inning": _float(_ratio(totals["strikeOuts"] - totals["baseOnBalls"], innings)),
+        "pitch_count": _float(_ratio(totals["numberOfPitches"], len(sample))),
+        "sample": {
+            "requested_games": limit,
+            "used_games": len(sample),
+            "first_date": _game_log_date(sample[-1]),
+            "last_date": _game_log_date(sample[0]),
+        },
+    }
+
+
+def _upsert_mlb_primary_pitcher(
+    session: Session,
+    game: MlbGame,
+    side: str,
+    day: date,
+    captured_at: datetime,
+    mlb_context: dict[str, object],
+    statcast_context: dict[str, object],
+    stats: dict[str, object],
+) -> PitcherDailyFeature | None:
+    team_code = (game.home_abbreviation if side == "home" else game.away_abbreviation) or "UNK"
+    identity = probable_pitcher_from_payload(game.raw_payload or {}, side)
+    if not identity or not identity.get("id"):
+        return None
+    pitcher_id = str(identity["id"])
+    season_payload = mlb_context.get("pitcher_season_by_id", {}).get(pitcher_id) if isinstance(mlb_context.get("pitcher_season_by_id"), dict) else None
+    log_payload = mlb_context.get("pitcher_game_logs_by_id", {}).get(pitcher_id) if isinstance(mlb_context.get("pitcher_game_logs_by_id"), dict) else None
+    season_stat = _first_stat(season_payload if isinstance(season_payload, dict) else None)
+    log_splits = _game_log_splits_before(log_payload if isinstance(log_payload, dict) else None, day)
+    if season_stat is None and not log_splits:
+        return None
+    innings = _baseball_innings((season_stat or {}).get("inningsPitched"))
+    games_started = _mlb_stat_decimal(season_stat, "gamesStarted")
+    season_innings_per_start = _ratio(innings, games_started)
+    last3 = _aggregate_pitcher_logs(log_splits, 3)
+    last5 = _aggregate_pitcher_logs(log_splits, 5)
+    last5_ips = _decimal((last5 or {}).get("innings_per_start"))
+    expected_ip = None
+    if season_innings_per_start is not None and last5_ips is not None:
+        expected_ip = ((season_innings_per_start + last5_ips) / Decimal("2")).quantize(Decimal("0.0001"))
+    else:
+        expected_ip = season_innings_per_start or last5_ips
+    if expected_ip is not None:
+        expected_ip = min(max(expected_ip, Decimal("1.0000")), Decimal("7.5000"))
+    last_date = (last5 or {}).get("sample", {}).get("last_date") if isinstance((last5 or {}).get("sample"), dict) else None
+    rest_days = None
+    if last_date:
+        try:
+            rest_days = max((day - date.fromisoformat(str(last_date))).days - 1, 0)
+        except ValueError:
+            rest_days = None
+    contact = statcast_context.get("pitcher_contact_by_id", {}).get(pitcher_id) if isinstance(statcast_context.get("pitcher_contact_by_id"), dict) else None
+    season = {
+        "pitcher_id": pitcher_id,
+        "pitcher_name": identity.get("name") or identity.get("pitcher_name"),
+        "handedness": identity.get("handedness"),
+        "wins": _mlb_stat_int(season_stat, "wins"),
+        "losses": _mlb_stat_int(season_stat, "losses"),
+        "era": _float(_mlb_stat_decimal(season_stat, "era")),
+        "whip": _float(_mlb_stat_decimal(season_stat, "whip")),
+        "innings_pitched": _float(innings),
+        "strikeouts": _mlb_stat_int(season_stat, "strikeOuts"),
+        "base_on_balls": _mlb_stat_int(season_stat, "baseOnBalls"),
+        "hits": _mlb_stat_int(season_stat, "hits"),
+        "home_runs": _mlb_stat_int(season_stat, "homeRuns"),
+        "games_started": _mlb_stat_int(season_stat, "gamesStarted"),
+        "k_minus_bb_per_inning": _float(_ratio((_mlb_stat_decimal(season_stat, "strikeOuts") or Decimal("0")) - (_mlb_stat_decimal(season_stat, "baseOnBalls") or Decimal("0")), innings)),
+        "innings_per_start": _float(season_innings_per_start),
+        "hr_per_9_proxy": _float(_ratio((_mlb_stat_decimal(season_stat, "homeRuns") or Decimal("0")) * Decimal("9"), innings)),
+        "walk_rate_proxy": _float(_ratio(_mlb_stat_decimal(season_stat, "baseOnBalls"), _mlb_stat_decimal(season_stat, "battersFaced"))),
+        "strikeout_rate_proxy": _float(_ratio(_mlb_stat_decimal(season_stat, "strikeOuts"), _mlb_stat_decimal(season_stat, "battersFaced"))),
+        "fip_proxy": None,
+        "xfip_status": "missing",
+    }
+    recent = {
+        "source_status": "available" if last5 else "missing",
+        "confidence": 0.75 if last5 else 0.0,
+        "completeness": 0.70 if last5 else 0.0,
+        "last_3_starts": last3,
+        "last_5_starts": last5,
+        "innings_per_start": (last5 or {}).get("innings_per_start") if last5 else None,
+        "pitch_count": (last5 or {}).get("pitch_count") if last5 else None,
+        "era_proxy": (last5 or {}).get("era") if last5 else None,
+        "fip_proxy": None,
+        "k_bb": (last5 or {}).get("k_minus_bb_per_inning") if last5 else None,
+        "home_runs_allowed": (last5 or {}).get("home_runs") if last5 else None,
+        "velocity_trend": contact.get("average_release_speed") if isinstance(contact, dict) else None,
+    }
+    workload = {
+        "source_status": "available" if expected_ip is not None else "missing",
+        "confidence": 0.75 if expected_ip is not None else 0.0,
+        "completeness": 0.70 if expected_ip is not None else 0.0,
+        "expected_innings_projection": _float(expected_ip),
+        "recent_pitch_count_ceiling": (last5 or {}).get("pitch_count") if last5 else None,
+        "days_rest": rest_days,
+        "opener_or_bulk_pitcher": False,
+        "short_start_risk": _float(Decimal("1") - (expected_ip / Decimal("5"))) if expected_ip is not None and expected_ip < Decimal("5") else 0.0 if expected_ip is not None else None,
+        "expected_bullpen_innings": _float(max(Decimal("1.5000"), min(Decimal("8.0000"), Decimal("9") - expected_ip))) if expected_ip is not None else None,
+    }
+    status = "available" if season["era"] is not None and season["whip"] is not None and season["innings_pitched"] is not None else "partial"
+    row = session.scalar(
+        select(PitcherDailyFeature)
+        .where(PitcherDailyFeature.target_date == day)
+        .where(PitcherDailyFeature.team_code == team_code)
+        .where(PitcherDailyFeature.pitcher_id == pitcher_id)
+        .where(PitcherDailyFeature.source == MLB_STATS_SOURCE)
+    )
+    row = row or PitcherDailyFeature(target_date=day, team_code=team_code, pitcher_id=pitcher_id, source=MLB_STATS_SOURCE)
+    row.pitcher_name = str(identity.get("name") or identity.get("pitcher_name") or "")
+    row.captured_at = captured_at
+    row.source_status = status
+    row.sample_size = _int(innings)
+    row.confidence = Decimal("0.85") if status == "available" else Decimal("0.45")
+    row.completeness = Decimal("0.80") if status == "available" else Decimal("0.45")
+    row.stale = False
+    row.features = {
+        **identity,
+        "season": season,
+        "recent": recent,
+        "workload": workload,
+        "season_contact_quality": contact,
+        "recent_contact_quality": contact,
+        "contact_quality_status": _statcast_status(contact if isinstance(contact, dict) else None),
+    }
+    row.raw_payload = {"season": season_payload, "game_log": log_payload, "statcast": contact}
+    if status == "available":
+        stats["pitcher_season_stats_available_count"] = int(stats.get("pitcher_season_stats_available_count", 0)) + 1
+    if last5:
+        stats["pitcher_game_log_available_count"] = int(stats.get("pitcher_game_log_available_count", 0)) + 1
+        stats["starter_recent_available_count"] = int(stats.get("starter_recent_available_count", 0)) + 1
+    if expected_ip is not None:
+        stats["starter_workload_available_count"] = int(stats.get("starter_workload_available_count", 0)) + 1
+    session.add(row)
+    return row
+
+
 def _upsert_pitcher(
     session: Session,
     game: MlbGame,
@@ -2062,13 +2823,13 @@ def _upsert_pitcher(
         .where(PitcherDailyFeature.target_date == day)
         .where(PitcherDailyFeature.team_code == team_code)
         .where(PitcherDailyFeature.pitcher_id == pitcher_id)
-        .where(PitcherDailyFeature.source == MLB_STATS_SOURCE)
+        .where(PitcherDailyFeature.source == DERIVED_SOURCE)
     )
     row = row or PitcherDailyFeature(
         target_date=day,
         team_code=team_code,
         pitcher_id=pitcher_id,
-        source=MLB_STATS_SOURCE,
+        source=DERIVED_SOURCE,
     )
     row.pitcher_name = str(identity.get("name") or "")
     row.captured_at = captured_at
@@ -2280,6 +3041,8 @@ def _upsert_pybaseball_pitcher(
     if not identity or not identity.get("id"):
         return None
     pitcher_id = str(identity["id"])
+    if context.get("pitching") is None:
+        return None
     pitcher_row = _pitcher_pybaseball_row(context, identity, team_code)
     source_result = context.get("pitching") if isinstance(context.get("pitching"), dict) else {}
     source_status = "partial"
@@ -2875,8 +3638,24 @@ def _new_sync_stats(day: date, include_modules: set[str] | None) -> dict[str, ob
         "pybaseball_rows_seen": 0,
         "pybaseball_rows_matched": 0,
         "pybaseball_error_count": 0,
+        "pybaseball_fangraphs_status": "not_attempted",
         "advanced_available_count": 0,
         "advanced_partial_count": 0,
+        "mlb_stats_api_primary_available_count": 0,
+        "mlb_stats_api_primary_partial_count": 0,
+        "statcast_secondary_available_count": 0,
+        "statcast_secondary_partial_count": 0,
+        "statcast_rows_seen": 0,
+        "statcast_rows_matched": 0,
+        "statcast_pitcher_rows_seen": 0,
+        "statcast_pitcher_rows_matched": 0,
+        "statcast_error_count": 0,
+        "probable_starters_seen": 0,
+        "pitcher_season_stats_available_count": 0,
+        "pitcher_game_log_available_count": 0,
+        "starter_recent_available_count": 0,
+        "starter_workload_available_count": 0,
+        "player_mapping_failed_count": 0,
     }
 
 
@@ -2958,10 +3737,22 @@ def _record_feature_row(stats: dict[str, object], table: str, row: object | None
             stats["advanced_available_count"] = int(stats.get("advanced_available_count", 0)) + 1
         elif status == "partial":
             stats["advanced_partial_count"] = int(stats.get("advanced_partial_count", 0)) + 1
+    if getattr(row, "source", None) == MLB_STATS_SOURCE:
+        if status == "available":
+            stats["mlb_stats_api_primary_available_count"] = int(stats.get("mlb_stats_api_primary_available_count", 0)) + 1
+        elif status == "partial":
+            stats["mlb_stats_api_primary_partial_count"] = int(stats.get("mlb_stats_api_primary_partial_count", 0)) + 1
+    if getattr(row, "source", None) == STATCAST_SOURCE:
+        if status == "available":
+            stats["statcast_secondary_available_count"] = int(stats.get("statcast_secondary_available_count", 0)) + 1
+        elif status == "partial":
+            stats["statcast_secondary_partial_count"] = int(stats.get("statcast_secondary_partial_count", 0)) + 1
     raw_payload = getattr(row, "raw_payload", None)
     if isinstance(raw_payload, dict) and isinstance(raw_payload.get("error"), dict):
         error = dict(raw_payload["error"])
         error.setdefault("table", table)
+        if error.get("message") == "PLAYER_MAPPING_FAILED":
+            stats["player_mapping_failed_count"] = int(stats.get("player_mapping_failed_count", 0)) + 1
         _append_error(stats, error)
 
 
@@ -2999,10 +3790,17 @@ def _sync_game_feature_modules(
     captured_at: datetime,
     include_modules: set[str] | None,
     stats: dict[str, object],
+    mlb_context: dict[str, object],
+    statcast_context: dict[str, object],
     pybaseball_context: dict[str, object],
 ) -> None:
     if include_modules is None or "team" in include_modules:
         for side in ("home", "away"):
+            _record_feature_row(
+                stats,
+                "team_daily_features",
+                _upsert_mlb_primary_team_daily(session, game, side, day, captured_at, mlb_context, statcast_context),
+            )
             _record_feature_row(
                 stats,
                 "team_daily_features",
@@ -3017,10 +3815,38 @@ def _sync_game_feature_modules(
                 _record_feature_row(
                     stats,
                     "team_recent_features",
+                    _upsert_mlb_primary_team_recent(
+                        session,
+                        game,
+                        side,
+                        day,
+                        captured_at,
+                        window,
+                        mlb_context,
+                        statcast_context,
+                    ),
+                )
+                _record_feature_row(
+                    stats,
+                    "team_recent_features",
                     _upsert_team_recent(session, game, side, day, captured_at, window),
                 )
     if include_modules is None or "pitcher" in include_modules:
         for side in ("home", "away"):
+            _record_feature_row(
+                stats,
+                "pitcher_daily_features",
+                _upsert_mlb_primary_pitcher(
+                    session,
+                    game,
+                    side,
+                    day,
+                    captured_at,
+                    mlb_context,
+                    statcast_context,
+                    stats,
+                ),
+            )
             _record_feature_row(
                 stats,
                 "pitcher_daily_features",
@@ -3126,13 +3952,25 @@ def sync_mlb_features(
     stats["games_seen"] = len(games)
     for error in errors:
         _append_error(stats, error)
+    mlb_context = _mlb_primary_fetch_context(games, day, requested_modules, stats)
+    statcast_context = _statcast_fetch_context(games, day, requested_modules, stats)
     pybaseball_context = _pybaseball_fetch_context(day, requested_modules, stats)
     for game in games:
         if settings.feature_sync_enable_network_sources:
             error = _hydrate_game_endpoint_if_available(game)
             if error:
                 _append_error(stats, error)
-        _sync_game_feature_modules(session, game, day, captured_at, include_modules, stats, pybaseball_context)
+        _sync_game_feature_modules(
+            session,
+            game,
+            day,
+            captured_at,
+            include_modules,
+            stats,
+            mlb_context,
+            statcast_context,
+            pybaseball_context,
+        )
         session.flush()
         mapping = MarketMapping(
             mlb_game_id=game.id or 0,

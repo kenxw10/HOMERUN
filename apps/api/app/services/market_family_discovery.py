@@ -104,7 +104,14 @@ TARGET_FAMILIES = [
     "first_five_total",
 ]
 
-DISCOVERY_FAMILIES = [family_key for family_key in TARGET_FAMILIES if family_key != "full_game_winner"]
+DIRECT_TICKER_DISCOVERY_FAMILIES = {"full_game_winner", "first_five_winner"}
+EVENT_TICKER_DISCOVERY_FAMILIES = {
+    "full_game_spread",
+    "full_game_total",
+    "first_five_spread",
+    "first_five_total",
+}
+DISCOVERY_FAMILIES = TARGET_FAMILIES
 DISCOVERY_QUERY_FAMILIES = DISCOVERY_FAMILIES
 
 
@@ -424,7 +431,7 @@ def _direct_market_ticker_candidates(game: MlbGame, family_key: str, event_ticke
     elif family_key == "first_five_winner":
         suffixes = (away_code, home_code, "TIE")
     elif family_key in {"full_game_spread", "full_game_total", "first_five_spread", "first_five_total"}:
-        return [event_ticker]
+        return []
     else:
         return []
 
@@ -674,6 +681,7 @@ def _probe_audit_summary(probe_attempts: list[dict[str, object]]) -> dict[str, o
     exact_attempt_counts: dict[str, int] = {}
     fallback_attempt_counts: dict[str, int] = {}
     event_filter_attempt_counts: dict[str, int] = {}
+    strategy_counts: dict[str, int] = {}
 
     for attempt in probe_attempts:
         family_key = str(attempt.get("family_key") or "unknown")
@@ -684,11 +692,12 @@ def _probe_audit_summary(probe_attempts: list[dict[str, object]]) -> dict[str, o
         _append_example(family_examples["event_tickers"], attempt.get("candidate_event_ticker"))  # type: ignore[arg-type]
         _append_example(family_examples["market_tickers"], attempt.get("candidate_market_ticker"))  # type: ignore[arg-type]
         source_strategy = str(attempt.get("source_strategy") or "")
-        if source_strategy == "batched_exact_ticker":
+        strategy_counts[source_strategy] = strategy_counts.get(source_strategy, 0) + 1
+        if source_strategy == "direct_ticker":
             exact_attempt_counts[family_key] = exact_attempt_counts.get(family_key, 0) + 1
-        elif source_strategy == "batched_fallback_ticker":
+        elif source_strategy == "guessed_market_ticker":
             fallback_attempt_counts[family_key] = fallback_attempt_counts.get(family_key, 0) + 1
-        elif source_strategy == "event_ticker_filter_fallback":
+        elif source_strategy == "event_ticker":
             event_filter_attempt_counts[family_key] = event_filter_attempt_counts.get(family_key, 0) + 1
         if attempt.get("outcome") in {"no_match", "partial_no_match"}:
             no_match_counts[family_key] = no_match_counts.get(family_key, 0) + 1
@@ -696,6 +705,13 @@ def _probe_audit_summary(probe_attempts: list[dict[str, object]]) -> dict[str, o
     return {
         "attempted_event_tickers_count": len(event_tickers),
         "attempted_market_tickers_count": len(market_tickers),
+        "lookup_strategy_counts": {
+            "direct_ticker": strategy_counts.get("direct_ticker", 0),
+            "event_ticker": strategy_counts.get("event_ticker", 0),
+            "guessed_market_ticker": strategy_counts.get("guessed_market_ticker", 0),
+        },
+        "event_ticker_request_count": strategy_counts.get("event_ticker", 0),
+        "guessed_market_ticker_request_count": strategy_counts.get("guessed_market_ticker", 0),
         "attempted_ticker_examples": examples,
         "no_match_counts": no_match_counts,
         "exact_scheduled_time_attempt_counts": exact_attempt_counts,
@@ -979,7 +995,7 @@ def _event_filter_probe_entries(
                             candidate_series_ticker=series_ticker,
                             candidate_event_ticker=event_ticker,
                             candidate_market_ticker=None,
-                            source_strategy="event_ticker_filter_fallback",
+                            source_strategy="event_ticker",
                             offset_minutes=event_ticker_offset(game, event_ticker),
                         ),
                         game,
@@ -1004,9 +1020,9 @@ def _discover_markets_low_request(
 
     exact_entries = _probes_for_offsets(
         games,
-        DISCOVERY_QUERY_FAMILIES,
+        sorted(DIRECT_TICKER_DISCOVERY_FAMILIES),
         EXACT_OFFSETS_MINUTES,
-        "batched_exact_ticker",
+        "direct_ticker",
     )
     exact_found = _batch_lookup_markets(
         client=client,
@@ -1026,9 +1042,9 @@ def _discover_markets_low_request(
         fallback_entries = _filter_probe_entries_for_missing_keys(
             _probes_for_offsets(
                 games,
-                DISCOVERY_QUERY_FAMILIES,
+                sorted(DIRECT_TICKER_DISCOVERY_FAMILIES),
                 fallback_offsets,
-                "batched_fallback_ticker",
+                "guessed_market_ticker",
             ),
             found_keys,
         )
@@ -1047,7 +1063,12 @@ def _discover_markets_low_request(
 
     if not metrics.stopped_due_to_rate_limit:
         event_offsets = (0, *fallback_offsets)
-        event_entries = _event_filter_probe_entries(games, DISCOVERY_QUERY_FAMILIES, event_offsets, found_keys)
+        event_entries = _event_filter_probe_entries(
+            games,
+            sorted(EVENT_TICKER_DISCOVERY_FAMILIES),
+            event_offsets,
+            found_keys,
+        )
         event_found = _event_filter_lookup_markets(
             client=client,
             probe_entries=event_entries,
@@ -1125,6 +1146,9 @@ def _cached_discovery_result(
     result["cached_run_id"] = run.id
     result["cached_run_status"] = run.status
     result["stale_runs_finalized"] = stale_runs_finalized
+    result.setdefault("lookup_strategy_counts", {"direct_ticker": 0, "event_ticker": 0, "guessed_market_ticker": 0})
+    result.setdefault("event_ticker_request_count", 0)
+    result.setdefault("guessed_market_ticker_request_count", 0)
     return result
 
 
@@ -1217,6 +1241,9 @@ def run_market_family_discovery(
             "families_considered": len(families),
             "attempted_event_tickers_count": 0,
             "attempted_market_tickers_count": 0,
+            "lookup_strategy_counts": {"direct_ticker": 0, "event_ticker": 0, "guessed_market_ticker": 0},
+            "event_ticker_request_count": 0,
+            "guessed_market_ticker_request_count": 0,
             "markets_found": 0,
             "by_family": _summarize_by_family(families, [], completed),
             "warnings": [{"message": "MARKET_FAMILY_DISCOVERY_DISABLED"}],
@@ -1413,6 +1440,9 @@ def latest_market_family_discovery(session: Session, target_date: date | None = 
             "by_family": {family_key: _empty_family_summary(family_key) for family_key in TARGET_FAMILIES},
             "attempted_event_tickers_count": 0,
             "attempted_market_tickers_count": 0,
+            "lookup_strategy_counts": {"direct_ticker": 0, "event_ticker": 0, "guessed_market_ticker": 0},
+            "event_ticker_request_count": 0,
+            "guessed_market_ticker_request_count": 0,
             "attempted_ticker_examples": {},
             "no_match_counts": {},
             "item_examples_by_family": {family_key: [] for family_key in TARGET_FAMILIES},
@@ -1453,6 +1483,9 @@ def latest_market_family_discovery(session: Session, target_date: date | None = 
         or _summarize_by_family(TARGET_FAMILIES, items, run.completed_at or utc_now()),
         "attempted_event_tickers_count": raw_summary.get("attempted_event_tickers_count", 0),
         "attempted_market_tickers_count": raw_summary.get("attempted_market_tickers_count", 0),
+        "lookup_strategy_counts": raw_summary.get("lookup_strategy_counts", {}),
+        "event_ticker_request_count": raw_summary.get("event_ticker_request_count", 0),
+        "guessed_market_ticker_request_count": raw_summary.get("guessed_market_ticker_request_count", 0),
         "attempted_ticker_examples": raw_summary.get("attempted_ticker_examples", {}),
         "no_match_counts": raw_summary.get("no_match_counts", {}),
         "item_examples_by_family": _item_examples_by_family(items),
