@@ -287,7 +287,7 @@ Validate the hotfix after deploy:
 4. Run `GET /v1/market-families/discovery?date=YYYY-MM-DD` with `X-API-Key`.
 5. Confirm `run` is not null and `market_family_discovery_runs.raw_summary` includes `attempted_event_tickers_count`, `attempted_market_tickers_count`, `no_match_counts`, `attempted_probe_count`, `probe_attempts`, `request_count`, `requests_saved_by_batching`, `rate_limited_count`, `retries_attempted`, and `stopped_due_to_rate_limit`.
 6. Treat `markets_found=0` and zero `market_family_discovery_items` as valid when no markets are returned.
-7. Confirm active registry prefixes are only `KXMLBGAME`, `KXMLBSPREAD`, `KXMLBTOTAL`, `KXMLBF5`, `KXMLBF5SPREAD`, and `KXMLBF5TOTAL`; guessed legacy prefixes and `KXMLBTEAMTOTAL` must not be probed.
+7. Confirm active registry prefixes are only `KXMLBGAME`, `KXMLBSPREAD`, `KXMLBTOTAL`, `KXMLBF5`, `KXMLBF5SPREAD`, and `KXMLBF5TOTAL`; guessed legacy prefixes and `KXMLBTEAMTOTAL` must not be probed. Spread and total families should be discovered through event-ticker filtering, not guessed exact market-ticker batches.
 8. Confirm spread, total, and first-five families create paper candidates/trades only after `market_family_mapping_sync` marks the mapping `paper_supported`.
 9. Confirm known exact `KXMLBGAME` full-game winner resolver matches remain `confirmed_for_paper` with confidence around `0.9700`, zero or near-zero time delta, and team match score `1.0`.
 10. Confirm `request_count` is materially lower than the previous event-filter-heavy validation run, and that repeated 429s produce `partial_rate_limited`, `stopped_due_to_rate_limit=true`, and `cooldown_until` rather than leaving a run in `running`.
@@ -305,6 +305,32 @@ Invoke-RestMethod -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-RAILWAY-API/v
 3. Confirm `pybaseball_available=true`, `pybaseball_import_error=$null`, and `pybaseball_version` or `pybaseball_module_path` is present.
 4. Run team/pitcher feature sync and check `pybaseball_functions_attempted`, `pybaseball_rows_seen`, `pybaseball_rows_matched`, `advanced_available_count`, and `advanced_partial_count`.
 5. If pybaseball calls fail, treat `advanced_stats_status` and `pybaseball_last_error` as the source of truth; the system should degrade to derived partial rows, not return a blank 500.
+
+PR3c fix6 mature MLB ingestion and event-discovery validation:
+
+1. Run a full feature sync for a known slate:
+
+```powershell
+Invoke-RestMethod -Method Post -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-RAILWAY-API/v1/sync/mlb-features?target_date=2026-06-27&include_modules=all&refresh_schedule=true"
+```
+
+2. Expected: `validation_status` is `ok` or `degraded_with_errors`, not a blank 500. The response should include MLB Stats API primary counters such as `mlb_stats_api_primary_available_count`, `probable_starters_seen`, `pitcher_season_stats_available_count`, `pitcher_game_log_available_count`, `starter_recent_available_count`, and `starter_workload_available_count`.
+3. If FanGraphs-backed pybaseball functions return HTTP 403, expected behavior is degraded diagnostics with `pybaseball_fangraphs_status=unavailable_http_403` or an equivalent structured error. MLB Stats API primary rows should still be written where public Stats API data exists.
+4. Check feature detail:
+
+```powershell
+Invoke-RestMethod -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-RAILWAY-API/v1/model/features/detail?date=2026-06-27"
+```
+
+5. Expected: team strength, handedness/platoon, starter recent, and starter workload modules prefer `source=mlb_stats_api_primary_v1` when those rows are available. Statcast/Savant contact quality is secondary enrichment, and `derived_homerun_v2` remains partial fallback.
+6. Run market-family discovery with cache disabled only for deliberate validation:
+
+```powershell
+Invoke-RestMethod -Method Post -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-RAILWAY-API/v1/run/market-family-discovery?target_date=2026-06-27&force_refresh=true"
+Invoke-RestMethod -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-RAILWAY-API/v1/market-families/discovery?date=2026-06-27"
+```
+
+7. Expected: full-game and first-five winner families may use direct market-ticker probes. Spread and total families should show `event_ticker` lookup activity and should not spend ticker batches on guessed spread/total market tickers. Cache hits, no-match responses, source errors, and 429s should be structured; repeated 429s should produce `partial_rate_limited` plus cooldown metadata.
 
 ## Required Context Updates
 
