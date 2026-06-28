@@ -3900,24 +3900,47 @@ def test_pybaseball_ingestion_writes_available_advanced_rows_and_snapshots(monke
                 {
                     "Team": "PIT",
                     "G": 81,
-                    "R": 365,
-                    "OBP": ".329",
-                    "SLG": ".418",
-                    "ISO": ".171",
-                    "K%": "22.4%",
-                    "BB%": "8.7%",
-                    "HR": 96,
-                    "BABIP": ".302",
-                    "wRC+": 108,
-                    "wOBA": ".323",
-                    "HardHit%": "41.2%",
-                    "Barrel%": "8.1%",
-                    "EV": 89.4,
-                    "LA": 12.1,
+                    "PA": 100,
+                    "AB": 90,
+                    "R": 10,
+                    "OBP": ".250",
+                    "SLG": ".300",
+                    "ISO": ".100",
+                    "K%": "30.0%",
+                    "BB%": "5.0%",
+                    "HR": 2,
+                    "BABIP": ".250",
+                    "wRC+": 80,
+                    "wOBA": ".280",
+                    "HardHit%": "40.0%",
+                    "Barrel%": "5.0%",
+                    "EV": 88.0,
+                    "LA": 10.0,
+                },
+                {
+                    "Team": "PIT",
+                    "G": 78,
+                    "PA": 300,
+                    "AB": 270,
+                    "R": 50,
+                    "OBP": ".350",
+                    "SLG": ".450",
+                    "ISO": ".190",
+                    "K%": "20.0%",
+                    "BB%": "10.0%",
+                    "HR": 15,
+                    "BABIP": ".320",
+                    "wRC+": 120,
+                    "wOBA": ".340",
+                    "HardHit%": "42.0%",
+                    "Barrel%": "9.0%",
+                    "EV": 90.0,
+                    "LA": 13.0,
                 },
                 {
                     "Team": "SEA",
                     "G": 81,
+                    "PA": 390,
                     "R": 340,
                     "OBP": ".316",
                     "SLG": ".401",
@@ -3929,8 +3952,8 @@ def test_pybaseball_ingestion_writes_available_advanced_rows_and_snapshots(monke
                     "wOBA": ".315",
                 },
             ],
-            "row_count": 2,
-            "columns": ["Team", "G", "R", "OBP", "SLG", "ISO", "K%", "BB%", "wRC+", "wOBA"],
+            "row_count": 3,
+            "columns": ["Team", "G", "PA", "R", "OBP", "SLG", "ISO", "K%", "BB%", "wRC+", "wOBA"],
         },
     )
     monkeypatch.setattr(
@@ -4028,12 +4051,15 @@ def test_pybaseball_ingestion_writes_available_advanced_rows_and_snapshots(monke
 
     assert result["pybaseball_available"] is True
     assert result["pybaseball_functions_attempted"] == ["batting_stats", "pitching_stats"]
-    assert result["pybaseball_rows_seen"] == 4
+    assert result["pybaseball_rows_seen"] == 5
     assert result["pybaseball_rows_matched"] >= 4
     assert result["advanced_available_count"] >= 2
     assert advanced_team is not None
     assert advanced_team.source_status == "available"
-    assert advanced_team.features["obp"] == 0.329
+    assert advanced_team.features["obp"] == 0.325
+    assert advanced_team.features["runs_per_game"] == 0.7407
+    assert advanced_team.features["wrc_plus"] == 110.0
+    assert advanced_team.raw_payload["row"]["player_rows_aggregated"] == 2
     assert derived_team is not None
     assert derived_team.source_status in {"missing", "partial"}
     assert advanced_pitcher is not None

@@ -696,6 +696,91 @@ def _pybaseball_team_code(row: dict[str, object]) -> str | None:
     return PYBASEBALL_TEAM_ALIASES.get(normalized, normalized)
 
 
+def _stat_weight(row: dict[str, object]) -> Decimal:
+    return _decimal_stat(row, "PA", "Plate Appearances", "AB", "At Bats", "G", "Games") or Decimal("1")
+
+
+def _sum_stat(rows: list[dict[str, object]], *names: str) -> Decimal | None:
+    total = Decimal("0")
+    found = False
+    for row in rows:
+        value = _decimal_stat(row, *names)
+        if value is None:
+            continue
+        total += value
+        found = True
+    return total.quantize(Decimal("0.0001")) if found else None
+
+
+def _max_int_stat(rows: list[dict[str, object]], *names: str) -> int | None:
+    values = [_int_stat(row, *names) for row in rows]
+    present = [value for value in values if value is not None]
+    return max(present) if present else None
+
+
+def _weighted_stat(rows: list[dict[str, object]], *names: str, rate: bool = False) -> Decimal | None:
+    numerator = Decimal("0")
+    denominator = Decimal("0")
+    for row in rows:
+        value = _rate_stat(row, *names) if rate else _decimal_stat(row, *names)
+        if value is None:
+            continue
+        weight = _stat_weight(row)
+        numerator += value * weight
+        denominator += weight
+    if denominator <= 0:
+        return None
+    return (numerator / denominator).quantize(Decimal("0.0001"))
+
+
+def _count_rate(rows: list[dict[str, object]], count_name: str, denominator: Decimal | None) -> Decimal | None:
+    count = _sum_stat(rows, count_name)
+    if count is None or denominator is None or denominator <= 0:
+        return None
+    return (count / denominator).quantize(Decimal("0.0001"))
+
+
+def _aggregate_pybaseball_batting_by_team(rows: list[dict[str, object]]) -> dict[str, dict[str, object]]:
+    grouped: dict[str, list[dict[str, object]]] = {}
+    for row in rows:
+        team_code = _pybaseball_team_code(row)
+        if team_code:
+            grouped.setdefault(team_code, []).append(row)
+
+    aggregated: dict[str, dict[str, object]] = {}
+    for team_code, team_rows in grouped.items():
+        plate_appearances = _sum_stat(team_rows, "PA", "Plate Appearances")
+        at_bats = _sum_stat(team_rows, "AB", "At Bats")
+        k_rate = _count_rate(team_rows, "SO", plate_appearances) or _weighted_stat(team_rows, "K%", "K_pct", "SO%", rate=True)
+        bb_rate = _count_rate(team_rows, "BB", plate_appearances) or _weighted_stat(team_rows, "BB%", "BB_pct", rate=True)
+        hr_rate = _count_rate(team_rows, "HR", plate_appearances) or _weighted_stat(team_rows, "HR%", "HR_pct", rate=True)
+        aggregated[team_code] = {
+            "Team": team_code,
+            "G": _max_int_stat(team_rows, "G", "Games", "games"),
+            "PA": _float(plate_appearances),
+            "AB": _float(at_bats),
+            "R": _float(_sum_stat(team_rows, "R", "Runs", "runs")),
+            "HR": _float(_sum_stat(team_rows, "HR")),
+            "OBP": _float(_weighted_stat(team_rows, "OBP", "obp")),
+            "SLG": _float(_weighted_stat(team_rows, "SLG", "slg")),
+            "ISO": _float(_weighted_stat(team_rows, "ISO", "iso")),
+            "K%": _float(k_rate),
+            "BB%": _float(bb_rate),
+            "HR%": _float(hr_rate),
+            "BABIP": _float(_weighted_stat(team_rows, "BABIP", "babip")),
+            "wRC+": _float(_weighted_stat(team_rows, "wRC+", "wRC_plus", "wrc_plus")),
+            "wOBA": _float(_weighted_stat(team_rows, "wOBA", "woba")),
+            "xwOBA": _float(_weighted_stat(team_rows, "xwOBA", "xwoba")),
+            "HardHit%": _float(_weighted_stat(team_rows, "HardHit%", "HardHit_pct", "HardHit%+", rate=True)),
+            "Barrel%": _float(_weighted_stat(team_rows, "Barrel%", "Barrel_pct", rate=True)),
+            "EV": _float(_weighted_stat(team_rows, "EV", "avgEV", "Exit Velocity")),
+            "LA": _float(_weighted_stat(team_rows, "LA", "Launch Angle")),
+            "SweetSpot%": _float(_weighted_stat(team_rows, "SweetSpot%", "SweetSpot_pct", rate=True)),
+            "player_rows_aggregated": len(team_rows),
+        }
+    return aggregated
+
+
 def _pybaseball_rows(result: dict[str, object] | None) -> list[dict[str, object]]:
     rows = result.get("rows") if isinstance(result, dict) else None
     return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
@@ -752,12 +837,7 @@ def _pybaseball_fetch_context(day: date, requested_modules: set[str], stats: dic
             batting = pybaseball_client.get_batting_stats(season)
             context["batting"] = batting
             _record_pybaseball_source_call(stats, batting)
-            batting_by_team: dict[str, dict[str, object]] = {}
-            for row in _pybaseball_rows(batting):
-                team_code = _pybaseball_team_code(row)
-                if team_code:
-                    batting_by_team.setdefault(team_code, row)
-            context["batting_by_team"] = batting_by_team
+            context["batting_by_team"] = _aggregate_pybaseball_batting_by_team(_pybaseball_rows(batting))
         except Exception as exc:
             _record_pybaseball_source_error(stats, "batting_stats", exc)
 
@@ -2093,10 +2173,10 @@ def _upsert_pybaseball_team_daily(
     slg = _decimal_stat(batting_row, "SLG", "slg")
     iso = _decimal_stat(batting_row, "ISO", "iso")
     woba = _decimal_stat(batting_row, "wOBA", "woba")
-    wrc_plus = _int_stat(batting_row, "wRC+", "wRC_plus", "wrc_plus")
+    wrc_plus = _decimal_stat(batting_row, "wRC+", "wRC_plus", "wrc_plus")
     advanced_fields_present = any(value is not None for value in (obp, slg, iso, woba, wrc_plus))
     source_status = "available" if advanced_fields_present and sample_size else "partial"
-    rating_base = Decimal(str(wrc_plus)) / Decimal("100") if wrc_plus is not None else None
+    rating_base = wrc_plus / Decimal("100") if wrc_plus is not None else None
     if rating_base is None and runs_per_game is not None:
         rating_base = (runs_per_game / LEAGUE_AVG_FULL_GAME_RUNS).quantize(Decimal("0.0001"))
 
@@ -2118,8 +2198,8 @@ def _upsert_pybaseball_team_daily(
         "bb_rate": _float(_rate_stat(batting_row, "BB%", "BB_pct")),
         "hr_rate": _float(_rate_stat(batting_row, "HR%", "HR_pct")),
         "babip": _float(_decimal_stat(batting_row, "BABIP", "babip")),
-        "wrc_plus": wrc_plus,
-        "wrc_plus_proxy": wrc_plus,
+        "wrc_plus": _float(wrc_plus),
+        "wrc_plus_proxy": _float(wrc_plus),
         "woba": _float(woba),
         "woba_proxy": _float(woba),
         "xwoba_proxy": _float(_decimal_stat(batting_row, "xwOBA", "xwoba")),
