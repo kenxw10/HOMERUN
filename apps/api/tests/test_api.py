@@ -4163,6 +4163,65 @@ def test_pybaseball_ingestion_writes_available_advanced_rows_and_snapshots(monke
     assert report["advanced_stats_status"] == "available"
 
 
+def test_handedness_platoon_requires_actual_split_values() -> None:
+    captured_at = datetime(2026, 6, 24, 16, 0, tzinfo=UTC)
+    empty_daily = TeamDailyFeature(
+        target_date=date(2026, 6, 24),
+        team_code="PIT",
+        source=features.MLB_STATS_SOURCE,
+        source_status="available",
+        captured_at=captured_at,
+        features={
+            "handedness_splits": {
+                "hitting": {
+                    "source": features.MLB_STATS_SOURCE,
+                    "basis": "hitting",
+                    "vsLeft": None,
+                    "vsRight": {},
+                },
+                "pitching": {
+                    "source": features.MLB_STATS_SOURCE,
+                    "basis": "pitching",
+                    "vsLeft": {"code": "vl", "description": "vs Left", "avg": None},
+                    "vsRight": None,
+                },
+            }
+        },
+    )
+
+    empty_module = features._handedness_module(None, None, None, None, empty_daily, None, captured_at)
+
+    assert empty_module["source_status"] == "missing"
+
+    valued_daily = TeamDailyFeature(
+        target_date=date(2026, 6, 24),
+        team_code="PIT",
+        source=features.MLB_STATS_SOURCE,
+        source_status="available",
+        captured_at=captured_at,
+        features={
+            "handedness_splits": {
+                "hitting": {
+                    "source": features.MLB_STATS_SOURCE,
+                    "basis": "hitting",
+                    "vsLeft": {"code": "vl", "description": "vs Left", "avg": 0.0},
+                    "vsRight": None,
+                },
+                "pitching": {
+                    "source": features.MLB_STATS_SOURCE,
+                    "basis": "pitching",
+                    "vsLeft": None,
+                    "vsRight": None,
+                },
+            }
+        },
+    )
+
+    valued_module = features._handedness_module(None, None, None, None, valued_daily, None, captured_at)
+
+    assert valued_module["source_status"] == "available"
+
+
 def test_mlb_stats_primary_populates_features_when_fangraphs_403(monkeypatch) -> None:
     monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "true")
     get_settings.cache_clear()

@@ -2109,6 +2109,41 @@ def _bullpen_recent_module(
     return _missing(f"{side}_bullpen_recent_workload", "bullpen workload cache missing", captured_at)
 
 
+HANDEDNESS_SPLIT_STAT_FIELDS = (
+    "games_played",
+    "at_bats",
+    "plate_appearances",
+    "hits",
+    "home_runs",
+    "walks",
+    "strikeouts",
+    "avg",
+    "obp",
+    "slg",
+    "ops",
+    "innings_pitched",
+    "whip",
+)
+
+
+def _split_map_has_stat_values(split_map: object) -> bool:
+    if not isinstance(split_map, dict):
+        return False
+    for side in ("vsLeft", "vsRight"):
+        split_values = split_map.get(side)
+        if isinstance(split_values, dict) and any(
+            split_values.get(field) is not None for field in HANDEDNESS_SPLIT_STAT_FIELDS
+        ):
+            return True
+    return False
+
+
+def _handedness_splits_have_stat_values(splits: object) -> bool:
+    if not isinstance(splits, dict):
+        return False
+    return _split_map_has_stat_values(splits.get("hitting")) or _split_map_has_stat_values(splits.get("pitching"))
+
+
 def _handedness_module(
     home_lineup: LineupSnapshot | None,
     away_lineup: LineupSnapshot | None,
@@ -2130,7 +2165,9 @@ def _handedness_module(
         "home_opposing_starter_handedness": away_starter.get("handedness") if away_starter else None,
         "away_opposing_starter_handedness": home_starter.get("handedness") if home_starter else None,
     }
-    if home_splits or away_splits:
+    if _handedness_splits_have_stat_values(home_splits) or _handedness_splits_have_stat_values(
+        away_splits
+    ):
         return _available(
             "handedness_platoon",
             values,
