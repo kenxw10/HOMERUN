@@ -1117,16 +1117,6 @@ def _mlb_primary_fetch_context(
     client = MLBStatsClient()
     season = day.year
     if requested_modules & {"team"}:
-        if hasattr(client, "get_team_season_stats"):
-            try:
-                context["team_season_hitting_by_id"] = _team_stats_map(client.get_team_season_stats("hitting", season))
-            except Exception as exc:
-                _record_mlb_source_error(stats, table="team_season_hitting", exc=exc)
-            try:
-                context["team_season_pitching_by_id"] = _team_stats_map(client.get_team_season_stats("pitching", season))
-            except Exception as exc:
-                _record_mlb_source_error(stats, table="team_season_pitching", exc=exc)
-
         team_ids = sorted(
             {
                 team_id
@@ -2426,61 +2416,66 @@ def _upsert_mlb_primary_team_daily(
     team_id = _team_id(game, side)
     if team_id is None:
         return None
-    hitting = mlb_context.get("team_season_hitting_by_id", {}).get(team_id) if isinstance(mlb_context.get("team_season_hitting_by_id"), dict) else None
-    pitching = mlb_context.get("team_season_pitching_by_id", {}).get(team_id) if isinstance(mlb_context.get("team_season_pitching_by_id"), dict) else None
-    if not isinstance(hitting, dict) and not isinstance(pitching, dict):
+    hitting_payload = mlb_context.get("team_hitting_logs_by_id", {}).get(team_id) if isinstance(mlb_context.get("team_hitting_logs_by_id"), dict) else None
+    pitching_payload = mlb_context.get("team_pitching_logs_by_id", {}).get(team_id) if isinstance(mlb_context.get("team_pitching_logs_by_id"), dict) else None
+    hitting_splits = _game_log_splits_before(hitting_payload if isinstance(hitting_payload, dict) else None, day)
+    pitching_splits = _game_log_splits_before(pitching_payload if isinstance(pitching_payload, dict) else None, day)
+    if not hitting_splits and not pitching_splits:
         return None
-    hitting = hitting if isinstance(hitting, dict) else {}
-    pitching = pitching if isinstance(pitching, dict) else {}
-    games_played = _mlb_stat_int(hitting, "gamesPlayed") or _mlb_stat_int(pitching, "gamesPlayed")
-    runs = _mlb_stat_decimal(hitting, "runs")
-    runs_allowed = _mlb_stat_decimal(pitching, "runs")
-    plate_appearances = _mlb_stat_decimal(hitting, "plateAppearances")
-    at_bats = _mlb_stat_decimal(hitting, "atBats")
-    strikeouts = _mlb_stat_decimal(hitting, "strikeOuts")
-    walks = _mlb_stat_decimal(hitting, "baseOnBalls")
-    innings = _baseball_innings(pitching.get("inningsPitched"))
+    hitting = _aggregate_team_hitting_logs(hitting_splits, len(hitting_splits))
+    pitching = _aggregate_team_pitching_logs(pitching_splits, len(pitching_splits))
+    games_played = max(int(hitting.get("game_count") or 0), int(pitching.get("game_count") or 0)) or None
+    runs = _decimal(hitting.get("runs"))
+    runs_allowed = _decimal(pitching.get("runs"))
+    plate_appearances = _decimal(hitting.get("plate_appearances"))
+    at_bats = _decimal(hitting.get("at_bats"))
+    strikeouts = _decimal(hitting.get("strikeouts"))
+    walks = _decimal(hitting.get("walks"))
+    innings = _decimal(pitching.get("innings_pitched"))
+    pitching_home_runs = _decimal(pitching.get("home_runs"))
     contact = statcast_context.get("team_contact_by_code", {}).get(team_code) if isinstance(statcast_context.get("team_contact_by_code"), dict) else None
-    status = "available" if hitting.get("runs") is not None and pitching.get("runs") is not None else "partial"
+    status = "available" if hitting.get("game_count") and pitching.get("game_count") else "partial"
     features = {
         **_team_record(game, side),
+        "stats_basis": "team_game_logs_before_target_date",
+        "stats_cutoff_date": day.isoformat(),
         "sample_size": games_played,
         "team_id": team_id,
         "games_played": games_played,
         "runs": _float(runs),
-        "runs_per_game": _float(_ratio(runs, games_played)),
-        "hits": _mlb_stat_int(hitting, "hits"),
-        "home_runs": _mlb_stat_int(hitting, "homeRuns"),
-        "home_runs_per_game": _float(_ratio(_mlb_stat_decimal(hitting, "homeRuns"), games_played)),
+        "runs_per_game": hitting.get("runs_per_game"),
+        "hits": _int(hitting.get("hits")),
+        "home_runs": _int(hitting.get("home_runs")),
+        "home_runs_per_game": hitting.get("home_runs_per_game"),
         "strikeouts": _float(strikeouts),
         "base_on_balls": _float(walks),
-        "avg": _float(_mlb_stat_decimal(hitting, "avg")),
-        "obp": _float(_mlb_stat_decimal(hitting, "obp")),
-        "slg": _float(_mlb_stat_decimal(hitting, "slg")),
-        "ops": _float(_mlb_stat_decimal(hitting, "ops")),
-        "stolen_bases": _mlb_stat_int(hitting, "stolenBases"),
-        "babip": _float(_mlb_stat_decimal(hitting, "babip")),
-        "iso": _float((_mlb_stat_decimal(hitting, "slg") - _mlb_stat_decimal(hitting, "avg")).quantize(Decimal("0.0001")) if _mlb_stat_decimal(hitting, "slg") is not None and _mlb_stat_decimal(hitting, "avg") is not None else None),
+        "avg": hitting.get("batting_average"),
+        "obp": hitting.get("on_base_percentage"),
+        "slg": hitting.get("slugging_percentage"),
+        "ops": hitting.get("ops"),
+        "stolen_bases": None,
+        "babip": None,
+        "iso": None,
         "k_rate": _float(_ratio(strikeouts, plate_appearances or at_bats)),
         "bb_rate": _float(_ratio(walks, plate_appearances or at_bats)),
         "proxy_basis": "plateAppearances" if plate_appearances is not None else "atBats" if at_bats is not None else None,
-        "pitching_games_played": _mlb_stat_int(pitching, "gamesPlayed"),
-        "wins": _mlb_stat_int(pitching, "wins"),
-        "losses": _mlb_stat_int(pitching, "losses"),
-        "era": _float(_mlb_stat_decimal(pitching, "era")),
-        "whip": _float(_mlb_stat_decimal(pitching, "whip")),
+        "pitching_games_played": _int(pitching.get("game_count")),
+        "wins": None,
+        "losses": None,
+        "era": pitching.get("era"),
+        "whip": pitching.get("whip"),
         "innings_pitched": _float(innings),
-        "pitching_strikeouts": _mlb_stat_int(pitching, "strikeOuts"),
-        "pitching_walks": _mlb_stat_int(pitching, "baseOnBalls"),
-        "pitching_hits": _mlb_stat_int(pitching, "hits"),
-        "pitching_home_runs": _mlb_stat_int(pitching, "homeRuns"),
+        "pitching_strikeouts": _int(pitching.get("strikeouts")),
+        "pitching_walks": _int(pitching.get("walks")),
+        "pitching_hits": _int(pitching.get("hits")),
+        "pitching_home_runs": _int(pitching.get("home_runs")),
         "runs_allowed": _float(runs_allowed),
-        "earned_runs": _mlb_stat_int(pitching, "earnedRuns"),
-        "saves": _mlb_stat_int(pitching, "saves"),
-        "blown_saves": _mlb_stat_int(pitching, "blownSaves"),
-        "k_minus_bb_per_inning": _float(_ratio((_mlb_stat_decimal(pitching, "strikeOuts") or Decimal("0")) - (_mlb_stat_decimal(pitching, "baseOnBalls") or Decimal("0")), innings)),
-        "hr_per_9_proxy": _float(_ratio((_mlb_stat_decimal(pitching, "homeRuns") or Decimal("0")) * Decimal("9"), innings)),
-        "runs_allowed_per_game": _float(_ratio(runs_allowed, games_played)),
+        "earned_runs": _int(pitching.get("earned_runs")),
+        "saves": _int(pitching.get("saves")),
+        "blown_saves": _int(pitching.get("blown_saves")),
+        "k_minus_bb_per_inning": pitching.get("k_minus_bb_per_inning"),
+        "hr_per_9_proxy": _float(_ratio((pitching_home_runs or Decimal("0")) * Decimal("9"), innings)),
+        "runs_allowed_per_game": pitching.get("runs_per_game"),
         "run_differential_per_game": _float(_ratio((runs or Decimal("0")) - (runs_allowed or Decimal("0")), games_played)) if runs is not None and runs_allowed is not None else None,
         "contact_quality": contact,
         "contact_quality_status": _statcast_status(contact if isinstance(contact, dict) else None),
@@ -2507,7 +2502,12 @@ def _upsert_mlb_primary_team_daily(
     row.completeness = Decimal("0.80") if status == "available" else Decimal("0.45")
     row.stale = False
     row.features = features
-    row.raw_payload = {"team_id": team_id, "hitting": hitting, "pitching": pitching}
+    row.raw_payload = {
+        "team_id": team_id,
+        "bounded_before": day.isoformat(),
+        "hitting_rows": len(hitting_splits),
+        "pitching_rows": len(pitching_splits),
+    }
     session.add(row)
     return row
 

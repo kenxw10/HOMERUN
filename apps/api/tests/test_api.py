@@ -4703,6 +4703,169 @@ def test_mlb_primary_team_recent_uses_calendar_window(monkeypatch) -> None:
     assert recent_14.features["hitting"]["game_count"] == 3
 
 
+def test_mlb_primary_team_daily_uses_logs_before_target_date(monkeypatch) -> None:
+    monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "true")
+    get_settings.cache_clear()
+    _stub_pybaseball_unavailable(monkeypatch)
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    season_calls: list[str] = []
+
+    class FakeMLBStatsClient:
+        def get_team_season_stats(self, group: str, season: int):
+            season_calls.append(group)
+            return {
+                "stats": [
+                    {
+                        "splits": [
+                            {
+                                "team": {"id": 134},
+                                "stat": {
+                                    "gamesPlayed": 162,
+                                    "runs": 999,
+                                    "hits": 999,
+                                    "homeRuns": 999,
+                                },
+                            }
+                        ]
+                    }
+                ]
+            }
+
+        def get_team_game_log_stats(self, team_id: str, group: str, season: int):
+            if group == "hitting":
+                rows = [
+                    {
+                        "date": "2026-06-30",
+                        "stat": {
+                            "runs": 4,
+                            "hits": 8,
+                            "homeRuns": 1,
+                            "baseOnBalls": 2,
+                            "strikeOuts": 7,
+                            "atBats": 32,
+                            "plateAppearances": 36,
+                            "totalBases": 13,
+                        },
+                    },
+                    {
+                        "date": "2026-07-01",
+                        "stat": {
+                            "runs": 50,
+                            "hits": 50,
+                            "homeRuns": 10,
+                            "baseOnBalls": 10,
+                            "strikeOuts": 1,
+                            "atBats": 40,
+                            "plateAppearances": 50,
+                            "totalBases": 90,
+                        },
+                    },
+                    {
+                        "date": "2026-07-02",
+                        "stat": {
+                            "runs": 60,
+                            "hits": 60,
+                            "homeRuns": 12,
+                            "baseOnBalls": 12,
+                            "strikeOuts": 1,
+                            "atBats": 44,
+                            "plateAppearances": 56,
+                            "totalBases": 110,
+                        },
+                    },
+                ]
+            else:
+                rows = [
+                    {
+                        "date": "2026-06-30",
+                        "stat": {
+                            "inningsPitched": "9.0",
+                            "runs": 3,
+                            "earnedRuns": 3,
+                            "hits": 7,
+                            "homeRuns": 1,
+                            "baseOnBalls": 2,
+                            "strikeOuts": 8,
+                            "battersFaced": 35,
+                            "numberOfPitches": 135,
+                            "saves": 1,
+                            "holds": 0,
+                            "blownSaves": 0,
+                            "saveOpportunities": 1,
+                            "gamesFinished": 1,
+                        },
+                    },
+                    {
+                        "date": "2026-07-02",
+                        "stat": {
+                            "inningsPitched": "9.0",
+                            "runs": 99,
+                            "earnedRuns": 99,
+                            "hits": 99,
+                            "homeRuns": 20,
+                            "baseOnBalls": 20,
+                            "strikeOuts": 1,
+                            "battersFaced": 60,
+                            "numberOfPitches": 200,
+                        },
+                    },
+                ]
+            return {"stats": [{"splits": rows}]}
+
+        def get_team_stat_splits(self, *_args, **_kwargs):
+            return {"stats": [{"splits": []}]}
+
+        def get_game_feed(self, *_args, **_kwargs):
+            return {}
+
+    monkeypatch.setattr(features, "MLBStatsClient", FakeMLBStatsClient)
+    monkeypatch.setattr(features, "_hydrate_game_endpoint_if_available", lambda *_args, **_kwargs: None)
+
+    try:
+        with Session(engine) as session:
+            session.add(
+                MlbGame(
+                    external_game_id="bounded-primary-team-daily",
+                    home_team="Pittsburgh Pirates",
+                    away_team="Seattle Mariners",
+                    home_abbreviation="PIT",
+                    away_abbreviation="SEA",
+                    scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+                    status="scheduled",
+                    raw_payload={
+                        "teams": {
+                            "home": {"team": {"id": 134, "name": "Pittsburgh Pirates"}},
+                            "away": {"team": {"id": 136, "name": "Seattle Mariners"}},
+                        }
+                    },
+                )
+            )
+            session.commit()
+
+            result = features.sync_mlb_team_features(session, date(2026, 7, 1), refresh_schedule=False)
+            team_daily = session.scalar(
+                select(TeamDailyFeature)
+                .where(TeamDailyFeature.source == features.MLB_STATS_SOURCE)
+                .where(TeamDailyFeature.team_code == "PIT")
+            )
+    finally:
+        get_settings.cache_clear()
+
+    assert result["validation_status"] == "ok"
+    assert season_calls == []
+    assert team_daily is not None
+    assert team_daily.source_status == "available"
+    assert team_daily.features["stats_basis"] == "team_game_logs_before_target_date"
+    assert team_daily.features["sample_size"] == 1
+    assert team_daily.features["runs"] == 4.0
+    assert team_daily.features["runs_allowed"] == 3.0
+    assert team_daily.features["home_runs"] == 1
+    assert team_daily.raw_payload["bounded_before"] == "2026-07-01"
+    assert team_daily.raw_payload["hitting_rows"] == 1
+    assert team_daily.raw_payload["pitching_rows"] == 1
+
+
 def test_bullpen_only_sync_skips_mlb_primary_team_fetches(monkeypatch) -> None:
     monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "true")
     get_settings.cache_clear()
@@ -4763,12 +4926,16 @@ def test_mlb_primary_team_fetch_timeout_degrades_sync(monkeypatch) -> None:
     _stub_pybaseball_unavailable(monkeypatch)
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
+    season_calls: list[str] = []
 
     class TimeoutTeamStatsClient:
         def get_team_season_stats(self, *_args, **_kwargs):
-            raise TimeoutError("team stats timed out")
+            season_calls.append("season")
+            return {"stats": [{"splits": []}]}
 
-        def get_team_game_log_stats(self, *_args, **_kwargs):
+        def get_team_game_log_stats(self, _team_id: str, group: str, _season: int):
+            if group == "hitting":
+                raise TimeoutError("team hitting log timed out")
             return {"stats": [{"splits": []}]}
 
         def get_team_stat_splits(self, *_args, **_kwargs):
@@ -4807,10 +4974,8 @@ def test_mlb_primary_team_fetch_timeout_degrades_sync(monkeypatch) -> None:
 
     assert result["validation_status"] == "degraded_with_errors"
     assert result["error_count"] == 2
-    assert {error["table"] for error in result["errors"]} == {
-        "team_season_hitting",
-        "team_season_pitching",
-    }
+    assert season_calls == []
+    assert {error["table"] for error in result["errors"]} == {"team_hitting_game_log"}
     assert all(error["error_type"] == "TimeoutError" for error in result["errors"])
 
 
