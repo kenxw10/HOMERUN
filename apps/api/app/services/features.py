@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import importlib.util
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from math import atan2, cos, radians, sin, sqrt
+import re
 from typing import Any
 
 from sqlalchemy import select
@@ -38,6 +38,7 @@ from app.services.contracts import (
 from app.services.http_json import HttpJsonError, get_json
 from app.services.kalshi_mlb_resolver import normalize_team_abbreviation
 from app.services.mlb_stats_client import MLBStatsClient
+from app.services import pybaseball_client
 from app.time_utils import ensure_aware_utc, get_dashboard_zone, parse_datetime, today_eastern, utc_now
 
 FEATURE_VERSION = "mature_mlb_features_v2"
@@ -50,6 +51,7 @@ STATIC_SOURCE = "static_mlb_reference_v1"
 MLB_STATS_SOURCE = "mlb_stats_api"
 OPEN_METEO_SOURCE = "open_meteo"
 DERIVED_SOURCE = "derived_homerun_v2"
+PYBASEBALL_SOURCE = "pybaseball_public_stats_v1"
 NETWORK_SOURCE_MODULES = {"team", "pitcher", "bullpen", "lineup", "weather"}
 ALL_SYNC_MODULES = NETWORK_SOURCE_MODULES | {"injuries", "travel"}
 RAW_TABLES_BY_MODULE = {
@@ -595,13 +597,243 @@ def fetch_game_endpoint(game_pk: str) -> dict[str, object]:
 
 
 def pybaseball_available() -> bool:
-    return importlib.util.find_spec("pybaseball") is not None
+    return bool(pybaseball_client.import_status().get("available"))
 
 
 def advanced_public_stats_status() -> str:
-    if pybaseball_available():
-        return "not_ingested_pybaseball_adapter_not_implemented"
-    return "unavailable_pybaseball_not_installed"
+    return "pybaseball_adapter_available" if pybaseball_available() else "unavailable_pybaseball_not_installed"
+
+
+PYBASEBALL_TEAM_ALIASES = {
+    "ANA": "LAA",
+    "ARI": "ARI",
+    "ARZ": "ARI",
+    "ATL": "ATL",
+    "BAL": "BAL",
+    "BOS": "BOS",
+    "CHC": "CHC",
+    "CHW": "CWS",
+    "CIN": "CIN",
+    "CLE": "CLE",
+    "COL": "COL",
+    "CWS": "CWS",
+    "DET": "DET",
+    "FLA": "MIA",
+    "HOU": "HOU",
+    "KCR": "KC",
+    "KC": "KC",
+    "LAA": "LAA",
+    "LAD": "LAD",
+    "MIA": "MIA",
+    "MIL": "MIL",
+    "MIN": "MIN",
+    "NYM": "NYM",
+    "NYY": "NYY",
+    "OAK": "ATH",
+    "ATH": "ATH",
+    "PHI": "PHI",
+    "PIT": "PIT",
+    "SDP": "SD",
+    "SD": "SD",
+    "SEA": "SEA",
+    "SFG": "SF",
+    "SF": "SF",
+    "STL": "STL",
+    "TBR": "TB",
+    "TB": "TB",
+    "TEX": "TEX",
+    "TOR": "TOR",
+    "WSN": "WSH",
+    "WSH": "WSH",
+}
+
+
+def _row_value(row: dict[str, object], *names: str) -> object | None:
+    lower_lookup = {str(key).lower(): value for key, value in row.items()}
+    for name in names:
+        if name in row:
+            return row[name]
+        value = lower_lookup.get(name.lower())
+        if value is not None:
+            return value
+    return None
+
+
+def _decimal_stat(row: dict[str, object], *names: str, places: str = "0.0001") -> Decimal | None:
+    value = _row_value(row, *names)
+    if value is None or value == "":
+        return None
+    if isinstance(value, str) and value.endswith("%"):
+        value = value[:-1]
+    return _decimal(value, places)
+
+
+def _rate_stat(row: dict[str, object], *names: str) -> Decimal | None:
+    value = _decimal_stat(row, *names)
+    if value is None:
+        return None
+    if value > Decimal("1"):
+        value = value / Decimal("100")
+    return value.quantize(Decimal("0.0001"))
+
+
+def _int_stat(row: dict[str, object], *names: str) -> int | None:
+    return _int(_row_value(row, *names))
+
+
+def _normalized_player_name(value: object) -> str:
+    return " ".join(re.findall(r"[a-z0-9]+", str(value or "").lower()))
+
+
+def _pybaseball_team_code(row: dict[str, object]) -> str | None:
+    value = _row_value(row, "Team", "Tm", "team", "team_code", "Squad")
+    if value is None:
+        return None
+    raw = re.sub(r"[^A-Za-z0-9]", "", str(value)).upper()
+    if raw in PYBASEBALL_TEAM_ALIASES:
+        return PYBASEBALL_TEAM_ALIASES[raw]
+    normalized = normalize_team_abbreviation(str(value), raw)
+    return PYBASEBALL_TEAM_ALIASES.get(normalized, normalized)
+
+
+def _pybaseball_rows(result: dict[str, object] | None) -> list[dict[str, object]]:
+    rows = result.get("rows") if isinstance(result, dict) else None
+    return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+
+
+def _pybaseball_columns(result: dict[str, object] | None) -> list[str]:
+    columns = result.get("columns") if isinstance(result, dict) else None
+    return [str(column) for column in columns] if isinstance(columns, list) else []
+
+
+def _pybaseball_function(result: dict[str, object] | None) -> str | None:
+    value = result.get("function") if isinstance(result, dict) else None
+    return str(value) if value else None
+
+
+def _pybaseball_error(source_function: str, exc: BaseException) -> dict[str, object]:
+    if isinstance(exc, pybaseball_client.PybaseballSourceError):
+        return exc.to_detail()
+    return {
+        "source": PYBASEBALL_SOURCE,
+        "function": source_function,
+        "error_type": exc.__class__.__name__,
+        "message": str(exc),
+    }
+
+
+def _pybaseball_fetch_context(day: date, requested_modules: set[str], stats: dict[str, object]) -> dict[str, object]:
+    context: dict[str, object] = {
+        "available": False,
+        "batting": None,
+        "pitching": None,
+        "batting_by_team": {},
+        "pitching_by_team": {},
+        "pitching_by_pitcher_id": {},
+        "pitching_by_name_team": {},
+    }
+    if not (requested_modules & {"team", "pitcher", "bullpen"}):
+        return context
+
+    import_info = pybaseball_client.import_status()
+    stats["pybaseball_available"] = bool(import_info.get("available"))
+    stats["pybaseball_import_error"] = import_info.get("import_error")
+    if not import_info.get("available"):
+        _append_warning(
+            stats,
+            "pybaseball is unavailable; advanced public offense/pitching stats are degraded to existing partial proxies.",
+        )
+        return context
+
+    context["available"] = True
+    season = day.year
+    if requested_modules & {"team"}:
+        try:
+            batting = pybaseball_client.get_batting_stats(season)
+            context["batting"] = batting
+            _record_pybaseball_source_call(stats, batting)
+            batting_by_team: dict[str, dict[str, object]] = {}
+            for row in _pybaseball_rows(batting):
+                team_code = _pybaseball_team_code(row)
+                if team_code:
+                    batting_by_team.setdefault(team_code, row)
+            context["batting_by_team"] = batting_by_team
+        except Exception as exc:
+            _record_pybaseball_source_error(stats, "batting_stats", exc)
+
+    if requested_modules & {"pitcher", "bullpen"}:
+        try:
+            pitching = pybaseball_client.get_pitching_stats(season)
+            context["pitching"] = pitching
+            _record_pybaseball_source_call(stats, pitching)
+            pitching_by_team: dict[str, list[dict[str, object]]] = {}
+            pitching_by_pitcher_id: dict[str, dict[str, object]] = {}
+            pitching_by_name_team: dict[tuple[str, str], dict[str, object]] = {}
+            for row in _pybaseball_rows(pitching):
+                team_code = _pybaseball_team_code(row)
+                if team_code:
+                    pitching_by_team.setdefault(team_code, []).append(row)
+                player_id = _row_value(row, "MLBAMID", "mlbamid", "mlb_id", "player_id", "IDfg")
+                if player_id is not None:
+                    pitching_by_pitcher_id[str(player_id)] = row
+                name = _normalized_player_name(
+                    _row_value(row, "Name", "PlayerName", "player_name", "NameASCII", "last_name, first_name")
+                )
+                if name and team_code:
+                    pitching_by_name_team[(name, team_code)] = row
+            context["pitching_by_team"] = pitching_by_team
+            context["pitching_by_pitcher_id"] = pitching_by_pitcher_id
+            context["pitching_by_name_team"] = pitching_by_name_team
+        except Exception as exc:
+            _record_pybaseball_source_error(stats, "pitching_stats", exc)
+
+    return context
+
+
+def _record_pybaseball_source_call(stats: dict[str, object], result: dict[str, object]) -> None:
+    function_name = _pybaseball_function(result)
+    functions = stats.setdefault("pybaseball_functions_attempted", [])
+    if function_name and isinstance(functions, list) and function_name not in functions:
+        functions.append(function_name)
+    stats["pybaseball_rows_seen"] = int(stats.get("pybaseball_rows_seen", 0)) + len(_pybaseball_rows(result))
+
+
+def _record_pybaseball_source_error(stats: dict[str, object], function_name: str, exc: BaseException) -> None:
+    stats["pybaseball_error_count"] = int(stats.get("pybaseball_error_count", 0)) + 1
+    _append_error(stats, _pybaseball_error(function_name, exc))
+
+
+def _team_pybaseball_row(context: dict[str, object], team_code: str) -> dict[str, object] | None:
+    batting_by_team = context.get("batting_by_team")
+    if isinstance(batting_by_team, dict):
+        row = batting_by_team.get(team_code)
+        return row if isinstance(row, dict) else None
+    return None
+
+
+def _pitching_rows_for_team(context: dict[str, object], team_code: str) -> list[dict[str, object]]:
+    pitching_by_team = context.get("pitching_by_team")
+    rows = pitching_by_team.get(team_code) if isinstance(pitching_by_team, dict) else None
+    return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+
+
+def _pitcher_pybaseball_row(
+    context: dict[str, object],
+    identity: dict[str, object],
+    team_code: str,
+) -> dict[str, object] | None:
+    pitcher_id = identity.get("id")
+    by_id = context.get("pitching_by_pitcher_id")
+    if pitcher_id is not None and isinstance(by_id, dict):
+        row = by_id.get(str(pitcher_id))
+        if isinstance(row, dict):
+            return row
+    by_name = context.get("pitching_by_name_team")
+    if not isinstance(by_name, dict):
+        return None
+    name = _normalized_player_name(identity.get("name") or identity.get("pitcher_name"))
+    row = by_name.get((name, team_code))
+    return row if isinstance(row, dict) else None
 
 
 def _merge_game_payload(game: MlbGame, payload: dict[str, object]) -> None:
@@ -771,13 +1003,16 @@ def _hydrate_schedule_window(
 def _cached_team_daily(session: Session | None, day: date, team_code: str | None) -> TeamDailyFeature | None:
     if session is None or not team_code:
         return None
-    return session.scalar(
+    rows = list(
+        session.scalars(
         select(TeamDailyFeature)
         .where(TeamDailyFeature.target_date == day)
         .where(TeamDailyFeature.team_code == team_code)
         .order_by(TeamDailyFeature.updated_at.desc())
-        .limit(1)
+        .limit(10)
+        )
     )
+    return _preferred_feature_row(rows)
 
 
 def _cached_team_recent(
@@ -788,14 +1023,34 @@ def _cached_team_recent(
 ) -> TeamRecentFeature | None:
     if session is None or not team_code:
         return None
-    return session.scalar(
+    rows = list(
+        session.scalars(
         select(TeamRecentFeature)
         .where(TeamRecentFeature.target_date == day)
         .where(TeamRecentFeature.team_code == team_code)
         .where(TeamRecentFeature.window_days == window_days)
         .order_by(TeamRecentFeature.updated_at.desc())
-        .limit(1)
+        .limit(10)
+        )
     )
+    return _preferred_feature_row(rows)
+
+
+def _feature_row_priority(row: object) -> tuple[int, int, datetime]:
+    status = str(getattr(row, "source_status", "") or "").lower()
+    source = str(getattr(row, "source", "") or "")
+    status_priority = {"available": 3, "partial": 2, "missing": 1}.get(status, 0)
+    source_priority = {PYBASEBALL_SOURCE: 3, MLB_STATS_SOURCE: 2, DERIVED_SOURCE: 1}.get(source, 0)
+    updated_at = getattr(row, "updated_at", None) or getattr(row, "captured_at", None) or datetime.min
+    if isinstance(updated_at, datetime) and updated_at.tzinfo is not None:
+        updated_at = updated_at.replace(tzinfo=None)
+    return status_priority, source_priority, updated_at if isinstance(updated_at, datetime) else datetime.min
+
+
+def _preferred_feature_row(rows: list[Any]) -> Any | None:
+    if not rows:
+        return None
+    return max(rows, key=_feature_row_priority)
 
 
 def _cached_lineup(
@@ -1051,18 +1306,8 @@ def build_feature_snapshot(
         TravelScheduleFeature.mlb_game_id == game.id,
         TravelScheduleFeature.team_code == away_code,
     )
-    home_bullpen = _cached_single(
-        session,
-        BullpenDailyFeature,
-        BullpenDailyFeature.target_date == target_date,
-        BullpenDailyFeature.team_code == home_code,
-    )
-    away_bullpen = _cached_single(
-        session,
-        BullpenDailyFeature,
-        BullpenDailyFeature.target_date == target_date,
-        BullpenDailyFeature.team_code == away_code,
-    )
+    home_bullpen = _cached_bullpen(session, target_date, home_code)
+    away_bullpen = _cached_bullpen(session, target_date, away_code)
     home_injury = _cached_single(
         session,
         InjurySnapshot,
@@ -1233,14 +1478,32 @@ def _cached_pitcher(
     pitcher_id = identity.get("id")
     if not pitcher_id:
         return None
-    return session.scalar(
+    rows = list(
+        session.scalars(
         select(PitcherDailyFeature)
         .where(PitcherDailyFeature.target_date == day)
         .where(PitcherDailyFeature.team_code == team_code)
         .where(PitcherDailyFeature.pitcher_id == str(pitcher_id))
         .order_by(PitcherDailyFeature.updated_at.desc())
-        .limit(1)
+        .limit(10)
+        )
     )
+    return _preferred_feature_row(rows)
+
+
+def _cached_bullpen(session: Session | None, day: date, team_code: str | None) -> BullpenDailyFeature | None:
+    if session is None or not team_code:
+        return None
+    rows = list(
+        session.scalars(
+            select(BullpenDailyFeature)
+            .where(BullpenDailyFeature.target_date == day)
+            .where(BullpenDailyFeature.team_code == team_code)
+            .order_by(BullpenDailyFeature.updated_at.desc())
+            .limit(10)
+        )
+    )
+    return _preferred_feature_row(rows)
 
 
 def _doubleheader_flag(game: MlbGame) -> bool:
@@ -1810,6 +2073,294 @@ def _upsert_bullpen(
     return row
 
 
+def _upsert_pybaseball_team_daily(
+    session: Session,
+    game: MlbGame,
+    side: str,
+    day: date,
+    captured_at: datetime,
+    context: dict[str, object],
+) -> TeamDailyFeature | None:
+    team_code = (game.home_abbreviation if side == "home" else game.away_abbreviation) or "UNK"
+    batting_row = _team_pybaseball_row(context, team_code)
+    if batting_row is None:
+        return None
+
+    sample_size = _int_stat(batting_row, "G", "Games", "games")
+    runs = _decimal_stat(batting_row, "R", "Runs", "runs")
+    runs_per_game = (runs / Decimal(sample_size)).quantize(Decimal("0.0001")) if runs is not None and sample_size else None
+    obp = _decimal_stat(batting_row, "OBP", "obp")
+    slg = _decimal_stat(batting_row, "SLG", "slg")
+    iso = _decimal_stat(batting_row, "ISO", "iso")
+    woba = _decimal_stat(batting_row, "wOBA", "woba")
+    wrc_plus = _int_stat(batting_row, "wRC+", "wRC_plus", "wrc_plus")
+    advanced_fields_present = any(value is not None for value in (obp, slg, iso, woba, wrc_plus))
+    source_status = "available" if advanced_fields_present and sample_size else "partial"
+    rating_base = Decimal(str(wrc_plus)) / Decimal("100") if wrc_plus is not None else None
+    if rating_base is None and runs_per_game is not None:
+        rating_base = (runs_per_game / LEAGUE_AVG_FULL_GAME_RUNS).quantize(Decimal("0.0001"))
+
+    features = {
+        **_team_record(game, side),
+        "sample_size": sample_size,
+        "runs_per_game": _float(runs_per_game),
+        "runs_allowed_per_game": None,
+        "run_differential_per_game": None,
+        "pythagorean_win_pct": None,
+        "time_decayed_team_rating": _float((rating_base - Decimal("1")) if rating_base is not None else None),
+        "recent_team_strength_trend": None,
+        "opponent_adjusted_proxy": None,
+        "league_average_baseline": 0.5000,
+        "obp": _float(obp),
+        "slg": _float(slg),
+        "iso": _float(iso),
+        "k_rate": _float(_rate_stat(batting_row, "K%", "K_pct", "SO%")),
+        "bb_rate": _float(_rate_stat(batting_row, "BB%", "BB_pct")),
+        "hr_rate": _float(_rate_stat(batting_row, "HR%", "HR_pct")),
+        "babip": _float(_decimal_stat(batting_row, "BABIP", "babip")),
+        "wrc_plus": wrc_plus,
+        "wrc_plus_proxy": wrc_plus,
+        "woba": _float(woba),
+        "woba_proxy": _float(woba),
+        "xwoba_proxy": _float(_decimal_stat(batting_row, "xwOBA", "xwoba")),
+        "hard_hit_pct": _float(_rate_stat(batting_row, "HardHit%", "HardHit_pct", "HardHit%+")),
+        "barrel_pct": _float(_rate_stat(batting_row, "Barrel%", "Barrel_pct")),
+        "average_exit_velocity": _float(_decimal_stat(batting_row, "EV", "avgEV", "Exit Velocity")),
+        "launch_angle": _float(_decimal_stat(batting_row, "LA", "Launch Angle")),
+        "sweet_spot_proxy": _float(_rate_stat(batting_row, "SweetSpot%", "SweetSpot_pct")),
+        "platoon_split_status": "not_implemented",
+    }
+    source_result = context.get("batting") if isinstance(context.get("batting"), dict) else {}
+    row = session.scalar(
+        select(TeamDailyFeature)
+        .where(TeamDailyFeature.target_date == day)
+        .where(TeamDailyFeature.team_code == team_code)
+        .where(TeamDailyFeature.source == PYBASEBALL_SOURCE)
+    )
+    row = row or TeamDailyFeature(target_date=day, team_code=team_code, source=PYBASEBALL_SOURCE)
+    row.captured_at = captured_at
+    row.source_status = source_status
+    row.confidence = Decimal("0.85") if source_status == "available" else Decimal("0.35")
+    row.completeness = Decimal("0.75") if source_status == "available" else Decimal("0.25")
+    row.stale = False
+    row.features = features
+    row.raw_payload = {
+        "source_function": _pybaseball_function(source_result),
+        "source_row_count": len(_pybaseball_rows(source_result)),
+        "columns_seen": _pybaseball_columns(source_result),
+        "normalized_team_code": team_code,
+        "synced_at": captured_at.isoformat(),
+        "row": batting_row,
+    }
+    session.add(row)
+    return row
+
+
+def _upsert_pybaseball_pitcher(
+    session: Session,
+    game: MlbGame,
+    side: str,
+    day: date,
+    captured_at: datetime,
+    context: dict[str, object],
+) -> PitcherDailyFeature | None:
+    if not context.get("available"):
+        return None
+    team_code = (game.home_abbreviation if side == "home" else game.away_abbreviation) or "UNK"
+    identity = probable_pitcher_from_payload(game.raw_payload or {}, side)
+    if not identity or not identity.get("id"):
+        return None
+    pitcher_id = str(identity["id"])
+    pitcher_row = _pitcher_pybaseball_row(context, identity, team_code)
+    source_result = context.get("pitching") if isinstance(context.get("pitching"), dict) else {}
+    source_status = "partial"
+    sample_size = None
+    raw_error = None
+    season: dict[str, object] = {
+        "era": None,
+        "whip": None,
+        "innings_pitched": None,
+        "k_rate": None,
+        "bb_rate": None,
+        "k_minus_bb_rate": None,
+        "hr_per_9": None,
+        "fip": None,
+        "xfip_proxy": None,
+        "xera_proxy": None,
+        "xwoba_allowed": None,
+        "hard_hit_allowed": None,
+        "barrel_allowed": None,
+        "ground_ball_proxy": None,
+        "pitch_mix": None,
+    }
+    if pitcher_row is None:
+        raw_error = {
+            "source": PYBASEBALL_SOURCE,
+            "table": "pitcher_daily_features",
+            "error_type": "PlayerMappingFailed",
+            "message": "PLAYER_MAPPING_FAILED",
+            "pitcher_id": pitcher_id,
+            "pitcher_name": identity.get("name") or identity.get("pitcher_name"),
+            "team_code": team_code,
+        }
+    else:
+        innings = _decimal_stat(pitcher_row, "IP", "Innings", "innings_pitched")
+        sample_size = _int(innings)
+        season = {
+            "era": _float(_decimal_stat(pitcher_row, "ERA", "era")),
+            "whip": _float(_decimal_stat(pitcher_row, "WHIP", "whip")),
+            "innings_pitched": _float(innings),
+            "k_rate": _float(_rate_stat(pitcher_row, "K%", "K_pct")),
+            "bb_rate": _float(_rate_stat(pitcher_row, "BB%", "BB_pct")),
+            "k_minus_bb_rate": _float(_rate_stat(pitcher_row, "K-BB%", "K-BB_pct", "KBB%")),
+            "hr_per_9": _float(_decimal_stat(pitcher_row, "HR/9", "HR_per_9")),
+            "fip": _float(_decimal_stat(pitcher_row, "FIP", "fip")),
+            "xfip_proxy": _float(_decimal_stat(pitcher_row, "xFIP", "SIERA", "xfip")),
+            "xera_proxy": _float(_decimal_stat(pitcher_row, "xERA", "xera")),
+            "xwoba_allowed": _float(_decimal_stat(pitcher_row, "xwOBA", "xwoba")),
+            "hard_hit_allowed": _float(_rate_stat(pitcher_row, "HardHit%", "HardHit_pct")),
+            "barrel_allowed": _float(_rate_stat(pitcher_row, "Barrel%", "Barrel_pct")),
+            "ground_ball_proxy": _float(_rate_stat(pitcher_row, "GB%", "GB_pct")),
+            "pitch_mix": None,
+        }
+        if season["era"] is not None and season["whip"] is not None and season["innings_pitched"] is not None:
+            source_status = "available"
+
+    row = session.scalar(
+        select(PitcherDailyFeature)
+        .where(PitcherDailyFeature.target_date == day)
+        .where(PitcherDailyFeature.team_code == team_code)
+        .where(PitcherDailyFeature.pitcher_id == pitcher_id)
+        .where(PitcherDailyFeature.source == PYBASEBALL_SOURCE)
+    )
+    row = row or PitcherDailyFeature(
+        target_date=day,
+        team_code=team_code,
+        pitcher_id=pitcher_id,
+        source=PYBASEBALL_SOURCE,
+    )
+    row.pitcher_name = str(identity.get("name") or identity.get("pitcher_name") or "")
+    row.captured_at = captured_at
+    row.source_status = source_status
+    row.sample_size = sample_size
+    row.confidence = Decimal("0.85") if source_status == "available" else Decimal("0.35")
+    row.completeness = Decimal("0.75") if source_status == "available" else Decimal("0.25")
+    row.stale = False
+    row.features = {
+        **identity,
+        "season": season,
+        "recent": {
+            "last_3_starts": None,
+            "last_5_starts": None,
+            "innings_per_start": None,
+            "pitch_count": None,
+            "era_proxy": None,
+            "fip_proxy": None,
+            "k_bb": None,
+            "home_runs_allowed": None,
+            "velocity_trend": None,
+        },
+        "workload": {
+            "expected_innings_projection": season.get("innings_pitched"),
+            "recent_pitch_count_ceiling": None,
+            "days_rest": None,
+            "opener_or_bulk_pitcher": None,
+            "short_start_risk": None,
+            "expected_bullpen_innings": None,
+        },
+    }
+    row.raw_payload = {
+        "source_function": _pybaseball_function(source_result),
+        "source_row_count": len(_pybaseball_rows(source_result)),
+        "columns_seen": _pybaseball_columns(source_result),
+        "normalized_team_code": team_code,
+        "synced_at": captured_at.isoformat(),
+        "row": pitcher_row,
+        "error": raw_error,
+    }
+    session.add(row)
+    return row
+
+
+def _avg_pybaseball_stat(rows: list[dict[str, object]], *names: str, rate: bool = False) -> Decimal | None:
+    values = []
+    for row in rows:
+        value = _rate_stat(row, *names) if rate else _decimal_stat(row, *names)
+        if value is not None:
+            values.append(value)
+    if not values:
+        return None
+    return (sum(values) / Decimal(len(values))).quantize(Decimal("0.0001"))
+
+
+def _upsert_pybaseball_bullpen(
+    session: Session,
+    game: MlbGame,
+    side: str,
+    day: date,
+    captured_at: datetime,
+    context: dict[str, object],
+) -> BullpenDailyFeature | None:
+    if not context.get("available"):
+        return None
+    team_code = (game.home_abbreviation if side == "home" else game.away_abbreviation) or "UNK"
+    rows = _pitching_rows_for_team(context, team_code)
+    if not rows:
+        return None
+    source_result = context.get("pitching") if isinstance(context.get("pitching"), dict) else {}
+    row = session.scalar(
+        select(BullpenDailyFeature)
+        .where(BullpenDailyFeature.target_date == day)
+        .where(BullpenDailyFeature.team_code == team_code)
+        .where(BullpenDailyFeature.source == PYBASEBALL_SOURCE)
+    )
+    row = row or BullpenDailyFeature(target_date=day, team_code=team_code, source=PYBASEBALL_SOURCE)
+    row.captured_at = captured_at
+    row.source_status = "partial"
+    row.confidence = Decimal("0.40")
+    row.completeness = Decimal("0.35")
+    row.stale = False
+    row.features = {
+        "sample_size": len(rows),
+        "era": _float(_avg_pybaseball_stat(rows, "ERA", "era")),
+        "fip_proxy": _float(_avg_pybaseball_stat(rows, "FIP", "fip")),
+        "xfip_proxy": _float(_avg_pybaseball_stat(rows, "xFIP", "SIERA", "xfip")),
+        "whip": _float(_avg_pybaseball_stat(rows, "WHIP", "whip")),
+        "k_rate": _float(_avg_pybaseball_stat(rows, "K%", "K_pct", rate=True)),
+        "bb_rate": _float(_avg_pybaseball_stat(rows, "BB%", "BB_pct", rate=True)),
+        "k_minus_bb_rate": _float(_avg_pybaseball_stat(rows, "K-BB%", "K-BB_pct", rate=True)),
+        "hr_per_9": _float(_avg_pybaseball_stat(rows, "HR/9", "HR_per_9")),
+        "leverage_neutral_run_prevention": _float(_avg_pybaseball_stat(rows, "ERA", "era")),
+        "expected_bullpen_innings": 3.5,
+        "recent_workload": {
+            "innings_last_1_days": None,
+            "innings_last_2_days": None,
+            "innings_last_3_days": None,
+            "appearances_last_1_days": None,
+            "appearances_last_2_days": None,
+            "appearances_last_3_days": None,
+            "pitches_last_1_days": None,
+            "pitches_last_2_days": None,
+            "pitches_last_3_days": None,
+            "last_7_day_performance": None,
+            "last_14_day_performance": None,
+            "high_leverage_availability_proxy": None,
+            "expected_bullpen_fatigue_score": None,
+        },
+        "limitation": "team pitching rows are public season context, not true reliever workload splits",
+    }
+    row.raw_payload = {
+        "source_function": _pybaseball_function(source_result),
+        "source_row_count": len(_pybaseball_rows(source_result)),
+        "columns_seen": _pybaseball_columns(source_result),
+        "normalized_team_code": team_code,
+        "synced_at": captured_at.isoformat(),
+        "matched_pitcher_rows": len(rows),
+    }
+    session.add(row)
+    return row
+
+
 def _upsert_lineup(
     session: Session,
     game: MlbGame,
@@ -2201,6 +2752,14 @@ def _new_sync_stats(day: date, include_modules: set[str] | None) -> dict[str, ob
         "feature_version": FEATURE_VERSION,
         "source": FEATURE_VERSION,
         "include_modules": modules,
+        "pybaseball_available": False,
+        "pybaseball_import_error": None,
+        "pybaseball_functions_attempted": [],
+        "pybaseball_rows_seen": 0,
+        "pybaseball_rows_matched": 0,
+        "pybaseball_error_count": 0,
+        "advanced_available_count": 0,
+        "advanced_partial_count": 0,
     }
 
 
@@ -2276,6 +2835,12 @@ def _record_feature_row(stats: dict[str, object], table: str, row: object | None
         stats[bucket_key] = int(stats.get(bucket_key, 0)) + 1
     if isinstance(table_summary, dict):
         table_summary[status] = int(table_summary.get(status, 0)) + 1
+    if getattr(row, "source", None) == PYBASEBALL_SOURCE:
+        stats["pybaseball_rows_matched"] = int(stats.get("pybaseball_rows_matched", 0)) + 1
+        if status == "available":
+            stats["advanced_available_count"] = int(stats.get("advanced_available_count", 0)) + 1
+        elif status == "partial":
+            stats["advanced_partial_count"] = int(stats.get("advanced_partial_count", 0)) + 1
     raw_payload = getattr(row, "raw_payload", None)
     if isinstance(raw_payload, dict) and isinstance(raw_payload.get("error"), dict):
         error = dict(raw_payload["error"])
@@ -2317,6 +2882,7 @@ def _sync_game_feature_modules(
     captured_at: datetime,
     include_modules: set[str] | None,
     stats: dict[str, object],
+    pybaseball_context: dict[str, object],
 ) -> None:
     if include_modules is None or "team" in include_modules:
         for side in ("home", "away"):
@@ -2324,6 +2890,11 @@ def _sync_game_feature_modules(
                 stats,
                 "team_daily_features",
                 _upsert_team_daily(session, game, side, day, captured_at),
+            )
+            _record_feature_row(
+                stats,
+                "team_daily_features",
+                _upsert_pybaseball_team_daily(session, game, side, day, captured_at, pybaseball_context),
             )
             for window in (7, 14, 30):
                 _record_feature_row(
@@ -2338,12 +2909,22 @@ def _sync_game_feature_modules(
                 "pitcher_daily_features",
                 _upsert_pitcher(session, game, side, day, captured_at),
             )
+            _record_feature_row(
+                stats,
+                "pitcher_daily_features",
+                _upsert_pybaseball_pitcher(session, game, side, day, captured_at, pybaseball_context),
+            )
     if include_modules is None or "bullpen" in include_modules:
         for side in ("home", "away"):
             _record_feature_row(
                 stats,
                 "bullpen_daily_features",
                 _upsert_bullpen(session, game, side, day, captured_at),
+            )
+            _record_feature_row(
+                stats,
+                "bullpen_daily_features",
+                _upsert_pybaseball_bullpen(session, game, side, day, captured_at, pybaseball_context),
             )
     if include_modules is None or "lineup" in include_modules:
         for side in ("home", "away"):
@@ -2428,17 +3009,13 @@ def sync_mlb_features(
     stats["games_seen"] = len(games)
     for error in errors:
         _append_error(stats, error)
-    if not pybaseball_available() and requested_modules & {"team", "pitcher", "bullpen"}:
-        _append_warning(
-            stats,
-            "pybaseball is unavailable; advanced public offense/pitching stats are degraded to MLB schedule-derived partial proxies.",
-        )
+    pybaseball_context = _pybaseball_fetch_context(day, requested_modules, stats)
     for game in games:
         if settings.feature_sync_enable_network_sources:
             error = _hydrate_game_endpoint_if_available(game)
             if error:
                 _append_error(stats, error)
-        _sync_game_feature_modules(session, game, day, captured_at, include_modules, stats)
+        _sync_game_feature_modules(session, game, day, captured_at, include_modules, stats, pybaseball_context)
         session.flush()
         mapping = MarketMapping(
             mlb_game_id=game.id or 0,
@@ -2492,6 +3069,13 @@ def sync_mlb_features(
         "hydration_validation_status": stats["hydration_validation_status"],
         "hydration_error_count": stats["hydration_error_count"],
         "hydration_duplicate_count": stats["hydration_duplicate_count"],
+        "pybaseball_available": stats["pybaseball_available"],
+        "pybaseball_functions_attempted": stats["pybaseball_functions_attempted"],
+        "pybaseball_rows_seen": stats["pybaseball_rows_seen"],
+        "pybaseball_rows_matched": stats["pybaseball_rows_matched"],
+        "pybaseball_error_count": stats["pybaseball_error_count"],
+        "advanced_available_count": stats["advanced_available_count"],
+        "advanced_partial_count": stats["advanced_partial_count"],
     }
     for row in snapshot_rows:
         row.features = {**(row.features or {}), "sync_status": sync_status}
@@ -2666,6 +3250,62 @@ def _secret_configured(value: object) -> bool:
     return bool(value)
 
 
+def _pybaseball_db_status(session: Session) -> dict[str, object]:
+    import_info = pybaseball_client.import_status()
+    models = (TeamDailyFeature, TeamRecentFeature, PitcherDailyFeature, BullpenDailyFeature)
+    rows = []
+    for model in models:
+        rows.extend(
+            session.scalars(
+                select(model)
+                .where(model.source == PYBASEBALL_SOURCE)
+                .order_by(model.captured_at.desc())
+                .limit(100)
+            )
+        )
+    rows = sorted(rows, key=lambda row: row.captured_at, reverse=True)[:200]
+    counts: dict[str, int] = {}
+    functions_attempted: list[str] = []
+    last_success = None
+    last_error = None
+    for row in rows:
+        status = str(getattr(row, "source_status", None) or "missing")
+        counts[status] = counts.get(status, 0) + 1
+        if last_success is None and status in {"available", "partial"}:
+            last_success = ensure_aware_utc(row.captured_at).isoformat()
+        raw_payload = getattr(row, "raw_payload", None)
+        if isinstance(raw_payload, dict):
+            function_name = raw_payload.get("source_function")
+            if function_name and str(function_name) not in functions_attempted:
+                functions_attempted.append(str(function_name))
+            if last_error is None and isinstance(raw_payload.get("error"), dict):
+                last_error = raw_payload["error"]
+    if counts.get("available", 0) > 0:
+        advanced_status = "available"
+    elif counts.get("partial", 0) > 0:
+        advanced_status = "partial"
+    elif import_info.get("available"):
+        advanced_status = "degraded_no_cached_pybaseball_rows"
+    else:
+        advanced_status = "unavailable_pybaseball_not_installed"
+    import_error = import_info.get("import_error")
+    return {
+        "pybaseball_available": bool(import_info.get("available")),
+        "pybaseball_version": import_info.get("version"),
+        "pybaseball_module_path": import_info.get("module_path"),
+        "pybaseball_import_error": import_error,
+        "pybaseball_last_import_error": import_error,
+        "pybaseball_last_successful_sync": last_success,
+        "pybaseball_last_error": last_error,
+        "pybaseball_functions_attempted": functions_attempted,
+        "pybaseball_cache_status": "db_cached" if rows else "empty",
+        "advanced_stats_status": advanced_status,
+        "advanced_public_stats_status": advanced_status,
+        "pybaseball_row_sample_count": len(rows),
+        "pybaseball_status_counts": counts,
+    }
+
+
 def source_status_report(session: Session) -> dict[str, object]:
     settings = get_settings()
     table_status = {
@@ -2684,12 +3324,12 @@ def source_status_report(session: Session) -> dict[str, object]:
         if isinstance(error, dict):
             table = str(error.get("table") or "feature_sync")
             table_errors.setdefault(table, error)
+    pybaseball_status = _pybaseball_db_status(session)
     return {
         "feature_sync_enable_network_sources": settings.feature_sync_enable_network_sources,
         "mlb_stats_base_url": settings.mlb_stats_base_url,
         "open_meteo_base_url": settings.open_meteo_base_url,
-        "pybaseball_available": pybaseball_available(),
-        "advanced_public_stats_status": advanced_public_stats_status(),
+        **pybaseball_status,
         "public_sources_enabled": settings.feature_sync_enable_network_sources,
         "optional_injury_provider_configured": _secret_configured(settings.injury_provider_api_key),
         "optional_lineup_provider_configured": _secret_configured(settings.lineup_provider_api_key),

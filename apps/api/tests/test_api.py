@@ -53,6 +53,7 @@ from app.services import (
     mlb_stats_client,
     modeling,
     position_refresh,
+    pybaseball_client,
 )
 from app.services.contracts import selected_team_from_ticker
 from app.services.http_json import HttpJsonError
@@ -87,9 +88,23 @@ def _relax_data_quality_gate(monkeypatch) -> None:
 def _stub_public_feature_network(monkeypatch) -> None:
     monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "true")
     get_settings.cache_clear()
+    _stub_pybaseball_unavailable(monkeypatch)
     monkeypatch.setattr(features, "_hydrate_schedule_window", lambda *_args, **_kwargs: 0)
     monkeypatch.setattr(features, "_hydrate_game_endpoint_if_available", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(features, "_fetch_open_meteo", lambda *_args, **_kwargs: {"hourly": {"time": []}})
+
+
+def _stub_pybaseball_unavailable(monkeypatch) -> None:
+    monkeypatch.setattr(
+        features.pybaseball_client,
+        "import_status",
+        lambda: {
+            "available": False,
+            "version": None,
+            "module_path": None,
+            "import_error": {"error_type": "ImportError", "message": "pybaseball unavailable in this test"},
+        },
+    )
 
 
 def _add_candidate_mapping(
@@ -1184,6 +1199,10 @@ def test_generate_candidates_handles_no_mappings_cleanly(monkeypatch) -> None:
 
     assert result["candidates"] == 0
     assert result["paper_trades"] == 0
+    assert result["zero_trade_reason"] == "no_candidates_missing_mappings"
+    assert result["warnings"] == [
+        "no_candidates_missing_mappings: run Kalshi market discovery and mapping sync for this target date."
+    ]
     assert all_candidates == []
     assert all_trades == []
 
@@ -3364,6 +3383,7 @@ def test_feature_coverage_and_detail_filter_to_active_feature_version() -> None:
 def test_feature_sync_hydrates_final_games_for_backfill(monkeypatch) -> None:
     monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "true")
     get_settings.cache_clear()
+    _stub_pybaseball_unavailable(monkeypatch)
     monkeypatch.setattr(features, "_hydrate_schedule_window", lambda *_args, **_kwargs: 0)
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
@@ -3515,6 +3535,7 @@ def test_schedule_hydration_deduplicates_game_pk_and_updates_existing() -> None:
 def test_team_feature_sync_can_run_twice_without_duplicate_games(monkeypatch) -> None:
     monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "true")
     get_settings.cache_clear()
+    _stub_pybaseball_unavailable(monkeypatch)
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
 
@@ -3568,6 +3589,7 @@ def test_team_feature_sync_can_run_twice_without_duplicate_games(monkeypatch) ->
 def test_feature_sync_returns_degraded_and_records_source_error(monkeypatch) -> None:
     monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "true")
     get_settings.cache_clear()
+    _stub_pybaseball_unavailable(monkeypatch)
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
 
@@ -3623,6 +3645,7 @@ def test_feature_sync_returns_degraded_and_records_source_error(monkeypatch) -> 
 def test_failed_sync_without_game_snapshots_persists_source_audit(monkeypatch) -> None:
     monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "true")
     get_settings.cache_clear()
+    _stub_pybaseball_unavailable(monkeypatch)
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
 
@@ -3731,6 +3754,7 @@ def test_source_status_errors_are_limited_to_latest_sync_attempt() -> None:
 def test_refresh_schedule_false_skips_hydration_when_games_exist(monkeypatch) -> None:
     monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "true")
     get_settings.cache_clear()
+    _stub_pybaseball_unavailable(monkeypatch)
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
     called = {"hydration": 0}
@@ -3769,6 +3793,7 @@ def test_refresh_schedule_false_skips_hydration_when_games_exist(monkeypatch) ->
 def test_full_feature_sync_refreshes_schedule_by_default_with_existing_games(monkeypatch) -> None:
     monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "true")
     get_settings.cache_clear()
+    _stub_pybaseball_unavailable(monkeypatch)
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
     called = {"hydration": 0}
@@ -3814,7 +3839,16 @@ def test_full_feature_sync_refreshes_schedule_by_default_with_existing_games(mon
 
 
 def test_pybaseball_unavailable_is_reported_and_advanced_stats_degraded(monkeypatch) -> None:
-    monkeypatch.setattr(features.importlib.util, "find_spec", lambda name: None)
+    monkeypatch.setattr(
+        features.pybaseball_client,
+        "import_status",
+        lambda: {
+            "available": False,
+            "version": None,
+            "module_path": None,
+            "import_error": {"error_type": "ImportError", "message": "No module named pybaseball"},
+        },
+    )
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
 
@@ -3822,24 +3856,203 @@ def test_pybaseball_unavailable_is_reported_and_advanced_stats_degraded(monkeypa
         report = features.source_status_report(session)
 
     assert report["pybaseball_available"] is False
+    assert report["pybaseball_import_error"]["message"] == "No module named pybaseball"
     assert report["advanced_public_stats_status"] == "unavailable_pybaseball_not_installed"
 
 
-def test_pybaseball_presence_does_not_mark_advanced_stats_available(monkeypatch) -> None:
-    monkeypatch.setattr(features.importlib.util, "find_spec", lambda name: object() if name == "pybaseball" else None)
+def test_pybaseball_import_check_reports_module_metadata(monkeypatch) -> None:
+    class FakePybaseballModule:
+        __version__ = "2.2.7"
+        __file__ = "C:/site-packages/pybaseball/__init__.py"
+
+    monkeypatch.setattr(pybaseball_client.importlib, "import_module", lambda name: FakePybaseballModule())
+
+    status = pybaseball_client.import_status()
+
+    assert status["available"] is True
+    assert status["version"] == "2.2.7"
+    assert status["module_path"] == "C:/site-packages/pybaseball/__init__.py"
+    assert status["import_error"] is None
+
+
+def test_pybaseball_ingestion_writes_available_advanced_rows_and_snapshots(monkeypatch) -> None:
+    monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "true")
+    get_settings.cache_clear()
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
 
-    with Session(engine) as session:
-        report = features.source_status_report(session)
+    monkeypatch.setattr(
+        features.pybaseball_client,
+        "import_status",
+        lambda: {
+            "available": True,
+            "version": "2.2.7",
+            "module_path": "mocked/pybaseball.py",
+            "import_error": None,
+        },
+    )
+    monkeypatch.setattr(
+        features.pybaseball_client,
+        "get_batting_stats",
+        lambda season: {
+            "function": "batting_stats",
+            "rows": [
+                {
+                    "Team": "PIT",
+                    "G": 81,
+                    "R": 365,
+                    "OBP": ".329",
+                    "SLG": ".418",
+                    "ISO": ".171",
+                    "K%": "22.4%",
+                    "BB%": "8.7%",
+                    "HR": 96,
+                    "BABIP": ".302",
+                    "wRC+": 108,
+                    "wOBA": ".323",
+                    "HardHit%": "41.2%",
+                    "Barrel%": "8.1%",
+                    "EV": 89.4,
+                    "LA": 12.1,
+                },
+                {
+                    "Team": "SEA",
+                    "G": 81,
+                    "R": 340,
+                    "OBP": ".316",
+                    "SLG": ".401",
+                    "ISO": ".160",
+                    "K%": "24.1%",
+                    "BB%": "8.1%",
+                    "BABIP": ".295",
+                    "wRC+": 101,
+                    "wOBA": ".315",
+                },
+            ],
+            "row_count": 2,
+            "columns": ["Team", "G", "R", "OBP", "SLG", "ISO", "K%", "BB%", "wRC+", "wOBA"],
+        },
+    )
+    monkeypatch.setattr(
+        features.pybaseball_client,
+        "get_pitching_stats",
+        lambda season: {
+            "function": "pitching_stats",
+            "rows": [
+                {
+                    "Name": "Pitcher 1999",
+                    "Team": "PIT",
+                    "MLBAMID": "1999",
+                    "IP": 102.1,
+                    "ERA": 3.45,
+                    "WHIP": 1.12,
+                    "K%": "26.0%",
+                    "BB%": "7.1%",
+                    "K-BB%": "18.9%",
+                    "HR/9": 0.92,
+                    "FIP": 3.61,
+                    "xFIP": 3.77,
+                    "HardHit%": "35.0%",
+                    "Barrel%": "6.2%",
+                    "GB%": "43.3%",
+                },
+                {
+                    "Name": "Pitcher 2999",
+                    "Team": "SEA",
+                    "MLBAMID": "2999",
+                    "IP": 98.0,
+                    "ERA": 3.88,
+                    "WHIP": 1.21,
+                    "K%": "24.2%",
+                    "BB%": "7.9%",
+                    "FIP": 3.96,
+                },
+            ],
+            "row_count": 2,
+            "columns": ["Name", "Team", "MLBAMID", "IP", "ERA", "WHIP", "K%", "BB%", "FIP"],
+        },
+    )
 
+    def hydrate_schedule(session: Session, day: date, **_kwargs) -> int:
+        session.add(
+            MlbGame(
+                external_game_id="pybaseball-advanced-1",
+                home_team="Pittsburgh Pirates",
+                away_team="Seattle Mariners",
+                home_abbreviation="PIT",
+                away_abbreviation="SEA",
+                scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+                status="scheduled",
+                raw_payload={
+                    "venue": {"id": 31, "name": "PNC Park"},
+                    "teams": {
+                        "home": {"probablePitcher": {"id": 1999, "fullName": "Pitcher 1999"}},
+                        "away": {"probablePitcher": {"id": 2999, "fullName": "Pitcher 2999"}},
+                    },
+                },
+            )
+        )
+        session.flush()
+        return 1
+
+    monkeypatch.setattr(features, "_hydrate_schedule_window", hydrate_schedule)
+    monkeypatch.setattr(features, "_hydrate_game_endpoint_if_available", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(features, "_fetch_open_meteo", lambda *_args, **_kwargs: {"hourly": {"time": []}})
+
+    try:
+        with Session(engine) as session:
+            result = features.sync_mlb_features(session, date(2026, 7, 1))
+            advanced_team = session.scalar(
+                select(TeamDailyFeature)
+                .where(TeamDailyFeature.team_code == "PIT")
+                .where(TeamDailyFeature.source == features.PYBASEBALL_SOURCE)
+            )
+            derived_team = session.scalar(
+                select(TeamDailyFeature)
+                .where(TeamDailyFeature.team_code == "PIT")
+                .where(TeamDailyFeature.source == features.DERIVED_SOURCE)
+            )
+            advanced_pitcher = session.scalar(
+                select(PitcherDailyFeature)
+                .where(PitcherDailyFeature.team_code == "PIT")
+                .where(PitcherDailyFeature.source == features.PYBASEBALL_SOURCE)
+            )
+            snapshot = session.scalar(
+                select(MlbFeatureSnapshot)
+                .where(MlbFeatureSnapshot.source == features.FEATURE_VERSION)
+                .where(MlbFeatureSnapshot.mlb_game_id.is_not(None))
+            )
+            report = features.source_status_report(session)
+    finally:
+        get_settings.cache_clear()
+
+    assert result["pybaseball_available"] is True
+    assert result["pybaseball_functions_attempted"] == ["batting_stats", "pitching_stats"]
+    assert result["pybaseball_rows_seen"] == 4
+    assert result["pybaseball_rows_matched"] >= 4
+    assert result["advanced_available_count"] >= 2
+    assert advanced_team is not None
+    assert advanced_team.source_status == "available"
+    assert advanced_team.features["obp"] == 0.329
+    assert derived_team is not None
+    assert derived_team.source_status in {"missing", "partial"}
+    assert advanced_pitcher is not None
+    assert advanced_pitcher.source_status == "available"
+    assert advanced_pitcher.features["season"]["era"] == 3.45
+    assert snapshot is not None
+    assert snapshot.features["offense_season"]["home"]["source"] == features.PYBASEBALL_SOURCE
+    assert snapshot.features["starter_season"]["home"]["source"] == features.PYBASEBALL_SOURCE
+    assert snapshot.data_quality is not None
+    assert snapshot.data_quality > Decimal("0.3900")
     assert report["pybaseball_available"] is True
-    assert report["advanced_public_stats_status"] == "not_ingested_pybaseball_adapter_not_implemented"
+    assert report["pybaseball_version"] == "2.2.7"
+    assert report["advanced_stats_status"] == "available"
 
 
 def test_weather_sync_handles_open_meteo_failure_without_500(monkeypatch) -> None:
     monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "true")
     get_settings.cache_clear()
+    _stub_pybaseball_unavailable(monkeypatch)
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
 
@@ -3928,6 +4141,7 @@ def test_feature_ingestion_scope_excludes_live_execution_team_totals_and_umpires
 def test_public_feature_sync_writes_raw_tables_from_fixture_payloads(monkeypatch) -> None:
     monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "true")
     get_settings.cache_clear()
+    _stub_pybaseball_unavailable(monkeypatch)
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
 
@@ -5701,14 +5915,217 @@ def test_market_family_discovery_rate_limit_circuit_breaker_finalizes_partial_er
     finally:
         get_settings.cache_clear()
 
-    assert result["status"] == "partial_error"
+    assert result["status"] == "partial_rate_limited"
     assert result["stopped_due_to_rate_limit"] is True
     assert result["rate_limited_count"] >= 1
+    assert result["cooldown_until"] is not None
     assert result["errors"][0]["error"]["upstream_status_code"] == 429
     assert run is not None
-    assert run.status == "partial_error"
+    assert run.status == "partial_rate_limited"
     assert run.completed_at is not None
     assert running_run is None
+
+
+def test_market_family_discovery_uses_recent_cache_unless_force_refresh(monkeypatch) -> None:
+    fixed_now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+    monkeypatch.setattr(market_family_discovery, "utc_now", lambda: fixed_now)
+    monkeypatch.setenv("KALSHI_DISCOVERY_USE_CACHE_FIRST", "true")
+    monkeypatch.setenv("KALSHI_DISCOVERY_SKIP_IF_RECENT_MINUTES", "60")
+    get_settings.cache_clear()
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    class ExplodingClient:
+        def get_markets_by_tickers(self, tickers: list[str]):
+            raise AssertionError("recent cached discovery should skip network calls")
+
+        def get_markets_by_event_ticker(self, event_ticker: str):
+            raise AssertionError("recent cached discovery should skip network calls")
+
+    class CountingClient:
+        def __init__(self) -> None:
+            self.market_batch_calls = 0
+            self.request_count = 0
+            self.rate_limited_count = 0
+            self.retries_attempted = 0
+
+        def get_markets_by_tickers(self, tickers: list[str]):
+            self.market_batch_calls += 1
+            return {"markets": []}
+
+        def get_markets_by_event_ticker(self, event_ticker: str):
+            return {"markets": []}
+
+    try:
+        with Session(engine) as session:
+            session.add_all(
+                [
+                    MlbGame(
+                        external_game_id="cached-discovery-game",
+                        home_team="Pittsburgh Pirates",
+                        away_team="Seattle Mariners",
+                        home_abbreviation="PIT",
+                        away_abbreviation="SEA",
+                        scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+                        status="scheduled",
+                    ),
+                    MarketFamilyDiscoveryRun(
+                        target_date=date(2026, 7, 1),
+                        started_at=fixed_now - timedelta(minutes=5),
+                        completed_at=fixed_now - timedelta(minutes=4),
+                        status="completed",
+                        games_considered=1,
+                        families_considered=6,
+                        markets_found=1,
+                        errors=[],
+                        warnings=[],
+                        raw_summary={
+                            "run_id": 1,
+                            "date": "2026-07-01",
+                            "resolver_mode": market_family_discovery.RESOLVER_MODE,
+                            "status": "completed",
+                            "markets_found": 1,
+                            "warnings": [],
+                            "errors": [],
+                        },
+                    ),
+                ]
+            )
+            session.commit()
+
+            cached = market_family_discovery.run_market_family_discovery(
+                session,
+                date(2026, 7, 1),
+                client=ExplodingClient(),
+            )
+            counting_client = CountingClient()
+            refreshed = market_family_discovery.run_market_family_discovery(
+                session,
+                date(2026, 7, 1),
+                client=counting_client,
+                force_refresh=True,
+            )
+    finally:
+        get_settings.cache_clear()
+
+    assert cached["served_from_cache"] is True
+    assert cached["network_skipped_reason"] == "recent_cached_discovery"
+    assert refreshed["served_from_cache"] is False
+    assert counting_client.market_batch_calls > 0
+
+
+def test_market_family_discovery_cooldown_blocks_repeated_rate_limited_calls(monkeypatch) -> None:
+    fixed_now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+    monkeypatch.setattr(market_family_discovery, "utc_now", lambda: fixed_now)
+    monkeypatch.setenv("KALSHI_DISCOVERY_MAX_429_ERRORS", "1")
+    monkeypatch.setenv("KALSHI_DISCOVERY_COOLDOWN_SECONDS", "300")
+    get_settings.cache_clear()
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    class RateLimitedClient:
+        request_count = 0
+        rate_limited_count = 0
+        retries_attempted = 0
+
+        def get_markets_by_tickers(self, tickers: list[str]):
+            self.request_count += 1
+            raise _kalshi_probe_error(429, "https://kalshi.test/markets")
+
+        def get_markets_by_event_ticker(self, event_ticker: str):
+            raise AssertionError("event fallback should not run after the rate-limit breaker opens")
+
+    class ExplodingClient:
+        def get_markets_by_tickers(self, tickers: list[str]):
+            raise AssertionError("cooldown should skip network calls")
+
+        def get_markets_by_event_ticker(self, event_ticker: str):
+            raise AssertionError("cooldown should skip network calls")
+
+    try:
+        with Session(engine) as session:
+            session.add(
+                MlbGame(
+                    external_game_id="cooldown-discovery-game",
+                    home_team="Pittsburgh Pirates",
+                    away_team="Seattle Mariners",
+                    home_abbreviation="PIT",
+                    away_abbreviation="SEA",
+                    scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+                    status="scheduled",
+                )
+            )
+            session.commit()
+
+            first = market_family_discovery.run_market_family_discovery(
+                session,
+                date(2026, 7, 1),
+                client=RateLimitedClient(),
+                force_refresh=True,
+            )
+            second = market_family_discovery.run_market_family_discovery(
+                session,
+                date(2026, 7, 1),
+                client=ExplodingClient(),
+            )
+    finally:
+        get_settings.cache_clear()
+
+    assert first["status"] == "partial_rate_limited"
+    assert first["cooldown_until"] is not None
+    assert second["served_from_cache"] is True
+    assert second["network_skipped_reason"] == "discovery_cooldown_active"
+
+
+def test_market_family_discovery_respects_configured_batch_size(monkeypatch) -> None:
+    monkeypatch.setenv("KALSHI_DISCOVERY_MAX_BATCH_SIZE", "2")
+    monkeypatch.setenv("KALSHI_DISCOVERY_USE_CACHE_FIRST", "false")
+    get_settings.cache_clear()
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    class BatchTrackingClient:
+        request_count = 0
+        rate_limited_count = 0
+        retries_attempted = 0
+
+        def __init__(self) -> None:
+            self.batch_sizes: list[int] = []
+
+        def get_markets_by_tickers(self, tickers: list[str]):
+            self.batch_sizes.append(len(tickers))
+            return {"markets": []}
+
+        def get_markets_by_event_ticker(self, event_ticker: str):
+            return {"markets": []}
+
+    fake_client = BatchTrackingClient()
+    try:
+        with Session(engine) as session:
+            session.add(
+                MlbGame(
+                    external_game_id="batch-size-discovery-game",
+                    home_team="Pittsburgh Pirates",
+                    away_team="Seattle Mariners",
+                    home_abbreviation="PIT",
+                    away_abbreviation="SEA",
+                    scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+                    status="scheduled",
+                )
+            )
+            session.commit()
+            result = market_family_discovery.run_market_family_discovery(
+                session,
+                date(2026, 7, 1),
+                client=fake_client,
+                force_refresh=True,
+            )
+    finally:
+        get_settings.cache_clear()
+
+    assert result["discovery_batch_size"] == 2
+    assert fake_client.batch_sizes
+    assert max(fake_client.batch_sizes) <= 2
 
 
 def test_market_family_discovery_finalizes_stale_running_runs(monkeypatch) -> None:

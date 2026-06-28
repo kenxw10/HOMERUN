@@ -566,11 +566,12 @@ def run_training_eligibility_repair(_: None = Depends(require_internal_api_key))
 @app.post("/v1/run/market-family-discovery", response_model=RunResponse)
 def run_market_family_discovery_endpoint(
     target_date: date | None = Query(default=None),
+    force_refresh: bool = Query(default=False),
     _: None = Depends(require_internal_api_key),
 ) -> RunResponse:
     with _db_session_or_503() as session:
         try:
-            result = run_market_family_discovery(session, target_date)
+            result = run_market_family_discovery(session, target_date, force_refresh=force_refresh)
         except Exception as exc:
             return RunResponse(
                 ok=False,
