@@ -5018,6 +5018,31 @@ def test_statcast_team_rows_use_pybaseball_team_aliases(monkeypatch) -> None:
     assert context["team_contact_by_code"]["CWS"]["batted_ball_events_count"] == 30
 
 
+def test_statcast_contact_uses_all_release_speed_and_numeric_barrels() -> None:
+    contact = features._aggregate_statcast_contact(
+        [
+            {"release_speed": 95.0},
+            {
+                "release_speed": 97.0,
+                "launch_speed": 100.0,
+                "launch_angle": 24.0,
+                "launch_speed_angle": 6.0,
+            },
+            {
+                "launch_speed": 88.0,
+                "launch_angle": 10.0,
+                "launch_speed_angle": "barrel",
+            },
+        ]
+    )
+
+    assert contact["batted_ball_events_count"] == 2
+    assert contact["average_exit_velocity"] == 94.0
+    assert contact["average_release_speed"] == 96.0
+    assert contact["barrel_count"] == 2
+    assert contact["barrel_pct"] == 1.0
+
+
 def test_weather_sync_handles_open_meteo_failure_without_500(monkeypatch) -> None:
     monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "true")
     get_settings.cache_clear()

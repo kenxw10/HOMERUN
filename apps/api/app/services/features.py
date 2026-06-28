@@ -1207,23 +1207,33 @@ def _statcast_date_range(day: date) -> tuple[date, date] | None:
     return start, end
 
 
+def _is_statcast_barrel_code(value: object) -> bool:
+    normalized = str(value or "").strip().lower()
+    if normalized in {"barrel", "barrels"}:
+        return True
+    parsed = _decimal(value)
+    return parsed == Decimal("6.0000")
+
+
 def _aggregate_statcast_contact(rows: list[dict[str, object]]) -> dict[str, object]:
     bbe_rows = [row for row in rows if _decimal_stat(row, "launch_speed") is not None or _decimal_stat(row, "launch_angle") is not None]
     bbe_count = len(bbe_rows)
 
-    def average(*names: str) -> float | None:
-        values = [_decimal_stat(row, *names) for row in bbe_rows]
+    def average_over(source_rows: list[dict[str, object]], *names: str) -> float | None:
+        values = [_decimal_stat(row, *names) for row in source_rows]
         present = [value for value in values if value is not None]
         if not present:
             return None
         return _float((sum(present) / Decimal(len(present))).quantize(Decimal("0.0001")))
 
+    def average_bbe(*names: str) -> float | None:
+        return average_over(bbe_rows, *names)
+
     hard_hit_count = sum(1 for row in bbe_rows if (_decimal_stat(row, "launch_speed") or Decimal("0")) >= Decimal("95"))
     barrel_count = 0
     bb_mix = {"ground_ball": 0, "fly_ball": 0, "line_drive": 0, "popup": 0}
     for row in bbe_rows:
-        launch_speed_angle = str(row.get("launch_speed_angle") or "").lower()
-        if launch_speed_angle in {"6", "barrel", "barrels"}:
+        if _is_statcast_barrel_code(row.get("launch_speed_angle")):
             barrel_count += 1
         bb_type = str(row.get("bb_type") or "").lower()
         if bb_type in {"ground_ball", "fly_ball", "line_drive", "popup"}:
@@ -1232,20 +1242,20 @@ def _aggregate_statcast_contact(rows: list[dict[str, object]]) -> dict[str, obje
         "source": STATCAST_SOURCE,
         "row_count": len(rows),
         "batted_ball_events_count": bbe_count,
-        "average_exit_velocity": average("launch_speed"),
-        "average_launch_angle": average("launch_angle"),
+        "average_exit_velocity": average_bbe("launch_speed"),
+        "average_launch_angle": average_bbe("launch_angle"),
         "hard_hit_count": hard_hit_count,
         "hard_hit_pct": _float(_ratio(hard_hit_count, bbe_count)),
         "barrel_count": barrel_count,
         "barrel_pct": _float(_ratio(barrel_count, bbe_count)),
-        "estimated_woba_contact": average("estimated_woba_using_speedangle"),
-        "xba_proxy": average("estimated_ba_using_speedangle"),
-        "woba_observed": average("woba_value"),
-        "iso_allowed_proxy": average("iso_value"),
-        "babip_value": average("babip_value"),
+        "estimated_woba_contact": average_bbe("estimated_woba_using_speedangle"),
+        "xba_proxy": average_bbe("estimated_ba_using_speedangle"),
+        "woba_observed": average_bbe("woba_value"),
+        "iso_allowed_proxy": average_bbe("iso_value"),
+        "babip_value": average_bbe("babip_value"),
         "sweet_spot_pct": _float(_ratio(sum(1 for row in bbe_rows if Decimal("8") <= (_decimal_stat(row, "launch_angle") or Decimal("-999")) <= Decimal("32")), bbe_count)),
         "batted_ball_mix": bb_mix,
-        "average_release_speed": average("release_speed"),
+        "average_release_speed": average_over(rows, "release_speed"),
         "source_columns_seen": sorted({str(key) for row in rows for key in row}),
     }
 
