@@ -5160,6 +5160,49 @@ def test_statcast_team_rows_use_pybaseball_team_aliases(monkeypatch) -> None:
     assert context["team_contact_by_code"]["CWS"]["batted_ball_events_count"] == 30
 
 
+def test_statcast_team_rows_derive_batting_team_from_inning_half(monkeypatch) -> None:
+    monkeypatch.setattr(
+        features.pybaseball_client,
+        "import_status",
+        lambda: {"available": True, "version": "2.2.7", "module_path": "mocked", "import_error": None},
+    )
+    monkeypatch.setattr(
+        features.pybaseball_client,
+        "get_statcast_range",
+        lambda *_args, **_kwargs: {
+            "rows": [
+                {
+                    "home_team": "PIT",
+                    "away_team": "CHW",
+                    "inning_topbot": "Top",
+                    "launch_speed": 96,
+                    "launch_angle": 18,
+                }
+                for _ in range(30)
+            ]
+            + [
+                {
+                    "home_team": "PIT",
+                    "away_team": "CHW",
+                    "inning_topbot": "Bot",
+                    "launch_speed": 91,
+                    "launch_angle": 12,
+                }
+                for _ in range(30)
+            ]
+        },
+    )
+
+    stats = features._new_sync_stats(date(2026, 6, 24), {"team"})
+    context = features._statcast_fetch_context([], date(2026, 6, 24), {"team"}, stats)
+
+    assert "CWS" in context["team_contact_by_code"]
+    assert "PIT" in context["team_contact_by_code"]
+    assert context["team_contact_by_code"]["CWS"]["batted_ball_events_count"] == 30
+    assert context["team_contact_by_code"]["PIT"]["batted_ball_events_count"] == 30
+    assert stats["statcast_rows_matched"] == 60
+
+
 def test_statcast_contact_uses_all_release_speed_and_numeric_barrels() -> None:
     contact = features._aggregate_statcast_contact(
         [

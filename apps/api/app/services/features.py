@@ -1265,6 +1265,19 @@ def _statcast_status(contact: dict[str, object] | None) -> str:
     return "missing"
 
 
+def _statcast_batting_team_code(row: dict[str, object]) -> str | None:
+    direct = _canonical_public_team_code(_row_value(row, "bat_team"))
+    if direct:
+        return direct
+
+    inning_half = str(_row_value(row, "inning_topbot") or "").strip().lower()
+    if inning_half.startswith("top") or inning_half == "t":
+        return _canonical_public_team_code(_row_value(row, "away_team"))
+    if inning_half.startswith("bot") or inning_half in {"bottom", "b"}:
+        return _canonical_public_team_code(_row_value(row, "home_team"))
+    return None
+
+
 def _statcast_fetch_context(
     games: list[MlbGame],
     day: date,
@@ -1291,8 +1304,7 @@ def _statcast_fetch_context(
             stats["statcast_rows_seen"] = int(stats.get("statcast_rows_seen", 0)) + len(rows)
             by_team: dict[str, list[dict[str, object]]] = {}
             for row in rows:
-                team_code = row.get("bat_team")
-                normalized = _canonical_public_team_code(team_code)
+                normalized = _statcast_batting_team_code(row)
                 if normalized:
                     by_team.setdefault(normalized, []).append(row)
             context["team_contact_by_code"] = {
