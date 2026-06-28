@@ -30,7 +30,10 @@ from app.models import (
     ModelPredictionOutput,
     ModelPredictionRun,
     ModelVersion,
+    JobRun,
+    MarketDataWorkerStatus,
     PaperTrade,
+    PaperTradingEpoch,
     Position,
     Settlement,
     TeamDailyFeature,
@@ -55,6 +58,7 @@ from app.services import (
     modeling,
     position_refresh,
     pybaseball_client,
+    ws_market_data,
 )
 from app.services.contracts import selected_team_from_ticker
 from app.services.http_json import HttpJsonError
@@ -68,6 +72,8 @@ from app.services.kalshi_mlb_resolver import (
 )
 from app.services.mapping import infer_market_type, score_mapping, sync_market_mappings
 from app.services.modeling import run_model_governance
+from app.services.job_runs import run_job
+from app.services.paper_epoch import RESET_CONFIRMATION, get_or_create_active_paper_epoch, reset_paper_trading_epoch
 from app.services.settlement import settle_paper_trades
 from app.time_utils import classify_time_bucket, eastern_display
 
@@ -83,6 +89,7 @@ def _clear_settings_cache_between_tests():
 
 def _relax_data_quality_gate(monkeypatch) -> None:
     monkeypatch.setenv("PAPER_MIN_DATA_QUALITY", "0")
+    monkeypatch.setenv("PAPER_OBSERVATION_MIN_DATA_QUALITY", "0")
     get_settings.cache_clear()
 
 
@@ -156,6 +163,10 @@ def _add_candidate_mapping(
     return mapping
 
 
+def _active_epoch_id(session: Session) -> int:
+    return get_or_create_active_paper_epoch(session).id
+
+
 def _fixed_model_score(
     probability: str = "0.800000",
     *,
@@ -217,6 +228,63 @@ def test_dashboard_summary_shape_is_empty_and_safe() -> None:
     assert payload["bot"]["live_trading_enabled"] is False
     assert payload["bot"]["execution_kill_switch"] is True
     assert payload["model_status"]["candidate_count"] == 0
+
+
+def test_paper_epoch_reset_archives_old_rows_and_starts_at_500() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        epoch = get_or_create_active_paper_epoch(session, starting_balance=Decimal("1000.00"))
+        trade = PaperTrade(
+            paper_trading_epoch_id=epoch.id,
+            market_ticker="KXMLBGAME-RESET-PIT",
+            contract_side="yes",
+            entry_price=Decimal("0.4000"),
+            current_price=Decimal("0.4000"),
+            quantity=1,
+            entry_time=datetime(2026, 7, 1, 12, 0, tzinfo=UTC),
+            status="open",
+        )
+        session.add(trade)
+        session.commit()
+
+        with pytest.raises(ValueError):
+            reset_paper_trading_epoch(
+                session,
+                archive_current_as="pre_pr3d_validation",
+                new_epoch="pr3d_paper_observation_v1",
+                starting_balance=Decimal("500.00"),
+                archive_open_positions=True,
+                reset_dashboard_metrics=True,
+                confirmation="WRONG",
+            )
+
+        result = reset_paper_trading_epoch(
+            session,
+            archive_current_as="pre_pr3d_validation",
+            new_epoch="pr3d_paper_observation_v1",
+            starting_balance=Decimal("500.00"),
+            archive_open_positions=True,
+            reset_dashboard_metrics=True,
+            confirmation=RESET_CONFIRMATION,
+        )
+        summary = dashboard.dashboard_summary_from_db(session)
+        archived_trade = session.scalar(select(PaperTrade).where(PaperTrade.market_ticker == "KXMLBGAME-RESET-PIT"))
+
+    assert result["new_epoch_key"] == "pr3d_paper_observation_v1"
+    assert result["starting_balance"] == 500.0
+    assert result["new_balance_snapshot_id"] is not None
+    assert archived_trade is not None
+    assert archived_trade.status == "archived"
+    assert summary.active_epoch is not None
+    assert summary.active_epoch.epoch_key == "pr3d_paper_observation_v1"
+    assert summary.portfolio_value == 500.0
+    assert summary.cash_balance == 500.0
+    assert summary.positions == []
+    assert summary.closed_positions == []
+    assert summary.performance.record == "0-0-0"
+    assert summary.performance.profit_loss == 0.0
 
 
 def test_system_status_redacts_secrets_and_allows_missing_database() -> None:
@@ -539,6 +607,200 @@ def test_generate_candidates_preserves_traded_candidate_snapshot(monkeypatch) ->
     assert all_candidates[0].executable_price == Decimal("0.4000")
     assert all_candidates[1].executable_price == Decimal("0.3500")
     assert all_candidates[1].decision == "candidate_only_existing_trade"
+
+
+def test_generate_candidates_records_quality_gate_counterfactual(monkeypatch) -> None:
+    monkeypatch.setenv("PAPER_OBSERVATION_MIN_DATA_QUALITY", "0.55")
+    get_settings.cache_clear()
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+    monkeypatch.setattr(candidates, "utc_now", lambda: now)
+    monkeypatch.setattr(
+        candidates,
+        "score_mature_candidate",
+        lambda *_args, **_kwargs: _fixed_model_score("0.800000", data_quality="0.5000"),
+    )
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        get_or_create_active_paper_epoch(session, starting_balance=Decimal("500.00"))
+        game = MlbGame(
+            external_game_id="quality-gate-1",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 2, 23, 0, tzinfo=UTC),
+            status="scheduled",
+        )
+        market = KalshiMarket(
+            kalshi_market_id="KX-QUALITY-GATE",
+            ticker="KXMLBGAME-QUALITY-PIT",
+            title="Will the Pittsburgh Pirates win?",
+            status="open",
+            implied_yes_ask=Decimal("0.4000"),
+            market_price_updated_at=now,
+        )
+        session.add_all([game, market])
+        _add_candidate_mapping(session, game, market, market_family="full_game_winner", market_type="full_game_winner")
+        session.commit()
+
+        result = candidates.generate_candidates(session, target_date=date(2026, 7, 2))
+        candidate = session.scalar(select(ModelCandidate).order_by(ModelCandidate.id.desc()).limit(1))
+
+    assert result["paper_trades"] == 0
+    assert result["blocked_by_quality_only"] == 1
+    assert result["would_pass_ev_if_quality_allowed"] == 1
+    assert result["ev_edge_pass_but_quality_fail"] == 1
+    assert candidate is not None
+    assert candidate.decision == "no_trade_low_data_quality"
+    assert candidate.gate_data_quality_ok is False
+    assert candidate.counterfactual_trade_eligible_before_quality is True
+
+
+def test_fixed_risk_sizing_uses_active_epoch_bankroll(monkeypatch) -> None:
+    _relax_data_quality_gate(monkeypatch)
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+    monkeypatch.setattr(candidates, "utc_now", lambda: now)
+    monkeypatch.setattr(candidates, "score_mature_candidate", lambda *_args, **_kwargs: _fixed_model_score("0.800000"))
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        get_or_create_active_paper_epoch(session, starting_balance=Decimal("500.00"))
+        game = MlbGame(
+            external_game_id="sizing-1",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 2, 23, 0, tzinfo=UTC),
+            status="scheduled",
+        )
+        market = KalshiMarket(
+            kalshi_market_id="KX-SIZING",
+            ticker="KXMLBGAME-SIZING-PIT",
+            title="Will the Pittsburgh Pirates win?",
+            status="open",
+            implied_yes_ask=Decimal("0.4000"),
+            market_price_updated_at=now,
+        )
+        session.add_all([game, market])
+        _add_candidate_mapping(session, game, market, market_family="full_game_winner", market_type="full_game_winner")
+        session.commit()
+
+        result = candidates.generate_candidates(session, target_date=date(2026, 7, 2))
+        trade = session.scalar(select(PaperTrade).where(PaperTrade.market_ticker == "KXMLBGAME-SIZING-PIT"))
+        candidate = session.get(ModelCandidate, trade.candidate_id) if trade else None
+
+    assert result["paper_trades"] == 1
+    assert trade is not None
+    assert candidate is not None
+    assert trade.quantity > 1
+    assert trade.bankroll_at_entry == Decimal("500.00")
+    assert trade.risk_pct == Decimal("0.025000")
+    assert trade.estimated_total_cost is not None
+    assert candidate.one_contract_expected_value is not None
+    assert candidate.sized_expected_value is not None
+
+
+def test_job_lock_skips_existing_running_job() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    target = date(2026, 7, 2)
+
+    with Session(engine) as session:
+        epoch = get_or_create_active_paper_epoch(session)
+        running = JobRun(
+            job_name="price-refresh",
+            job_type="paper_ops",
+            target_date=target,
+            paper_trading_epoch_id=epoch.id,
+            status="running",
+            started_at=datetime(2026, 7, 2, 12, 0, tzinfo=UTC),
+            heartbeat_at=datetime(2026, 7, 2, 12, 0, tzinfo=UTC),
+            lock_key="price-refresh:2026-07-02",
+            triggered_by="cron",
+        )
+        session.add(running)
+        session.commit()
+        running_id = running.id
+
+        result = run_job(session, job_name="price-refresh", target_date=target, triggered_by="api")
+        skipped = session.scalar(select(JobRun).where(JobRun.status == "skipped"))
+
+    assert result["status"] == "skipped"
+    assert result["skipped_reason"] == "skipped_existing_run"
+    assert skipped is not None
+    assert skipped.result["existing_run_id"] == running_id
+
+
+def test_websocket_market_update_only_marks_active_epoch_trade() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+
+    with Session(engine) as session:
+        active = get_or_create_active_paper_epoch(session, starting_balance=Decimal("500.00"))
+        archived = PaperTradingEpoch(
+            epoch_key="archived-test",
+            display_name="ARCHIVED TEST",
+            status="archived",
+            mode="paper",
+            starting_balance=Decimal("1000.00"),
+            started_at=now,
+            archived_at=now,
+        )
+        market = KalshiMarket(
+            kalshi_market_id="KX-WS",
+            ticker="KXMLBGAME-WS-PIT",
+            title="Will Pittsburgh win?",
+            status="open",
+        )
+        active_trade = PaperTrade(
+            paper_trading_epoch_id=active.id,
+            market_ticker="KXMLBGAME-WS-PIT",
+            contract_side="yes",
+            entry_price=Decimal("0.4000"),
+            current_price=Decimal("0.4000"),
+            quantity=1,
+            entry_time=now,
+            status="open",
+        )
+        archived_trade = PaperTrade(
+            paper_trading_epoch_id=None,
+            market_ticker="KXMLBGAME-WS-PIT",
+            contract_side="yes",
+            entry_price=Decimal("0.4000"),
+            current_price=Decimal("0.4000"),
+            quantity=1,
+            entry_time=now,
+            status="open",
+        )
+        session.add_all([archived, market, active_trade, archived_trade])
+        session.flush()
+        archived_trade.paper_trading_epoch_id = archived.id
+        session.commit()
+
+        result = ws_market_data.apply_ws_market_update(
+            session,
+            "KXMLBGAME-WS-PIT",
+            {"market_ticker": "KXMLBGAME-WS-PIT", "best_yes_bid": "0.5500"},
+        )
+        status_row = session.scalar(select(MarketDataWorkerStatus).where(MarketDataWorkerStatus.status_key == "kalshi_ws_paper"))
+        session.commit()
+        active_price = active_trade.current_price
+        archived_price = archived_trade.current_price
+        market_source = market.market_data_source
+        status_source = status_row.source if status_row else None
+
+    assert result["updated"] is True
+    assert result["updated_trades"] == 1
+    assert active_price == Decimal("0.5500")
+    assert archived_price == Decimal("0.4000")
+    assert market_source == "websocket"
+    assert status_row is not None
+    assert status_source == "websocket"
 
 
 def test_generate_candidates_avoids_duplicate_open_trade_across_days(monkeypatch) -> None:
@@ -2310,10 +2572,12 @@ def test_dashboard_uses_newest_portfolio_snapshots() -> None:
     captured_at = datetime(2026, 7, 1, 12, 0, tzinfo=UTC)
 
     with Session(engine) as session:
+        epoch_id = _active_epoch_id(session)
         for index in range(501):
             value = Decimal(index)
             session.add(
                 BalanceSnapshot(
+                    paper_trading_epoch_id=epoch_id,
                     captured_at=captured_at + timedelta(minutes=index),
                     cash_balance=value,
                     portfolio_value=value,
@@ -2369,6 +2633,7 @@ def test_dashboard_includes_paper_trades_alongside_positions() -> None:
     Base.metadata.create_all(engine)
 
     with Session(engine) as session:
+        epoch_id = _active_epoch_id(session)
         session.add(
             Position(
                 market_ticker="KXMLB-POSITION",
@@ -2382,6 +2647,7 @@ def test_dashboard_includes_paper_trades_alongside_positions() -> None:
         )
         session.add(
             PaperTrade(
+                paper_trading_epoch_id=epoch_id,
                 market_ticker="KXMLB-TRADE",
                 contract_side="yes",
                 entry_price=Decimal("0.4000"),
@@ -2393,6 +2659,7 @@ def test_dashboard_includes_paper_trades_alongside_positions() -> None:
         )
         session.add(
             PaperTrade(
+                paper_trading_epoch_id=epoch_id,
                 market_ticker="KXMLB-POSITION",
                 contract_side="yes",
                 entry_price=Decimal("0.5000"),
@@ -2404,7 +2671,7 @@ def test_dashboard_includes_paper_trades_alongside_positions() -> None:
         )
         session.commit()
 
-        summary = dashboard.dashboard_summary_from_db(session)
+        summary = dashboard.dashboard_summary_from_db(session, include_archived=True)
 
     markets = [position.market for position in summary.positions]
     assert markets == ["KXMLB-POSITION", "KXMLB-TRADE"]
@@ -2415,9 +2682,11 @@ def test_dashboard_summary_filters_closed_positions_by_selected_date() -> None:
     Base.metadata.create_all(engine)
 
     with Session(engine) as session:
+        epoch_id = _active_epoch_id(session)
         session.add_all(
             [
                 PaperTrade(
+                    paper_trading_epoch_id=epoch_id,
                     market_ticker="KXMLBGAME-CLOSED-JULY1-PIT",
                     contract_side="yes",
                     entry_price=Decimal("0.4000"),
@@ -2432,6 +2701,7 @@ def test_dashboard_summary_filters_closed_positions_by_selected_date() -> None:
                     realized_pnl=Decimal("0.60"),
                 ),
                 PaperTrade(
+                    paper_trading_epoch_id=epoch_id,
                     market_ticker="KXMLBGAME-CLOSED-JULY2-PIT",
                     contract_side="yes",
                     entry_price=Decimal("0.4000"),
@@ -2497,6 +2767,7 @@ def test_paper_settlement_sync_settles_wins_losses_and_is_idempotent() -> None:
     settled_at = datetime(2026, 7, 2, 4, 0, tzinfo=UTC)
 
     with Session(engine) as session:
+        epoch_id = _active_epoch_id(session)
         game = MlbGame(
             external_game_id="settle-1",
             home_team="Pittsburgh Pirates",
@@ -2537,6 +2808,7 @@ def test_paper_settlement_sync_settles_wins_losses_and_is_idempotent() -> None:
         session.add_all([win_mapping, loss_mapping])
         session.flush()
         win_candidate = ModelCandidate(
+            paper_trading_epoch_id=epoch_id,
             mlb_game_id=game.id,
             kalshi_market_id=win_market.id,
             mapping_id=win_mapping.id,
@@ -2546,6 +2818,7 @@ def test_paper_settlement_sync_settles_wins_losses_and_is_idempotent() -> None:
             market_type="full_game_winner",
         )
         loss_candidate = ModelCandidate(
+            paper_trading_epoch_id=epoch_id,
             mlb_game_id=game.id,
             kalshi_market_id=loss_market.id,
             mapping_id=loss_mapping.id,
@@ -2555,6 +2828,7 @@ def test_paper_settlement_sync_settles_wins_losses_and_is_idempotent() -> None:
             market_type="full_game_winner",
         )
         no_trade_candidate = ModelCandidate(
+            paper_trading_epoch_id=epoch_id,
             mlb_game_id=game.id,
             kalshi_market_id=win_market.id,
             mapping_id=win_mapping.id,
@@ -2569,6 +2843,7 @@ def test_paper_settlement_sync_settles_wins_losses_and_is_idempotent() -> None:
         session.add_all(
             [
                 PaperTrade(
+                    paper_trading_epoch_id=epoch_id,
                     candidate_id=win_candidate.id,
                     market_ticker=win_market.ticker,
                     contract_side="yes",
@@ -2579,6 +2854,7 @@ def test_paper_settlement_sync_settles_wins_losses_and_is_idempotent() -> None:
                     status="open",
                 ),
                 PaperTrade(
+                    paper_trading_epoch_id=epoch_id,
                     candidate_id=loss_candidate.id,
                     market_ticker=loss_market.ticker,
                     contract_side="yes",
@@ -2621,6 +2897,7 @@ def test_paper_settlement_leaves_untrusted_ticker_selection_unresolved() -> None
     Base.metadata.create_all(engine)
 
     with Session(engine) as session:
+        epoch_id = _active_epoch_id(session)
         game = MlbGame(
             external_game_id="settle-invalid-selection-1",
             home_team="Pittsburgh Pirates",
@@ -2649,6 +2926,7 @@ def test_paper_settlement_leaves_untrusted_ticker_selection_unresolved() -> None
         session.add(mapping)
         session.flush()
         candidate = ModelCandidate(
+            paper_trading_epoch_id=epoch_id,
             mlb_game_id=game.id,
             kalshi_market_id=market.id,
             mapping_id=mapping.id,
@@ -2661,6 +2939,7 @@ def test_paper_settlement_leaves_untrusted_ticker_selection_unresolved() -> None
         session.add(candidate)
         session.flush()
         trade = PaperTrade(
+            paper_trading_epoch_id=epoch_id,
             candidate_id=candidate.id,
             market_ticker=market.ticker,
             contract_side="yes",
@@ -2691,6 +2970,7 @@ def test_paper_settlement_keeps_suspended_games_open() -> None:
     Base.metadata.create_all(engine)
 
     with Session(engine) as session:
+        epoch_id = _active_epoch_id(session)
         game = MlbGame(
             external_game_id="settle-suspended-1",
             home_team="Pittsburgh Pirates",
@@ -2719,6 +2999,7 @@ def test_paper_settlement_keeps_suspended_games_open() -> None:
         session.add(mapping)
         session.flush()
         candidate = ModelCandidate(
+            paper_trading_epoch_id=epoch_id,
             mlb_game_id=game.id,
             kalshi_market_id=market.id,
             mapping_id=mapping.id,
@@ -2731,6 +3012,7 @@ def test_paper_settlement_keeps_suspended_games_open() -> None:
         session.add(candidate)
         session.flush()
         trade = PaperTrade(
+            paper_trading_epoch_id=epoch_id,
             candidate_id=candidate.id,
             market_ticker=market.ticker,
             contract_side="yes",
@@ -2762,6 +3044,7 @@ def test_paper_settlement_handles_spread_total_and_first_five_families() -> None
     Base.metadata.create_all(engine)
 
     with Session(engine) as session:
+        epoch_id = _active_epoch_id(session)
         game = MlbGame(
             external_game_id="settle-pr3b-families",
             home_team="Pittsburgh Pirates",
@@ -2826,6 +3109,7 @@ def test_paper_settlement_handles_spread_total_and_first_five_families() -> None
             )
             session.flush()
             candidate = ModelCandidate(
+                paper_trading_epoch_id=epoch_id,
                 mlb_game_id=game.id,
                 kalshi_market_id=market.id,
                 mapping_id=mapping.id,
@@ -2845,6 +3129,7 @@ def test_paper_settlement_handles_spread_total_and_first_five_families() -> None
             session.flush()
             session.add(
                 PaperTrade(
+                    paper_trading_epoch_id=epoch_id,
                     candidate_id=candidate.id,
                     market_ticker=ticker,
                     contract_side="yes",
@@ -2909,6 +3194,7 @@ def test_paper_settlement_skips_first_five_without_linescore() -> None:
     Base.metadata.create_all(engine)
 
     with Session(engine) as session:
+        epoch_id = _active_epoch_id(session)
         game = MlbGame(
             external_game_id="settle-missing-f5-linescore",
             home_team="Pittsburgh Pirates",
@@ -2945,6 +3231,7 @@ def test_paper_settlement_skips_first_five_without_linescore() -> None:
         )
         session.flush()
         candidate = ModelCandidate(
+            paper_trading_epoch_id=epoch_id,
             mlb_game_id=game.id,
             kalshi_market_id=market.id,
             mapping_id=mapping.id,
@@ -2960,6 +3247,7 @@ def test_paper_settlement_skips_first_five_without_linescore() -> None:
         session.add(candidate)
         session.flush()
         trade = PaperTrade(
+            paper_trading_epoch_id=epoch_id,
             candidate_id=candidate.id,
             market_ticker=market.ticker,
             contract_side="yes",
@@ -2991,6 +3279,7 @@ def test_dashboard_summary_uses_labels_snapshots_and_settled_performance() -> No
     opened_at = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
 
     with Session(engine) as session:
+        epoch_id = _active_epoch_id(session)
         game = MlbGame(
             external_game_id="dashboard-pr3-1",
             home_team="Pittsburgh Pirates",
@@ -3017,6 +3306,7 @@ def test_dashboard_summary_uses_labels_snapshots_and_settled_performance() -> No
         session.add(mapping)
         session.flush()
         candidate = ModelCandidate(
+            paper_trading_epoch_id=epoch_id,
             mlb_game_id=game.id,
             kalshi_market_id=market.id,
             mapping_id=mapping.id,
@@ -3030,6 +3320,7 @@ def test_dashboard_summary_uses_labels_snapshots_and_settled_performance() -> No
         session.add_all(
             [
                 PaperTrade(
+                    paper_trading_epoch_id=epoch_id,
                     candidate_id=candidate.id,
                     market_ticker=market.ticker,
                     contract_side="yes",
@@ -3045,6 +3336,7 @@ def test_dashboard_summary_uses_labels_snapshots_and_settled_performance() -> No
                     matchup_display="SEA @ PIT",
                 ),
                 PaperTrade(
+                    paper_trading_epoch_id=epoch_id,
                     market_ticker="KXMLBGAME-SETTLED-PIT",
                     contract_side="yes",
                     entry_price=Decimal("0.4000"),
@@ -3057,6 +3349,7 @@ def test_dashboard_summary_uses_labels_snapshots_and_settled_performance() -> No
                     resolution="WIN",
                 ),
                 BalanceSnapshot(
+                    paper_trading_epoch_id=epoch_id,
                     captured_at=opened_at,
                     cash_balance=Decimal("999.60"),
                     portfolio_value=Decimal("1000.15"),
@@ -3089,8 +3382,10 @@ def test_dashboard_trade_caps_use_today_prediction_run(monkeypatch) -> None:
     Base.metadata.create_all(engine)
 
     with Session(engine) as session:
+        epoch_id = _active_epoch_id(session)
         session.add(
             ModelPredictionRun(
+                paper_trading_epoch_id=epoch_id,
                 started_at=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
                 target_date=date(2026, 7, 1),
                 status="completed",
@@ -3105,6 +3400,7 @@ def test_dashboard_trade_caps_use_today_prediction_run(monkeypatch) -> None:
 
         session.add(
             ModelPredictionRun(
+                paper_trading_epoch_id=epoch_id,
                 started_at=datetime(2026, 7, 2, 16, 0, tzinfo=UTC),
                 target_date=date(2026, 7, 2),
                 status="completed",
@@ -3308,6 +3604,7 @@ def test_model_governance_counts_samples_after_settlement_labels_candidates() ->
     Base.metadata.create_all(engine)
 
     with Session(engine) as session:
+        epoch_id = _active_epoch_id(session)
         game = MlbGame(
             external_game_id="governance-after-settlement-1",
             home_team="Pittsburgh Pirates",
@@ -3336,6 +3633,7 @@ def test_model_governance_counts_samples_after_settlement_labels_candidates() ->
         session.add(mapping)
         session.flush()
         candidate = ModelCandidate(
+            paper_trading_epoch_id=epoch_id,
             mlb_game_id=game.id,
             kalshi_market_id=market.id,
             mapping_id=mapping.id,
@@ -6304,6 +6602,7 @@ def test_full_game_winner_probabilities_allocate_tie_mass_to_no_tie_outcomes() -
 def test_pr3c_trade_policy_caps_slate_trades(monkeypatch) -> None:
     monkeypatch.setenv("PAPER_MAX_TRADES_PER_SLATE", "2")
     monkeypatch.setenv("PAPER_MIN_DATA_QUALITY", "0")
+    monkeypatch.setenv("PAPER_OBSERVATION_MIN_DATA_QUALITY", "0")
     get_settings.cache_clear()
     now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
     monkeypatch.setattr(candidates, "utc_now", lambda: now)
@@ -6348,7 +6647,7 @@ def test_pr3c_trade_policy_caps_slate_trades(monkeypatch) -> None:
     assert prediction_run is not None
     assert prediction_run.trade_policy["paper_max_trades_per_slate"] == 2
     assert snapshot is not None
-    assert snapshot.cash_balance == Decimal("999.80")
+    assert snapshot.cash_balance == Decimal("980.00")
     assert snapshot.portfolio_value == Decimal("1000.00")
     assert result["cap_counts"]["no_trade_slate_cap"] == 3
     assert result["decision_counts"] == {"paper_trade": 2, "no_trade_slate_cap": 3}
@@ -6360,6 +6659,7 @@ def test_pr3c_trade_policy_caps_slate_trades(monkeypatch) -> None:
 def test_first_five_tie_markets_still_obey_normal_trade_gates(monkeypatch) -> None:
     monkeypatch.setenv("PAPER_CANDIDATE_ENGINE_ENABLED", "false")
     monkeypatch.setenv("PAPER_MIN_DATA_QUALITY", "0")
+    monkeypatch.setenv("PAPER_OBSERVATION_MIN_DATA_QUALITY", "0")
     monkeypatch.setenv("PAPER_MIN_NET_EV", "0")
     monkeypatch.setenv("PAPER_MIN_PROB_EDGE", "0")
     get_settings.cache_clear()
@@ -6423,6 +6723,7 @@ def test_pr3c_trade_policy_counts_settled_trades_against_daily_caps(monkeypatch)
     monkeypatch.setenv("PAPER_MAX_TRADES_PER_GAME", "1")
     monkeypatch.setenv("PAPER_MAX_TRADES_PER_SLATE", "20")
     monkeypatch.setenv("PAPER_MIN_DATA_QUALITY", "0")
+    monkeypatch.setenv("PAPER_OBSERVATION_MIN_DATA_QUALITY", "0")
     get_settings.cache_clear()
     now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
     monkeypatch.setattr(candidates, "utc_now", lambda: now)
@@ -6432,6 +6733,7 @@ def test_pr3c_trade_policy_counts_settled_trades_against_daily_caps(monkeypatch)
 
     try:
         with Session(engine) as session:
+            epoch_id = _active_epoch_id(session)
             game = MlbGame(
                 external_game_id="settled-cap-game",
                 home_team="Pittsburgh Pirates",
@@ -6453,6 +6755,7 @@ def test_pr3c_trade_policy_counts_settled_trades_against_daily_caps(monkeypatch)
             _add_candidate_mapping(session, game, market)
 
             settled_candidate = ModelCandidate(
+                paper_trading_epoch_id=epoch_id,
                 mlb_game_id=game.id,
                 evaluated_at=now - timedelta(hours=1),
                 features={},
@@ -6463,6 +6766,7 @@ def test_pr3c_trade_policy_counts_settled_trades_against_daily_caps(monkeypatch)
             session.flush()
             session.add(
                 PaperTrade(
+                    paper_trading_epoch_id=epoch_id,
                     candidate_id=settled_candidate.id,
                     market_ticker="KXMLBGAME-SETTLED-CAP-OLD",
                     contract_side="yes",
@@ -6509,6 +6813,7 @@ def test_candidate_less_trade_entry_time_counts_against_slate_cap(monkeypatch) -
 
     try:
         with Session(engine) as session:
+            epoch_id = _active_epoch_id(session)
             game = MlbGame(
                 external_game_id="candidate-less-slate-cap-game",
                 home_team="Pittsburgh Pirates",
@@ -6530,6 +6835,7 @@ def test_candidate_less_trade_entry_time_counts_against_slate_cap(monkeypatch) -
             _add_candidate_mapping(session, game, market)
             session.add(
                 PaperTrade(
+                    paper_trading_epoch_id=epoch_id,
                     candidate_id=None,
                     market_ticker="LEGACY-MANUAL-PAPER-TRADE",
                     contract_side="yes",
@@ -8321,6 +8627,7 @@ def test_open_position_price_refresh_updates_only_open_paper_trades() -> None:
             return {"orderbook": {"yes": [[44, 10]], "no": [[55, 20]]}}
 
     with Session(engine) as session:
+        epoch_id = _active_epoch_id(session)
         market = KalshiMarket(
             kalshi_market_id="KX-REFRESH-OPEN",
             ticker="KXMLBGAME-26JUL011900SEAPIT-PIT",
@@ -8330,6 +8637,7 @@ def test_open_position_price_refresh_updates_only_open_paper_trades() -> None:
         session.add(market)
         session.flush()
         candidate = ModelCandidate(
+            paper_trading_epoch_id=epoch_id,
             kalshi_market_id=market.id,
             evaluated_at=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
             features={},
@@ -8339,6 +8647,7 @@ def test_open_position_price_refresh_updates_only_open_paper_trades() -> None:
         session.add(candidate)
         session.flush()
         open_trade = PaperTrade(
+            paper_trading_epoch_id=epoch_id,
             candidate_id=candidate.id,
             market_ticker=market.ticker,
             contract_side="yes",
@@ -8405,6 +8714,7 @@ def test_open_position_price_refresh_falls_back_to_orderbook_when_batch_quote_mi
             return {"orderbook": {"yes": [[47, 10]], "no": [[52, 20]]}}
 
     with Session(engine) as session:
+        epoch_id = _active_epoch_id(session)
         market = KalshiMarket(
             kalshi_market_id="KX-REFRESH-BATCH-MISS",
             ticker="KXMLBGAME-26JUL011900SEAPIT-PIT",
@@ -8414,6 +8724,7 @@ def test_open_position_price_refresh_falls_back_to_orderbook_when_batch_quote_mi
         session.add(market)
         session.flush()
         candidate = ModelCandidate(
+            paper_trading_epoch_id=epoch_id,
             kalshi_market_id=market.id,
             evaluated_at=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
             features={},
@@ -8423,6 +8734,7 @@ def test_open_position_price_refresh_falls_back_to_orderbook_when_batch_quote_mi
         session.add(candidate)
         session.flush()
         open_trade = PaperTrade(
+            paper_trading_epoch_id=epoch_id,
             candidate_id=candidate.id,
             market_ticker=market.ticker,
             contract_side="yes",
@@ -8470,6 +8782,7 @@ def test_open_position_price_refresh_complements_last_price_for_no_side_batch_ma
             raise AssertionError("last price complement should avoid orderbook fallback")
 
     with Session(engine) as session:
+        epoch_id = _active_epoch_id(session)
         market = KalshiMarket(
             kalshi_market_id="KX-REFRESH-NO-LAST",
             ticker="KXMLBGAME-26JUL011900SEAPIT-PIT",
@@ -8479,6 +8792,7 @@ def test_open_position_price_refresh_complements_last_price_for_no_side_batch_ma
         session.add(market)
         session.flush()
         candidate = ModelCandidate(
+            paper_trading_epoch_id=epoch_id,
             kalshi_market_id=market.id,
             evaluated_at=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
             features={},
@@ -8488,6 +8802,7 @@ def test_open_position_price_refresh_complements_last_price_for_no_side_batch_ma
         session.add(candidate)
         session.flush()
         open_trade = PaperTrade(
+            paper_trading_epoch_id=epoch_id,
             candidate_id=candidate.id,
             market_ticker=market.ticker,
             contract_side="no",
@@ -8520,6 +8835,7 @@ def test_open_position_price_refresh_does_not_stamp_cached_prices_on_orderbook_e
 
     old_mark_time = datetime(2026, 7, 1, 15, 0, tzinfo=UTC)
     with Session(engine) as session:
+        epoch_id = _active_epoch_id(session)
         market = KalshiMarket(
             kalshi_market_id="KX-REFRESH-STALE",
             ticker="KXMLBGAME-26JUL011900SEAPIT-PIT",
@@ -8530,6 +8846,7 @@ def test_open_position_price_refresh_does_not_stamp_cached_prices_on_orderbook_e
         session.add(market)
         session.flush()
         candidate = ModelCandidate(
+            paper_trading_epoch_id=epoch_id,
             kalshi_market_id=market.id,
             evaluated_at=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
             features={},
@@ -8539,6 +8856,7 @@ def test_open_position_price_refresh_does_not_stamp_cached_prices_on_orderbook_e
         session.add(candidate)
         session.flush()
         open_trade = PaperTrade(
+            paper_trading_epoch_id=epoch_id,
             candidate_id=candidate.id,
             market_ticker=market.ticker,
             contract_side="yes",

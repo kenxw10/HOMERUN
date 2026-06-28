@@ -20,6 +20,7 @@ from app.services.contracts import (
     selected_team_from_ticker,
 )
 from app.services.portfolio import create_balance_snapshot
+from app.services.paper_epoch import get_or_create_active_paper_epoch
 from app.time_utils import ensure_aware_utc, get_dashboard_zone, utc_now
 
 FINAL_STATUS_TOKENS = ("final", "game over", "completed")
@@ -313,8 +314,10 @@ def settle_paper_trades(
     target_date: date | None = None,
     *,
     now: datetime | None = None,
+    include_archived: bool = False,
 ) -> dict[str, object]:
     settled_at = now or utc_now()
+    active_epoch = get_or_create_active_paper_epoch(session)
     bounds = _target_bounds(target_date)
     candidate_query = (
         select(ModelCandidate, MarketMapping, MlbGame, KalshiMarket)
@@ -322,6 +325,8 @@ def settle_paper_trades(
         .join(MlbGame, MarketMapping.mlb_game_id == MlbGame.id)
         .join(KalshiMarket, MarketMapping.kalshi_market_id == KalshiMarket.id)
     )
+    if not include_archived:
+        candidate_query = candidate_query.where(ModelCandidate.paper_trading_epoch_id == active_epoch.id)
     if bounds is not None:
         start, end = bounds
         candidate_query = candidate_query.where(MlbGame.scheduled_start >= start).where(MlbGame.scheduled_start < end)
@@ -336,6 +341,8 @@ def settle_paper_trades(
         .join(KalshiMarket, MarketMapping.kalshi_market_id == KalshiMarket.id)
         .where(PaperTrade.status == "open")
     )
+    if not include_archived:
+        query = query.where(PaperTrade.paper_trading_epoch_id == active_epoch.id)
     if bounds is not None:
         start, end = bounds
         query = query.where(MlbGame.scheduled_start >= start).where(MlbGame.scheduled_start < end)
@@ -499,7 +506,7 @@ def settle_paper_trades(
         else:
             result["settled"] = int(result["settled"]) + 1
 
-    snapshot = create_balance_snapshot(session, source="settlement_sync")
+    snapshot = create_balance_snapshot(session, source="settlement_sync", epoch=active_epoch)
     result["snapshot_id"] = snapshot.id
     session.commit()
     return result

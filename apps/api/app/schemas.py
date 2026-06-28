@@ -25,6 +25,37 @@ class PerformanceMetrics(BaseModel):
     record: str
 
 
+class ActiveEpochSummary(BaseModel):
+    epoch_key: str
+    display_name: str
+    status: str
+    mode: str
+    starting_balance: float
+    started_at: str | None = None
+
+
+class JobRunSummary(BaseModel):
+    job_name: str
+    status: str
+    started_at: str | None = None
+    completed_at: str | None = None
+    duration_seconds: int | None = None
+    target_date: str | None = None
+    result: dict[str, object] = Field(default_factory=dict)
+
+
+class WebSocketStatusSummary(BaseModel):
+    enabled: bool
+    running: bool
+    source: str
+    subscribed_market_count: int = 0
+    last_seen_at: str | None = None
+    last_message_at: str | None = None
+    reconnect_count: int = 0
+    stale_count: int = 0
+    last_error: str | None = None
+
+
 class PositionSummary(BaseModel):
     time_entered: str | None = None
     time_entered_display: str | None = None
@@ -90,6 +121,7 @@ class ModelStatus(BaseModel):
 
 
 class DashboardSummary(BaseModel):
+    active_epoch: ActiveEpochSummary | None = None
     portfolio_series: list[PortfolioPoint]
     performance: PerformanceMetrics
     positions: list[PositionSummary]
@@ -101,6 +133,13 @@ class DashboardSummary(BaseModel):
     cash_balance: float | None = None
     portfolio_value: float | None = None
     paper_starting_balance: float | None = None
+    performance_by_scope: dict[str, dict[str, object]] = Field(default_factory=dict)
+    performance_by_family: dict[str, dict[str, object]] = Field(default_factory=dict)
+    decision_breakdown_by_scope: dict[str, dict[str, int]] = Field(default_factory=dict)
+    decision_breakdown_by_family: dict[str, dict[str, int]] = Field(default_factory=dict)
+    latest_candidate_diagnostics: dict[str, object] = Field(default_factory=dict)
+    job_status: dict[str, JobRunSummary] = Field(default_factory=dict)
+    websocket_status: WebSocketStatusSummary | None = None
     last_update: str | None = None
     last_update_display: str | None = None
 
@@ -202,3 +241,12 @@ class RunResponse(BaseModel):
     ok: bool
     action: str
     result: dict[str, object]
+
+
+class PaperEpochResetRequest(BaseModel):
+    archive_current_as: str = "pre_pr3d_validation"
+    new_epoch: str = "pr3d_paper_observation_v1"
+    starting_balance: float = 500.0
+    archive_open_positions: bool = True
+    reset_dashboard_metrics: bool = True
+    confirmation: str

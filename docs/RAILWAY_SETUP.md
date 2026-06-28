@@ -56,9 +56,9 @@ OPEN_POSITION_PRICE_REFRESH_ENABLED=true
 OPEN_POSITION_PRICE_REFRESH_MAX_PER_RUN=100
 PAPER_CANDIDATE_ENGINE_ENABLED=true
 DEFAULT_PAPER_CONTRACTS=1
-PAPER_MAX_TRADES_PER_SLATE=20
+PAPER_MAX_TRADES_PER_SLATE=30
 PAPER_MAX_TRADES_PER_GAME=3
-PAPER_MAX_TRADES_PER_MARKET_FAMILY=8
+PAPER_MAX_TRADES_PER_MARKET_FAMILY=15
 PAPER_MAX_TRADES_PER_GAME_FAMILY=1
 PAPER_ALLOW_MULTIPLE_LINES_PER_GAME_FAMILY=false
 PAPER_ALLOW_MULTIPLE_F5_WINNER_OUTCOMES=false
@@ -66,14 +66,29 @@ PAPER_MAX_OPEN_POSITIONS=50
 PAPER_MIN_NET_EV=0.05
 PAPER_MIN_PROB_EDGE=0.03
 PAPER_MIN_DATA_QUALITY=0.60
+PAPER_OBSERVATION_MIN_DATA_QUALITY=0.55
+LIVE_MIN_DATA_QUALITY=0.60
 PAPER_REQUIRE_CALIBRATED_FOR_TRADE=false
 PAPER_MAX_PRICE_STALENESS_SECONDS=900
 PAPER_ALLOW_LAST_PRICE_FALLBACK_FOR_TRADE=false
 PAPER_STARTING_BALANCE=1000.00
+PAPER_BANKROLL_STARTING_BALANCE=500.00
+PAPER_POSITION_SIZING_MODE=fixed_risk
+PAPER_RISK_PER_TRADE_PCT=0.025
+PAPER_MIN_CONTRACTS=1
+PAPER_MAX_CONTRACTS_PER_TRADE=100
+PAPER_STORE_ONE_CONTRACT_EV=true
 KALSHI_TRADE_FEE_RATE=0.07
 KALSHI_FEE_ESTIMATE_MODE=conservative
 KALSHI_FEE_ROUNDING_MODE=centicent_or_cent_conservative
 KALSHI_ASSUME_TAKER=true
+WEBSOCKET_MARKET_DATA_ENABLED=false
+WS_SUBSCRIBE_OPEN_POSITIONS=true
+WS_SUBSCRIBE_ACTIVE_CANDIDATES=true
+WS_MAX_MARKETS=500
+WS_RECONNECT_BACKOFF_SECONDS=5
+WS_HEARTBEAT_TIMEOUT_SECONDS=30
+WS_PRICE_STALE_AFTER_SECONDS=120
 MODEL_TRAINING_MIN_SAMPLES=100
 MODEL_MIN_SAMPLES_TRAIN=250
 MODEL_MIN_SAMPLES_CALIBRATE=250
@@ -119,28 +134,41 @@ alembic upgrade head
 
 If migration fails, check that `DATABASE_URL` exists and points to the Railway PostgreSQL service.
 
-## PR 3c One-Off Job Commands
+## PR3d One-Off Job Commands And Cron Services
 
 Run these from the Railway backend service shell after migrations succeed:
 
 ```powershell
-python -m app.jobs.mlb_schedule_sync
-python -m app.jobs.kalshi_market_sync
-python -m app.jobs.paper_candidate_engine 2026-06-27
-python -m app.jobs.mlb_results_sync
-python -m app.jobs.paper_settlement_sync
-python -m app.jobs.balance_snapshot
-python -m app.jobs.model_governance
-python -m app.jobs.mlb_feature_sync
-python -m app.jobs.mlb_feature_sync 2026-06-27
-python -m app.jobs.model_feature_snapshot_backfill
-python -m app.jobs.training_eligibility_repair
-python -m app.jobs.market_family_discovery
-python -m app.jobs.market_family_mapping_sync
-python -m app.jobs.open_position_price_refresh
+python -m app.jobs.runner --job daily-setup --target-date today_et
+python -m app.jobs.runner --job candidate-sweep --target-date today_et
+python -m app.jobs.runner --job price-refresh --target-date today_et
+python -m app.jobs.runner --job settlement --target-date yesterday_et
+python -m app.jobs.runner --job governance
+python -m app.jobs.runner --job full-paper-cycle --target-date today_et
 ```
 
 These commands create database records for the dashboard and paper engine. They do not place live orders.
+
+Recommended Railway cron services should be separate short-lived services, not the main web server:
+
+| Service | Start command | UTC cron during EDT |
+| --- | --- | --- |
+| `homerun-job-daily-setup` | `python -m app.jobs.runner --job daily-setup --target-date today_et` | `30 13 * * *` |
+| `homerun-job-candidate-sweep` | `python -m app.jobs.runner --job candidate-sweep --target-date today_et` | `0 15-23 * * *` |
+| `homerun-job-price-refresh` | `python -m app.jobs.runner --job price-refresh --target-date today_et` | `*/15 15-23 * * *` |
+| `homerun-job-settlement-night` | `python -m app.jobs.runner --job settlement --target-date yesterday_et` | `30 6 * * *` |
+| `homerun-job-settlement-morning` | `python -m app.jobs.runner --job settlement --target-date yesterday_et` | `30 12 * * *` |
+| `homerun-job-governance` | `python -m app.jobs.runner --job governance` | `0 13 * * *` |
+
+Railway cron schedules use UTC. Adjust these schedules when EDT changes to EST. Railway may skip a run if the previous execution is still active; PR3d job locks also skip overlap or mark stale runs failed before starting safely.
+
+Optional long-running paper market-data service:
+
+```powershell
+python -m app.workers.kalshi_ws_paper
+```
+
+Leave `WEBSOCKET_MARKET_DATA_ENABLED=false` until you deliberately validate the worker. When disabled, `/v1/ws/status` reports REST fallback.
 
 ## PR 3c Targeted Resolver, Discovery, Mapping, Model, And Paper Results Validation
 

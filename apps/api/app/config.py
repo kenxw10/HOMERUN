@@ -59,9 +59,9 @@ class Settings(BaseSettings):
     open_position_price_refresh_max_per_run: int = Field(default=100, alias="OPEN_POSITION_PRICE_REFRESH_MAX_PER_RUN")
     paper_candidate_engine_enabled: bool = Field(default=True, alias="PAPER_CANDIDATE_ENGINE_ENABLED")
     default_paper_contracts: int = Field(default=1, alias="DEFAULT_PAPER_CONTRACTS")
-    paper_max_trades_per_slate: int = Field(default=20, alias="PAPER_MAX_TRADES_PER_SLATE")
+    paper_max_trades_per_slate: int = Field(default=30, alias="PAPER_MAX_TRADES_PER_SLATE")
     paper_max_trades_per_game: int = Field(default=3, alias="PAPER_MAX_TRADES_PER_GAME")
-    paper_max_trades_per_market_family: int = Field(default=8, alias="PAPER_MAX_TRADES_PER_MARKET_FAMILY")
+    paper_max_trades_per_market_family: int = Field(default=15, alias="PAPER_MAX_TRADES_PER_MARKET_FAMILY")
     paper_max_trades_per_game_family: int = Field(default=1, alias="PAPER_MAX_TRADES_PER_GAME_FAMILY")
     paper_allow_multiple_lines_per_game_family: bool = Field(
         default=False, alias="PAPER_ALLOW_MULTIPLE_LINES_PER_GAME_FAMILY"
@@ -73,18 +73,37 @@ class Settings(BaseSettings):
     paper_min_net_ev: Decimal = Field(default=Decimal("0.05"), alias="PAPER_MIN_NET_EV")
     paper_min_prob_edge: Decimal = Field(default=Decimal("0.03"), alias="PAPER_MIN_PROB_EDGE")
     paper_min_data_quality: Decimal = Field(default=Decimal("0.60"), alias="PAPER_MIN_DATA_QUALITY")
+    paper_observation_min_data_quality: Decimal = Field(
+        default=Decimal("0.55"), alias="PAPER_OBSERVATION_MIN_DATA_QUALITY"
+    )
+    live_min_data_quality: Decimal = Field(default=Decimal("0.60"), alias="LIVE_MIN_DATA_QUALITY")
     paper_require_calibrated_for_trade: bool = Field(default=False, alias="PAPER_REQUIRE_CALIBRATED_FOR_TRADE")
     paper_max_price_staleness_seconds: int = Field(default=900, alias="PAPER_MAX_PRICE_STALENESS_SECONDS")
     paper_allow_last_price_fallback_for_trade: bool = Field(
         default=False, alias="PAPER_ALLOW_LAST_PRICE_FALLBACK_FOR_TRADE"
     )
     paper_starting_balance: Decimal = Field(default=Decimal("1000.00"), alias="PAPER_STARTING_BALANCE")
+    paper_bankroll_starting_balance: Decimal = Field(
+        default=Decimal("500.00"), alias="PAPER_BANKROLL_STARTING_BALANCE"
+    )
+    paper_position_sizing_mode: str = Field(default="fixed_risk", alias="PAPER_POSITION_SIZING_MODE")
+    paper_risk_per_trade_pct: Decimal = Field(default=Decimal("0.025"), alias="PAPER_RISK_PER_TRADE_PCT")
+    paper_min_contracts: int = Field(default=1, alias="PAPER_MIN_CONTRACTS")
+    paper_max_contracts_per_trade: int = Field(default=100, alias="PAPER_MAX_CONTRACTS_PER_TRADE")
+    paper_store_one_contract_ev: bool = Field(default=True, alias="PAPER_STORE_ONE_CONTRACT_EV")
     kalshi_trade_fee_rate: Decimal = Field(default=Decimal("0.07"), alias="KALSHI_TRADE_FEE_RATE")
     kalshi_fee_estimate_mode: str = Field(default="conservative", alias="KALSHI_FEE_ESTIMATE_MODE")
     kalshi_fee_rounding_mode: str = Field(
         default="centicent_or_cent_conservative", alias="KALSHI_FEE_ROUNDING_MODE"
     )
     kalshi_assume_taker: bool = Field(default=True, alias="KALSHI_ASSUME_TAKER")
+    websocket_market_data_enabled: bool = Field(default=False, alias="WEBSOCKET_MARKET_DATA_ENABLED")
+    ws_subscribe_open_positions: bool = Field(default=True, alias="WS_SUBSCRIBE_OPEN_POSITIONS")
+    ws_subscribe_active_candidates: bool = Field(default=True, alias="WS_SUBSCRIBE_ACTIVE_CANDIDATES")
+    ws_max_markets: int = Field(default=500, alias="WS_MAX_MARKETS")
+    ws_reconnect_backoff_seconds: int = Field(default=5, alias="WS_RECONNECT_BACKOFF_SECONDS")
+    ws_heartbeat_timeout_seconds: int = Field(default=30, alias="WS_HEARTBEAT_TIMEOUT_SECONDS")
+    ws_price_stale_after_seconds: int = Field(default=120, alias="WS_PRICE_STALE_AFTER_SECONDS")
     feature_sync_enable_network_sources: bool = Field(default=True, alias="FEATURE_SYNC_ENABLE_NETWORK_SOURCES")
     open_meteo_base_url: str = Field(default="https://api.open-meteo.com/v1", alias="OPEN_METEO_BASE_URL")
     injury_provider_api_key: SecretStr | None = Field(default=None, alias="INJURY_PROVIDER_API_KEY")
@@ -171,7 +190,13 @@ class Settings(BaseSettings):
         "paper_max_trades_per_market_family",
         "paper_max_trades_per_game_family",
         "paper_max_open_positions",
+        "paper_min_contracts",
+        "paper_max_contracts_per_trade",
         "paper_max_price_staleness_seconds",
+        "ws_max_markets",
+        "ws_reconnect_backoff_seconds",
+        "ws_heartbeat_timeout_seconds",
+        "ws_price_stale_after_seconds",
         "model_min_samples_train",
         "model_min_samples_calibrate",
         "model_min_samples_promote",
@@ -186,6 +211,9 @@ class Settings(BaseSettings):
         "paper_min_net_ev",
         "paper_min_prob_edge",
         "paper_min_data_quality",
+        "paper_observation_min_data_quality",
+        "live_min_data_quality",
+        "paper_risk_per_trade_pct",
         "kalshi_trade_fee_rate",
         "model_promotion_min_logloss_improvement",
         "model_promotion_max_ece",
@@ -194,7 +222,7 @@ class Settings(BaseSettings):
     def validate_nonnegative_decimals(cls, value: Decimal) -> Decimal:
         return max(value, Decimal("0"))
 
-    @field_validator("paper_starting_balance")
+    @field_validator("paper_starting_balance", "paper_bankroll_starting_balance")
     @classmethod
     def validate_paper_starting_balance(cls, value: Decimal) -> Decimal:
         return max(value, Decimal("0.00"))

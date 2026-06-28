@@ -93,6 +93,7 @@ def _update_market_fields(row: KalshiMarket, market: dict[str, Any], ticker: str
         else None
     )
     row.market_price_updated_at = observed_at
+    row.market_data_source = "rest"
     row.raw_payload = market
 
 
@@ -169,6 +170,7 @@ def _fetch_orderbook(client: KalshiClient, row: KalshiMarket) -> None:
         row.implied_yes_ask = derived["implied_yes_ask"]
         row.implied_no_ask = derived["implied_no_ask"]
         row.market_price_updated_at = utc_now()
+        row.market_data_source = "rest"
         row.orderbook_raw = orderbook_payload
     except KalshiAPIError as exc:
         _clear_orderbook_prices(row)

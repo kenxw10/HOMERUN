@@ -10,6 +10,7 @@ from app.config import get_settings
 from app.models import (
     BalanceSnapshot,
     CalibrationRun,
+    JobRun,
     KalshiMarket,
     MarketMapping,
     MlbGame,
@@ -20,7 +21,9 @@ from app.models import (
     ModelThresholdVersion,
     ModelVersion,
     PaperTrade,
+    PaperTradingEpoch,
     Position,
+    MarketDataWorkerStatus,
     TrainingRun,
 )
 from app.schemas import (
@@ -30,10 +33,14 @@ from app.schemas import (
     PerformanceMetrics,
     PortfolioPoint,
     PositionSummary,
+    ActiveEpochSummary,
+    JobRunSummary,
+    WebSocketStatusSummary,
 )
 from app.services.contracts import contract_labels, market_type_from_ticker
 from app.services.features import FEATURE_VERSION, source_status_report
 from app.services.portfolio import calculate_paper_portfolio
+from app.services.paper_epoch import resolve_epoch_filter
 from app.time_utils import eastern_display, ensure_aware_utc, get_dashboard_zone, to_eastern_iso, today_eastern, utc_now
 
 MAPPING_STATUS_PRIORITY = {"confirmed": 0, "candidate": 1, "needs_review": 2}
@@ -82,6 +89,17 @@ def empty_dashboard_summary(closed_date: date | None = None) -> DashboardSummary
             notes=["No mature model run has been recorded yet."],
         ),
         paper_starting_balance=float(settings.paper_starting_balance),
+        performance_by_scope={},
+        performance_by_family={},
+        decision_breakdown_by_scope={},
+        decision_breakdown_by_family={},
+        latest_candidate_diagnostics={},
+        job_status={},
+        websocket_status=WebSocketStatusSummary(
+            enabled=settings.websocket_market_data_enabled,
+            running=False,
+            source="rest_fallback",
+        ),
         last_update=to_eastern_iso(utc_now()),
         last_update_display=eastern_display(utc_now()),
     )
@@ -272,11 +290,124 @@ def _module_status(source_statuses: dict[str, object], module_name: str) -> str:
     return str(value or "missing")
 
 
-def dashboard_summary_from_db(session: Session, closed_date: date | None = None) -> DashboardSummary:
+def _family_scope(family: str | None, inning_scope: str | None = None) -> str:
+    if inning_scope:
+        return inning_scope
+    return "first_five" if (family or "").startswith("first_five") else "full_game"
+
+
+def _performance_bucket(trades: list[PaperTrade], key_fn) -> dict[str, dict[str, object]]:
+    buckets: dict[str, list[PaperTrade]] = {}
+    for trade in trades:
+        buckets.setdefault(key_fn(trade), []).append(trade)
+    result: dict[str, dict[str, object]] = {}
+    for key, rows in buckets.items():
+        wins = sum(1 for trade in rows if trade.outcome == "win" or (trade.realized_pnl or Decimal("0")) > 0)
+        losses = sum(1 for trade in rows if trade.outcome == "loss" or (trade.realized_pnl or Decimal("0")) < 0)
+        pushes = sum(1 for trade in rows if trade.outcome in {"push", "void"})
+        realized = sum((trade.realized_pnl or Decimal("0")) for trade in rows)
+        stake = sum((trade.entry_price * trade.quantity) for trade in rows)
+        result[key] = {
+            "trades": len(rows),
+            "win_rate": (wins / len(rows)) if rows else None,
+            "roi": float(realized / stake) if stake else None,
+            "profit_loss": float(realized),
+            "record": f"{wins}-{losses}-{pushes}",
+        }
+    return result
+
+
+def _decision_breakdown(candidates: list[ModelCandidate]) -> tuple[dict[str, dict[str, int]], dict[str, dict[str, int]]]:
+    by_family: dict[str, dict[str, int]] = {}
+    by_scope: dict[str, dict[str, int]] = {}
+    for candidate in candidates:
+        family = candidate.market_family or candidate.market_type or "unknown"
+        scope = _family_scope(family, candidate.inning_scope)
+        decision = candidate.decision or "unknown"
+        by_family.setdefault(family, {})[decision] = by_family.setdefault(family, {}).get(decision, 0) + 1
+        by_scope.setdefault(scope, {})[decision] = by_scope.setdefault(scope, {}).get(decision, 0) + 1
+    return by_family, by_scope
+
+
+def _latest_job_status(session: Session, epoch: PaperTradingEpoch) -> dict[str, JobRunSummary]:
+    rows = list(
+        session.scalars(
+            select(JobRun)
+            .where(JobRun.job_name.in_(["daily-setup", "candidate-sweep", "price-refresh", "settlement", "governance"]))
+            .order_by(JobRun.started_at.desc(), JobRun.id.desc())
+            .limit(50)
+        )
+    )
+    latest: dict[str, JobRunSummary] = {}
+    for row in rows:
+        if row.job_name in latest:
+            continue
+        latest[row.job_name] = JobRunSummary(
+            job_name=row.job_name,
+            status=row.status,
+            started_at=to_eastern_iso(row.started_at),
+            completed_at=to_eastern_iso(row.completed_at),
+            duration_seconds=row.duration_seconds,
+            target_date=row.target_date.isoformat() if row.target_date else None,
+            result=row.result or {},
+        )
+    return latest
+
+
+def _websocket_status(session: Session) -> WebSocketStatusSummary:
+    settings = get_settings()
+    row = session.scalar(
+        select(MarketDataWorkerStatus)
+        .where(MarketDataWorkerStatus.status_key == "kalshi_ws_paper")
+        .order_by(MarketDataWorkerStatus.id.desc())
+        .limit(1)
+    )
+    if row is None:
+        return WebSocketStatusSummary(
+            enabled=settings.websocket_market_data_enabled,
+            running=False,
+            source="rest_fallback",
+        )
+    return WebSocketStatusSummary(
+        enabled=row.enabled,
+        running=row.running,
+        source=row.source,
+        subscribed_market_count=row.subscribed_market_count,
+        last_seen_at=to_eastern_iso(row.last_seen_at),
+        last_message_at=to_eastern_iso(row.last_message_at),
+        reconnect_count=row.reconnect_count,
+        stale_count=row.stale_count,
+        last_error=row.last_error,
+    )
+
+
+def dashboard_summary_from_db(
+    session: Session,
+    closed_date: date | None = None,
+    *,
+    epoch_key: str | None = None,
+    include_archived: bool = False,
+) -> DashboardSummary:
     selected_closed_date = closed_date or today_eastern()
     summary = empty_dashboard_summary(selected_closed_date)
+    epoch_filter = resolve_epoch_filter(session, epoch_key=epoch_key, include_archived=include_archived)
+    active_epoch = epoch_filter.epoch
+    summary.active_epoch = ActiveEpochSummary(
+        epoch_key=active_epoch.epoch_key,
+        display_name=active_epoch.display_name,
+        status=active_epoch.status,
+        mode=active_epoch.mode,
+        starting_balance=float(active_epoch.starting_balance),
+        started_at=to_eastern_iso(active_epoch.started_at),
+    )
+    summary.paper_starting_balance = float(active_epoch.starting_balance)
     newest_snapshots = list(
-        session.scalars(select(BalanceSnapshot).order_by(BalanceSnapshot.captured_at.desc()).limit(500))
+        session.scalars(
+            select(BalanceSnapshot)
+            .where(BalanceSnapshot.paper_trading_epoch_id == active_epoch.id)
+            .order_by(BalanceSnapshot.captured_at.desc())
+            .limit(500)
+        )
     )
     snapshots = list(reversed(newest_snapshots))
     summary.portfolio_series = [
@@ -287,11 +418,17 @@ def dashboard_summary_from_db(session: Session, closed_date: date | None = None)
         summary.cash_balance = float(latest_snapshot.cash_balance)
         summary.portfolio_value = float(latest_snapshot.portfolio_value)
     else:
-        totals = calculate_paper_portfolio(session)
+        totals = calculate_paper_portfolio(session, epoch=active_epoch)
         summary.cash_balance = float(totals.cash_balance)
         summary.portfolio_value = float(totals.portfolio_value)
 
-    settled = list(session.scalars(select(PaperTrade).where(PaperTrade.status.in_(["settled", "closed", "void"]))))
+    settled = list(
+        session.scalars(
+            select(PaperTrade)
+            .where(PaperTrade.paper_trading_epoch_id == active_epoch.id)
+            .where(PaperTrade.status.in_(["settled", "closed", "void"]))
+        )
+    )
     wins = sum(1 for trade in settled if trade.outcome == "win" or (trade.realized_pnl or Decimal("0")) > 0)
     losses = sum(1 for trade in settled if trade.outcome == "loss" or (trade.realized_pnl or Decimal("0")) < 0)
     pushes = sum(1 for trade in settled if trade.outcome in {"push", "void"})
@@ -304,13 +441,14 @@ def dashboard_summary_from_db(session: Session, closed_date: date | None = None)
         record=f"{wins}-{losses}-{pushes}",
     )
 
-    open_positions = list(session.scalars(select(Position).where(Position.status == "open").limit(100)))
+    open_positions = [] if not include_archived else list(session.scalars(select(Position).where(Position.status == "open").limit(100)))
     open_trade_rows = list(
         session.execute(
             select(PaperTrade, MlbGame, KalshiMarket)
             .outerjoin(ModelCandidate, PaperTrade.candidate_id == ModelCandidate.id)
             .outerjoin(MlbGame, ModelCandidate.mlb_game_id == MlbGame.id)
             .outerjoin(KalshiMarket, ModelCandidate.kalshi_market_id == KalshiMarket.id)
+            .where(PaperTrade.paper_trading_epoch_id == active_epoch.id)
             .where(PaperTrade.status == "open")
             .limit(100)
         )
@@ -329,6 +467,7 @@ def dashboard_summary_from_db(session: Session, closed_date: date | None = None)
             .outerjoin(ModelCandidate, PaperTrade.candidate_id == ModelCandidate.id)
             .outerjoin(MlbGame, ModelCandidate.mlb_game_id == MlbGame.id)
             .outerjoin(KalshiMarket, ModelCandidate.kalshi_market_id == KalshiMarket.id)
+            .where(PaperTrade.paper_trading_epoch_id == active_epoch.id)
             .where(PaperTrade.status.in_(["settled", "closed", "void"]))
             .where(
                 or_(
@@ -353,6 +492,7 @@ def dashboard_summary_from_db(session: Session, closed_date: date | None = None)
     last_threshold = session.scalar(select(ModelThresholdVersion).order_by(ModelThresholdVersion.created_at.desc()))
     last_prediction = session.scalar(
         select(ModelPredictionRun)
+        .where(ModelPredictionRun.paper_trading_epoch_id == active_epoch.id)
         .where(ModelPredictionRun.target_date == today_eastern())
         .order_by(ModelPredictionRun.started_at.desc())
     )
@@ -366,13 +506,24 @@ def dashboard_summary_from_db(session: Session, closed_date: date | None = None)
         )
     )
     feature_completeness, source_statuses, critical_warnings = _feature_status_summary(today_feature_rows)
-    candidate_count = session.scalar(select(func.count(ModelCandidate.id))) or 0
+    candidate_count = (
+        session.scalar(
+            select(func.count(ModelCandidate.id)).where(ModelCandidate.paper_trading_epoch_id == active_epoch.id)
+        )
+        or 0
+    )
     training_eligible_count = (
-        session.scalar(select(func.count(ModelCandidate.id)).where(ModelCandidate.training_eligible.is_(True))) or 0
+        session.scalar(
+            select(func.count(ModelCandidate.id))
+            .where(ModelCandidate.paper_trading_epoch_id == active_epoch.id)
+            .where(ModelCandidate.training_eligible.is_(True))
+        )
+        or 0
     )
     resolved_mature_samples = (
         session.scalar(
             select(func.count(ModelCandidate.id))
+            .where(ModelCandidate.paper_trading_epoch_id == active_epoch.id)
             .where(ModelCandidate.training_eligible.is_(True))
             .where(ModelCandidate.outcome.in_(["win", "loss"]))
             .where(ModelCandidate.feature_version == FEATURE_VERSION)
@@ -381,7 +532,29 @@ def dashboard_summary_from_db(session: Session, closed_date: date | None = None)
     )
     candidate_avg_data_quality = session.scalar(
         select(func.avg(ModelCandidate.data_quality)).where(ModelCandidate.feature_version == FEATURE_VERSION)
+        .where(ModelCandidate.paper_trading_epoch_id == active_epoch.id)
     )
+    active_candidates = list(
+        session.scalars(
+            select(ModelCandidate)
+            .where(ModelCandidate.paper_trading_epoch_id == active_epoch.id)
+            .order_by(ModelCandidate.evaluated_at.desc())
+            .limit(1000)
+        )
+    )
+    summary.decision_breakdown_by_family, summary.decision_breakdown_by_scope = _decision_breakdown(active_candidates)
+    summary.performance_by_family = _performance_bucket(
+        settled,
+        lambda trade: trade.market_family or "unknown",
+    )
+    summary.performance_by_scope = _performance_bucket(
+        settled,
+        lambda trade: _family_scope(trade.market_family, trade.inning_scope),
+    )
+    if last_prediction and last_prediction.summary:
+        summary.latest_candidate_diagnostics = dict(last_prediction.summary.get("candidate_diagnostics") or {})
+    summary.job_status = _latest_job_status(session, active_epoch)
+    summary.websocket_status = _websocket_status(session)
     feature_avg_data_quality = (
         sum((row.data_quality or Decimal("0")) for row in today_feature_rows) / Decimal(len(today_feature_rows))
         if today_feature_rows
@@ -476,11 +649,13 @@ def list_today_markets(session: Session):
 
 def list_today_candidates(session: Session):
     _, start, end = today_bounds()
+    active_epoch = resolve_epoch_filter(session).epoch
     return list(
         session.execute(
             select(ModelCandidate, MlbGame, KalshiMarket)
             .outerjoin(MlbGame, ModelCandidate.mlb_game_id == MlbGame.id)
             .outerjoin(KalshiMarket, ModelCandidate.kalshi_market_id == KalshiMarket.id)
+            .where(ModelCandidate.paper_trading_epoch_id == active_epoch.id)
             .where(ModelCandidate.evaluated_at >= start)
             .where(ModelCandidate.evaluated_at < end)
             .order_by(ModelCandidate.evaluated_at.desc())

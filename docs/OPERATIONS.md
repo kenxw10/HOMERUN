@@ -19,6 +19,8 @@ Before treating a deployment as valid:
 13. Confirm `KALSHI_ENABLE_BROAD_DISCOVERY=false` unless you are deliberately running bounded diagnostics.
 14. Confirm PR 3c only scores validated `paper_supported` market-family mappings and leaves uncertain rows in review.
 15. Confirm open-position current price is treated as a REST last mark, not WebSocket live price.
+16. Confirm `/v1/dashboard/summary` reports only the active paper epoch unless `epoch_key` and `include_archived=true` are deliberately used for backend debugging.
+17. Confirm optional WebSocket market data is disabled or healthy: `GET /v1/ws/status` should show `source=rest_fallback` when disabled.
 
 ## No-Live-Trading Safety Checklist
 
@@ -92,6 +94,85 @@ They do not probe retired guessed prefixes or `KXMLBTEAMTOTAL`.
 
 Each worker should be idempotent where possible, log risk events, and avoid live order execution unless future safety gates are in place.
 
+## PR3d Active Paper Observation Epoch
+
+PR3d adds active paper epochs so old validation data can stay in the database without polluting the live operator dashboard.
+
+Use this protected reset exactly when starting the PR3d observation period:
+
+```powershell
+$body = @{
+  archive_current_as = "pre_pr3d_validation"
+  new_epoch = "pr3d_paper_observation_v1"
+  starting_balance = 500.00
+  archive_open_positions = $true
+  reset_dashboard_metrics = $true
+  confirmation = "RESET_PAPER_EPOCH"
+} | ConvertTo-Json
+
+Invoke-RestMethod -Method Post -Headers @{"X-API-Key"="YOUR_KEY"; "Content-Type"="application/json"} -Body $body "https://YOUR-RAILWAY-API/v1/admin/paper-trading/reset-epoch"
+```
+
+Expected reset result:
+
+- `new_epoch_key=pr3d_paper_observation_v1`
+- `starting_balance=500`
+- `new_balance_snapshot_id` is present
+- old active/unassigned paper rows are archived, not deleted
+
+Expected dashboard immediately after reset:
+
+- Portfolio value: `$500.00`
+- Cash: `$500.00`
+- Open positions: `0`
+- Closed positions for today/yesterday/selected dates: `0`
+- P/L: `$0.00`
+- Record: `0-0-0`
+- Active epoch: `PR3D PAPER OBSERVATION V1`
+
+Do not add a frontend reset button. Reset remains protected API-only.
+
+## PR3d Cron-Safe Paper Jobs
+
+Use `app.jobs.runner` for Railway cron jobs. Each invocation opens a database session, acquires a job lock, runs one job, records `job_runs`, and exits.
+
+```powershell
+python -m app.jobs.runner --job daily-setup --target-date today_et
+python -m app.jobs.runner --job candidate-sweep --target-date today_et
+python -m app.jobs.runner --job price-refresh --target-date today_et
+python -m app.jobs.runner --job settlement --target-date yesterday_et
+python -m app.jobs.runner --job governance
+python -m app.jobs.runner --job full-paper-cycle --target-date today_et
+```
+
+Protected manual endpoints mirror the cron jobs:
+
+- `POST /v1/jobs/run/daily-setup?target_date=YYYY-MM-DD`
+- `POST /v1/jobs/run/candidate-sweep?target_date=YYYY-MM-DD`
+- `POST /v1/jobs/run/price-refresh?target_date=YYYY-MM-DD`
+- `POST /v1/jobs/run/settlement?target_date=YYYY-MM-DD`
+- `POST /v1/jobs/run/governance`
+- `POST /v1/jobs/run/full-paper-cycle?target_date=YYYY-MM-DD`
+
+The dashboard shows the last setup, candidate sweep, price refresh, settlement, governance, and WebSocket/REST status.
+
+## PR3d WebSocket Market Data Worker
+
+The optional paper-safe worker command is:
+
+```powershell
+python -m app.workers.kalshi_ws_paper
+```
+
+Safe defaults:
+
+- `WEBSOCKET_MARKET_DATA_ENABLED=false`
+- `WS_SUBSCRIBE_OPEN_POSITIONS=true`
+- `WS_SUBSCRIBE_ACTIVE_CANDIDATES=true`
+- `WS_MAX_MARKETS=500`
+
+When disabled or unavailable, `/v1/ws/status` should report REST fallback. The worker must never place live orders and must only update active paper epoch market/trade marks.
+
 ## Internal Run Endpoints
 
 The backend also exposes these POST endpoints for controlled operational runs:
@@ -122,6 +203,14 @@ The backend also exposes these POST endpoints for controlled operational runs:
 - `POST /v1/run/model-feature-snapshot-backfill?target_date=YYYY-MM-DD`
 - `POST /v1/run/training-eligibility-repair`
 - `POST /v1/run/open-position-price-refresh`
+- `POST /v1/admin/paper-trading/reset-epoch`
+- `POST /v1/jobs/run/daily-setup?target_date=YYYY-MM-DD`
+- `POST /v1/jobs/run/candidate-sweep?target_date=YYYY-MM-DD`
+- `POST /v1/jobs/run/price-refresh?target_date=YYYY-MM-DD`
+- `POST /v1/jobs/run/settlement?target_date=YYYY-MM-DD`
+- `POST /v1/jobs/run/governance`
+- `POST /v1/jobs/run/full-paper-cycle?target_date=YYYY-MM-DD`
+- `GET /v1/ws/status`
 - `POST /v1/run/market-family-discovery?target_date=YYYY-MM-DD`
 - `POST /v1/sync/market-family-mappings?target_date=YYYY-MM-DD`
 - `GET /v1/market-families/discovery?date=YYYY-MM-DD`

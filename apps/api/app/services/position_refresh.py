@@ -10,6 +10,7 @@ from app.models import KalshiMarket, ModelCandidate, PaperTrade, Position
 from app.services.kalshi import KalshiAPIError, KalshiClient, derive_orderbook_prices
 from app.services.market_sync import _market_status, _update_market_fields
 from app.services.portfolio import create_balance_snapshot
+from app.services.paper_epoch import get_or_create_active_paper_epoch
 from app.time_utils import utc_now
 
 
@@ -73,6 +74,7 @@ def refresh_open_position_prices(
     session: Session,
     *,
     client: KalshiClient | None = None,
+    include_archived: bool = False,
 ) -> dict[str, object]:
     settings = get_settings()
     if not settings.open_position_price_refresh_enabled:
@@ -86,8 +88,12 @@ def refresh_open_position_prices(
         }
 
     kalshi_client = client or KalshiClient.from_market_data_settings()
+    active_epoch = get_or_create_active_paper_epoch(session)
     now = utc_now()
-    all_trades = list(session.scalars(select(PaperTrade).where(PaperTrade.status == "open").order_by(PaperTrade.id.asc())))
+    trade_query = select(PaperTrade).where(PaperTrade.status == "open").order_by(PaperTrade.id.asc())
+    if not include_archived:
+        trade_query = trade_query.where(PaperTrade.paper_trading_epoch_id == active_epoch.id)
+    all_trades = list(session.scalars(trade_query))
     trades = all_trades[: settings.open_position_price_refresh_max_per_run]
     skipped_due_to_limit = max(len(all_trades) - len(trades), 0)
     updated = 0
@@ -124,6 +130,7 @@ def refresh_open_position_prices(
                 )
             _update_market_fields(market, payload, trade.market_ticker, _market_status(payload))
             market.market_price_updated_at = now
+            market.market_data_source = "rest"
             mark = _mark_from_market(market, trade)
         if mark is None and hasattr(kalshi_client, "get_orderbook"):
             try:
@@ -146,6 +153,7 @@ def refresh_open_position_prices(
 
         if market is not None:
             market.market_price_updated_at = now
+            market.market_data_source = "rest"
             session.add(market)
         trade.current_price = mark
         trade.current_price_updated_at = now
@@ -165,7 +173,7 @@ def refresh_open_position_prices(
             session.add(market)
         updated += 1
 
-    snapshot = create_balance_snapshot(session, source="open_position_price_refresh")
+    snapshot = create_balance_snapshot(session, source="open_position_price_refresh", epoch=active_epoch)
     session.commit()
     return {
         "checked": len(trades),

@@ -14,6 +14,37 @@ type PerformanceMetrics = {
   record: string;
 };
 
+type ActiveEpochSummary = {
+  epoch_key: string;
+  display_name: string;
+  status: string;
+  mode: string;
+  starting_balance: number;
+  started_at: string | null;
+};
+
+type JobRunSummary = {
+  job_name: string;
+  status: string;
+  started_at: string | null;
+  completed_at: string | null;
+  duration_seconds: number | null;
+  target_date: string | null;
+  result: Record<string, unknown>;
+};
+
+type WebSocketStatusSummary = {
+  enabled: boolean;
+  running: boolean;
+  source: string;
+  subscribed_market_count: number;
+  last_seen_at: string | null;
+  last_message_at: string | null;
+  reconnect_count: number;
+  stale_count: number;
+  last_error: string | null;
+};
+
 type PositionSummary = {
   time_entered: string | null;
   time_entered_display: string | null;
@@ -42,6 +73,7 @@ type PositionSummary = {
 };
 
 type DashboardSummary = {
+  active_epoch: ActiveEpochSummary | null;
   portfolio_series: PortfolioPoint[];
   performance: PerformanceMetrics;
   positions: PositionSummary[];
@@ -51,6 +83,13 @@ type DashboardSummary = {
   cash_balance: number | null;
   portfolio_value: number | null;
   paper_starting_balance: number | null;
+  performance_by_scope: Record<string, Record<string, unknown>>;
+  performance_by_family: Record<string, Record<string, unknown>>;
+  decision_breakdown_by_scope: Record<string, Record<string, number>>;
+  decision_breakdown_by_family: Record<string, Record<string, number>>;
+  latest_candidate_diagnostics: Record<string, unknown>;
+  job_status: Record<string, JobRunSummary>;
+  websocket_status: WebSocketStatusSummary | null;
   last_update: string | null;
   last_update_display: string | null;
   bot: {
@@ -140,6 +179,7 @@ const rangeMs: Record<Exclude<ChartRange, "ALL">, number> = {
 };
 
 const emptySummary: DashboardSummary = {
+  active_epoch: null,
   portfolio_series: [],
   performance: {
     win_rate: null,
@@ -154,6 +194,23 @@ const emptySummary: DashboardSummary = {
   cash_balance: null,
   portfolio_value: null,
   paper_starting_balance: 1000,
+  performance_by_scope: {},
+  performance_by_family: {},
+  decision_breakdown_by_scope: {},
+  decision_breakdown_by_family: {},
+  latest_candidate_diagnostics: {},
+  job_status: {},
+  websocket_status: {
+    enabled: false,
+    running: false,
+    source: "rest_fallback",
+    subscribed_market_count: 0,
+    last_seen_at: null,
+    last_message_at: null,
+    reconnect_count: 0,
+    stale_count: 0,
+    last_error: null,
+  },
   last_update: null,
   last_update_display: null,
   bot: {
@@ -387,6 +444,10 @@ function Header({
         <span>
           KILL SWITCH: <b className={killSwitchOn ? "green" : "red"}>{killSwitchOn ? "ON" : "OFF"}</b>
         </span>
+        <span>
+          OBSERVATION EPOCH: <b>{summary.active_epoch?.display_name ?? "ACTIVE PAPER"}</b>
+        </span>
+        <span>STARTING BALANCE: <b>{formatCurrency(summary.active_epoch?.starting_balance ?? summary.paper_starting_balance)}</b></span>
         <span>CASH: <b className="green">{formatCurrency(summary.cash_balance)}</b></span>
         <span>PORTFOLIO: <b className="amber">{formatCurrency(summary.portfolio_value)}</b></span>
         <button type="button" className="refresh-button" onClick={onRefresh} aria-label="Refresh dashboard">
@@ -791,6 +852,103 @@ function StatusTable({
   );
 }
 
+function PerformanceBreakdownTable({
+  title,
+  rows,
+  decisions,
+}: {
+  title: string;
+  rows: Record<string, Record<string, unknown>>;
+  decisions: Record<string, Record<string, number>>;
+}) {
+  const keys = Array.from(new Set([...Object.keys(rows), ...Object.keys(decisions)])).sort();
+  return (
+    <section className="panel positions-panel">
+      <div className="panel-heading positions-heading">
+        <h2>{title}</h2>
+        <span>{keys.length} GROUPS</span>
+      </div>
+      <div className="terminal-table-wrap">
+        <table className="terminal-table compact-table">
+          <thead>
+            <tr>
+              <th>GROUP</th>
+              <th>TRADES</th>
+              <th>WIN RATE</th>
+              <th>ROI</th>
+              <th>P/L</th>
+              <th>RECORD</th>
+              <th>CANDIDATES</th>
+              <th>PAPER TRADES</th>
+            </tr>
+          </thead>
+          <tbody>
+            {keys.length === 0 ? (
+              <tr>
+                <td colSpan={8} className="table-empty">
+                  <b>NO PERFORMANCE GROUPS</b>
+                  <span>ACTIVE EPOCH HAS NO SETTLED PAPER SAMPLE YET.</span>
+                </td>
+              </tr>
+            ) : (
+              keys.map((key) => {
+                const row = rows[key] ?? {};
+                const decision = decisions[key] ?? {};
+                const candidateCount = Object.values(decision).reduce((sum, value) => sum + value, 0);
+                return (
+                  <tr key={key}>
+                    <td>{key.replaceAll("_", " ").toUpperCase()}</td>
+                    <td>{formatUnknown(row.trades)}</td>
+                    <td>{formatPercent(typeof row.win_rate === "number" ? row.win_rate : null)}</td>
+                    <td>{formatPercent(typeof row.roi === "number" ? row.roi : null)}</td>
+                    <td className={pctClass(typeof row.profit_loss === "number" ? row.profit_loss : null)}>
+                      {formatSignedCurrency(typeof row.profit_loss === "number" ? row.profit_loss : null)}
+                    </td>
+                    <td>{typeof row.record === "string" ? row.record : "0-0-0"}</td>
+                    <td>{candidateCount}</td>
+                    <td>{decision.paper_trade ?? 0}</td>
+                  </tr>
+                );
+              })
+            )}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  );
+}
+
+function jobStatusRows(summary: DashboardSummary): StatusRow[] {
+  const jobLabels: [string, string][] = [
+    ["LAST SETUP JOB", "daily-setup"],
+    ["LAST CANDIDATE SWEEP", "candidate-sweep"],
+    ["LAST PRICE REFRESH", "price-refresh"],
+    ["LAST SETTLEMENT", "settlement"],
+    ["LAST GOVERNANCE", "governance"],
+  ];
+  const rows = jobLabels.map(([label, key]) => {
+    const job = summary.job_status[key];
+    const value = job ? `${job.status.toUpperCase()} ${job.completed_at ? formatEastern(job.completed_at) : ""}`.trim() : "NOT RUN";
+    return {
+      label,
+      value,
+      tone: job?.status === "succeeded" ? "green" : job?.status === "failed" ? "red" : "amber",
+    } as StatusRow;
+  });
+  const ws = summary.websocket_status;
+  rows.push({
+    label: "WS STATUS",
+    value: ws ? `${ws.running ? "RUNNING" : ws.enabled ? "ENABLED" : "REST FALLBACK"} / ${ws.source.toUpperCase()}` : "REST FALLBACK",
+    tone: ws?.running ? "green" : ws?.enabled ? "amber" : "amber",
+  });
+  rows.push({
+    label: "WS MARKETS",
+    value: String(ws?.subscribed_market_count ?? 0),
+    tone: (ws?.stale_count ?? 0) > 0 ? "amber" : "green",
+  });
+  return rows;
+}
+
 function modelNotes(notes: string | string[]): string {
   return Array.isArray(notes) ? notes.join(" ") : notes;
 }
@@ -919,8 +1077,22 @@ export default function DashboardPage() {
         onSelectedDateChange={setSelectedClosedDate}
       />
 
+      <section className="breakdown-grid">
+        <PerformanceBreakdownTable
+          title="PERFORMANCE BY SCOPE"
+          rows={summary.performance_by_scope}
+          decisions={summary.decision_breakdown_by_scope}
+        />
+        <PerformanceBreakdownTable
+          title="PERFORMANCE BY FAMILY"
+          rows={summary.performance_by_family}
+          decisions={summary.decision_breakdown_by_family}
+        />
+      </section>
+
       <section className="status-grid">
         <StatusTable title="MODEL QUALITY" rows={modelRows} note={modelNotes(summary.model_status.notes)} />
+        <StatusTable title="PAPER OPS JOBS" rows={jobStatusRows(summary)} note="JOBS ARE API OR CRON RUNS; RESET IS PROTECTED API ONLY." />
         <StatusTable title="SYSTEM STATUS" rows={systemRows} note={system?.database.message ?? "DATABASE STATUS UNAVAILABLE."} />
       </section>
 

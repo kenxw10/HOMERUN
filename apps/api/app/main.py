@@ -1,4 +1,5 @@
 from datetime import UTC, date, datetime
+from decimal import Decimal
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,6 +18,7 @@ from app.schemas import (
     ListResponse,
     MarketMappingSummary,
     MarketSummary,
+    PaperEpochResetRequest,
     RunResponse,
     SystemStatus,
 )
@@ -54,11 +56,14 @@ from app.services.modeling import (
     repair_training_eligibility,
     run_model_governance,
 )
+from app.services.job_runs import run_job
 from app.services.market_sync import resolve_preview_for_date, sync_kalshi_markets
 from app.services.mlb import sync_results, sync_schedule
 from app.services.position_refresh import refresh_open_position_prices
 from app.services.portfolio import create_balance_snapshot
+from app.services.paper_epoch import reset_paper_trading_epoch
 from app.services.settlement import settle_paper_trades
+from app.services.ws_market_data import ws_status_payload
 from app.time_utils import eastern_display, today_eastern, to_eastern_iso
 
 settings = get_settings()
@@ -95,14 +100,23 @@ def health() -> HealthResponse:
 
 
 @app.get("/v1/dashboard/summary", response_model=DashboardSummary)
-def dashboard_summary(closed_date: date | None = Query(default=None)) -> DashboardSummary:
+def dashboard_summary(
+    closed_date: date | None = Query(default=None),
+    epoch_key: str | None = Query(default=None),
+    include_archived: bool = Query(default=False),
+) -> DashboardSummary:
     if not database_status()["ready"]:
         return empty_dashboard_summary(closed_date)
 
     try:
         session_factory = get_session_factory()
         with session_factory() as session:
-            return dashboard_summary_from_db(session, closed_date)
+            return dashboard_summary_from_db(
+                session,
+                closed_date,
+                epoch_key=epoch_key,
+                include_archived=include_archived,
+            )
     except Exception:
         return empty_dashboard_summary(closed_date)
 
@@ -330,10 +344,11 @@ def run_mlb_results_sync(
 @app.post("/v1/run/paper-settlement-sync", response_model=RunResponse)
 def run_paper_settlement_sync(
     target_date: date | None = Query(default=None),
+    include_archived: bool = Query(default=False),
     _: None = Depends(require_internal_api_key),
 ) -> RunResponse:
     with _db_session_or_503() as session:
-        result = settle_paper_trades(session, target_date)
+        result = settle_paper_trades(session, target_date, include_archived=include_archived)
     return RunResponse(ok=True, action="paper_settlement_sync", result=result)
 
 
@@ -351,11 +366,94 @@ def run_balance_snapshot(_: None = Depends(require_internal_api_key)) -> RunResp
     return RunResponse(ok=True, action="balance_snapshot", result=result)
 
 
-@app.post("/v1/run/open-position-price-refresh", response_model=RunResponse)
-def run_open_position_price_refresh(_: None = Depends(require_internal_api_key)) -> RunResponse:
+@app.post("/v1/admin/paper-trading/reset-epoch", response_model=RunResponse)
+def reset_paper_epoch_endpoint(
+    request: PaperEpochResetRequest,
+    _: None = Depends(require_internal_api_key),
+) -> RunResponse:
     with _db_session_or_503() as session:
-        result = refresh_open_position_prices(session)
+        try:
+            result = reset_paper_trading_epoch(
+                session,
+                archive_current_as=request.archive_current_as,
+                new_epoch=request.new_epoch,
+                starting_balance=Decimal(str(request.starting_balance)),
+                archive_open_positions=request.archive_open_positions,
+                reset_dashboard_metrics=request.reset_dashboard_metrics,
+                confirmation=request.confirmation,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    return RunResponse(ok=True, action="paper_trading_reset_epoch", result=result)
+
+
+@app.post("/v1/run/open-position-price-refresh", response_model=RunResponse)
+def run_open_position_price_refresh(
+    include_archived: bool = Query(default=False),
+    _: None = Depends(require_internal_api_key),
+) -> RunResponse:
+    with _db_session_or_503() as session:
+        result = refresh_open_position_prices(session, include_archived=include_archived)
     return RunResponse(ok=True, action="open_position_price_refresh", result=result)
+
+
+@app.get("/v1/ws/status", response_model=RunResponse)
+def websocket_status(_: None = Depends(require_internal_api_key)) -> RunResponse:
+    with _db_session_or_503() as session:
+        result = ws_status_payload(session)
+        session.commit()
+    return RunResponse(ok=True, action="websocket_status", result=result)
+
+
+def _run_named_job(job_name: str, target_date: date | None, triggered_by: str = "api") -> RunResponse:
+    with _db_session_or_503() as session:
+        result = run_job(session, job_name=job_name, target_date=target_date, triggered_by=triggered_by)
+    return RunResponse(ok=result.get("status") not in {"failed", "failed_stale"}, action=f"job_{job_name}", result=result)
+
+
+@app.post("/v1/jobs/run/daily-setup", response_model=RunResponse)
+def run_daily_setup_job(
+    target_date: date | None = Query(default=None),
+    _: None = Depends(require_internal_api_key),
+) -> RunResponse:
+    return _run_named_job("daily-setup", target_date)
+
+
+@app.post("/v1/jobs/run/candidate-sweep", response_model=RunResponse)
+def run_candidate_sweep_job(
+    target_date: date | None = Query(default=None),
+    _: None = Depends(require_internal_api_key),
+) -> RunResponse:
+    return _run_named_job("candidate-sweep", target_date)
+
+
+@app.post("/v1/jobs/run/price-refresh", response_model=RunResponse)
+def run_price_refresh_job(
+    target_date: date | None = Query(default=None),
+    _: None = Depends(require_internal_api_key),
+) -> RunResponse:
+    return _run_named_job("price-refresh", target_date)
+
+
+@app.post("/v1/jobs/run/settlement", response_model=RunResponse)
+def run_settlement_job(
+    target_date: date | None = Query(default=None),
+    _: None = Depends(require_internal_api_key),
+) -> RunResponse:
+    return _run_named_job("settlement", target_date)
+
+
+@app.post("/v1/jobs/run/governance", response_model=RunResponse)
+def run_governance_job(_: None = Depends(require_internal_api_key)) -> RunResponse:
+    return _run_named_job("governance", None)
+
+
+@app.post("/v1/jobs/run/full-paper-cycle", response_model=RunResponse)
+def run_full_paper_cycle_job(
+    target_date: date | None = Query(default=None),
+    _: None = Depends(require_internal_api_key),
+) -> RunResponse:
+    return _run_named_job("full-paper-cycle", target_date)
 
 
 @app.post("/v1/run/model-governance", response_model=RunResponse)
