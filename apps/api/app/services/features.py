@@ -970,10 +970,32 @@ def _record_pybaseball_source_call(stats: dict[str, object], result: dict[str, o
     stats["pybaseball_rows_seen"] = int(stats.get("pybaseball_rows_seen", 0)) + len(_pybaseball_rows(result))
 
 
+def _is_pybaseball_http_403(exc: BaseException) -> bool:
+    parts = [str(exc)]
+    if isinstance(exc, pybaseball_client.PybaseballSourceError):
+        detail = exc.to_detail()
+        parts.extend(str(value) for value in detail.values() if value is not None)
+        wrapped = getattr(exc, "error", None)
+        if wrapped is not None:
+            parts.append(str(wrapped))
+            parts.extend(
+                str(value)
+                for value in (
+                    getattr(wrapped, "code", None),
+                    getattr(wrapped, "status", None),
+                    getattr(wrapped, "status_code", None),
+                )
+                if value is not None
+            )
+    return any("403" in part for part in parts)
+
+
 def _record_pybaseball_source_error(stats: dict[str, object], function_name: str, exc: BaseException) -> None:
     stats["pybaseball_error_count"] = int(stats.get("pybaseball_error_count", 0)) + 1
     if function_name in {"batting_stats", "pitching_stats"}:
-        stats["pybaseball_fangraphs_status"] = "unavailable_http_403" if "403" in str(exc) else "unavailable_error"
+        stats["pybaseball_fangraphs_status"] = (
+            "unavailable_http_403" if _is_pybaseball_http_403(exc) else "unavailable_error"
+        )
     _append_error(stats, _pybaseball_error(function_name, exc))
 
 

@@ -4222,6 +4222,20 @@ def test_handedness_platoon_requires_actual_split_values() -> None:
     assert valued_module["source_status"] == "available"
 
 
+def test_pybaseball_fangraphs_status_detects_wrapped_403() -> None:
+    stats = features._new_sync_stats(date(2026, 6, 24), {"team"})
+    wrapped = features.pybaseball_client.PybaseballSourceError(
+        "pybaseball call failed.",
+        function_name="batting_stats",
+        error=RuntimeError("HTTP Error 403: Forbidden"),
+    )
+
+    features._record_pybaseball_source_error(stats, "batting_stats", wrapped)
+
+    assert stats["pybaseball_fangraphs_status"] == "unavailable_http_403"
+    assert stats["errors"][0]["message"] == "HTTP Error 403: Forbidden"
+
+
 def test_mlb_stats_primary_populates_features_when_fangraphs_403(monkeypatch) -> None:
     monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "true")
     get_settings.cache_clear()
