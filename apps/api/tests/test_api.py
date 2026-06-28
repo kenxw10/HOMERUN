@@ -281,6 +281,25 @@ def test_mlb_stats_client_uses_v1_1_for_live_game_feeds(monkeypatch) -> None:
     assert captured["params"] == {}
 
 
+def test_mlb_stats_client_default_schedule_hydrates_linescore(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_get_json(url: str, **kwargs):
+        captured["url"] = url
+        captured["params"] = kwargs.get("params")
+        return {"dates": []}
+
+    monkeypatch.setattr(mlb_stats_client, "get_json", fake_get_json)
+    client = mlb_stats_client.MLBStatsClient(base_url="https://statsapi.mlb.com/api/v1")
+
+    response = client.get_schedule(date(2026, 7, 1))
+
+    assert response == {"dates": []}
+    assert captured["url"] == "https://statsapi.mlb.com/api/v1/schedule"
+    assert captured["params"]["date"] == "2026-07-01"
+    assert "linescore" in str(captured["params"]["hydrate"])
+
+
 def test_database_status_does_not_mark_unreachable_database_ready(monkeypatch) -> None:
     monkeypatch.setenv("DATABASE_URL", "postgresql+psycopg://bad:bad@127.0.0.1:1/bad")
     get_settings.cache_clear()

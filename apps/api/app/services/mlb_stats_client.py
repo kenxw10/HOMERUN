@@ -22,7 +22,7 @@ class MLBStatsClient:
         *,
         start_date: date | None = None,
         end_date: date | None = None,
-        hydrate: str = "probablePitcher(note),team,venue",
+        hydrate: str = "probablePitcher(note),team,venue,linescore",
     ) -> dict[str, Any]:
         params: dict[str, object] = {"sportId": 1, "hydrate": hydrate}
         if target_date is not None:
