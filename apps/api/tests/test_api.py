@@ -1,5 +1,6 @@
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+import json
 
 import pytest
 from fastapi import HTTPException
@@ -3875,6 +3876,34 @@ def test_pybaseball_import_check_reports_module_metadata(monkeypatch) -> None:
     assert status["import_error"] is None
 
 
+def test_pybaseball_records_normalize_non_json_scalars() -> None:
+    class FakeScalar:
+        def __init__(self, value: object) -> None:
+            self.value = value
+
+        def item(self) -> object:
+            return self.value
+
+    class FakeFrame:
+        columns = ["Team", "OBP", "SLG", "PA", "as_of"]
+
+        def to_dict(self, *_args, **_kwargs) -> list[dict[str, object]]:
+            return [
+                {
+                    "Team": "PIT",
+                    "OBP": float("nan"),
+                    "SLG": float("inf"),
+                    "PA": FakeScalar(401),
+                    "as_of": date(2026, 7, 1),
+                }
+            ]
+
+    result = pybaseball_client._records_from_frame(FakeFrame())
+
+    assert result.rows == [{"Team": "PIT", "OBP": None, "SLG": None, "PA": 401, "as_of": "2026-07-01"}]
+    json.dumps(result.to_dict(), allow_nan=False)
+
+
 def test_pybaseball_ingestion_writes_available_advanced_rows_and_snapshots(monkeypatch) -> None:
     monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "true")
     get_settings.cache_clear()
@@ -6751,7 +6780,7 @@ def test_market_family_mapping_sync_promotes_only_parseable_supported_families()
             target_date=date(2026, 7, 1),
             started_at=datetime(2026, 7, 1, 12, 0, tzinfo=UTC),
             completed_at=datetime(2026, 7, 1, 12, 1, tzinfo=UTC),
-            status="completed",
+            status="partial_rate_limited",
             games_considered=1,
             families_considered=6,
             markets_found=5,

@@ -35,7 +35,7 @@ from app.time_utils import ensure_aware_utc, get_dashboard_zone, today_eastern
 PAPER_SUPPORTED = "paper_supported"
 NEEDS_REVIEW = "needs_review"
 UNSUPPORTED = "unsupported"
-DISCOVERY_FINAL_STATUSES = {"completed", "partial_error"}
+DISCOVERY_FINAL_STATUSES = {"completed", "partial_error", "partial_rate_limited"}
 TEAM_TOTAL_PREFIX = "KXMLBTEAMTOTAL"
 YES_SELECTION_TEXT_FIELDS = ("yes_sub_title", "yes_subtitle", "title", "subtitle")
 

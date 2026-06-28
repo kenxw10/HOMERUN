@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date
 import importlib
+import math
+import numbers
 from typing import Any
 
 
@@ -65,11 +67,65 @@ def _load_pybaseball():
         raise PybaseballSourceError("pybaseball import failed.", function_name="import_pybaseball", error=exc) from exc
 
 
+def _is_missing_scalar(value: object) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, float):
+        return not math.isfinite(value)
+    try:
+        comparison = value != value
+        if bool(comparison):
+            return True
+    except Exception:
+        pass
+    return str(value).strip().lower() in {"<na>", "nan", "nat"}
+
+
+def _json_safe_value(value: object) -> object:
+    if _is_missing_scalar(value):
+        return None
+    if isinstance(value, bool | str):
+        return value
+    if isinstance(value, numbers.Integral):
+        return int(value)
+    if isinstance(value, numbers.Real):
+        number = float(value)
+        return number if math.isfinite(number) else None
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {str(key): _json_safe_value(child) for key, child in value.items()}
+    if isinstance(value, list | tuple):
+        return [_json_safe_value(child) for child in value]
+    item = getattr(value, "item", None)
+    if callable(item):
+        try:
+            return _json_safe_value(item())
+        except Exception:
+            pass
+    isoformat = getattr(value, "isoformat", None)
+    if callable(isoformat):
+        try:
+            return str(isoformat())
+        except Exception:
+            pass
+    return str(value)
+
+
+def _json_safe_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [{str(key): _json_safe_value(value) for key, value in row.items()} for row in rows]
+
+
 def _records_from_frame(frame: object) -> PybaseballResult:
     if isinstance(frame, PybaseballResult):
-        return frame
+        return PybaseballResult(
+            function=frame.function,
+            rows=_json_safe_rows(frame.rows),
+            row_count=frame.row_count,
+            columns=frame.columns,
+        )
     if isinstance(frame, dict) and isinstance(frame.get("rows"), list):
-        rows = [row for row in frame["rows"] if isinstance(row, dict)]
+        rows = _json_safe_rows([row for row in frame["rows"] if isinstance(row, dict)])
         columns = frame.get("columns")
         return PybaseballResult(
             function=str(frame.get("function") or "pybaseball"),
@@ -78,7 +134,7 @@ def _records_from_frame(frame: object) -> PybaseballResult:
             columns=[str(column) for column in columns] if isinstance(columns, list) else _columns_from_rows(rows),
         )
     if isinstance(frame, list):
-        rows = [row for row in frame if isinstance(row, dict)]
+        rows = _json_safe_rows([row for row in frame if isinstance(row, dict)])
         return PybaseballResult(function="pybaseball", rows=rows, row_count=len(rows), columns=_columns_from_rows(rows))
 
     to_dict = getattr(frame, "to_dict", None)
@@ -89,7 +145,7 @@ def _records_from_frame(frame: object) -> PybaseballResult:
             rows = to_dict(orient="records")
         if not isinstance(rows, list):
             rows = []
-        typed_rows = [row for row in rows if isinstance(row, dict)]
+        typed_rows = _json_safe_rows([row for row in rows if isinstance(row, dict)])
         columns = getattr(frame, "columns", [])
         return PybaseballResult(
             function="pybaseball",
