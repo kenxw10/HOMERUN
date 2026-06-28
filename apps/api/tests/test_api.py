@@ -4094,11 +4094,17 @@ def test_pybaseball_ingestion_writes_available_advanced_rows_and_snapshots(monke
     assert advanced_pitcher is not None
     assert advanced_pitcher.source_status == "available"
     assert advanced_pitcher.features["season"]["era"] == 3.45
+    assert advanced_pitcher.features["recent"]["source_status"] == "missing"
+    assert advanced_pitcher.features["workload"]["source_status"] == "missing"
+    assert advanced_pitcher.features["workload"]["expected_innings_projection"] is None
     assert snapshot is not None
     assert snapshot.features["offense_season"]["home"]["source"] == features.PYBASEBALL_SOURCE
     assert snapshot.features["starter_season"]["home"]["source"] == features.PYBASEBALL_SOURCE
+    assert snapshot.features["starter_recent"]["home"]["source_status"] == "missing"
+    assert snapshot.features["starter_workload"]["home"]["source_status"] == "missing"
+    assert snapshot.features["starter_workload"]["home"]["expected_innings_projection"] is None
     assert snapshot.data_quality is not None
-    assert snapshot.data_quality > Decimal("0.3900")
+    assert snapshot.data_quality > Decimal("0.3500")
     assert report["pybaseball_available"] is True
     assert report["pybaseball_version"] == "2.2.7"
     assert report["advanced_stats_status"] == "available"

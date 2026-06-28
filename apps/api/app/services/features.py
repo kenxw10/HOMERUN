@@ -1664,14 +1664,20 @@ def _pitcher_recent_module(
     if row is not None:
         recent = row.features.get("recent") if isinstance(row.features, dict) else None
         if isinstance(recent, dict):
+            status, confidence, completeness = _feature_section_quality(
+                recent,
+                fallback_status=row.source_status,
+                fallback_confidence=row.confidence,
+                fallback_completeness=row.completeness,
+            )
             return _module(
                 f"{side}_starter_recent",
-                row.source_status,
+                status,
                 "cached pitcher recent feature",
                 captured_at=row.captured_at,
                 source=row.source,
-                confidence=row.confidence or Decimal("0"),
-                completeness=row.completeness or Decimal("0"),
+                confidence=confidence,
+                completeness=completeness,
                 stale=row.stale,
                 values=recent,
             )
@@ -1687,14 +1693,20 @@ def _pitcher_workload_module(
     if pitcher_row is not None:
         workload = pitcher_row.features.get("workload") if isinstance(pitcher_row.features, dict) else None
         if isinstance(workload, dict):
+            status, confidence, completeness = _feature_section_quality(
+                workload,
+                fallback_status=pitcher_row.source_status,
+                fallback_confidence=pitcher_row.confidence,
+                fallback_completeness=pitcher_row.completeness,
+            )
             return _module(
                 f"{side}_starter_workload",
-                pitcher_row.source_status,
+                status,
                 "cached pitcher workload feature",
                 captured_at=pitcher_row.captured_at,
                 source=pitcher_row.source,
-                confidence=pitcher_row.confidence or Decimal("0"),
-                completeness=pitcher_row.completeness or Decimal("0"),
+                confidence=confidence,
+                completeness=completeness,
                 stale=pitcher_row.stale,
                 values=workload,
             )
@@ -1710,6 +1722,23 @@ def _pitcher_workload_module(
         completeness="0.20",
         values={"expected_bullpen_innings": expected_bullpen},
     )
+
+
+def _feature_section_quality(
+    values: dict[str, object],
+    *,
+    fallback_status: str,
+    fallback_confidence: Decimal | None,
+    fallback_completeness: Decimal | None,
+) -> tuple[str, Decimal, Decimal]:
+    status = str(values.get("source_status") or fallback_status or "missing")
+    confidence = _decimal(values.get("confidence"))
+    completeness = _decimal(values.get("completeness"))
+    if confidence is None:
+        confidence = fallback_confidence if fallback_confidence is not None else Decimal("0")
+    if completeness is None:
+        completeness = fallback_completeness if fallback_completeness is not None else Decimal("0")
+    return status, confidence, completeness
 
 
 def _bullpen_module(
@@ -2330,6 +2359,10 @@ def _upsert_pybaseball_pitcher(
         **identity,
         "season": season,
         "recent": {
+            "source_status": "missing",
+            "confidence": 0.0,
+            "completeness": 0.0,
+            "limitation": "pybaseball season pitching rows do not provide recent-start form",
             "last_3_starts": None,
             "last_5_starts": None,
             "innings_per_start": None,
@@ -2341,7 +2374,11 @@ def _upsert_pybaseball_pitcher(
             "velocity_trend": None,
         },
         "workload": {
-            "expected_innings_projection": season.get("innings_pitched"),
+            "source_status": "missing",
+            "confidence": 0.0,
+            "completeness": 0.0,
+            "limitation": "pybaseball season innings pitched is a season total, not an upcoming-start projection",
+            "expected_innings_projection": None,
             "recent_pitch_count_ceiling": None,
             "days_rest": None,
             "opener_or_bulk_pitcher": None,
