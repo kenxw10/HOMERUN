@@ -1062,16 +1062,15 @@ def _discover_markets_low_request(
         found_keys.update(_persistable_found_keys(fallback_found))
 
     if not metrics.stopped_due_to_rate_limit:
-        event_offsets = (0, *fallback_offsets)
-        event_entries = _event_filter_probe_entries(
+        exact_event_entries = _event_filter_probe_entries(
             games,
             sorted(EVENT_TICKER_DISCOVERY_FAMILIES),
-            event_offsets,
+            EXACT_OFFSETS_MINUTES,
             found_keys,
         )
-        event_found = _event_filter_lookup_markets(
+        exact_event_found = _event_filter_lookup_markets(
             client=client,
-            probe_entries=event_entries,
+            probe_entries=exact_event_entries,
             settings=settings,
             warnings=warnings,
             errors=errors,
@@ -1079,8 +1078,28 @@ def _discover_markets_low_request(
             metrics=metrics,
             max_429_errors=max_429_errors,
         )
-        found.extend(event_found)
-        found_keys.update(_persistable_found_keys(event_found))
+        found.extend(exact_event_found)
+        found_keys.update(_persistable_found_keys(exact_event_found))
+
+    if fallback_offsets and not metrics.stopped_due_to_rate_limit:
+        fallback_event_entries = _event_filter_probe_entries(
+            games,
+            sorted(EVENT_TICKER_DISCOVERY_FAMILIES),
+            fallback_offsets,
+            found_keys,
+        )
+        fallback_event_found = _event_filter_lookup_markets(
+            client=client,
+            probe_entries=fallback_event_entries,
+            settings=settings,
+            warnings=warnings,
+            errors=errors,
+            probe_attempts=probe_attempts,
+            metrics=metrics,
+            max_429_errors=max_429_errors,
+        )
+        found.extend(fallback_event_found)
+        found_keys.update(_persistable_found_keys(fallback_event_found))
 
     _merge_client_metrics(metrics, client)
     if metrics.stopped_due_to_rate_limit:

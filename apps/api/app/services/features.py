@@ -3952,14 +3952,15 @@ def sync_mlb_features(
     stats["games_seen"] = len(games)
     for error in errors:
         _append_error(stats, error)
-    mlb_context = _mlb_primary_fetch_context(games, day, requested_modules, stats)
-    statcast_context = _statcast_fetch_context(games, day, requested_modules, stats)
-    pybaseball_context = _pybaseball_fetch_context(day, requested_modules, stats)
     for game in games:
         if settings.feature_sync_enable_network_sources:
             error = _hydrate_game_endpoint_if_available(game)
             if error:
                 _append_error(stats, error)
+    mlb_context = _mlb_primary_fetch_context(games, day, requested_modules, stats)
+    statcast_context = _statcast_fetch_context(games, day, requested_modules, stats)
+    pybaseball_context = _pybaseball_fetch_context(day, requested_modules, stats)
+    for game in games:
         _sync_game_feature_modules(
             session,
             game,
