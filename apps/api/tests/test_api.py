@@ -4619,12 +4619,154 @@ def test_mlb_stats_primary_hydrates_feed_before_collecting_pitcher_ids(monkeypat
         get_settings.cache_clear()
 
     assert result["probable_starters_seen"] == 2
-    assert pitcher_season_calls == ["1999", "2999"]
+    assert pitcher_season_calls == []
     assert pitcher_log_calls == ["1999", "2999"]
     assert pitcher is not None
+    assert pitcher.features["season"]["stats_basis"] == "pitcher_game_logs_before_target_date"
     assert pitcher.features["recent"]["source_status"] == "available"
     assert pitcher.features["recent"]["last_5_starts"]["sample"]["last_date"] == "2026-06-22"
     assert pitcher.features["workload"]["source_status"] == "available"
+
+
+def test_mlb_primary_pitcher_uses_logs_before_target_date(monkeypatch) -> None:
+    monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "true")
+    get_settings.cache_clear()
+    _stub_pybaseball_unavailable(monkeypatch)
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    season_calls: list[str] = []
+
+    class FakeMLBStatsClient:
+        def get_pitcher_season_stats(self, person_id: str, season: int):
+            season_calls.append(str(person_id))
+            return {
+                "stats": [
+                    {
+                        "splits": [
+                            {
+                                "stat": {
+                                    "era": "0.01",
+                                    "whip": "0.01",
+                                    "inningsPitched": "200.0",
+                                    "strikeOuts": 999,
+                                    "gamesStarted": 30,
+                                }
+                            }
+                        ]
+                    }
+                ]
+            }
+
+        def get_pitcher_game_log_stats(self, person_id: str, season: int):
+            return {
+                "stats": [
+                    {
+                        "splits": [
+                            {
+                                "date": "2026-06-30",
+                                "stat": {
+                                    "inningsPitched": "6.0",
+                                    "gamesStarted": 1,
+                                    "strikeOuts": 6,
+                                    "baseOnBalls": 2,
+                                    "hits": 5,
+                                    "homeRuns": 1,
+                                    "runs": 2,
+                                    "earnedRuns": 2,
+                                    "numberOfPitches": 90,
+                                    "battersFaced": 25,
+                                },
+                            },
+                            {
+                                "date": "2026-07-01",
+                                "stat": {
+                                    "inningsPitched": "9.0",
+                                    "gamesStarted": 1,
+                                    "strikeOuts": 20,
+                                    "baseOnBalls": 0,
+                                    "hits": 0,
+                                    "homeRuns": 0,
+                                    "runs": 0,
+                                    "earnedRuns": 0,
+                                    "numberOfPitches": 110,
+                                    "battersFaced": 27,
+                                },
+                            },
+                            {
+                                "date": "2026-07-02",
+                                "stat": {
+                                    "inningsPitched": "9.0",
+                                    "gamesStarted": 1,
+                                    "strikeOuts": 30,
+                                    "baseOnBalls": 0,
+                                    "hits": 0,
+                                    "homeRuns": 0,
+                                    "runs": 0,
+                                    "earnedRuns": 0,
+                                    "numberOfPitches": 110,
+                                    "battersFaced": 27,
+                                },
+                            },
+                        ]
+                    }
+                ]
+            }
+
+        def get_game_feed(self, *_args, **_kwargs):
+            return {}
+
+    monkeypatch.setattr(features, "MLBStatsClient", FakeMLBStatsClient)
+    monkeypatch.setattr(features, "_hydrate_game_endpoint_if_available", lambda *_args, **_kwargs: None)
+
+    try:
+        with Session(engine) as session:
+            session.add(
+                MlbGame(
+                    external_game_id="bounded-primary-pitcher",
+                    home_team="Pittsburgh Pirates",
+                    away_team="Seattle Mariners",
+                    home_abbreviation="PIT",
+                    away_abbreviation="SEA",
+                    scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+                    status="scheduled",
+                    raw_payload={
+                        "teams": {
+                            "home": {
+                                "team": {"id": 134, "name": "Pittsburgh Pirates"},
+                                "probablePitcher": {"id": 1999, "fullName": "Pitcher 1999"},
+                            },
+                            "away": {
+                                "team": {"id": 136, "name": "Seattle Mariners"},
+                                "probablePitcher": {"id": 2999, "fullName": "Pitcher 2999"},
+                            },
+                        }
+                    },
+                )
+            )
+            session.commit()
+
+            result = features.sync_mlb_pitcher_features(session, date(2026, 7, 1), refresh_schedule=False)
+            pitcher = session.scalar(
+                select(PitcherDailyFeature)
+                .where(PitcherDailyFeature.source == features.MLB_STATS_SOURCE)
+                .where(PitcherDailyFeature.pitcher_id == "1999")
+            )
+    finally:
+        get_settings.cache_clear()
+
+    assert result["validation_status"] == "ok"
+    assert season_calls == []
+    assert pitcher is not None
+    assert pitcher.source_status == "available"
+    assert pitcher.features["season"]["stats_basis"] == "pitcher_game_logs_before_target_date"
+    assert pitcher.features["season"]["stats_cutoff_date"] == "2026-07-01"
+    assert pitcher.features["season"]["innings_pitched"] == 6.0
+    assert pitcher.features["season"]["strikeouts"] == 6
+    assert pitcher.features["season"]["era"] == 3.0
+    assert pitcher.features["season"]["whip"] == 1.1667
+    assert pitcher.features["workload"]["expected_innings_projection"] == 6.0
+    assert pitcher.raw_payload["season"]["bounded_before"] == "2026-07-01"
+    assert pitcher.raw_payload["season"]["rows"] == 1
 
 
 def test_mlb_primary_team_recent_uses_calendar_window(monkeypatch) -> None:

@@ -1130,7 +1130,6 @@ def _mlb_primary_fetch_context(
         "team_pitching_logs_by_id": {},
         "team_hitting_splits_by_id": {},
         "team_pitching_splits_by_id": {},
-        "pitcher_season_by_id": {},
         "pitcher_game_logs_by_id": {},
     }
     if not (requested_modules & {"team", "pitcher"}):
@@ -1180,11 +1179,6 @@ def _mlb_primary_fetch_context(
         )
         stats["probable_starters_seen"] = len(pitcher_ids)
         for pitcher_id in pitcher_ids:
-            if hasattr(client, "get_pitcher_season_stats"):
-                try:
-                    context["pitcher_season_by_id"][pitcher_id] = client.get_pitcher_season_stats(pitcher_id, season)
-                except Exception as exc:
-                    _record_mlb_source_error(stats, table="pitcher_season_stats", exc=exc)
             if hasattr(client, "get_pitcher_game_log_stats"):
                 try:
                     context["pitcher_game_logs_by_id"][pitcher_id] = client.get_pitcher_game_log_stats(pitcher_id, season)
@@ -2729,7 +2723,20 @@ def _aggregate_pitcher_logs(splits: list[dict[str, object]], limit: int) -> dict
     if not sample:
         return None
     innings = Decimal("0")
-    totals = {key: Decimal("0") for key in ("strikeOuts", "baseOnBalls", "hits", "homeRuns", "runs", "earnedRuns", "gamesStarted", "numberOfPitches")}
+    totals = {
+        key: Decimal("0")
+        for key in (
+            "strikeOuts",
+            "baseOnBalls",
+            "hits",
+            "homeRuns",
+            "runs",
+            "earnedRuns",
+            "gamesStarted",
+            "numberOfPitches",
+            "battersFaced",
+        )
+    }
     for split in sample:
         stat = split.get("stat") if isinstance(split.get("stat"), dict) else {}
         innings += _baseball_innings(stat.get("inningsPitched")) or Decimal("0")
@@ -2750,6 +2757,7 @@ def _aggregate_pitcher_logs(splits: list[dict[str, object]], limit: int) -> dict
         "home_runs": _float(totals["homeRuns"]),
         "runs": _float(totals["runs"]),
         "earned_runs": _float(totals["earnedRuns"]),
+        "batters_faced": _float(totals["battersFaced"]),
         "k_minus_bb_per_inning": _float(_ratio(totals["strikeOuts"] - totals["baseOnBalls"], innings)),
         "pitch_count": _float(_ratio(totals["numberOfPitches"], len(sample))),
         "sample": {
@@ -2785,15 +2793,15 @@ def _upsert_mlb_primary_pitcher(
     if not identity or not identity.get("id"):
         return None
     pitcher_id = str(identity["id"])
-    season_payload = mlb_context.get("pitcher_season_by_id", {}).get(pitcher_id) if isinstance(mlb_context.get("pitcher_season_by_id"), dict) else None
     log_payload = mlb_context.get("pitcher_game_logs_by_id", {}).get(pitcher_id) if isinstance(mlb_context.get("pitcher_game_logs_by_id"), dict) else None
-    season_stat = _first_stat(season_payload if isinstance(season_payload, dict) else None)
     log_splits = _pitcher_start_splits(_game_log_splits_before(log_payload if isinstance(log_payload, dict) else None, day))
-    if season_stat is None and not log_splits:
+    if not log_splits:
         return None
-    innings = _baseball_innings((season_stat or {}).get("inningsPitched"))
-    games_started = _mlb_stat_decimal(season_stat, "gamesStarted")
-    season_innings_per_start = _ratio(innings, games_started)
+    season_total = _aggregate_pitcher_logs(log_splits, len(log_splits))
+    if season_total is None:
+        return None
+    innings = _decimal(season_total.get("innings_pitched"))
+    season_innings_per_start = _decimal(season_total.get("innings_per_start"))
     last3 = _aggregate_pitcher_logs(log_splits, 3)
     last5 = _aggregate_pitcher_logs(log_splits, 5)
     last5_ips = _decimal((last5 or {}).get("innings_per_start"))
@@ -2816,21 +2824,29 @@ def _upsert_mlb_primary_pitcher(
         "pitcher_id": pitcher_id,
         "pitcher_name": identity.get("name") or identity.get("pitcher_name"),
         "handedness": identity.get("handedness"),
-        "wins": _mlb_stat_int(season_stat, "wins"),
-        "losses": _mlb_stat_int(season_stat, "losses"),
-        "era": _float(_mlb_stat_decimal(season_stat, "era")),
-        "whip": _float(_mlb_stat_decimal(season_stat, "whip")),
+        "stats_basis": "pitcher_game_logs_before_target_date",
+        "stats_cutoff_date": day.isoformat(),
+        "wins": None,
+        "losses": None,
+        "era": season_total.get("era"),
+        "whip": season_total.get("whip"),
         "innings_pitched": _float(innings),
-        "strikeouts": _mlb_stat_int(season_stat, "strikeOuts"),
-        "base_on_balls": _mlb_stat_int(season_stat, "baseOnBalls"),
-        "hits": _mlb_stat_int(season_stat, "hits"),
-        "home_runs": _mlb_stat_int(season_stat, "homeRuns"),
-        "games_started": _mlb_stat_int(season_stat, "gamesStarted"),
-        "k_minus_bb_per_inning": _float(_ratio((_mlb_stat_decimal(season_stat, "strikeOuts") or Decimal("0")) - (_mlb_stat_decimal(season_stat, "baseOnBalls") or Decimal("0")), innings)),
+        "strikeouts": _int(season_total.get("strikeouts")),
+        "base_on_balls": _int(season_total.get("base_on_balls")),
+        "hits": _int(season_total.get("hits")),
+        "home_runs": _int(season_total.get("home_runs")),
+        "games_started": _int(season_total.get("games_started")),
+        "k_minus_bb_per_inning": season_total.get("k_minus_bb_per_inning"),
         "innings_per_start": _float(season_innings_per_start),
-        "hr_per_9_proxy": _float(_ratio((_mlb_stat_decimal(season_stat, "homeRuns") or Decimal("0")) * Decimal("9"), innings)),
-        "walk_rate_proxy": _float(_ratio(_mlb_stat_decimal(season_stat, "baseOnBalls"), _mlb_stat_decimal(season_stat, "battersFaced"))),
-        "strikeout_rate_proxy": _float(_ratio(_mlb_stat_decimal(season_stat, "strikeOuts"), _mlb_stat_decimal(season_stat, "battersFaced"))),
+        "hr_per_9_proxy": _float(
+            _ratio((_decimal(season_total.get("home_runs")) or Decimal("0")) * Decimal("9"), innings)
+        ),
+        "walk_rate_proxy": _float(
+            _ratio(_decimal(season_total.get("base_on_balls")), _decimal(season_total.get("batters_faced")))
+        ),
+        "strikeout_rate_proxy": _float(
+            _ratio(_decimal(season_total.get("strikeouts")), _decimal(season_total.get("batters_faced")))
+        ),
         "fip_proxy": None,
         "xfip_status": "missing",
     }
@@ -2884,7 +2900,15 @@ def _upsert_mlb_primary_pitcher(
         "recent_contact_quality": contact,
         "contact_quality_status": _statcast_status(contact if isinstance(contact, dict) else None),
     }
-    row.raw_payload = {"season": season_payload, "game_log": log_payload, "statcast": contact}
+    row.raw_payload = {
+        "season": {
+            "bounded_before": day.isoformat(),
+            "source": "pitcher_game_logs",
+            "rows": len(log_splits),
+        },
+        "game_log": log_payload,
+        "statcast": contact,
+    }
     if status == "available":
         stats["pitcher_season_stats_available_count"] = int(stats.get("pitcher_season_stats_available_count", 0)) + 1
     if last5:
