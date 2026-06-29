@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
-from decimal import Decimal, ROUND_CEILING
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -39,7 +39,8 @@ from app.services.modeling import (
     get_or_create_mature_model_version,
     score_mature_candidate,
 )
-from app.services.portfolio import create_balance_snapshot
+from app.services.portfolio import calculate_paper_portfolio, create_balance_snapshot
+from app.services.paper_epoch import get_or_create_active_paper_epoch
 from app.time_utils import classify_time_bucket, ensure_aware_utc, get_dashboard_zone, utc_now
 
 TRADABLE_MARKET_STATUSES = {"active", "open"}
@@ -55,6 +56,8 @@ class TradeIntent:
     price: Decimal
     labels: object
     score: Decimal
+    quantity: int = 1
+    sizing: dict[str, Decimal | int | str | None] | None = None
 
 
 @dataclass(frozen=True)
@@ -65,6 +68,42 @@ class PriceContext:
     updated_at: datetime | None
     staleness_seconds: int | None
     status: str
+
+
+@dataclass(frozen=True)
+class SizingContext:
+    bankroll_at_entry: Decimal | None
+    risk_pct: Decimal | None
+    risk_dollars: Decimal | None
+    contracts: int
+    estimated_cost_per_contract: Decimal | None
+    estimated_total_cost: Decimal | None
+    one_contract_expected_value: Decimal | None
+    sized_expected_value: Decimal | None
+    one_contract_fee_estimate: Decimal | None
+    total_fee_estimate: Decimal | None
+    status: str
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "bankroll_at_entry": float(self.bankroll_at_entry) if self.bankroll_at_entry is not None else None,
+            "risk_pct": float(self.risk_pct) if self.risk_pct is not None else None,
+            "risk_dollars": float(self.risk_dollars) if self.risk_dollars is not None else None,
+            "contracts": self.contracts,
+            "estimated_cost_per_contract": (
+                float(self.estimated_cost_per_contract) if self.estimated_cost_per_contract is not None else None
+            ),
+            "estimated_total_cost": float(self.estimated_total_cost) if self.estimated_total_cost is not None else None,
+            "one_contract_expected_value": (
+                float(self.one_contract_expected_value) if self.one_contract_expected_value is not None else None
+            ),
+            "sized_expected_value": float(self.sized_expected_value) if self.sized_expected_value is not None else None,
+            "one_contract_fee_estimate": (
+                float(self.one_contract_fee_estimate) if self.one_contract_fee_estimate is not None else None
+            ),
+            "total_fee_estimate": float(self.total_fee_estimate) if self.total_fee_estimate is not None else None,
+            "status": self.status,
+        }
 
 
 def _candidate_day_bounds(now: datetime, target_date: date | None = None) -> tuple[date, datetime, datetime]:
@@ -167,6 +206,232 @@ def _expected_values(
     return gross, fee, net, edge
 
 
+def _decimal_json(value: Decimal | None) -> float | None:
+    return float(value) if value is not None else None
+
+
+def _scope_for_family(family: str | None) -> str:
+    return "first_five" if (family or "").startswith("first_five") else "full_game"
+
+
+def _paper_quality_threshold() -> Decimal:
+    return get_settings().paper_observation_min_data_quality
+
+
+def _sizing_context(
+    *,
+    bankroll: Decimal,
+    price: Decimal | None,
+    one_contract_net_ev: Decimal | None,
+) -> SizingContext:
+    settings = get_settings()
+    if settings.paper_position_sizing_mode.strip().lower() != "fixed_risk":
+        quantity = max(settings.default_paper_contracts, 1)
+        fee = _estimate_trade_fee(price, quantity)
+        one_fee = _estimate_trade_fee(price, 1)
+        cost_per_contract = (price + (one_fee or Decimal("0"))).quantize(Decimal("0.000001")) if price else None
+        total_cost = (cost_per_contract * Decimal(quantity)).quantize(Decimal("0.01")) if cost_per_contract else None
+        sized_ev = (one_contract_net_ev * Decimal(quantity)).quantize(Decimal("0.000001")) if one_contract_net_ev else None
+        return SizingContext(
+            bankroll_at_entry=bankroll.quantize(Decimal("0.01")),
+            risk_pct=None,
+            risk_dollars=None,
+            contracts=quantity,
+            estimated_cost_per_contract=cost_per_contract,
+            estimated_total_cost=total_cost,
+            one_contract_expected_value=one_contract_net_ev,
+            sized_expected_value=sized_ev,
+            one_contract_fee_estimate=one_fee,
+            total_fee_estimate=fee,
+            status="default_contracts",
+        )
+
+    if not _is_executable_price(price):
+        return SizingContext(None, None, None, 0, None, None, one_contract_net_ev, None, None, None, "missing_price")
+
+    one_fee = _estimate_trade_fee(price, 1)
+    if one_fee is None:
+        return SizingContext(None, None, None, 0, None, None, one_contract_net_ev, None, None, None, "missing_fee")
+
+    risk_pct = settings.paper_risk_per_trade_pct
+    risk_dollars = (bankroll * risk_pct).quantize(Decimal("0.01"))
+    cost_per_contract = (price + one_fee).quantize(Decimal("0.000001"))
+    raw_contracts = int((risk_dollars / cost_per_contract).to_integral_value(rounding=ROUND_FLOOR))
+    if raw_contracts < settings.paper_min_contracts:
+        return SizingContext(
+            bankroll_at_entry=bankroll.quantize(Decimal("0.01")),
+            risk_pct=risk_pct,
+            risk_dollars=risk_dollars,
+            contracts=0,
+            estimated_cost_per_contract=cost_per_contract,
+            estimated_total_cost=None,
+            one_contract_expected_value=one_contract_net_ev,
+            sized_expected_value=None,
+            one_contract_fee_estimate=one_fee,
+            total_fee_estimate=None,
+            status="insufficient_bankroll_or_contract_size",
+        )
+
+    contracts = min(raw_contracts, settings.paper_max_contracts_per_trade)
+    total_fee = _estimate_trade_fee(price, contracts)
+    total_cost = ((price * Decimal(contracts)) + (total_fee or Decimal("0"))).quantize(Decimal("0.01"))
+    sized_ev = (one_contract_net_ev * Decimal(contracts)).quantize(Decimal("0.000001")) if one_contract_net_ev else None
+    if total_fee is not None and one_fee is not None:
+        sized_ev = (
+            ((one_contract_net_ev or Decimal("0")) + one_fee) * Decimal(contracts) - total_fee
+        ).quantize(Decimal("0.000001"))
+    return SizingContext(
+        bankroll_at_entry=bankroll.quantize(Decimal("0.01")),
+        risk_pct=risk_pct,
+        risk_dollars=risk_dollars,
+        contracts=contracts,
+        estimated_cost_per_contract=cost_per_contract,
+        estimated_total_cost=total_cost,
+        one_contract_expected_value=one_contract_net_ev,
+        sized_expected_value=sized_ev,
+        one_contract_fee_estimate=one_fee,
+        total_fee_estimate=total_fee,
+        status="sized",
+    )
+
+
+def _diagnostics_payload(
+    *,
+    mapping: MarketMapping,
+    game: MlbGame,
+    market: KalshiMarket,
+    market_type: str,
+    target_date: date,
+    minutes_to_start: int,
+    price_context: PriceContext,
+    probability: Decimal | None,
+    gross_ev: Decimal | None,
+    fee_estimate: Decimal | None,
+    net_ev: Decimal | None,
+    probability_edge: Decimal | None,
+    data_quality: Decimal | None,
+    calibration_status: str | None,
+    push_probability: Decimal | None,
+    open_trade_exists: bool,
+) -> dict[str, object]:
+    settings = get_settings()
+    settlement_status = _settlement_status(mapping, market)
+    mapping_ok = mapping.mapping_status != "needs_review" and (mapping.confidence or Decimal("0")) >= Decimal("0.55")
+    supported_ok = market_type in PAPER_SUPPORTED_MARKET_FAMILIES
+    if market_type != FULL_GAME_WINNER and settlement_status != "paper_supported":
+        supported_ok = False
+    game_not_started = minutes_to_start > 0 and _eastern_date(game.scheduled_start) == target_date
+    market_open = market.status.strip().lower() in TRADABLE_MARKET_STATUSES
+    price_ok = price_context.status == "fresh_executable"
+    data_quality_ok = data_quality is not None and data_quality >= _paper_quality_threshold()
+    push_ok = not (push_probability is not None and push_probability > Decimal("0") and market_type.endswith(("spread", "total")))
+    probability_present = probability is not None
+    gross_ev_positive = gross_ev is not None and gross_ev > Decimal("0")
+    fee_present = fee_estimate is not None
+    probability_edge_ok = probability_edge is not None and probability_edge >= settings.paper_min_prob_edge
+    net_ev_ok = net_ev is not None and net_ev >= settings.paper_min_net_ev
+    calibration_ok = not settings.paper_require_calibrated_for_trade or calibration_status == "calibrated"
+    open_position_ok = not open_trade_exists
+    selection_code = (mapping.selection_code or market.selection_code or "").upper()
+    trusted_tie_selection = market_type == "first_five_winner" and selection_code == "TIE"
+    selection_trusted_ok = (
+        not settings.safe_execution_posture
+        or market_type not in SELECTION_REQUIRED_FAMILIES
+        or trusted_tie_selection
+        or _has_trusted_candidate_selection(mapping, game, market)
+    )
+    pre_quality_gates = [
+        mapping_ok,
+        supported_ok,
+        game_not_started,
+        market_open,
+        selection_trusted_ok,
+        price_ok,
+        push_ok,
+        probability_present,
+        gross_ev_positive,
+        fee_present,
+        probability_edge_ok,
+        net_ev_ok,
+        calibration_ok,
+        settings.paper_candidate_engine_enabled,
+        open_position_ok,
+    ]
+    before_quality = all(pre_quality_gates)
+    after_quality = before_quality and data_quality_ok
+    flags = {
+        "gate_mapping_ok": mapping_ok and supported_ok,
+        "gate_market_open": market_open,
+        "gate_game_not_started": game_not_started,
+        "gate_selection_trusted_ok": selection_trusted_ok,
+        "gate_price_fresh_executable": price_ok,
+        "gate_data_quality_ok": data_quality_ok,
+        "gate_push_ok": push_ok,
+        "gate_probability_present": probability_present,
+        "gate_gross_ev_positive": gross_ev_positive,
+        "gate_fee_present": fee_present,
+        "gate_probability_edge_ok": probability_edge_ok,
+        "gate_net_ev_ok": net_ev_ok,
+        "gate_calibration_ok": calibration_ok,
+        "gate_line_selection_ok": True,
+        "gate_caps_ok": True,
+        "gate_open_position_ok": open_position_ok,
+        "gate_final_trade_eligible": after_quality,
+        "blocked_by_quality_only": before_quality and not data_quality_ok,
+        "would_pass_ev_if_quality_allowed": gross_ev_positive and net_ev_ok,
+        "would_pass_edge_if_quality_allowed": probability_edge_ok,
+        "ev_edge_pass_but_quality_fail": gross_ev_positive and net_ev_ok and probability_edge_ok and not data_quality_ok,
+        "counterfactual_trade_eligible_before_quality": before_quality,
+        "counterfactual_trade_eligible_after_quality": after_quality,
+        "market_type_supported": supported_ok,
+        "paper_quality_threshold": float(_paper_quality_threshold()),
+    }
+    return flags
+
+
+def _apply_gate_fields(candidate: ModelCandidate, diagnostics: dict[str, object]) -> None:
+    candidate.gate_diagnostics = diagnostics
+    for key, value in diagnostics.items():
+        if key.startswith("gate_") or key in {
+            "blocked_by_quality_only",
+            "would_pass_ev_if_quality_allowed",
+            "would_pass_edge_if_quality_allowed",
+            "ev_edge_pass_but_quality_fail",
+            "counterfactual_trade_eligible_before_quality",
+            "counterfactual_trade_eligible_after_quality",
+        }:
+            if hasattr(candidate, key):
+                setattr(candidate, key, bool(value))
+
+
+def _update_gate(candidate: ModelCandidate, key: str, value: bool) -> None:
+    diagnostics = dict(candidate.gate_diagnostics or {})
+    diagnostics[key] = value
+    final = all(
+        bool(diagnostics.get(flag))
+        for flag in (
+            "gate_mapping_ok",
+            "gate_market_open",
+            "gate_game_not_started",
+            "gate_selection_trusted_ok",
+            "gate_price_fresh_executable",
+            "gate_data_quality_ok",
+            "gate_push_ok",
+            "gate_probability_present",
+            "gate_gross_ev_positive",
+            "gate_fee_present",
+            "gate_probability_edge_ok",
+            "gate_net_ev_ok",
+            "gate_calibration_ok",
+            "gate_line_selection_ok",
+            "gate_caps_ok",
+            "gate_open_position_ok",
+        )
+    )
+    diagnostics["gate_final_trade_eligible"] = final
+    _apply_gate_fields(candidate, diagnostics)
+
+
 def _market_classification_text(market: KalshiMarket) -> str:
     return " ".join(
         value or ""
@@ -182,27 +447,34 @@ def _market_classification_text(market: KalshiMarket) -> str:
     )
 
 
-def _candidate_ids_with_trades(session: Session, candidate_ids: list[int]) -> set[int]:
+def _candidate_ids_with_trades(session: Session, candidate_ids: list[int], epoch_id: int | None) -> set[int]:
     if not candidate_ids:
         return set()
+    query = select(PaperTrade.candidate_id).where(PaperTrade.candidate_id.in_(candidate_ids))
+    if epoch_id is not None:
+        query = query.where(PaperTrade.paper_trading_epoch_id == epoch_id)
     return {
         candidate_id
-        for candidate_id in session.scalars(
-            select(PaperTrade.candidate_id).where(PaperTrade.candidate_id.in_(candidate_ids))
-        )
+        for candidate_id in session.scalars(query)
         if candidate_id is not None
     }
 
 
-def _open_trade_for_market(session: Session, market_ticker: str, contract_side: str) -> PaperTrade | None:
-    return session.scalar(
+def _open_trade_for_market(
+    session: Session,
+    market_ticker: str,
+    contract_side: str,
+    epoch_id: int | None,
+) -> PaperTrade | None:
+    query = (
         select(PaperTrade)
         .where(PaperTrade.market_ticker == market_ticker)
         .where(PaperTrade.contract_side == contract_side)
         .where(PaperTrade.status == "open")
-        .order_by(PaperTrade.entry_time.desc(), PaperTrade.id.desc())
-        .limit(1)
     )
+    if epoch_id is not None:
+        query = query.where(PaperTrade.paper_trading_epoch_id == epoch_id)
+    return session.scalar(query.order_by(PaperTrade.entry_time.desc(), PaperTrade.id.desc()).limit(1))
 
 
 def _has_trusted_candidate_selection(mapping: MarketMapping, game: MlbGame, market: KalshiMarket) -> bool:
@@ -264,7 +536,7 @@ def _base_decision(
         return "no_trade_stale_price"
     if price_context.status != "fresh_executable":
         return "no_trade_non_executable_price"
-    if data_quality is None or data_quality < settings.paper_min_data_quality:
+    if data_quality is None or data_quality < settings.paper_observation_min_data_quality:
         return "no_trade_low_data_quality"
     if push_probability is not None and push_probability > Decimal("0") and market_type.endswith(("spread", "total")):
         return "no_trade_push_possible"
@@ -300,29 +572,33 @@ def _slate_trade_counts(
     target_date: date,
     start: datetime,
     end: datetime,
+    epoch_id: int | None,
 ) -> tuple[int, dict[int, int], dict[str, int], dict[tuple[int, str], int], set[str]]:
-    rows = list(
-        session.execute(
-            select(PaperTrade, ModelCandidate, MlbGame)
-            .outerjoin(ModelCandidate, PaperTrade.candidate_id == ModelCandidate.id)
-            .outerjoin(MlbGame, ModelCandidate.mlb_game_id == MlbGame.id)
-            .where(
-                (ModelCandidate.target_date == target_date)
-                | (
-                    (ModelCandidate.target_date.is_(None))
-                    & (MlbGame.scheduled_start >= start)
-                    & (MlbGame.scheduled_start < end)
-                )
-                | (
-                    (PaperTrade.entry_time >= start)
-                    & (PaperTrade.entry_time < end)
-                    & (
-                        (ModelCandidate.id.is_(None))
-                        | ((ModelCandidate.target_date.is_(None)) & (MlbGame.id.is_(None)))
-                    )
+    query = (
+        select(PaperTrade, ModelCandidate, MlbGame)
+        .outerjoin(ModelCandidate, PaperTrade.candidate_id == ModelCandidate.id)
+        .outerjoin(MlbGame, ModelCandidate.mlb_game_id == MlbGame.id)
+        .where(
+            (ModelCandidate.target_date == target_date)
+            | (
+                (ModelCandidate.target_date.is_(None))
+                & (MlbGame.scheduled_start >= start)
+                & (MlbGame.scheduled_start < end)
+            )
+            | (
+                (PaperTrade.entry_time >= start)
+                & (PaperTrade.entry_time < end)
+                & (
+                    (ModelCandidate.id.is_(None))
+                    | ((ModelCandidate.target_date.is_(None)) & (MlbGame.id.is_(None)))
                 )
             )
         )
+    )
+    if epoch_id is not None:
+        query = query.where(PaperTrade.paper_trading_epoch_id == epoch_id)
+    rows = list(
+        session.execute(query)
     )
     game_counts: dict[int, int] = {}
     family_counts: dict[str, int] = {}
@@ -340,8 +616,11 @@ def _slate_trade_counts(
     return len(rows), game_counts, family_counts, game_family_counts, market_tickers
 
 
-def _open_position_count(session: Session) -> int:
-    return int(session.scalar(select(func.count(PaperTrade.id)).where(PaperTrade.status == "open")) or 0)
+def _open_position_count(session: Session, epoch_id: int | None) -> int:
+    query = select(func.count(PaperTrade.id)).where(PaperTrade.status == "open")
+    if epoch_id is not None:
+        query = query.where(PaperTrade.paper_trading_epoch_id == epoch_id)
+    return int(session.scalar(query) or 0)
 
 
 def _trade_rank_score(candidate: ModelCandidate) -> Decimal:
@@ -385,8 +664,11 @@ def _apply_line_selection(intents: list[TradeIntent]) -> tuple[list[TradeIntent]
         kept = ranked[:limit]
         selected.extend(kept)
         counts["line_selection_candidates_kept"] += len(kept)
+        for accepted in kept:
+            _update_gate(accepted.candidate, "gate_line_selection_ok", True)
         for rejected in ranked[limit:]:
             rejected.candidate.decision = "no_trade_line_selection_not_best"
+            _update_gate(rejected.candidate, "gate_line_selection_ok", False)
             counts["line_selection_candidates_rejected"] += 1
 
     return selected, counts
@@ -398,12 +680,13 @@ def _apply_trade_caps(
     target_date: date,
     day_start: datetime,
     day_end: datetime,
+    epoch_id: int | None,
 ) -> tuple[list[TradeIntent], dict[str, int]]:
     settings = get_settings()
     existing_slate, game_counts, family_counts, game_family_counts, market_tickers = _slate_trade_counts(
-        session, target_date, day_start, day_end
+        session, target_date, day_start, day_end, epoch_id
     )
-    open_positions = _open_position_count(session)
+    open_positions = _open_position_count(session, epoch_id)
     selected: list[TradeIntent] = []
     cap_counts = {
         "candidate_only_due_to_trade_cap": 0,
@@ -421,21 +704,29 @@ def _apply_trade_caps(
         game_id = candidate.mlb_game_id
         if intent.market.ticker in market_tickers:
             candidate.decision = "no_trade_correlated_market_cap"
+            _update_gate(candidate, "gate_caps_ok", False)
         elif existing_slate + len(selected) >= settings.paper_max_trades_per_slate:
             candidate.decision = "no_trade_slate_cap"
+            _update_gate(candidate, "gate_caps_ok", False)
         elif open_positions + len(selected) >= settings.paper_max_open_positions:
             candidate.decision = "no_trade_open_position_cap"
+            _update_gate(candidate, "gate_open_position_ok", False)
         elif game_id is not None and game_counts.get(game_id, 0) >= settings.paper_max_trades_per_game:
             candidate.decision = "no_trade_game_cap"
+            _update_gate(candidate, "gate_caps_ok", False)
         elif family_counts.get(family, 0) >= settings.paper_max_trades_per_market_family:
             candidate.decision = "no_trade_market_family_cap"
+            _update_gate(candidate, "gate_caps_ok", False)
         elif (
             game_id is not None
             and game_family_counts.get((game_id, family), 0) >= _game_family_trade_limit(family)
         ):
             candidate.decision = "no_trade_game_family_cap"
+            _update_gate(candidate, "gate_caps_ok", False)
         else:
             candidate.decision = "paper_trade"
+            _update_gate(candidate, "gate_caps_ok", True)
+            _update_gate(candidate, "gate_open_position_ok", True)
             selected.append(intent)
             family_counts[family] = family_counts.get(family, 0) + 1
             if game_id is not None:
@@ -461,6 +752,63 @@ def _max_decimal(values: list[Decimal]) -> float | None:
     return float(max(values))
 
 
+def _min_decimal(values: list[Decimal]) -> float | None:
+    if not values:
+        return None
+    return float(min(values))
+
+
+def _decision_breakdowns(candidates: list[ModelCandidate]) -> tuple[dict[str, dict[str, int]], dict[str, dict[str, int]]]:
+    by_family: dict[str, dict[str, int]] = {}
+    by_scope: dict[str, dict[str, int]] = {}
+    for candidate in candidates:
+        family = candidate.market_family or candidate.market_type or "unknown"
+        scope = candidate.inning_scope or _scope_for_family(family)
+        decision = candidate.decision or "unknown"
+        family_bucket = by_family.setdefault(family, {})
+        family_bucket[decision] = family_bucket.get(decision, 0) + 1
+        scope_bucket = by_scope.setdefault(scope, {})
+        scope_bucket[decision] = scope_bucket.get(decision, 0) + 1
+    return by_family, by_scope
+
+
+def _gate_summary(candidates: list[ModelCandidate]) -> dict[str, object]:
+    def count(key: str, expected: bool = True) -> int:
+        return sum(1 for candidate in candidates if bool((candidate.gate_diagnostics or {}).get(key)) is expected)
+
+    data_quality_values = [candidate.data_quality for candidate in candidates if candidate.data_quality is not None]
+    ev_passing_values = [
+        candidate.net_expected_value
+        for candidate in candidates
+        if candidate.net_expected_value is not None and bool((candidate.gate_diagnostics or {}).get("gate_net_ev_ok"))
+    ]
+    edge_passing_values = [
+        candidate.probability_edge
+        for candidate in candidates
+        if candidate.probability_edge is not None and bool((candidate.gate_diagnostics or {}).get("gate_probability_edge_ok"))
+    ]
+    return {
+        "trade_eligible_before_quality": count("counterfactual_trade_eligible_before_quality"),
+        "trade_eligible_after_quality": count("counterfactual_trade_eligible_after_quality"),
+        "blocked_by_quality_only": count("blocked_by_quality_only"),
+        "would_pass_ev_if_quality_allowed": count("would_pass_ev_if_quality_allowed"),
+        "would_pass_edge_if_quality_allowed": count("would_pass_edge_if_quality_allowed"),
+        "ev_edge_pass_but_quality_fail": count("ev_edge_pass_but_quality_fail"),
+        "blocked_by_ev": count("gate_net_ev_ok", False),
+        "blocked_by_edge": count("gate_probability_edge_ok", False),
+        "blocked_by_price": count("gate_price_fresh_executable", False),
+        "blocked_by_mapping": count("gate_mapping_ok", False),
+        "blocked_by_push": count("gate_push_ok", False),
+        "blocked_by_line_selection": count("gate_line_selection_ok", False),
+        "blocked_by_caps": count("gate_caps_ok", False),
+        "average_data_quality": _avg_decimal(data_quality_values),
+        "min_data_quality": _min_decimal(data_quality_values),
+        "max_data_quality": _max_decimal(data_quality_values),
+        "average_net_ev_among_ev_passing": _avg_decimal(ev_passing_values),
+        "average_probability_edge_among_edge_passing": _avg_decimal(edge_passing_values),
+    }
+
+
 def _zero_trade_reason(decision_counts: dict[str, int]) -> str | None:
     if not decision_counts:
         return "no_candidates_evaluated"
@@ -474,11 +822,13 @@ def generate_candidates(session: Session, target_date: date | None = None) -> di
     settings = get_settings()
     now = utc_now()
     day, day_start, day_end = _candidate_day_bounds(now, target_date)
+    active_epoch = get_or_create_active_paper_epoch(session)
     created_or_updated = 0
     paper_trades = 0
     model_version = get_or_create_mature_model_version(session)
     parameter_version = get_or_create_active_parameter_version(session)
     prediction_run = ModelPredictionRun(
+        paper_trading_epoch_id=active_epoch.id,
         started_at=now,
         target_date=day,
         status="running",
@@ -493,6 +843,8 @@ def generate_candidates(session: Session, target_date: date | None = None) -> di
             "paper_min_net_ev": float(settings.paper_min_net_ev),
             "paper_min_prob_edge": float(settings.paper_min_prob_edge),
             "paper_min_data_quality": float(settings.paper_min_data_quality),
+            "paper_observation_min_data_quality": float(settings.paper_observation_min_data_quality),
+            "live_min_data_quality": float(settings.live_min_data_quality),
             "paper_require_calibrated_for_trade": settings.paper_require_calibrated_for_trade,
             "paper_max_price_staleness_seconds": settings.paper_max_price_staleness_seconds,
             "paper_allow_last_price_fallback_for_trade": settings.paper_allow_last_price_fallback_for_trade,
@@ -502,6 +854,10 @@ def generate_candidates(session: Session, target_date: date | None = None) -> di
             "kalshi_fee_estimate_mode": settings.kalshi_fee_estimate_mode,
             "kalshi_fee_rounding_mode": settings.kalshi_fee_rounding_mode,
             "kalshi_assume_taker": settings.kalshi_assume_taker,
+            "paper_position_sizing_mode": settings.paper_position_sizing_mode,
+            "paper_risk_per_trade_pct": float(settings.paper_risk_per_trade_pct),
+            "paper_min_contracts": settings.paper_min_contracts,
+            "paper_max_contracts_per_trade": settings.paper_max_contracts_per_trade,
         },
     )
     session.add(prediction_run)
@@ -555,9 +911,7 @@ def generate_candidates(session: Session, target_date: date | None = None) -> di
         )
         probability = model_score.probability_calibrated or model_score.probability
         fair_value = model_score.fair_value
-        gross_ev, fee, net_ev, probability_edge = _expected_values(
-            probability, price, settings.default_paper_contracts
-        )
+        gross_ev, fee, net_ev, probability_edge = _expected_values(probability, price, 1)
         if price_context.status == "stale":
             stale_price_count += 1
         elif price_context.status not in {"fresh_executable", "missing"}:
@@ -592,25 +946,28 @@ def generate_candidates(session: Session, target_date: date | None = None) -> di
             session.scalars(
                 select(ModelCandidate)
                 .where(ModelCandidate.mapping_id == mapping.id)
+                .where(ModelCandidate.paper_trading_epoch_id == active_epoch.id)
                 .where(ModelCandidate.time_bucket == bucket)
                 .where(ModelCandidate.target_date == day)
                 .order_by(ModelCandidate.evaluated_at.desc(), ModelCandidate.id.desc())
             )
         )
         traded_candidate_ids = _candidate_ids_with_trades(
-            session, [candidate.id for candidate in existing_candidates if candidate.id is not None]
+            session, [candidate.id for candidate in existing_candidates if candidate.id is not None], active_epoch.id
         )
         existing = next(
             (candidate for candidate in existing_candidates if candidate.id not in traded_candidate_ids),
             None,
         )
-        open_trade_for_market = _open_trade_for_market(session, market.ticker, contract_side)
+        open_trade_for_market = _open_trade_for_market(session, market.ticker, contract_side, active_epoch.id)
         candidate = existing or ModelCandidate(
+            paper_trading_epoch_id=active_epoch.id,
             mapping_id=mapping.id,
             mlb_game_id=game.id,
             kalshi_market_id=market.id,
             evaluated_at=now,
         )
+        candidate.paper_trading_epoch_id = active_epoch.id
         if open_trade_for_market is not None and price is not None:
             open_trade_for_market.current_price = price
             open_trade_for_market.market_display = open_trade_for_market.market_display or labels.market_display
@@ -638,6 +995,7 @@ def generate_candidates(session: Session, target_date: date | None = None) -> di
             session.add(open_trade_for_market)
         if (traded_candidate_ids or open_trade_for_market is not None) and decision == "eligible_for_paper_trade":
             decision = "candidate_only_existing_trade"
+            _update_gate(candidate, "gate_open_position_ok", False)
 
         candidate.model_version_id = model_version.id
         candidate.evaluated_at = now
@@ -695,6 +1053,28 @@ def generate_candidates(session: Session, target_date: date | None = None) -> di
         candidate.over_under_side = mapping.over_under_side or market.over_under_side
         candidate.inning_scope = mapping.inning_scope or market.inning_scope
         candidate.settlement_rule_status = mapping.settlement_rule_status or market.settlement_rule_status
+        diagnostics = _diagnostics_payload(
+            mapping=mapping,
+            game=game,
+            market=market,
+            market_type=market_type,
+            target_date=day,
+            minutes_to_start=minutes_to_start,
+            price_context=price_context,
+            probability=probability,
+            gross_ev=gross_ev,
+            fee_estimate=fee,
+            net_ev=net_ev,
+            probability_edge=probability_edge,
+            data_quality=model_score.data_quality,
+            calibration_status=model_score.calibration_status,
+            push_probability=model_score.push_probability,
+            open_trade_exists=open_trade_for_market is not None,
+        )
+        if decision == "candidate_only_existing_trade":
+            diagnostics["gate_open_position_ok"] = False
+            diagnostics["gate_final_trade_eligible"] = False
+        _apply_gate_fields(candidate, diagnostics)
         session.add(candidate)
         session.flush()
         session.add(
@@ -711,6 +1091,7 @@ def generate_candidates(session: Session, target_date: date | None = None) -> di
         evaluated_candidates.append(candidate)
 
         output = ModelPredictionOutput(
+            paper_trading_epoch_id=active_epoch.id,
             prediction_run_id=prediction_run.id,
             candidate_id=candidate.id,
             market_family=candidate.market_family,
@@ -744,8 +1125,9 @@ def generate_candidates(session: Session, target_date: date | None = None) -> di
                     "fee_estimate_mode": settings.kalshi_fee_estimate_mode,
                     "fee_rounding_mode": settings.kalshi_fee_rounding_mode,
                     "assume_taker": settings.kalshi_assume_taker,
-                    "quantity": settings.default_paper_contracts,
+                    "quantity": 1,
                 },
+                "gate_diagnostics": diagnostics,
             },
         )
         session.add(output)
@@ -768,22 +1150,81 @@ def generate_candidates(session: Session, target_date: date | None = None) -> di
         output = outputs_by_candidate_id.get(intent.candidate.id)
         if output is not None:
             output.decision_reason = intent.candidate.decision
+            raw = dict(output.raw_output or {})
+            raw["gate_diagnostics"] = intent.candidate.gate_diagnostics or {}
+            output.raw_output = raw
             session.add(output)
         session.add(intent.candidate)
 
-    selected_trades, cap_counts = _apply_trade_caps(session, line_selected_trades, day, day_start, day_end)
+    selected_trades, cap_counts = _apply_trade_caps(session, line_selected_trades, day, day_start, day_end, active_epoch.id)
     session.flush()
     for intent in line_selected_trades:
         output = outputs_by_candidate_id.get(intent.candidate.id)
         if output is not None:
             output.decision_reason = intent.candidate.decision
+            raw = dict(output.raw_output or {})
+            raw["gate_diagnostics"] = intent.candidate.gate_diagnostics or {}
+            output.raw_output = raw
             session.add(output)
 
-    for rank, intent in enumerate(selected_trades, start=1):
+    bankroll_for_sizing = Decimal(calculate_paper_portfolio(session, epoch=active_epoch).portfolio_value)
+
+    sized_selected_trades: list[TradeIntent] = []
+    sizing_rejections = 0
+    for intent in selected_trades:
+        sizing = _sizing_context(
+            bankroll=bankroll_for_sizing,
+            price=intent.price,
+            one_contract_net_ev=intent.candidate.net_expected_value,
+        )
+        if sizing.contracts < settings.paper_min_contracts:
+            intent.candidate.decision = "no_trade_insufficient_bankroll_or_contract_size"
+            _update_gate(intent.candidate, "gate_caps_ok", False)
+            intent.candidate.bankroll_at_entry = sizing.bankroll_at_entry
+            intent.candidate.risk_pct = sizing.risk_pct
+            intent.candidate.risk_dollars = sizing.risk_dollars
+            intent.candidate.contracts = sizing.contracts
+            intent.candidate.estimated_cost_per_contract = sizing.estimated_cost_per_contract
+            intent.candidate.estimated_total_cost = sizing.estimated_total_cost
+            intent.candidate.one_contract_expected_value = sizing.one_contract_expected_value
+            intent.candidate.sized_expected_value = sizing.sized_expected_value
+            intent.candidate.one_contract_fee_estimate = sizing.one_contract_fee_estimate
+            intent.candidate.total_fee_estimate = sizing.total_fee_estimate
+            output = outputs_by_candidate_id.get(intent.candidate.id)
+            if output is not None:
+                output.decision_reason = intent.candidate.decision
+                raw = dict(output.raw_output or {})
+                raw["sizing"] = sizing.as_dict()
+                raw["gate_diagnostics"] = intent.candidate.gate_diagnostics or {}
+                output.raw_output = raw
+                session.add(output)
+            session.add(intent.candidate)
+            sizing_rejections += 1
+            continue
+        intent.quantity = sizing.contracts
+        intent.sizing = sizing.as_dict()
+        intent.candidate.bankroll_at_entry = sizing.bankroll_at_entry
+        intent.candidate.risk_pct = sizing.risk_pct
+        intent.candidate.risk_dollars = sizing.risk_dollars
+        intent.candidate.contracts = sizing.contracts
+        intent.candidate.estimated_cost_per_contract = sizing.estimated_cost_per_contract
+        intent.candidate.estimated_total_cost = sizing.estimated_total_cost
+        intent.candidate.one_contract_expected_value = sizing.one_contract_expected_value
+        intent.candidate.sized_expected_value = sizing.sized_expected_value
+        intent.candidate.one_contract_fee_estimate = sizing.one_contract_fee_estimate
+        intent.candidate.total_fee_estimate = sizing.total_fee_estimate
+        sized_selected_trades.append(intent)
+
+    for rank, intent in enumerate(sized_selected_trades, start=1):
         candidate = intent.candidate
-        existing_trade = session.scalar(select(PaperTrade).where(PaperTrade.candidate_id == candidate.id))
+        existing_trade = session.scalar(
+            select(PaperTrade)
+            .where(PaperTrade.candidate_id == candidate.id)
+            .where(PaperTrade.paper_trading_epoch_id == active_epoch.id)
+        )
         if existing_trade is not None:
             candidate.decision = "candidate_only_existing_trade"
+            _update_gate(candidate, "gate_open_position_ok", False)
             session.add(candidate)
             output = outputs_by_candidate_id.get(candidate.id)
             if output is not None:
@@ -791,15 +1232,16 @@ def generate_candidates(session: Session, target_date: date | None = None) -> di
                 session.add(output)
             continue
         trade = PaperTrade(
+            paper_trading_epoch_id=active_epoch.id,
             candidate_id=candidate.id,
             market_ticker=intent.market.ticker,
             contract_side="yes",
             entry_price=intent.price,
             current_price=intent.price,
-            quantity=settings.default_paper_contracts,
+            quantity=intent.quantity,
             entry_time=now,
             status="open",
-            expected_value=candidate.net_expected_value,
+            expected_value=candidate.sized_expected_value or candidate.net_expected_value,
             market_display=intent.labels.market_display,
             selection_display=intent.labels.selection_display,
             matchup_display=intent.labels.matchup_display,
@@ -811,12 +1253,28 @@ def generate_candidates(session: Session, target_date: date | None = None) -> di
             inning_scope=candidate.inning_scope,
             settlement_rule_status=candidate.settlement_rule_status,
             training_eligible=candidate.training_eligible,
+            bankroll_at_entry=candidate.bankroll_at_entry,
+            risk_pct=candidate.risk_pct,
+            risk_dollars=candidate.risk_dollars,
+            estimated_cost_per_contract=candidate.estimated_cost_per_contract,
+            estimated_total_cost=candidate.estimated_total_cost,
+            one_contract_expected_value=candidate.one_contract_expected_value,
+            sized_expected_value=candidate.sized_expected_value,
+            one_contract_fee_estimate=candidate.one_contract_fee_estimate,
+            total_fee_estimate=candidate.total_fee_estimate,
         )
         session.add(trade)
         output = outputs_by_candidate_id.get(candidate.id)
         if output is not None:
             output.trade_rank = rank
             output.decision_reason = "paper_trade"
+            raw = dict(output.raw_output or {})
+            raw["sizing"] = {
+                **(intent.sizing or {}),
+                "contracts": intent.quantity,
+            }
+            raw["gate_diagnostics"] = candidate.gate_diagnostics or {}
+            output.raw_output = raw
             session.add(output)
         paper_trades += 1
 
@@ -825,6 +1283,8 @@ def generate_candidates(session: Session, target_date: date | None = None) -> di
     for candidate in evaluated_candidates:
         decision = candidate.decision or "unknown"
         decision_counts[decision] = decision_counts.get(decision, 0) + 1
+    decision_breakdown_by_family, decision_breakdown_by_scope = _decision_breakdowns(evaluated_candidates)
+    gate_summary = _gate_summary(evaluated_candidates)
     edge_values = [candidate.probability_edge for candidate in evaluated_candidates if candidate.probability_edge is not None]
     net_ev_values = [
         candidate.net_expected_value for candidate in evaluated_candidates if candidate.net_expected_value is not None
@@ -837,7 +1297,7 @@ def generate_candidates(session: Session, target_date: date | None = None) -> di
         "no_trade_missing_fee_estimate",
     }
     trades_blocked_by_edge_or_fee = sum(decision_counts.get(reason, 0) for reason in edge_or_fee_reasons)
-    trades_blocked_by_caps = sum(cap_counts.values())
+    trades_blocked_by_caps = sum(cap_counts.values()) + sizing_rejections
 
     snapshot = create_balance_snapshot(session, source="candidate_engine")
     prediction_run.completed_at = now
@@ -846,6 +1306,9 @@ def generate_candidates(session: Session, target_date: date | None = None) -> di
     prediction_run.trades_created = paper_trades
     prediction_run.summary = {
         "decision_counts": decision_counts,
+        "candidate_diagnostics": gate_summary,
+        "by_family": decision_breakdown_by_family,
+        "by_scope": decision_breakdown_by_scope,
         "cap_counts": cap_counts,
         "line_selection": line_selection_counts,
         "warnings": warnings,
@@ -856,6 +1319,7 @@ def generate_candidates(session: Session, target_date: date | None = None) -> di
         "trades_blocked_by_line_selection": line_selection_counts["line_selection_candidates_rejected"],
         "stale_price_count": stale_price_count,
         "paper_trades": paper_trades,
+        "sizing_rejections": sizing_rejections,
     }
     session.add(prediction_run)
     session.commit()
@@ -882,7 +1346,23 @@ def generate_candidates(session: Session, target_date: date | None = None) -> di
         "prediction_run_target_date": prediction_run.target_date.isoformat() if prediction_run.target_date else None,
         "snapshot_id": snapshot.id,
         "decision_counts": decision_counts,
+        "candidate_diagnostics": gate_summary,
+        "decision_breakdown_by_family": decision_breakdown_by_family,
+        "decision_breakdown_by_scope": decision_breakdown_by_scope,
         "cap_counts": cap_counts,
+        "trade_eligible_before_quality": gate_summary["trade_eligible_before_quality"],
+        "trade_eligible_after_quality": gate_summary["trade_eligible_after_quality"],
+        "blocked_by_quality_only": gate_summary["blocked_by_quality_only"],
+        "would_pass_ev_if_quality_allowed": gate_summary["would_pass_ev_if_quality_allowed"],
+        "would_pass_edge_if_quality_allowed": gate_summary["would_pass_edge_if_quality_allowed"],
+        "ev_edge_pass_but_quality_fail": gate_summary["ev_edge_pass_but_quality_fail"],
+        "blocked_by_ev": gate_summary["blocked_by_ev"],
+        "blocked_by_edge": gate_summary["blocked_by_edge"],
+        "blocked_by_price": gate_summary["blocked_by_price"],
+        "blocked_by_mapping": gate_summary["blocked_by_mapping"],
+        "blocked_by_push": gate_summary["blocked_by_push"],
+        "blocked_by_line_selection": gate_summary["blocked_by_line_selection"],
+        "blocked_by_caps": gate_summary["blocked_by_caps"],
         "trade_eligible_before_caps": len(line_selected_trades),
         "trade_eligible_after_ev_filters": len(trade_intents),
         "trade_eligible_after_line_selection": len(line_selected_trades),
@@ -899,8 +1379,19 @@ def generate_candidates(session: Session, target_date: date | None = None) -> di
         "avg_probability_edge": _avg_decimal(edge_values),
         "avg_expected_value_net": _avg_decimal(net_ev_values),
         "max_expected_value_net": _max_decimal(net_ev_values),
+        "average_data_quality": gate_summary["average_data_quality"],
+        "min_data_quality": gate_summary["min_data_quality"],
+        "max_data_quality": gate_summary["max_data_quality"],
+        "average_net_ev_among_ev_passing": gate_summary["average_net_ev_among_ev_passing"],
+        "average_probability_edge_among_edge_passing": gate_summary["average_probability_edge_among_edge_passing"],
         "fee_estimate_avg": _avg_decimal(fee_values),
         "zero_trade_reason": zero_trade_reason,
         "warnings": warnings,
         "trade_policy": prediction_run.trade_policy,
+        "active_epoch": {
+            "id": active_epoch.id,
+            "epoch_key": active_epoch.epoch_key,
+            "display_name": active_epoch.display_name,
+            "starting_balance": float(active_epoch.starting_balance),
+        },
     }

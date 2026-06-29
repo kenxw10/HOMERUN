@@ -3,9 +3,9 @@ from __future__ import annotations
 from datetime import date, datetime
 from decimal import Decimal
 
-from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Integer, JSON, Numeric, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Index, Integer, JSON, Numeric, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
-from sqlalchemy.sql import func
+from sqlalchemy.sql import func, text
 
 from app.database import Base
 
@@ -28,10 +28,27 @@ class BotSetting(TimestampMixin, Base):
     description: Mapped[str | None] = mapped_column(Text)
 
 
+class PaperTradingEpoch(TimestampMixin, Base):
+    __tablename__ = "paper_trading_epochs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    epoch_key: Mapped[str] = mapped_column(String(120), unique=True, nullable=False, index=True)
+    display_name: Mapped[str] = mapped_column(String(160), nullable=False)
+    status: Mapped[str] = mapped_column(String(40), default="active", nullable=False, index=True)
+    mode: Mapped[str] = mapped_column(String(40), default="paper", nullable=False)
+    starting_balance: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False)
+    current_balance_snapshot_id: Mapped[int | None] = mapped_column(ForeignKey("balance_snapshots.id"))
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    archive_reason: Mapped[str | None] = mapped_column(Text)
+    notes: Mapped[dict[str, object] | None] = mapped_column(JSON)
+
+
 class BalanceSnapshot(TimestampMixin, Base):
     __tablename__ = "balance_snapshots"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    paper_trading_epoch_id: Mapped[int | None] = mapped_column(ForeignKey("paper_trading_epochs.id"), index=True)
     captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     cash_balance: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False)
     portfolio_value: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False)
@@ -79,6 +96,8 @@ class KalshiMarket(TimestampMixin, Base):
     implied_yes_ask: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
     implied_no_ask: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
     market_price_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    websocket_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    market_data_source: Mapped[str | None] = mapped_column(String(40))
     status: Mapped[str] = mapped_column(String(40), default="untracked", nullable=False)
     raw_status: Mapped[str | None] = mapped_column(String(40))
     open_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -137,6 +156,7 @@ class ModelCandidate(TimestampMixin, Base):
     __tablename__ = "model_candidates"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    paper_trading_epoch_id: Mapped[int | None] = mapped_column(ForeignKey("paper_trading_epochs.id"), index=True)
     mlb_game_id: Mapped[int | None] = mapped_column(ForeignKey("mlb_games.id"))
     kalshi_market_id: Mapped[int | None] = mapped_column(ForeignKey("kalshi_markets.id"))
     mapping_id: Mapped[int | None] = mapped_column(ForeignKey("market_mappings.id"))
@@ -184,12 +204,46 @@ class ModelCandidate(TimestampMixin, Base):
     over_under_side: Mapped[str | None] = mapped_column(String(20))
     inning_scope: Mapped[str | None] = mapped_column(String(40))
     settlement_rule_status: Mapped[str | None] = mapped_column(String(80))
+    gate_diagnostics: Mapped[dict[str, object] | None] = mapped_column(JSON)
+    gate_mapping_ok: Mapped[bool | None] = mapped_column(Boolean)
+    gate_market_open: Mapped[bool | None] = mapped_column(Boolean)
+    gate_game_not_started: Mapped[bool | None] = mapped_column(Boolean)
+    gate_price_fresh_executable: Mapped[bool | None] = mapped_column(Boolean)
+    gate_data_quality_ok: Mapped[bool | None] = mapped_column(Boolean)
+    gate_push_ok: Mapped[bool | None] = mapped_column(Boolean)
+    gate_probability_present: Mapped[bool | None] = mapped_column(Boolean)
+    gate_gross_ev_positive: Mapped[bool | None] = mapped_column(Boolean)
+    gate_fee_present: Mapped[bool | None] = mapped_column(Boolean)
+    gate_probability_edge_ok: Mapped[bool | None] = mapped_column(Boolean)
+    gate_net_ev_ok: Mapped[bool | None] = mapped_column(Boolean)
+    gate_calibration_ok: Mapped[bool | None] = mapped_column(Boolean)
+    gate_line_selection_ok: Mapped[bool | None] = mapped_column(Boolean)
+    gate_caps_ok: Mapped[bool | None] = mapped_column(Boolean)
+    gate_open_position_ok: Mapped[bool | None] = mapped_column(Boolean)
+    gate_final_trade_eligible: Mapped[bool | None] = mapped_column(Boolean)
+    blocked_by_quality_only: Mapped[bool | None] = mapped_column(Boolean)
+    would_pass_ev_if_quality_allowed: Mapped[bool | None] = mapped_column(Boolean)
+    would_pass_edge_if_quality_allowed: Mapped[bool | None] = mapped_column(Boolean)
+    ev_edge_pass_but_quality_fail: Mapped[bool | None] = mapped_column(Boolean)
+    counterfactual_trade_eligible_before_quality: Mapped[bool | None] = mapped_column(Boolean)
+    counterfactual_trade_eligible_after_quality: Mapped[bool | None] = mapped_column(Boolean)
+    bankroll_at_entry: Mapped[Decimal | None] = mapped_column(Numeric(14, 2))
+    risk_pct: Mapped[Decimal | None] = mapped_column(Numeric(8, 6))
+    risk_dollars: Mapped[Decimal | None] = mapped_column(Numeric(14, 2))
+    contracts: Mapped[int | None] = mapped_column(Integer)
+    estimated_cost_per_contract: Mapped[Decimal | None] = mapped_column(Numeric(10, 6))
+    estimated_total_cost: Mapped[Decimal | None] = mapped_column(Numeric(14, 2))
+    one_contract_expected_value: Mapped[Decimal | None] = mapped_column(Numeric(10, 6))
+    sized_expected_value: Mapped[Decimal | None] = mapped_column(Numeric(14, 6))
+    one_contract_fee_estimate: Mapped[Decimal | None] = mapped_column(Numeric(10, 6))
+    total_fee_estimate: Mapped[Decimal | None] = mapped_column(Numeric(14, 6))
 
 
 class PaperTrade(TimestampMixin, Base):
     __tablename__ = "paper_trades"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    paper_trading_epoch_id: Mapped[int | None] = mapped_column(ForeignKey("paper_trading_epochs.id"), index=True)
     candidate_id: Mapped[int | None] = mapped_column(ForeignKey("model_candidates.id"))
     market_ticker: Mapped[str] = mapped_column(String(120), nullable=False)
     contract_side: Mapped[str] = mapped_column(String(10), nullable=False)
@@ -218,6 +272,15 @@ class PaperTrade(TimestampMixin, Base):
     inning_scope: Mapped[str | None] = mapped_column(String(40))
     settlement_rule_status: Mapped[str | None] = mapped_column(String(80))
     training_eligible: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    bankroll_at_entry: Mapped[Decimal | None] = mapped_column(Numeric(14, 2))
+    risk_pct: Mapped[Decimal | None] = mapped_column(Numeric(8, 6))
+    risk_dollars: Mapped[Decimal | None] = mapped_column(Numeric(14, 2))
+    estimated_cost_per_contract: Mapped[Decimal | None] = mapped_column(Numeric(10, 6))
+    estimated_total_cost: Mapped[Decimal | None] = mapped_column(Numeric(14, 2))
+    one_contract_expected_value: Mapped[Decimal | None] = mapped_column(Numeric(10, 6))
+    sized_expected_value: Mapped[Decimal | None] = mapped_column(Numeric(14, 6))
+    one_contract_fee_estimate: Mapped[Decimal | None] = mapped_column(Numeric(10, 6))
+    total_fee_estimate: Mapped[Decimal | None] = mapped_column(Numeric(14, 6))
 
 
 class Order(TimestampMixin, Base):
@@ -536,6 +599,7 @@ class ModelPredictionRun(TimestampMixin, Base):
     __tablename__ = "model_prediction_runs"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    paper_trading_epoch_id: Mapped[int | None] = mapped_column(ForeignKey("paper_trading_epochs.id"), index=True)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     target_date: Mapped[date | None] = mapped_column(Date)
@@ -552,6 +616,7 @@ class ModelPredictionOutput(TimestampMixin, Base):
     __tablename__ = "model_prediction_outputs"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    paper_trading_epoch_id: Mapped[int | None] = mapped_column(ForeignKey("paper_trading_epochs.id"), index=True)
     prediction_run_id: Mapped[int | None] = mapped_column(ForeignKey("model_prediction_runs.id"))
     candidate_id: Mapped[int | None] = mapped_column(ForeignKey("model_candidates.id"))
     market_family: Mapped[str | None] = mapped_column(String(80))
@@ -570,6 +635,59 @@ class ModelPredictionOutput(TimestampMixin, Base):
     trade_rank: Mapped[int | None] = mapped_column(Integer)
     decision_reason: Mapped[str | None] = mapped_column(String(120))
     raw_output: Mapped[dict[str, object] | None] = mapped_column(JSON)
+
+
+class JobRun(TimestampMixin, Base):
+    __tablename__ = "job_runs"
+    __table_args__ = (
+        Index("ix_job_runs_name_date_status", "job_name", "target_date", "status"),
+        Index("ix_job_runs_lock_status", "lock_key", "status"),
+        Index("ix_job_runs_started_at", "started_at"),
+        Index("ix_job_runs_epoch", "paper_trading_epoch_id"),
+        Index(
+            "uq_job_runs_running_lock_key",
+            "lock_key",
+            unique=True,
+            postgresql_where=text("status = 'running'"),
+            sqlite_where=text("status = 'running'"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    job_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    job_type: Mapped[str] = mapped_column(String(80), nullable=False)
+    target_date: Mapped[date | None] = mapped_column(Date)
+    paper_trading_epoch_id: Mapped[int | None] = mapped_column(ForeignKey("paper_trading_epochs.id"))
+    status: Mapped[str] = mapped_column(String(40), default="running", nullable=False)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    duration_seconds: Mapped[int | None] = mapped_column(Integer)
+    lock_key: Mapped[str | None] = mapped_column(String(180))
+    triggered_by: Mapped[str] = mapped_column(String(40), default="manual", nullable=False)
+    steps: Mapped[list[object] | None] = mapped_column(JSON)
+    result: Mapped[dict[str, object] | None] = mapped_column(JSON)
+    warnings: Mapped[list[object] | None] = mapped_column(JSON)
+    errors: Mapped[list[object] | None] = mapped_column(JSON)
+    idempotency_key: Mapped[str | None] = mapped_column(String(180))
+
+
+class MarketDataWorkerStatus(TimestampMixin, Base):
+    __tablename__ = "market_data_worker_status"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    status_key: Mapped[str] = mapped_column(String(80), unique=True, default="kalshi_ws_paper", nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    running: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    source: Mapped[str] = mapped_column(String(40), default="rest_fallback", nullable=False)
+    subscribed_market_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_message_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    reconnect_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    stale_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    last_error: Mapped[str | None] = mapped_column(Text)
+    raw_status: Mapped[dict[str, object] | None] = mapped_column(JSON)
 
 
 class ModelGovernanceEvent(TimestampMixin, Base):

@@ -31,6 +31,7 @@ from app.services.contracts import (
     PAPER_SUPPORTED_MARKET_FAMILIES,
 )
 from app.services.features import FEATURE_VERSION, LEAGUE_AVG_FULL_GAME_RUNS
+from app.services.paper_epoch import get_or_create_active_paper_epoch
 from app.time_utils import ensure_aware_utc, get_dashboard_zone, utc_now
 
 HEURISTIC_MODEL_TAG = "heuristic_full_game_winner_v1"
@@ -687,20 +688,24 @@ def _candidate_target_date_matches_game(candidate: ModelCandidate, game: MlbGame
     return candidate.target_date == game_day
 
 
-def _resolved_mature_candidates(session: Session) -> list[ModelCandidate]:
+def _resolved_mature_candidates(session: Session, paper_trading_epoch_id: int | None = None) -> list[ModelCandidate]:
+    stmt = (
+        select(ModelCandidate, MlbGame)
+        .outerjoin(MlbGame, ModelCandidate.mlb_game_id == MlbGame.id)
+        .where(ModelCandidate.outcome.in_(["win", "loss"]))
+        .where(ModelCandidate.training_eligible.is_(True))
+        .where(ModelCandidate.feature_version == FEATURE_VERSION)
+        .where(ModelCandidate.market_family.in_(PAPER_SUPPORTED_MARKET_FAMILIES))
+        .where(ModelCandidate.fee_estimate.is_not(None))
+        .where(ModelCandidate.price_status == "fresh_executable")
+        .where(ModelCandidate.time_to_start_minutes.is_not(None))
+        .where(ModelCandidate.time_to_start_minutes > 0)
+    )
+    if paper_trading_epoch_id is not None:
+        stmt = stmt.where(ModelCandidate.paper_trading_epoch_id == paper_trading_epoch_id)
     rows = list(
         session.execute(
-            select(ModelCandidate, MlbGame)
-            .outerjoin(MlbGame, ModelCandidate.mlb_game_id == MlbGame.id)
-            .where(ModelCandidate.outcome.in_(["win", "loss"]))
-            .where(ModelCandidate.training_eligible.is_(True))
-            .where(ModelCandidate.feature_version == FEATURE_VERSION)
-            .where(ModelCandidate.market_family.in_(PAPER_SUPPORTED_MARKET_FAMILIES))
-            .where(ModelCandidate.fee_estimate.is_not(None))
-            .where(ModelCandidate.price_status == "fresh_executable")
-            .where(ModelCandidate.time_to_start_minutes.is_not(None))
-            .where(ModelCandidate.time_to_start_minutes > 0)
-            .order_by(ModelCandidate.resolved_at.asc().nullslast(), ModelCandidate.evaluated_at.asc())
+            stmt.order_by(ModelCandidate.resolved_at.asc().nullslast(), ModelCandidate.evaluated_at.asc())
         )
     )
     return [candidate for candidate, game in rows if _candidate_target_date_matches_game(candidate, game)]
@@ -823,12 +828,72 @@ def _combine_probability_offsets(
     }
 
 
-def run_model_governance(session: Session, now: datetime | None = None) -> dict[str, object]:
+def _metadata_epoch_id(metadata: dict[str, object] | None) -> int | None:
+    if not isinstance(metadata, dict):
+        return None
+    value = metadata.get("paper_trading_epoch_id")
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _latest_row_by_metrics_epoch(session: Session, model, order_column, paper_trading_epoch_id: int):
+    for row in session.scalars(select(model).order_by(order_column.desc(), model.id.desc())):
+        if _metadata_epoch_id(getattr(row, "metrics", None)) == paper_trading_epoch_id:
+            return row
+    return None
+
+
+def _threshold_matches_epoch(
+    session: Session,
+    threshold: ModelThresholdVersion,
+    paper_trading_epoch_id: int,
+) -> bool:
+    if _metadata_epoch_id(threshold.metrics) == paper_trading_epoch_id:
+        return True
+    if threshold.source_training_run_id is None:
+        return False
+    training = session.get(TrainingRun, threshold.source_training_run_id)
+    return training is not None and _metadata_epoch_id(training.metrics) == paper_trading_epoch_id
+
+
+def latest_governance_artifacts(
+    session: Session,
+    paper_trading_epoch_id: int,
+) -> tuple[TrainingRun | None, CalibrationRun | None, ModelThresholdVersion | None]:
+    last_training = _latest_row_by_metrics_epoch(session, TrainingRun, TrainingRun.started_at, paper_trading_epoch_id)
+    last_calibration = _latest_row_by_metrics_epoch(
+        session, CalibrationRun, CalibrationRun.started_at, paper_trading_epoch_id
+    )
+    last_threshold = next(
+        (
+            threshold
+            for threshold in session.scalars(
+                select(ModelThresholdVersion).order_by(ModelThresholdVersion.created_at.desc(), ModelThresholdVersion.id.desc())
+            )
+            if _threshold_matches_epoch(session, threshold, paper_trading_epoch_id)
+        ),
+        None,
+    )
+    return last_training, last_calibration, last_threshold
+
+
+def run_model_governance(
+    session: Session,
+    now: datetime | None = None,
+    *,
+    paper_trading_epoch_id: int | None = None,
+) -> dict[str, object]:
     settings = get_settings()
     started = now or utc_now()
     active = get_or_create_mature_model_version(session)
     active_parameters = get_or_create_active_parameter_version(session)
-    candidates = _resolved_mature_candidates(session)
+    if paper_trading_epoch_id is None:
+        paper_trading_epoch_id = get_or_create_active_paper_epoch(session).id
+    candidates = _resolved_mature_candidates(session, paper_trading_epoch_id=paper_trading_epoch_id)
     sample_count = len(candidates)
     train_min = settings.model_min_samples_train
     calibrate_min = settings.model_min_samples_calibrate
@@ -847,6 +912,7 @@ def run_model_governance(session: Session, now: datetime | None = None) -> dict[
             "model_version": active.version_tag,
             "feature_version": FEATURE_VERSION,
             "active_parameter_version": active_parameters.version_tag,
+            "paper_trading_epoch_id": paper_trading_epoch_id,
             "minimum_samples_train": train_min,
             "minimum_samples_promote": promote_min,
             "split_policy": "chronological_holdout",
@@ -872,6 +938,7 @@ def run_model_governance(session: Session, now: datetime | None = None) -> dict[
             "post_start": "excluded",
             "void_push": "excluded",
             "unsupported_mapping": "excluded",
+            "paper_trading_epoch_id": paper_trading_epoch_id,
         },
         candidate_ids=[candidate.id for candidate in candidates if candidate.id is not None],
     )
@@ -885,6 +952,7 @@ def run_model_governance(session: Session, now: datetime | None = None) -> dict[
             **metrics,
             "minimum_samples_calibrate": calibrate_min,
             "minimum_samples_for_isotonic": settings.model_min_samples_for_isotonic,
+            "paper_trading_epoch_id": paper_trading_epoch_id,
             "calibration_policy": "bounded family/global offsets; isotonic requires higher sample threshold",
         },
     )
@@ -940,6 +1008,7 @@ def run_model_governance(session: Session, now: datetime | None = None) -> dict[
             },
             metrics={
                 "sample_count": sample_count,
+                "paper_trading_epoch_id": paper_trading_epoch_id,
                 "note": "Threshold tuning is evaluated separately from probability training.",
             },
         )
@@ -980,6 +1049,7 @@ def run_model_governance(session: Session, now: datetime | None = None) -> dict[
         "reason": reason,
         "method_selected": "platt_sigmoid" if sample_count >= calibrate_min else "none",
         "isotonic_allowed": sample_count >= settings.model_min_samples_for_isotonic,
+        "paper_trading_epoch_id": paper_trading_epoch_id,
     }
     event = ModelGovernanceEvent(
         occurred_at=started,
@@ -993,6 +1063,7 @@ def run_model_governance(session: Session, now: datetime | None = None) -> dict[
                 challenger.version_tag if promoted and challenger else active_parameters.version_tag
             ),
             "challenger_parameter_version": challenger.version_tag if challenger else None,
+            "paper_trading_epoch_id": paper_trading_epoch_id,
             "promoted": promoted,
             "metrics": metrics,
             "holdout_metrics": holdout_metrics,
@@ -1013,6 +1084,7 @@ def run_model_governance(session: Session, now: datetime | None = None) -> dict[
             challenger.version_tag if promoted and challenger else active_parameters.version_tag
         ),
         "challenger_parameter_version": challenger.version_tag if challenger else None,
+        "paper_trading_epoch_id": paper_trading_epoch_id,
         "feature_version": FEATURE_VERSION,
         "training_run_id": training.id,
         "calibration_run_id": calibration.id,
@@ -1024,24 +1096,26 @@ def run_model_governance(session: Session, now: datetime | None = None) -> dict[
     }
 
 
-def governance_status(session: Session) -> dict[str, object]:
+def governance_status(session: Session, paper_trading_epoch_id: int | None = None) -> dict[str, object]:
+    if paper_trading_epoch_id is None:
+        paper_trading_epoch_id = get_or_create_active_paper_epoch(session).id
     active = session.scalar(select(ModelVersion).where(ModelVersion.is_active.is_(True)))
     active_parameters = session.scalar(
         select(ModelParameterVersion).where(ModelParameterVersion.is_active.is_(True))
     )
-    last_training = session.scalar(select(TrainingRun).order_by(TrainingRun.started_at.desc()))
-    last_calibration = session.scalar(select(CalibrationRun).order_by(CalibrationRun.started_at.desc()))
-    last_threshold = session.scalar(select(ModelThresholdVersion).order_by(ModelThresholdVersion.created_at.desc()))
+    last_training, last_calibration, last_threshold = latest_governance_artifacts(session, paper_trading_epoch_id)
     mature_count = session.scalar(
         select(func.count(ModelCandidate.id))
+        .where(ModelCandidate.paper_trading_epoch_id == paper_trading_epoch_id)
         .where(ModelCandidate.feature_version == FEATURE_VERSION)
         .where(ModelCandidate.training_eligible.is_(True))
     ) or 0
-    resolved_count = len(_resolved_mature_candidates(session))
+    resolved_count = len(_resolved_mature_candidates(session, paper_trading_epoch_id=paper_trading_epoch_id))
     return {
         "active_model_version": active.version_tag if active else None,
         "active_parameter_version": active_parameters.version_tag if active_parameters else None,
         "active_calibration_version": active_parameters.version_tag if active_parameters else None,
+        "paper_trading_epoch_id": paper_trading_epoch_id,
         "feature_version": FEATURE_VERSION,
         "calibration_status": last_calibration.status if last_calibration else "not_run",
         "last_training_run": last_training.started_at.isoformat() if last_training else None,

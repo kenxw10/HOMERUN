@@ -7,7 +7,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
-from app.models import BalanceSnapshot, PaperTrade
+from app.models import BalanceSnapshot, PaperTrade, PaperTradingEpoch
+from app.services.paper_epoch import get_or_create_active_paper_epoch
 from app.time_utils import utc_now
 
 
@@ -24,16 +25,32 @@ def _money(value: Decimal) -> Decimal:
     return value.quantize(Decimal("0.01"))
 
 
-def calculate_paper_portfolio(session: Session) -> PortfolioTotals:
+def paper_trade_fee(trade: PaperTrade) -> Decimal:
+    value = trade.fee_paid if trade.fee_paid is not None else trade.total_fee_estimate
+    return _money(Decimal(value or "0"))
+
+
+def calculate_paper_portfolio(
+    session: Session,
+    *,
+    epoch: PaperTradingEpoch | None = None,
+    include_archived: bool = False,
+) -> PortfolioTotals:
     settings = get_settings()
-    starting_balance = Decimal(settings.paper_starting_balance)
-    trades = list(session.scalars(select(PaperTrade)))
+    active_epoch = epoch or get_or_create_active_paper_epoch(session)
+    starting_balance = Decimal(active_epoch.starting_balance or settings.paper_starting_balance)
+    query = select(PaperTrade)
+    if not include_archived:
+        query = query.where(PaperTrade.paper_trading_epoch_id == active_epoch.id)
+    trades = list(session.scalars(query))
 
     realized = sum(
         (trade.realized_pnl or Decimal("0")) for trade in trades if trade.status != "open"
     ) or Decimal("0")
     open_trades = [trade for trade in trades if trade.status == "open"]
-    open_cost = sum(trade.entry_price * Decimal(trade.quantity) for trade in open_trades) or Decimal("0")
+    open_cost = sum(
+        (trade.entry_price * Decimal(trade.quantity)) + paper_trade_fee(trade) for trade in open_trades
+    ) or Decimal("0")
     open_mark = sum(
         (trade.current_price if trade.current_price is not None else trade.entry_price) * Decimal(trade.quantity)
         for trade in open_trades
@@ -49,9 +66,17 @@ def calculate_paper_portfolio(session: Session) -> PortfolioTotals:
     )
 
 
-def create_balance_snapshot(session: Session, source: str = "paper_job") -> BalanceSnapshot:
-    totals = calculate_paper_portfolio(session)
+def create_balance_snapshot(
+    session: Session,
+    source: str = "paper_job",
+    *,
+    epoch: PaperTradingEpoch | None = None,
+    include_archived: bool = False,
+) -> BalanceSnapshot:
+    active_epoch = epoch or get_or_create_active_paper_epoch(session)
+    totals = calculate_paper_portfolio(session, epoch=active_epoch, include_archived=include_archived)
     snapshot = BalanceSnapshot(
+        paper_trading_epoch_id=active_epoch.id,
         captured_at=utc_now(),
         cash_balance=totals.cash_balance,
         portfolio_value=totals.portfolio_value,
@@ -60,4 +85,6 @@ def create_balance_snapshot(session: Session, source: str = "paper_job") -> Bala
     )
     session.add(snapshot)
     session.flush()
+    active_epoch.current_balance_snapshot_id = snapshot.id
+    session.add(active_epoch)
     return snapshot

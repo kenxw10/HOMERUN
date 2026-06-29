@@ -144,6 +144,22 @@ button {
   color: #b42318;
 }
 
+.breakdown-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr);
+  gap: 16px;
+  margin-top: 16px;
+}
+
+.compact-table th,
+.compact-table td {
+  white-space: nowrap;
+}
+
+.terminal-table.compact-table {
+  min-width: 760px;
+}
+
 .api-banner {
   margin-bottom: 14px;
   border: 1px solid #e2a08d;

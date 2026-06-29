@@ -23,8 +23,11 @@ This is not a sportsbook app. It does not use DraftKings, FanDuel, Odds API, or 
 - PR 3c scores validated MLB market-family rows with `mature_mlb_run_distribution_v2` and `mature_mlb_features_v2`.
 - Team totals, multivariate/MVE markets, sportsbook data, and guessed/retired prefixes remain out of scope.
 - Paper candidates are explicitly target-date scoped, priced from executable YES asks or orderbook-implied YES asks, filtered by conservative fee-adjusted EV before caps, and capped by slate, game, market family, open-position count, and correlated game/family exposure.
-- Open-position current price is a REST last mark, not a WebSocket live price.
+- Open-position current price uses REST last marks by default. PR3d adds an optional paper-only WebSocket market-data worker; it is disabled unless `WEBSOCKET_MARKET_DATA_ENABLED=true`.
 - `PAPER_STARTING_BALANCE=1000.00` by default.
+- Active PR3d observation epochs can be reset to a $500 paper bankroll through the protected reset endpoint. Archived validation rows stay in the database but are hidden from the main dashboard.
+- PR3d paper trades use fixed-risk sizing by default: `PAPER_RISK_PER_TRADE_PCT=0.025` of the active epoch portfolio, bounded by `PAPER_MIN_CONTRACTS` and `PAPER_MAX_CONTRACTS_PER_TRADE`.
+- Paper observation data quality uses `PAPER_OBSERVATION_MIN_DATA_QUALITY=0.55`; future live quality should remain `LIVE_MIN_DATA_QUALITY=0.60` or stricter.
 - Governance skips training/calibration/promotion until clean resolved-sample thresholds are met.
 - `FEATURE_SYNC_ENABLE_NETWORK_SOURCES=true` enables no-key public MLB Stats API and Open-Meteo feature ingestion by default. Set it to `false` only when you intentionally want source sync endpoints to skip network-backed ingestion.
 
@@ -70,6 +73,12 @@ From `apps/api` after installing backend dependencies:
 .\.venv\Scripts\python.exe -m app.jobs.market_family_discovery
 .\.venv\Scripts\python.exe -m app.jobs.market_family_mapping_sync
 .\.venv\Scripts\python.exe -m app.jobs.open_position_price_refresh
+.\.venv\Scripts\python.exe -m app.jobs.runner --job daily-setup --target-date today_et
+.\.venv\Scripts\python.exe -m app.jobs.runner --job candidate-sweep --target-date today_et
+.\.venv\Scripts\python.exe -m app.jobs.runner --job price-refresh --target-date today_et
+.\.venv\Scripts\python.exe -m app.jobs.runner --job settlement --target-date yesterday_et
+.\.venv\Scripts\python.exe -m app.jobs.runner --job governance
+.\.venv\Scripts\python.exe -m app.workers.kalshi_ws_paper --once
 ```
 
 You can pass a specific date to the MLB schedule job:
@@ -112,6 +121,14 @@ PR 3c exposes these internal API run endpoints:
 - `POST /v1/run/model-feature-snapshot-backfill?target_date=YYYY-MM-DD`
 - `POST /v1/run/training-eligibility-repair`
 - `POST /v1/run/open-position-price-refresh`
+- `POST /v1/admin/paper-trading/reset-epoch`
+- `POST /v1/jobs/run/daily-setup?target_date=YYYY-MM-DD`
+- `POST /v1/jobs/run/candidate-sweep?target_date=YYYY-MM-DD`
+- `POST /v1/jobs/run/price-refresh?target_date=YYYY-MM-DD`
+- `POST /v1/jobs/run/settlement?target_date=YYYY-MM-DD`
+- `POST /v1/jobs/run/governance`
+- `POST /v1/jobs/run/full-paper-cycle?target_date=YYYY-MM-DD`
+- `GET /v1/ws/status`
 - `POST /v1/run/market-family-discovery?target_date=YYYY-MM-DD`
 - `POST /v1/sync/market-family-mappings?target_date=YYYY-MM-DD`
 - `GET /v1/market-families/discovery?date=YYYY-MM-DD`
@@ -180,6 +197,40 @@ PR 3c adds migration `0007_pr3c_model_governance.py` for mature MLB feature snap
 PR3c hotfix adds migration `0008_pr3c_fee_date_scope.py` for target-date, executable-price, price-staleness, fee, edge, and net-EV diagnostics on model candidates and prediction outputs.
 
 PR3c fix2 adds migration `0009_pr3c_fix2_features.py` for additive MLB feature cache tables, model parameter versions, training datasets, and threshold policy versions.
+
+PR3d adds migration `0010_pr3d_paper_ops.py` for paper observation epochs, active-epoch links, job run audits, WebSocket worker status, gate diagnostics, and fixed-risk paper sizing fields.
+
+## PR3d Paper Ops Validation
+
+After deploy and migration, reset the active paper observation epoch:
+
+```powershell
+$body = @{
+  archive_current_as = "pre_pr3d_validation"
+  new_epoch = "pr3d_paper_observation_v1"
+  starting_balance = 500.00
+  archive_open_positions = $true
+  reset_dashboard_metrics = $true
+  confirmation = "RESET_PAPER_EPOCH"
+} | ConvertTo-Json
+Invoke-RestMethod -Method Post -Headers @{"X-API-Key"="YOUR_KEY"; "Content-Type"="application/json"} -Body $body "https://YOUR-RAILWAY-API/v1/admin/paper-trading/reset-epoch"
+```
+
+Then verify:
+
+```powershell
+Invoke-RestMethod https://YOUR-RAILWAY-API/health
+Invoke-RestMethod https://YOUR-RAILWAY-API/v1/system/status
+Invoke-RestMethod "https://YOUR-RAILWAY-API/v1/dashboard/summary"
+Invoke-RestMethod -Method Post -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-RAILWAY-API/v1/jobs/run/daily-setup?target_date=2026-06-27"
+Invoke-RestMethod -Method Post -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-RAILWAY-API/v1/jobs/run/candidate-sweep?target_date=2026-06-27"
+Invoke-RestMethod -Method Post -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-RAILWAY-API/v1/jobs/run/price-refresh?target_date=2026-06-27"
+Invoke-RestMethod -Method Post -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-RAILWAY-API/v1/jobs/run/settlement?target_date=2026-06-26"
+Invoke-RestMethod -Method Post -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-RAILWAY-API/v1/jobs/run/governance"
+Invoke-RestMethod -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-RAILWAY-API/v1/ws/status"
+```
+
+Expected dashboard result after reset: active epoch `PR3D PAPER OBSERVATION V1`, portfolio value `500.00`, cash `500.00`, open positions `0`, closed positions `0`, P/L `$0.00`, record `0-0-0`, and archived validation rows absent from active metrics. Candidate-sweep responses should include independent gate diagnostics and by-family/by-scope breakdowns. Paper trades should only occur when the active candidate clears data quality `0.55`, executable price freshness, EV, edge, line-selection, and caps.
 
 ## PR 3c Production Validation
 
