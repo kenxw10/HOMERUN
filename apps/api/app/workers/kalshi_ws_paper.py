@@ -3,8 +3,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import inspect
 import json
 import time
+from collections.abc import Callable
 from urllib.parse import urlparse
 
 from cryptography.hazmat.primitives import hashes, serialization
@@ -66,6 +68,20 @@ def _websocket_auth_headers(api_key: str, api_secret: str, ws_url: str, *, times
     }
 
 
+def _websocket_connect_kwargs(connect: Callable[..., object], auth_headers: dict[str, str]) -> dict[str, object]:
+    kwargs: dict[str, object] = {
+        "ping_interval": 20,
+        "ping_timeout": 20,
+    }
+    try:
+        parameters = inspect.signature(connect).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    header_arg = "extra_headers" if "extra_headers" in parameters and "additional_headers" not in parameters else "additional_headers"
+    kwargs[header_arg] = auth_headers
+    return kwargs
+
+
 async def _run_worker_once() -> dict[str, object]:
     settings = get_settings()
     session_factory = get_session_factory()
@@ -119,9 +135,7 @@ async def _run_worker_once() -> dict[str, object]:
         )
         async with websockets.connect(
             settings.kalshi_ws_base_url,
-            ping_interval=20,
-            ping_timeout=20,
-            additional_headers=auth_headers,
+            **_websocket_connect_kwargs(websockets.connect, auth_headers),
         ) as websocket:
             await websocket.send(json.dumps(subscribe_message))
             with session_factory() as session:

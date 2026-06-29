@@ -137,6 +137,7 @@ PRICE_FIELD_KEYS = {
     "implied_no_ask": ("implied_no_ask", "no_ask_dollars", "no_ask"),
 }
 EXECUTABLE_YES_PRICE_ATTRS = {"yes_ask", "implied_yes_ask", "no_bid", "best_no_bid"}
+POSITION_MARK_PRICE_ATTRS = {"yes_bid", "best_yes_bid", "no_bid", "best_no_bid", "last_price"}
 ORDERBOOK_SNAPSHOT_LEVEL_KEYS = {
     "yes_dollars_fp": "yes_dollars",
     "no_dollars_fp": "no_dollars",
@@ -170,35 +171,60 @@ def _orderbook_snapshot_prices(payload: dict[str, Any]) -> dict[str, Decimal | N
     }
     if not orderbook:
         return {}
-    return derive_orderbook_prices(orderbook)
+    derived = derive_orderbook_prices(orderbook)
+    updates: dict[str, Decimal | None] = {}
+    if any(key.startswith("yes") for key in orderbook):
+        updates["best_yes_bid"] = derived["best_yes_bid"]
+        updates["implied_no_ask"] = derived["implied_no_ask"]
+    if any(key.startswith("no") for key in orderbook):
+        updates["best_no_bid"] = derived["best_no_bid"]
+        updates["implied_yes_ask"] = derived["implied_yes_ask"]
+    return updates
 
 
-def _positive_delta(payload: dict[str, Any]) -> bool:
+def _delta_value(payload: dict[str, Any]) -> Decimal | None:
     for key in ("delta_fp", "delta", "quantity_delta"):
         value = _decimal(payload.get(key))
         if value is not None:
-            return value > 0
-    return False
+            return value
+    return None
+
+
+def _orderbook_delta_price(payload: dict[str, Any]) -> Decimal | None:
+    value = _decimal(payload.get("price_dollars"))
+    if value is not None:
+        return value
+    value = _decimal(payload.get("price"))
+    return (value / Decimal("100")).quantize(Decimal("0.0001")) if value is not None else None
 
 
 def _orderbook_delta_prices(market: KalshiMarket, payload: dict[str, Any]) -> dict[str, Decimal | None]:
     side = str(payload.get("side") or "").strip().lower()
-    price = _payload_price(payload, ("price_dollars", "price"))
-    if side not in {"yes", "no"} or price is None or not _positive_delta(payload):
+    price = _orderbook_delta_price(payload)
+    delta = _delta_value(payload)
+    if side not in {"yes", "no"} or price is None or delta is None:
         return {}
     if side == "yes":
-        if market.best_yes_bid is not None and price < market.best_yes_bid:
+        if delta > 0:
+            if market.best_yes_bid is not None and price < market.best_yes_bid:
+                return {}
+            return {
+                "best_yes_bid": price,
+                "implied_no_ask": (Decimal("1.0000") - price).quantize(Decimal("0.0001")),
+            }
+        if delta < 0 and market.best_yes_bid is not None and price >= market.best_yes_bid:
+            return {"best_yes_bid": None, "implied_no_ask": None}
+        return {}
+    if delta > 0:
+        if market.best_no_bid is not None and price < market.best_no_bid:
             return {}
         return {
-            "best_yes_bid": price,
-            "implied_no_ask": (Decimal("1.0000") - price).quantize(Decimal("0.0001")),
+            "best_no_bid": price,
+            "implied_yes_ask": (Decimal("1.0000") - price).quantize(Decimal("0.0001")),
         }
-    if market.best_no_bid is not None and price < market.best_no_bid:
-        return {}
-    return {
-        "best_no_bid": price,
-        "implied_yes_ask": (Decimal("1.0000") - price).quantize(Decimal("0.0001")),
-    }
+    if delta < 0 and market.best_no_bid is not None and price >= market.best_no_bid:
+        return {"best_no_bid": None, "implied_yes_ask": None}
+    return {}
 
 
 def apply_ws_market_update(session: Session, ticker: str, payload: dict[str, Any]) -> dict[str, object]:
@@ -209,6 +235,7 @@ def apply_ws_market_update(session: Session, ticker: str, payload: dict[str, Any
 
     price_applied = False
     executable_price_applied = False
+    position_mark_price_applied = False
     for attr, keys in PRICE_FIELD_KEYS.items():
         value = _payload_price(payload, keys)
         if value is not None:
@@ -216,15 +243,18 @@ def apply_ws_market_update(session: Session, ticker: str, payload: dict[str, Any
             price_applied = True
             if attr in EXECUTABLE_YES_PRICE_ATTRS:
                 executable_price_applied = True
+            if attr in POSITION_MARK_PRICE_ATTRS:
+                position_mark_price_applied = True
     for attr, value in {
         **_orderbook_snapshot_prices(payload),
         **_orderbook_delta_prices(market, payload),
     }.items():
-        if value is not None:
-            setattr(market, attr, value)
-            price_applied = True
-            if attr in EXECUTABLE_YES_PRICE_ATTRS:
-                executable_price_applied = True
+        setattr(market, attr, value)
+        price_applied = True
+        if value is not None and attr in EXECUTABLE_YES_PRICE_ATTRS:
+            executable_price_applied = True
+        if value is not None and attr in POSITION_MARK_PRICE_ATTRS:
+            position_mark_price_applied = True
     market.websocket_updated_at = now
     if price_applied:
         market.market_data_source = "websocket"
@@ -234,7 +264,7 @@ def apply_ws_market_update(session: Session, ticker: str, payload: dict[str, Any
 
     epoch = get_or_create_active_paper_epoch(session)
     updated_trades = 0
-    if price_applied:
+    if position_mark_price_applied:
         for trade in session.scalars(
             select(PaperTrade)
             .where(PaperTrade.paper_trading_epoch_id == epoch.id)

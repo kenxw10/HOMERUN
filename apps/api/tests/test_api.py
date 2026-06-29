@@ -1459,6 +1459,53 @@ def test_websocket_orderbook_delta_updates_bid_without_freshening_ask(monkeypatc
     assert values["trade_price_updated_at"].replace(tzinfo=UTC) == now
 
 
+def test_websocket_orderbook_delta_clears_removed_best_bid_without_freshening_price(monkeypatch) -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+    stale = now - timedelta(minutes=30)
+    monkeypatch.setattr(ws_market_data, "utc_now", lambda: now)
+
+    with Session(engine) as session:
+        get_or_create_active_paper_epoch(session, starting_balance=Decimal("500.00"))
+        market = KalshiMarket(
+            kalshi_market_id="KX-WS-DELTA-REMOVE",
+            ticker="KXMLBGAME-WS-DELTA-REMOVE-PIT",
+            title="Will Pittsburgh win?",
+            status="open",
+            best_no_bid=Decimal("0.4300"),
+            implied_yes_ask=Decimal("0.5700"),
+            market_price_updated_at=stale,
+            market_data_source="rest",
+        )
+        session.add(market)
+        session.commit()
+
+        result = ws_market_data.apply_ws_market_update(
+            session,
+            "KXMLBGAME-WS-DELTA-REMOVE-PIT",
+            {"market_ticker": "KXMLBGAME-WS-DELTA-REMOVE-PIT", "side": "no", "price_dollars": "0.4300", "delta_fp": -1},
+        )
+        session.commit()
+        values = {
+            "best_no_bid": market.best_no_bid,
+            "implied_yes_ask": market.implied_yes_ask,
+            "websocket_updated_at": market.websocket_updated_at,
+            "market_price_updated_at": market.market_price_updated_at,
+            "market_data_source": market.market_data_source,
+        }
+
+    assert result["updated"] is True
+    assert result["updated_trades"] == 0
+    assert values["best_no_bid"] is None
+    assert values["implied_yes_ask"] is None
+    assert values["websocket_updated_at"] is not None
+    assert values["websocket_updated_at"].replace(tzinfo=UTC) == now
+    assert values["market_price_updated_at"] is not None
+    assert values["market_price_updated_at"].replace(tzinfo=UTC) == stale
+    assert values["market_data_source"] == "websocket"
+
+
 def test_websocket_market_update_does_not_mark_non_price_message_fresh(monkeypatch) -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
@@ -1698,6 +1745,24 @@ def test_ws_auth_headers_sign_handshake_path() -> None:
     assert headers["KALSHI-ACCESS-KEY"] == "test-key"
     assert headers["KALSHI-ACCESS-TIMESTAMP"] == "1234567890000"
     assert headers["KALSHI-ACCESS-SIGNATURE"]
+
+
+def test_ws_connect_kwargs_supports_legacy_extra_headers() -> None:
+    headers = {"KALSHI-ACCESS-KEY": "test-key"}
+
+    def legacy_connect(_uri: str, *, extra_headers=None, ping_interval=None, ping_timeout=None):
+        return None
+
+    def current_connect(_uri: str, *, additional_headers=None, ping_interval=None, ping_timeout=None):
+        return None
+
+    legacy_kwargs = kalshi_ws_paper._websocket_connect_kwargs(legacy_connect, headers)
+    current_kwargs = kalshi_ws_paper._websocket_connect_kwargs(current_connect, headers)
+
+    assert legacy_kwargs["extra_headers"] == headers
+    assert "additional_headers" not in legacy_kwargs
+    assert current_kwargs["additional_headers"] == headers
+    assert "extra_headers" not in current_kwargs
 
 
 def test_ws_worker_continues_after_first_ticker_update(monkeypatch) -> None:
