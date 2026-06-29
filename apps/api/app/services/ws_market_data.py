@@ -148,6 +148,9 @@ ORDERBOOK_SNAPSHOT_LEVEL_KEYS = {
     "yes_bids": "yes_bids",
     "no_bids": "no_bids",
 }
+WS_ORDERBOOK_RAW_KEY = "websocket_orderbook"
+YES_BOOK_KEYS = ("yes_dollars", "yes", "yes_bids")
+NO_BOOK_KEYS = ("no_dollars", "no", "no_bids")
 
 
 def _payload_price(payload: dict[str, Any], keys: tuple[str, ...]) -> Decimal | None:
@@ -163,7 +166,101 @@ def _payload_price(payload: dict[str, Any], keys: tuple[str, ...]) -> Decimal | 
     return None
 
 
-def _orderbook_snapshot_prices(payload: dict[str, Any]) -> dict[str, Decimal | None]:
+def _first_present(mapping: dict[str, Any], *keys: str) -> object | None:
+    for key in keys:
+        if key in mapping and mapping[key] is not None:
+            return mapping[key]
+    return None
+
+
+def _book_price_key(side: str, book: dict[str, dict[str, str]]) -> str:
+    preferred = f"{side}_dollars"
+    fallback_keys = YES_BOOK_KEYS if side == "yes" else NO_BOOK_KEYS
+    if preferred in book or not any(key in book for key in fallback_keys):
+        return preferred
+    return next(key for key in fallback_keys if key in book)
+
+
+def _book_levels_for_derive(book: dict[str, dict[str, str]]) -> dict[str, list[list[str]]]:
+    orderbook: dict[str, list[list[str]]] = {}
+    for key, levels_by_price in book.items():
+        if not isinstance(levels_by_price, dict):
+            continue
+        levels: list[list[str]] = []
+        for price, quantity in levels_by_price.items():
+            parsed_quantity = _decimal(quantity)
+            if parsed_quantity is not None and parsed_quantity > 0:
+                levels.append([price, str(parsed_quantity)])
+        if levels:
+            levels.sort(key=lambda level: Decimal(level[0]), reverse=True)
+            orderbook[key] = levels
+    return orderbook
+
+
+def _ws_orderbook(market: KalshiMarket) -> dict[str, dict[str, str]]:
+    raw = market.orderbook_raw if isinstance(market.orderbook_raw, dict) else {}
+    raw_book = raw.get(WS_ORDERBOOK_RAW_KEY)
+    if not isinstance(raw_book, dict):
+        return {}
+    book: dict[str, dict[str, str]] = {}
+    for key, levels_by_price in raw_book.items():
+        if not isinstance(key, str) or not isinstance(levels_by_price, dict):
+            continue
+        book[key] = {str(price): str(quantity) for price, quantity in levels_by_price.items()}
+    return book
+
+
+def _store_ws_orderbook(market: KalshiMarket, book: dict[str, dict[str, str]]) -> None:
+    raw = dict(market.orderbook_raw or {})
+    raw[WS_ORDERBOOK_RAW_KEY] = {key: dict(levels) for key, levels in book.items()}
+    market.orderbook_raw = raw
+
+
+def _snapshot_book_side(levels: object) -> dict[str, str]:
+    if not isinstance(levels, list):
+        return {}
+    parsed_levels: dict[str, str] = {}
+    for level in levels:
+        price_value: object | None = None
+        quantity_value: object | None = None
+        if isinstance(level, dict):
+            price_value = _first_present(level, "price_dollars", "price")
+            quantity_value = _first_present(level, "quantity", "qty", "count")
+        elif isinstance(level, (list, tuple)) and level:
+            price_value = level[0]
+            quantity_value = level[1] if len(level) > 1 else Decimal("1")
+        else:
+            price_value = level
+            quantity_value = Decimal("1")
+        price = _decimal(price_value)
+        quantity = _decimal(quantity_value)
+        if price is None or quantity is None or quantity <= 0:
+            continue
+        parsed_levels[str(price)] = str(quantity)
+    return parsed_levels
+
+
+def _derived_book_updates(book: dict[str, dict[str, str]], sides: set[str]) -> dict[str, Decimal | None]:
+    derived = derive_orderbook_prices(_book_levels_for_derive(book))
+    updates: dict[str, Decimal | None] = {}
+    if "yes" in sides:
+        updates["best_yes_bid"] = derived["best_yes_bid"]
+        updates["implied_no_ask"] = derived["implied_no_ask"]
+    if "no" in sides:
+        updates["best_no_bid"] = derived["best_no_bid"]
+        updates["implied_yes_ask"] = derived["implied_yes_ask"]
+    return updates
+
+
+def _legacy_delta_clear(market: KalshiMarket, side: str, price: Decimal, delta: Decimal) -> dict[str, Decimal | None]:
+    if side == "yes" and delta < 0 and market.best_yes_bid is not None and price >= market.best_yes_bid:
+        return {"best_yes_bid": None, "implied_no_ask": None}
+    if side == "no" and delta < 0 and market.best_no_bid is not None and price >= market.best_no_bid:
+        return {"best_no_bid": None, "implied_yes_ask": None}
+    return {}
+
+
+def _orderbook_snapshot_prices(market: KalshiMarket, payload: dict[str, Any]) -> dict[str, Decimal | None]:
     orderbook = {
         target_key: payload[source_key]
         for source_key, target_key in ORDERBOOK_SNAPSHOT_LEVEL_KEYS.items()
@@ -171,15 +268,16 @@ def _orderbook_snapshot_prices(payload: dict[str, Any]) -> dict[str, Decimal | N
     }
     if not orderbook:
         return {}
-    derived = derive_orderbook_prices(orderbook)
-    updates: dict[str, Decimal | None] = {}
-    if any(key.startswith("yes") for key in orderbook):
-        updates["best_yes_bid"] = derived["best_yes_bid"]
-        updates["implied_no_ask"] = derived["implied_no_ask"]
-    if any(key.startswith("no") for key in orderbook):
-        updates["best_no_bid"] = derived["best_no_bid"]
-        updates["implied_yes_ask"] = derived["implied_yes_ask"]
-    return updates
+    book = _ws_orderbook(market)
+    sides: set[str] = set()
+    for key, levels in orderbook.items():
+        book[key] = _snapshot_book_side(levels)
+        if key.startswith("yes"):
+            sides.add("yes")
+        if key.startswith("no"):
+            sides.add("no")
+    _store_ws_orderbook(market, book)
+    return _derived_book_updates(book, sides)
 
 
 def _delta_value(payload: dict[str, Any]) -> Decimal | None:
@@ -204,27 +302,26 @@ def _orderbook_delta_prices(market: KalshiMarket, payload: dict[str, Any]) -> di
     delta = _delta_value(payload)
     if side not in {"yes", "no"} or price is None or delta is None:
         return {}
-    if side == "yes":
-        if delta > 0:
-            if market.best_yes_bid is not None and price < market.best_yes_bid:
-                return {}
-            return {
-                "best_yes_bid": price,
-                "implied_no_ask": (Decimal("1.0000") - price).quantize(Decimal("0.0001")),
-            }
-        if delta < 0 and market.best_yes_bid is not None and price >= market.best_yes_bid:
-            return {"best_yes_bid": None, "implied_no_ask": None}
-        return {}
-    if delta > 0:
-        if market.best_no_bid is not None and price < market.best_no_bid:
+
+    book = _ws_orderbook(market)
+    book_key = _book_price_key(side, book)
+    levels = dict(book.get(book_key) or {})
+    if book_key not in book and delta > 0:
+        current_best = market.best_yes_bid if side == "yes" else market.best_no_bid
+        if current_best is not None and price < current_best:
             return {}
-        return {
-            "best_no_bid": price,
-            "implied_yes_ask": (Decimal("1.0000") - price).quantize(Decimal("0.0001")),
-        }
-    if delta < 0 and market.best_no_bid is not None and price >= market.best_no_bid:
-        return {"best_no_bid": None, "implied_yes_ask": None}
-    return {}
+    existing_quantity = _decimal(levels.get(str(price))) or Decimal("0")
+    if existing_quantity == 0 and delta < 0:
+        return _legacy_delta_clear(market, side, price, delta)
+
+    new_quantity = existing_quantity + delta
+    if new_quantity > 0:
+        levels[str(price)] = str(new_quantity.quantize(Decimal("0.0001")))
+    else:
+        levels.pop(str(price), None)
+    book[book_key] = levels
+    _store_ws_orderbook(market, book)
+    return _derived_book_updates(book, {side})
 
 
 def apply_ws_market_update(session: Session, ticker: str, payload: dict[str, Any]) -> dict[str, object]:
@@ -246,7 +343,7 @@ def apply_ws_market_update(session: Session, ticker: str, payload: dict[str, Any
             if attr in POSITION_MARK_PRICE_ATTRS:
                 position_mark_price_applied = True
     for attr, value in {
-        **_orderbook_snapshot_prices(payload),
+        **_orderbook_snapshot_prices(market, payload),
         **_orderbook_delta_prices(market, payload),
     }.items():
         setattr(market, attr, value)

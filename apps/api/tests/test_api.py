@@ -1602,6 +1602,55 @@ def test_websocket_orderbook_delta_clears_removed_best_bid_without_freshening_pr
     assert values["market_data_source"] == "websocket"
 
 
+def test_websocket_orderbook_delta_falls_back_to_next_book_level(monkeypatch) -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+    monkeypatch.setattr(ws_market_data, "utc_now", lambda: now)
+
+    with Session(engine) as session:
+        get_or_create_active_paper_epoch(session, starting_balance=Decimal("500.00"))
+        market = KalshiMarket(
+            kalshi_market_id="KX-WS-DELTA-FALLBACK",
+            ticker="KXMLBGAME-WS-DELTA-FALLBACK-PIT",
+            title="Will Pittsburgh win?",
+            status="open",
+        )
+        session.add(market)
+        session.commit()
+
+        snapshot_result = ws_market_data.apply_ws_market_update(
+            session,
+            "KXMLBGAME-WS-DELTA-FALLBACK-PIT",
+            {
+                "market_ticker": "KXMLBGAME-WS-DELTA-FALLBACK-PIT",
+                "no_dollars_fp": [["0.4300", "8"], ["0.4100", "5"]],
+            },
+        )
+        delta_result = ws_market_data.apply_ws_market_update(
+            session,
+            "KXMLBGAME-WS-DELTA-FALLBACK-PIT",
+            {
+                "market_ticker": "KXMLBGAME-WS-DELTA-FALLBACK-PIT",
+                "side": "no",
+                "price_dollars": "0.4300",
+                "delta_fp": -8,
+            },
+        )
+        session.commit()
+        values = {
+            "best_no_bid": market.best_no_bid,
+            "implied_yes_ask": market.implied_yes_ask,
+            "orderbook_raw": market.orderbook_raw,
+        }
+
+    assert snapshot_result["updated"] is True
+    assert delta_result["updated"] is True
+    assert values["best_no_bid"] == Decimal("0.4100")
+    assert values["implied_yes_ask"] == Decimal("0.5900")
+    assert values["orderbook_raw"]["websocket_orderbook"]["no_dollars"] == {"0.4100": "5.0000"}
+
+
 def test_websocket_market_update_does_not_mark_non_price_message_fresh(monkeypatch) -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
