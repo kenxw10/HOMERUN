@@ -3,18 +3,20 @@ from __future__ import annotations
 from dataclasses import dataclass
 from decimal import Decimal
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.models import (
     BalanceSnapshot,
+    FeatureSnapshot,
     JobRun,
     ModelCandidate,
     ModelPredictionOutput,
     ModelPredictionRun,
     PaperTrade,
     PaperTradingEpoch,
+    Settlement,
 )
 from app.time_utils import utc_now
 
@@ -46,6 +48,70 @@ def _active_epochs(session: Session) -> list[PaperTradingEpoch]:
             .order_by(PaperTradingEpoch.started_at.desc(), PaperTradingEpoch.id.desc())
         )
     )
+
+
+def _delete_rows(session: Session, statement) -> int:
+    result = session.execute(statement)
+    return int(result.rowcount or 0)
+
+
+def _clear_epoch_rows(session: Session, epoch: PaperTradingEpoch) -> dict[str, int]:
+    epoch.current_balance_snapshot_id = None
+    session.add(epoch)
+    session.flush()
+
+    candidate_ids = list(
+        session.scalars(select(ModelCandidate.id).where(ModelCandidate.paper_trading_epoch_id == epoch.id))
+    )
+    prediction_run_ids = list(
+        session.scalars(select(ModelPredictionRun.id).where(ModelPredictionRun.paper_trading_epoch_id == epoch.id))
+    )
+    paper_trade_filters = [PaperTrade.paper_trading_epoch_id == epoch.id]
+    if candidate_ids:
+        paper_trade_filters.append(PaperTrade.candidate_id.in_(candidate_ids))
+    paper_trade_ids = list(session.scalars(select(PaperTrade.id).where(or_(*paper_trade_filters))))
+    output_filters = [ModelPredictionOutput.paper_trading_epoch_id == epoch.id]
+    if candidate_ids:
+        output_filters.append(ModelPredictionOutput.candidate_id.in_(candidate_ids))
+    if prediction_run_ids:
+        output_filters.append(ModelPredictionOutput.prediction_run_id.in_(prediction_run_ids))
+
+    counts: dict[str, int] = {}
+    if paper_trade_ids:
+        counts["settlements"] = _delete_rows(
+            session,
+            delete(Settlement).where(Settlement.paper_trade_id.in_(paper_trade_ids)),
+        )
+    counts["paper_trades"] = _delete_rows(
+        session,
+        delete(PaperTrade).where(or_(*paper_trade_filters)),
+    )
+    counts["model_prediction_outputs"] = _delete_rows(
+        session,
+        delete(ModelPredictionOutput).where(or_(*output_filters)),
+    )
+    if candidate_ids:
+        counts["feature_snapshots"] = _delete_rows(
+            session,
+            delete(FeatureSnapshot).where(FeatureSnapshot.candidate_id.in_(candidate_ids)),
+        )
+    counts["model_candidates"] = _delete_rows(
+        session,
+        delete(ModelCandidate).where(ModelCandidate.paper_trading_epoch_id == epoch.id),
+    )
+    counts["model_prediction_runs"] = _delete_rows(
+        session,
+        delete(ModelPredictionRun).where(ModelPredictionRun.paper_trading_epoch_id == epoch.id),
+    )
+    counts["balance_snapshots"] = _delete_rows(
+        session,
+        delete(BalanceSnapshot).where(BalanceSnapshot.paper_trading_epoch_id == epoch.id),
+    )
+    counts["job_runs"] = _delete_rows(
+        session,
+        delete(JobRun).where(JobRun.paper_trading_epoch_id == epoch.id),
+    )
+    return counts
 
 
 def get_or_create_active_paper_epoch(
@@ -110,6 +176,7 @@ def create_new_active_epoch(
 
     existing = session.scalar(select(PaperTradingEpoch).where(PaperTradingEpoch.epoch_key == epoch_key))
     if existing is not None:
+        cleared_counts = _clear_epoch_rows(session, existing)
         existing.status = "active"
         existing.mode = "paper"
         existing.display_name = _display_name(epoch_key)
@@ -117,7 +184,10 @@ def create_new_active_epoch(
         existing.started_at = now
         existing.archived_at = None
         existing.archive_reason = None
-        existing.notes = notes or existing.notes
+        existing.notes = {
+            **(notes or existing.notes or {}),
+            "cleared_reused_epoch_rows": {key: value for key, value in cleared_counts.items() if value},
+        }
         session.add(existing)
         session.flush()
         return existing

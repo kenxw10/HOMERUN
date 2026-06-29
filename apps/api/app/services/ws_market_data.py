@@ -154,6 +154,7 @@ ORDERBOOK_SNAPSHOT_LEVEL_KEYS = {
 WS_ORDERBOOK_RAW_KEY = "websocket_orderbook"
 YES_BOOK_KEYS = ("yes_dollars", "yes", "yes_bids")
 NO_BOOK_KEYS = ("no_dollars", "no", "no_bids")
+DOLLAR_BOOK_KEYS = {"yes_dollars", "no_dollars"}
 
 
 def _payload_price(payload: dict[str, Any], keys: tuple[str, ...]) -> Decimal | None:
@@ -319,6 +320,18 @@ def _orderbook_delta_price(payload: dict[str, Any]) -> Decimal | None:
     return (value / Decimal("100")).quantize(Decimal("0.0001")) if value is not None else None
 
 
+def _orderbook_delta_storage_price(payload: dict[str, Any], *, dollars: bool) -> Decimal | None:
+    dollar_value = _decimal(payload.get("price_dollars"))
+    cent_value = _decimal(payload.get("price"))
+    if dollars:
+        if dollar_value is not None:
+            return dollar_value
+        return (cent_value / Decimal("100")).quantize(Decimal("0.0001")) if cent_value is not None else None
+    if cent_value is not None:
+        return cent_value
+    return (dollar_value * Decimal("100")).quantize(Decimal("0.0001")) if dollar_value is not None else None
+
+
 def _orderbook_delta_prices(market: KalshiMarket, payload: dict[str, Any]) -> dict[str, Decimal | None]:
     side = str(payload.get("side") or "").strip().lower()
     price = _orderbook_delta_price(payload)
@@ -328,20 +341,24 @@ def _orderbook_delta_prices(market: KalshiMarket, payload: dict[str, Any]) -> di
 
     book = _ws_orderbook(market)
     book_key = _book_price_key(side, book)
+    storage_price = _orderbook_delta_storage_price(payload, dollars=book_key in DOLLAR_BOOK_KEYS)
+    if storage_price is None:
+        return {}
+    storage_key = str(storage_price)
     levels = dict(book.get(book_key) or {})
     if book_key not in book and delta > 0:
         current_best = market.best_yes_bid if side == "yes" else market.best_no_bid
         if current_best is not None and price < current_best:
             return {}
-    existing_quantity = _decimal(levels.get(str(price))) or Decimal("0")
+    existing_quantity = _decimal(levels.get(storage_key)) or Decimal("0")
     if existing_quantity == 0 and delta < 0:
         return _legacy_delta_clear(market, side, price, delta)
 
     new_quantity = existing_quantity + delta
     if new_quantity > 0:
-        levels[str(price)] = str(new_quantity.quantize(Decimal("0.0001")))
+        levels[storage_key] = str(new_quantity.quantize(Decimal("0.0001")))
     else:
-        levels.pop(str(price), None)
+        levels.pop(storage_key, None)
     book[book_key] = levels
     _store_ws_orderbook(market, book)
     return _derived_book_updates(book, {side})

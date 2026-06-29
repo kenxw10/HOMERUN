@@ -78,7 +78,12 @@ from app.services.kalshi_mlb_resolver import (
 from app.services.mapping import infer_market_type, score_mapping, sync_market_mappings
 from app.services.modeling import run_model_governance
 from app.services.job_runs import run_job
-from app.services.paper_epoch import RESET_CONFIRMATION, get_or_create_active_paper_epoch, reset_paper_trading_epoch
+from app.services.paper_epoch import (
+    RESET_CONFIRMATION,
+    create_new_active_epoch,
+    get_or_create_active_paper_epoch,
+    reset_paper_trading_epoch,
+)
 from app.services.portfolio import calculate_paper_portfolio
 from app.services.settlement import settle_paper_trades
 from app.time_utils import classify_time_bucket, eastern_display
@@ -308,6 +313,124 @@ def test_active_paper_epoch_uses_bankroll_starting_balance_by_default(monkeypatc
         get_settings.cache_clear()
 
     assert epoch.starting_balance == Decimal("500.00")
+
+
+def test_create_new_active_epoch_clears_rows_when_reusing_old_key() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+
+    with Session(engine) as session:
+        reused_epoch = PaperTradingEpoch(
+            epoch_key="reused-pr3d-epoch",
+            display_name="REUSED PR3D EPOCH",
+            status="archived",
+            mode="paper",
+            starting_balance=Decimal("1000.00"),
+            started_at=now - timedelta(days=2),
+            archived_at=now - timedelta(days=1),
+            archive_reason="previous_reset",
+        )
+        session.add(reused_epoch)
+        session.flush()
+        candidate = ModelCandidate(
+            paper_trading_epoch_id=reused_epoch.id,
+            evaluated_at=now - timedelta(days=1),
+            features={},
+            decision="candidate_only",
+        )
+        prediction_run = ModelPredictionRun(
+            paper_trading_epoch_id=reused_epoch.id,
+            started_at=now - timedelta(days=1),
+            target_date=date(2026, 7, 1),
+            status="completed",
+        )
+        balance_snapshot = BalanceSnapshot(
+            paper_trading_epoch_id=reused_epoch.id,
+            captured_at=now - timedelta(days=1),
+            cash_balance=Decimal("900.00"),
+            portfolio_value=Decimal("950.00"),
+            source="paper",
+        )
+        job_run = JobRun(
+            paper_trading_epoch_id=reused_epoch.id,
+            job_name="candidate-sweep",
+            job_type="paper_ops",
+            status="succeeded",
+            started_at=now - timedelta(days=1),
+            completed_at=now - timedelta(days=1) + timedelta(minutes=1),
+        )
+        session.add_all([candidate, prediction_run, balance_snapshot, job_run])
+        session.flush()
+        trade = PaperTrade(
+            paper_trading_epoch_id=reused_epoch.id,
+            candidate_id=candidate.id,
+            market_ticker="KXMLBGAME-REUSED-PIT",
+            contract_side="yes",
+            entry_price=Decimal("0.4000"),
+            current_price=Decimal("0.4000"),
+            quantity=1,
+            entry_time=now - timedelta(days=1),
+            status="settled",
+        )
+        prediction_output = ModelPredictionOutput(
+            paper_trading_epoch_id=reused_epoch.id,
+            prediction_run_id=prediction_run.id,
+            candidate_id=candidate.id,
+            decision_reason="old_output",
+        )
+        feature_snapshot = FeatureSnapshot(
+            candidate_id=candidate.id,
+            captured_at=now - timedelta(days=1),
+            features={},
+            source="old_epoch",
+        )
+        session.add_all([trade, prediction_output, feature_snapshot])
+        session.flush()
+        settlement = Settlement(
+            paper_trade_id=trade.id,
+            settled_at=now - timedelta(days=1),
+            resolution="win",
+            payout=Decimal("1.00"),
+            realized_pnl=Decimal("0.60"),
+        )
+        reused_epoch.current_balance_snapshot_id = balance_snapshot.id
+        session.add_all([settlement, reused_epoch])
+        session.commit()
+
+        active = create_new_active_epoch(
+            session,
+            epoch_key="reused-pr3d-epoch",
+            starting_balance=Decimal("500.00"),
+            notes={"created_by": "test"},
+        )
+        session.commit()
+
+        remaining = {
+            "trades": list(session.scalars(select(PaperTrade).where(PaperTrade.paper_trading_epoch_id == active.id))),
+            "settlements": list(session.scalars(select(Settlement))),
+            "candidates": list(
+                session.scalars(select(ModelCandidate).where(ModelCandidate.paper_trading_epoch_id == active.id))
+            ),
+            "outputs": list(
+                session.scalars(select(ModelPredictionOutput).where(ModelPredictionOutput.paper_trading_epoch_id == active.id))
+            ),
+            "runs": list(
+                session.scalars(select(ModelPredictionRun).where(ModelPredictionRun.paper_trading_epoch_id == active.id))
+            ),
+            "features": list(session.scalars(select(FeatureSnapshot))),
+            "snapshots": list(
+                session.scalars(select(BalanceSnapshot).where(BalanceSnapshot.paper_trading_epoch_id == active.id))
+            ),
+            "jobs": list(session.scalars(select(JobRun).where(JobRun.paper_trading_epoch_id == active.id))),
+        }
+
+    assert active.status == "active"
+    assert active.starting_balance == Decimal("500.00")
+    assert active.current_balance_snapshot_id is None
+    assert active.notes is not None
+    assert active.notes["cleared_reused_epoch_rows"]["paper_trades"] == 1
+    assert all(not rows for rows in remaining.values())
 
 
 def test_paper_epoch_reset_rejects_matching_archive_and_new_keys() -> None:
@@ -1748,6 +1871,70 @@ def test_websocket_orderbook_delta_falls_back_to_next_book_level(monkeypatch) ->
     assert values["best_no_bid"] == Decimal("0.4100")
     assert values["implied_yes_ask"] == Decimal("0.5900")
     assert values["orderbook_raw"]["websocket_orderbook"]["no_dollars"] == {"0.4100": "5.0000"}
+
+
+def test_websocket_legacy_orderbook_delta_keeps_snapshot_price_units(monkeypatch) -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+    monkeypatch.setattr(ws_market_data, "utc_now", lambda: now)
+
+    with Session(engine) as session:
+        get_or_create_active_paper_epoch(session, starting_balance=Decimal("500.00"))
+        market = KalshiMarket(
+            kalshi_market_id="KX-WS-LEGACY-DELTA",
+            ticker="KXMLBGAME-WS-LEGACY-DELTA-PIT",
+            title="Will Pittsburgh win?",
+            status="open",
+        )
+        session.add(market)
+        session.commit()
+
+        snapshot_result = ws_market_data.apply_ws_market_update(
+            session,
+            "KXMLBGAME-WS-LEGACY-DELTA-PIT",
+            {
+                "market_ticker": "KXMLBGAME-WS-LEGACY-DELTA-PIT",
+                "yes": [[55, 10], [52, 5]],
+            },
+        )
+        remove_result = ws_market_data.apply_ws_market_update(
+            session,
+            "KXMLBGAME-WS-LEGACY-DELTA-PIT",
+            {
+                "market_ticker": "KXMLBGAME-WS-LEGACY-DELTA-PIT",
+                "side": "yes",
+                "price": 55,
+                "delta_fp": -10,
+            },
+        )
+        add_result = ws_market_data.apply_ws_market_update(
+            session,
+            "KXMLBGAME-WS-LEGACY-DELTA-PIT",
+            {
+                "market_ticker": "KXMLBGAME-WS-LEGACY-DELTA-PIT",
+                "side": "yes",
+                "price_dollars": "0.5600",
+                "delta_fp": 3,
+            },
+        )
+        session.commit()
+        values = {
+            "best_yes_bid": market.best_yes_bid,
+            "implied_no_ask": market.implied_no_ask,
+            "orderbook_raw": market.orderbook_raw,
+        }
+
+    assert snapshot_result["updated"] is True
+    assert remove_result["updated"] is True
+    assert add_result["updated"] is True
+    assert values["best_yes_bid"] == Decimal("0.5600")
+    assert values["implied_no_ask"] == Decimal("0.4400")
+    assert values["orderbook_raw"]["websocket_orderbook"]["yes"] == {
+        "52.0000": "5.0000",
+        "56.0000": "3.0000",
+    }
+    assert "0.5600" not in values["orderbook_raw"]["websocket_orderbook"]["yes"]
 
 
 def test_websocket_inverse_ask_update_clears_stale_direct_yes_ask(monkeypatch) -> None:
