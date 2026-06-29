@@ -418,6 +418,33 @@ def test_paper_epoch_reset_does_not_resurrect_old_archived_positions() -> None:
     assert stale_trade.resolution == "EPOCH_ARCHIVED"
 
 
+def test_archived_epoch_key_requires_include_archived() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+
+    with Session(engine) as session:
+        get_or_create_active_paper_epoch(session, starting_balance=Decimal("500.00"))
+        archived = PaperTradingEpoch(
+            epoch_key="archived-dashboard",
+            display_name="ARCHIVED DASHBOARD",
+            status="archived",
+            mode="paper",
+            starting_balance=Decimal("1000.00"),
+            started_at=now - timedelta(days=1),
+            archived_at=now,
+        )
+        session.add(archived)
+        session.commit()
+
+        with pytest.raises(ValueError, match="include_archived=true"):
+            dashboard.dashboard_summary_from_db(session, epoch_key="archived-dashboard")
+        summary = dashboard.dashboard_summary_from_db(session, epoch_key="archived-dashboard", include_archived=True)
+
+    assert summary.active_epoch is not None
+    assert summary.active_epoch.epoch_key == "archived-dashboard"
+
+
 def test_dashboard_job_status_is_scoped_to_active_epoch() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
@@ -1314,6 +1341,47 @@ def test_websocket_bid_update_does_not_freshen_executable_ask(monkeypatch) -> No
     assert values["trade_price"] == Decimal("0.5500")
     assert values["trade_price_updated_at"] is not None
     assert values["trade_price_updated_at"].replace(tzinfo=UTC) == now
+
+
+def test_websocket_status_payload_expires_stale_running_worker(monkeypatch) -> None:
+    monkeypatch.setenv("WEBSOCKET_MARKET_DATA_ENABLED", "true")
+    monkeypatch.setenv("WS_HEARTBEAT_TIMEOUT_SECONDS", "30")
+    get_settings.cache_clear()
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+    stale = now - timedelta(seconds=31)
+    monkeypatch.setattr(ws_market_data, "utc_now", lambda: now)
+
+    try:
+        with Session(engine) as session:
+            session.add(
+                MarketDataWorkerStatus(
+                    status_key="kalshi_ws_paper",
+                    enabled=True,
+                    running=True,
+                    source="websocket",
+                    subscribed_market_count=3,
+                    reconnect_count=0,
+                    stale_count=0,
+                    last_seen_at=stale,
+                    heartbeat_at=stale,
+                    last_message_at=stale,
+                    raw_status={},
+                )
+            )
+            session.commit()
+
+            payload = ws_market_data.ws_status_payload(session)
+            dashboard_status = dashboard._websocket_status(session)
+    finally:
+        get_settings.cache_clear()
+
+    assert payload["enabled"] is True
+    assert payload["running"] is False
+    assert payload["source"] == "rest_fallback"
+    assert dashboard_status.running is False
+    assert dashboard_status.source == "rest_fallback"
 
 
 def test_ws_worker_uses_ticker_channel_and_nested_msg_payload() -> None:

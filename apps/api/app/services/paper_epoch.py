@@ -210,6 +210,8 @@ def resolve_epoch_filter(
         epoch = session.scalar(select(PaperTradingEpoch).where(PaperTradingEpoch.epoch_key == epoch_key))
         if epoch is None:
             raise ValueError(f"Unknown paper trading epoch: {epoch_key}")
+        if epoch.status != "active" and not include_archived:
+            raise ValueError(f"Paper trading epoch is archived; pass include_archived=true to view it: {epoch_key}")
         return EpochFilter(epoch=epoch, include_archived=include_archived)
     return EpochFilter(epoch=get_or_create_active_paper_epoch(session), include_archived=include_archived)
 

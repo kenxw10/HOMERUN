@@ -41,6 +41,7 @@ from app.services.contracts import contract_labels, market_type_from_ticker
 from app.services.features import FEATURE_VERSION, source_status_report
 from app.services.portfolio import calculate_paper_portfolio
 from app.services.paper_epoch import resolve_epoch_filter
+from app.services.ws_market_data import ws_status_running_is_fresh
 from app.time_utils import eastern_display, ensure_aware_utc, get_dashboard_zone, to_eastern_iso, today_eastern, utc_now
 
 MAPPING_STATUS_PRIORITY = {"confirmed": 0, "candidate": 1, "needs_review": 2}
@@ -369,10 +370,11 @@ def _websocket_status(session: Session) -> WebSocketStatusSummary:
             running=False,
             source="rest_fallback",
         )
+    running = ws_status_running_is_fresh(row)
     return WebSocketStatusSummary(
         enabled=row.enabled,
-        running=row.running,
-        source=row.source,
+        running=running,
+        source=row.source if running else "rest_fallback",
         subscribed_market_count=row.subscribed_market_count,
         last_seen_at=to_eastern_iso(row.last_seen_at),
         last_message_at=to_eastern_iso(row.last_message_at),

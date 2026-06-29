@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 from app.config import get_settings
 from app.models import KalshiMarket, MarketDataWorkerStatus, ModelCandidate, PaperTrade
 from app.services.paper_epoch import get_or_create_active_paper_epoch
-from app.time_utils import utc_now
+from app.time_utils import ensure_aware_utc, utc_now
 
 STATUS_KEY = "kalshi_ws_paper"
 
@@ -194,16 +194,30 @@ def apply_ws_market_update(session: Session, ticker: str, payload: dict[str, Any
     return {"updated": price_applied, "ticker": ticker, "updated_trades": updated_trades}
 
 
+def ws_status_running_is_fresh(row: MarketDataWorkerStatus, *, now=None) -> bool:
+    if not row.enabled or not row.running:
+        return False
+    newest_seen = max(
+        (ensure_aware_utc(value) for value in (row.heartbeat_at, row.last_seen_at) if value is not None),
+        default=None,
+    )
+    if newest_seen is None:
+        return False
+    timeout = timedelta(seconds=get_settings().ws_heartbeat_timeout_seconds)
+    return newest_seen >= ensure_aware_utc(now or utc_now()) - timeout
+
+
 def ws_status_payload(session: Session) -> dict[str, object]:
     row = get_or_create_ws_status(session)
+    running = ws_status_running_is_fresh(row)
     return {
         "enabled": row.enabled,
-        "running": row.running,
+        "running": running,
         "last_seen": row.last_seen_at.isoformat() if row.last_seen_at else None,
         "last_message_at": row.last_message_at.isoformat() if row.last_message_at else None,
         "subscribed_market_count": row.subscribed_market_count,
         "reconnect_count": row.reconnect_count,
         "last_error": row.last_error,
         "stale_count": row.stale_count,
-        "source": row.source,
+        "source": row.source if running else "rest_fallback",
     }
