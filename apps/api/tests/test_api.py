@@ -1713,6 +1713,122 @@ def test_websocket_orderbook_delta_falls_back_to_next_book_level(monkeypatch) ->
     assert values["orderbook_raw"]["websocket_orderbook"]["no_dollars"] == {"0.4100": "5.0000"}
 
 
+def test_websocket_inverse_ask_update_clears_stale_direct_yes_ask(monkeypatch) -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+    stale = now - timedelta(minutes=30)
+    monkeypatch.setattr(ws_market_data, "utc_now", lambda: now)
+
+    with Session(engine) as session:
+        get_or_create_active_paper_epoch(session, starting_balance=Decimal("500.00"))
+        market = KalshiMarket(
+            kalshi_market_id="KX-WS-INVERSE-ASK",
+            ticker="KXMLBGAME-WS-INVERSE-ASK-PIT",
+            title="Will Pittsburgh win?",
+            status="open",
+            yes_ask=Decimal("0.7000"),
+            implied_yes_ask=Decimal("0.6900"),
+            market_price_updated_at=stale,
+            market_data_source="rest",
+        )
+        session.add(market)
+        session.commit()
+
+        result = ws_market_data.apply_ws_market_update(
+            session,
+            "KXMLBGAME-WS-INVERSE-ASK-PIT",
+            {"market_ticker": "KXMLBGAME-WS-INVERSE-ASK-PIT", "no_dollars_fp": [["0.4300", "8"]]},
+        )
+        session.commit()
+        price_context = candidates._market_yes_price_context(market, now)
+        values = {
+            "yes_ask": market.yes_ask,
+            "implied_yes_ask": market.implied_yes_ask,
+            "best_no_bid": market.best_no_bid,
+            "market_price_updated_at": market.market_price_updated_at,
+            "price_context": price_context,
+        }
+
+    assert result["updated"] is True
+    assert values["yes_ask"] is None
+    assert values["implied_yes_ask"] == Decimal("0.5700")
+    assert values["best_no_bid"] == Decimal("0.4300")
+    assert values["market_price_updated_at"] is not None
+    assert values["market_price_updated_at"].replace(tzinfo=UTC) == now
+    assert values["price_context"].source == "orderbook_implied_yes_ask"
+    assert values["price_context"].executable_price == Decimal("0.5700")
+
+
+def test_websocket_mark_update_refreshes_only_matching_trade_side(monkeypatch) -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+    stale = now - timedelta(minutes=30)
+    monkeypatch.setattr(ws_market_data, "utc_now", lambda: now)
+
+    with Session(engine) as session:
+        active = get_or_create_active_paper_epoch(session, starting_balance=Decimal("500.00"))
+        market = KalshiMarket(
+            kalshi_market_id="KX-WS-SIDE-MARK",
+            ticker="KXMLBGAME-WS-SIDE-MARK-PIT",
+            title="Will Pittsburgh win?",
+            status="open",
+            best_yes_bid=Decimal("0.4000"),
+            best_no_bid=Decimal("0.4500"),
+            market_price_updated_at=stale,
+            market_data_source="rest",
+        )
+        yes_trade = PaperTrade(
+            paper_trading_epoch_id=active.id,
+            market_ticker="KXMLBGAME-WS-SIDE-MARK-PIT",
+            contract_side="yes",
+            entry_price=Decimal("0.4000"),
+            current_price=Decimal("0.4000"),
+            current_price_updated_at=stale,
+            quantity=1,
+            entry_time=now,
+            status="open",
+        )
+        no_trade = PaperTrade(
+            paper_trading_epoch_id=active.id,
+            market_ticker="KXMLBGAME-WS-SIDE-MARK-PIT",
+            contract_side="no",
+            entry_price=Decimal("0.4500"),
+            current_price=Decimal("0.4500"),
+            current_price_updated_at=stale,
+            quantity=1,
+            entry_time=now,
+            status="open",
+        )
+        session.add_all([market, yes_trade, no_trade])
+        session.commit()
+
+        result = ws_market_data.apply_ws_market_update(
+            session,
+            "KXMLBGAME-WS-SIDE-MARK-PIT",
+            {"market_ticker": "KXMLBGAME-WS-SIDE-MARK-PIT", "side": "no", "price_dollars": "0.5500", "delta_fp": 1},
+        )
+        session.commit()
+        values = {
+            "best_no_bid": market.best_no_bid,
+            "yes_price": yes_trade.current_price,
+            "yes_updated_at": yes_trade.current_price_updated_at,
+            "no_price": no_trade.current_price,
+            "no_updated_at": no_trade.current_price_updated_at,
+        }
+
+    assert result["updated"] is True
+    assert result["updated_trades"] == 1
+    assert values["best_no_bid"] == Decimal("0.5500")
+    assert values["yes_price"] == Decimal("0.4000")
+    assert values["yes_updated_at"] is not None
+    assert values["yes_updated_at"].replace(tzinfo=UTC) == stale
+    assert values["no_price"] == Decimal("0.5500")
+    assert values["no_updated_at"] is not None
+    assert values["no_updated_at"].replace(tzinfo=UTC) == now
+
+
 def test_websocket_market_update_does_not_mark_non_price_message_fresh(monkeypatch) -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)

@@ -138,6 +138,9 @@ PRICE_FIELD_KEYS = {
 }
 EXECUTABLE_YES_PRICE_ATTRS = {"yes_ask", "implied_yes_ask", "no_bid", "best_no_bid"}
 POSITION_MARK_PRICE_ATTRS = {"yes_bid", "best_yes_bid", "no_bid", "best_no_bid", "last_price"}
+INVERSE_YES_PRICE_ATTRS = {"implied_yes_ask", "no_bid", "best_no_bid"}
+YES_POSITION_MARK_ATTRS = {"yes_bid", "best_yes_bid"}
+NO_POSITION_MARK_ATTRS = {"no_bid", "best_no_bid"}
 ORDERBOOK_SNAPSHOT_LEVEL_KEYS = {
     "yes_dollars_fp": "yes_dollars",
     "no_dollars_fp": "no_dollars",
@@ -260,6 +263,26 @@ def _legacy_delta_clear(market: KalshiMarket, side: str, price: Decimal, delta: 
     return {}
 
 
+def _mark_sides_for_attr(attr: str, value: Decimal | None) -> set[str]:
+    if value is None:
+        return set()
+    if attr in YES_POSITION_MARK_ATTRS:
+        return {"yes"}
+    if attr in NO_POSITION_MARK_ATTRS:
+        return {"no"}
+    if attr == "last_price":
+        return {"yes", "no"}
+    return set()
+
+
+def _clear_stale_yes_ask_fields(market: KalshiMarket, executable_attrs: set[str]) -> None:
+    if not executable_attrs.intersection(INVERSE_YES_PRICE_ATTRS) or "yes_ask" in executable_attrs:
+        return
+    market.yes_ask = None
+    if "implied_yes_ask" not in executable_attrs:
+        market.implied_yes_ask = None
+
+
 def _orderbook_snapshot_prices(market: KalshiMarket, payload: dict[str, Any]) -> dict[str, Decimal | None]:
     orderbook = {
         target_key: payload[source_key]
@@ -331,17 +354,16 @@ def apply_ws_market_update(session: Session, ticker: str, payload: dict[str, Any
         return {"updated": False, "reason": "unknown_market", "ticker": ticker}
 
     price_applied = False
-    executable_price_applied = False
-    position_mark_price_applied = False
+    executable_attrs_applied: set[str] = set()
+    mark_sides_applied: set[str] = set()
     for attr, keys in PRICE_FIELD_KEYS.items():
         value = _payload_price(payload, keys)
         if value is not None:
             setattr(market, attr, value)
             price_applied = True
             if attr in EXECUTABLE_YES_PRICE_ATTRS:
-                executable_price_applied = True
-            if attr in POSITION_MARK_PRICE_ATTRS:
-                position_mark_price_applied = True
+                executable_attrs_applied.add(attr)
+            mark_sides_applied.update(_mark_sides_for_attr(attr, value))
     for attr, value in {
         **_orderbook_snapshot_prices(market, payload),
         **_orderbook_delta_prices(market, payload),
@@ -349,25 +371,27 @@ def apply_ws_market_update(session: Session, ticker: str, payload: dict[str, Any
         setattr(market, attr, value)
         price_applied = True
         if value is not None and attr in EXECUTABLE_YES_PRICE_ATTRS:
-            executable_price_applied = True
-        if value is not None and attr in POSITION_MARK_PRICE_ATTRS:
-            position_mark_price_applied = True
+            executable_attrs_applied.add(attr)
+        mark_sides_applied.update(_mark_sides_for_attr(attr, value))
+    _clear_stale_yes_ask_fields(market, executable_attrs_applied)
     market.websocket_updated_at = now
     if price_applied:
         market.market_data_source = "websocket"
-    if executable_price_applied:
+    if executable_attrs_applied:
         market.market_price_updated_at = now
     session.add(market)
 
     epoch = get_or_create_active_paper_epoch(session)
     updated_trades = 0
-    if position_mark_price_applied:
+    if mark_sides_applied:
         for trade in session.scalars(
             select(PaperTrade)
             .where(PaperTrade.paper_trading_epoch_id == epoch.id)
             .where(PaperTrade.market_ticker == ticker)
             .where(PaperTrade.status == "open")
         ):
+            if trade.contract_side not in mark_sides_applied:
+                continue
             if trade.contract_side == "no":
                 mark = market.best_no_bid or market.no_bid or ((Decimal("1.0000") - market.last_price) if market.last_price else None)
             else:
