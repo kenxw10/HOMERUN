@@ -293,6 +293,22 @@ def test_paper_epoch_reset_archives_old_rows_and_starts_at_500() -> None:
     assert summary.performance.profit_loss == 0.0
 
 
+def test_active_paper_epoch_uses_bankroll_starting_balance_by_default(monkeypatch) -> None:
+    monkeypatch.setenv("PAPER_STARTING_BALANCE", "1000.00")
+    monkeypatch.setenv("PAPER_BANKROLL_STARTING_BALANCE", "500.00")
+    get_settings.cache_clear()
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    try:
+        with Session(engine) as session:
+            epoch = get_or_create_active_paper_epoch(session)
+    finally:
+        get_settings.cache_clear()
+
+    assert epoch.starting_balance == Decimal("500.00")
+
+
 def test_paper_epoch_reset_carries_open_positions_into_new_epoch() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
@@ -3921,7 +3937,7 @@ def test_dashboard_summary_uses_labels_snapshots_and_settled_performance() -> No
     assert summary.portfolio_value == 1000.15
     assert summary.performance.record == "1-0-0"
     assert summary.performance.profit_loss == 0.6
-    assert summary.paper_starting_balance == 1000.0
+    assert summary.paper_starting_balance == 500.0
     assert summary.positions[0].market == "FULL GAME WINNER - SEA @ PIT - PIT"
     assert summary.positions[0].market_ticker == "KXMLBGAME-26JUL011900SEAPIT-PIT"
     assert summary.positions[0].game_status == "NOT STARTED"
@@ -7202,8 +7218,8 @@ def test_pr3c_trade_policy_caps_slate_trades(monkeypatch) -> None:
     assert prediction_run is not None
     assert prediction_run.trade_policy["paper_max_trades_per_slate"] == 2
     assert snapshot is not None
-    assert snapshot.cash_balance == Decimal("980.00")
-    assert snapshot.portfolio_value == Decimal("1000.00")
+    assert snapshot.cash_balance == Decimal("480.00")
+    assert snapshot.portfolio_value == Decimal("500.00")
     assert result["cap_counts"]["no_trade_slate_cap"] == 3
     assert result["decision_counts"] == {"paper_trade": 2, "no_trade_slate_cap": 3}
     assert prediction_run.summary["decision_counts"] == {"paper_trade": 2, "no_trade_slate_cap": 3}

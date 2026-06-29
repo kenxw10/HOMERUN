@@ -66,7 +66,7 @@ def get_or_create_active_paper_epoch(
         return keeper
 
     settings = get_settings()
-    balance = _money(starting_balance or settings.paper_starting_balance)
+    balance = _money(starting_balance or settings.paper_bankroll_starting_balance)
     existing = session.scalar(select(PaperTradingEpoch).where(PaperTradingEpoch.epoch_key == epoch_key))
     now = utc_now()
     if existing is not None:
