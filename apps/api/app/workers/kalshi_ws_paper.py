@@ -39,6 +39,45 @@ def _subscribe_message(tickers: list[str]) -> dict[str, object]:
     }
 
 
+def _update_subscription_message(message_id: int, sids: list[int], tickers: list[str]) -> dict[str, object]:
+    return {
+        "id": message_id,
+        "cmd": "update_subscription",
+        "params": {
+            "sids": sids,
+            "market_tickers": tickers,
+            "action": "add_markets",
+        },
+    }
+
+
+def _message_type(payload: dict[str, object]) -> str:
+    value = payload.get("type")
+    return value.strip().lower() if isinstance(value, str) else ""
+
+
+def _message_id(payload: dict[str, object]) -> int | None:
+    value = payload.get("id")
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _subscription_sid(payload: dict[str, object]) -> int | None:
+    message = payload.get("msg")
+    data = message if isinstance(message, dict) else payload
+    value = data.get("sid")
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _market_update_payload(payload: dict[str, object]) -> tuple[str | None, dict[str, object]]:
     message = payload.get("msg")
     update_payload = message if isinstance(message, dict) else payload
@@ -146,6 +185,9 @@ async def _run_worker_once() -> dict[str, object]:
             subscription_refreshes = 0
             active_subscription_count = len(tickers)
             subscribed_tickers = {ticker.upper() for ticker in tickers}
+            subscription_sids: set[int] = set()
+            pending_subscription_updates: dict[int, set[str]] = {}
+            next_message_id = 2
             subscription_refresh_interval = max(1, settings.ws_heartbeat_timeout_seconds)
             loop = asyncio.get_running_loop()
             next_subscription_refresh = loop.time() + subscription_refresh_interval
@@ -160,7 +202,32 @@ async def _run_worker_once() -> dict[str, object]:
                 except asyncio.TimeoutError:
                     break
                 payload = json.loads(raw)
-                ticker, update_payload = _market_update_payload(payload if isinstance(payload, dict) else {})
+                payload_dict = payload if isinstance(payload, dict) else {}
+                message_type = _message_type(payload_dict)
+                if message_type == "subscribed":
+                    sid = _subscription_sid(payload_dict)
+                    if sid is not None:
+                        subscription_sids.add(sid)
+                elif message_type == "ok":
+                    ack_id = _message_id(payload_dict)
+                    if ack_id in pending_subscription_updates:
+                        subscribed_tickers.update(pending_subscription_updates.pop(ack_id))
+                        subscription_refreshes += 1
+                        active_subscription_count = len(subscribed_tickers)
+                        with session_factory() as session:
+                            mark_ws_status(
+                                session,
+                                running=True,
+                                subscribed_market_count=active_subscription_count,
+                                source="websocket",
+                            )
+                            session.commit()
+                elif message_type == "error":
+                    ack_id = _message_id(payload_dict)
+                    if ack_id in pending_subscription_updates:
+                        pending_subscription_updates.pop(ack_id)
+
+                ticker, update_payload = _market_update_payload(payload_dict)
                 if ticker:
                     with session_factory() as session:
                         result = apply_ws_market_update(session, ticker, update_payload)
@@ -176,16 +243,19 @@ async def _run_worker_once() -> dict[str, object]:
                         mark_ws_status(
                             session,
                             running=True,
-                            subscribed_market_count=len(refreshed_tickers),
+                            subscribed_market_count=len(subscribed_tickers),
                             source="websocket",
                         )
                         session.commit()
-                    active_subscription_count = len(refreshed_tickers)
+                    active_subscription_count = len(subscribed_tickers)
                     new_tickers = [ticker for ticker in refreshed_tickers if ticker.upper() not in subscribed_tickers]
-                    if new_tickers:
-                        await websocket.send(json.dumps(_subscribe_message(new_tickers)))
-                        subscribed_tickers.update(ticker.upper() for ticker in new_tickers)
-                        subscription_refreshes += 1
+                    if new_tickers and subscription_sids:
+                        message_id = next_message_id
+                        next_message_id += 1
+                        pending_subscription_updates[message_id] = {ticker.upper() for ticker in new_tickers}
+                        await websocket.send(
+                            json.dumps(_update_subscription_message(message_id, sorted(subscription_sids), new_tickers))
+                        )
                     if not refreshed_tickers:
                         break
                     next_subscription_refresh = loop.time() + subscription_refresh_interval

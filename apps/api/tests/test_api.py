@@ -1806,6 +1806,17 @@ def test_ws_worker_uses_ticker_channel_and_nested_msg_payload() -> None:
     subscribe_message = kalshi_ws_paper._subscribe_message(["KXMLBGAME-WS-PIT"])
     assert subscribe_message["params"]["channels"] == ["ticker", "orderbook_delta"]
 
+    update_message = kalshi_ws_paper._update_subscription_message(2, [101, 102], ["KXMLBGAME-WS-SEA"])
+    assert update_message == {
+        "id": 2,
+        "cmd": "update_subscription",
+        "params": {
+            "sids": [101, 102],
+            "market_tickers": ["KXMLBGAME-WS-SEA"],
+            "action": "add_markets",
+        },
+    }
+
     ticker, update_payload = kalshi_ws_paper._market_update_payload(
         {
             "type": "ticker",
@@ -2019,7 +2030,8 @@ def test_ws_worker_subscribes_new_active_tickers_without_reconnect(monkeypatch) 
         def __init__(self) -> None:
             self.created_new_ticker = False
             self.messages = [
-                (0, json.dumps({"type": "subscribed", "msg": {"channel": "ticker"}})),
+                (0, json.dumps({"type": "subscribed", "msg": {"channel": "ticker", "sid": 101}})),
+                (0, json.dumps({"type": "subscribed", "msg": {"channel": "orderbook_delta", "sid": 102}})),
                 (
                     0.6,
                     json.dumps(
@@ -2038,6 +2050,7 @@ def test_ws_worker_subscribes_new_active_tickers_without_reconnect(monkeypatch) 
                         }
                     ),
                 ),
+                (0, json.dumps({"id": 2, "type": "ok", "msg": {}})),
             ]
 
         async def __aenter__(self):
@@ -2092,7 +2105,15 @@ def test_ws_worker_subscribes_new_active_tickers_without_reconnect(monkeypatch) 
     assert result["subscription_refreshes"] == 1
     assert result["subscribed_market_count"] == 2
     assert sent_messages[0]["params"]["market_tickers"] == ["KXMLBGAME-WS-REFRESH-PIT"]
-    assert sent_messages[1]["params"]["market_tickers"] == ["KXMLBGAME-WS-REFRESH-SEA"]
+    assert sent_messages[1] == {
+        "id": 2,
+        "cmd": "update_subscription",
+        "params": {
+            "sids": [101, 102],
+            "market_tickers": ["KXMLBGAME-WS-REFRESH-SEA"],
+            "action": "add_markets",
+        },
+    }
 
 
 def test_generate_candidates_does_not_reuse_archived_epoch_candidate(monkeypatch) -> None:
