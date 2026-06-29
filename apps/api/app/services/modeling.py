@@ -31,6 +31,7 @@ from app.services.contracts import (
     PAPER_SUPPORTED_MARKET_FAMILIES,
 )
 from app.services.features import FEATURE_VERSION, LEAGUE_AVG_FULL_GAME_RUNS
+from app.services.paper_epoch import get_or_create_active_paper_epoch
 from app.time_utils import ensure_aware_utc, get_dashboard_zone, utc_now
 
 HEURISTIC_MODEL_TAG = "heuristic_full_game_winner_v1"
@@ -837,6 +838,8 @@ def run_model_governance(
     started = now or utc_now()
     active = get_or_create_mature_model_version(session)
     active_parameters = get_or_create_active_parameter_version(session)
+    if paper_trading_epoch_id is None:
+        paper_trading_epoch_id = get_or_create_active_paper_epoch(session).id
     candidates = _resolved_mature_candidates(session, paper_trading_epoch_id=paper_trading_epoch_id)
     sample_count = len(candidates)
     train_min = settings.model_min_samples_train

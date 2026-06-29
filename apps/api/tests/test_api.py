@@ -5029,6 +5029,67 @@ def test_model_governance_counts_samples_after_settlement_labels_candidates() ->
     assert governance_result["resolved_samples"] == 0
 
 
+def test_model_governance_defaults_to_active_epoch_when_scope_omitted() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        active = get_or_create_active_paper_epoch(session, starting_balance=Decimal("500.00"))
+        archived = PaperTradingEpoch(
+            epoch_key="archived-governance-default",
+            display_name="ARCHIVED GOVERNANCE DEFAULT",
+            status="archived",
+            mode="paper",
+            starting_balance=Decimal("1000.00"),
+            started_at=datetime(2026, 7, 1, 12, 0, tzinfo=UTC),
+            archived_at=datetime(2026, 7, 2, 12, 0, tzinfo=UTC),
+        )
+        game = MlbGame(
+            external_game_id="governance-default-epoch",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+            status="Final",
+        )
+        session.add_all([archived, game])
+        session.flush()
+        active_id = active.id
+        archived_id = archived.id
+        for epoch_id, outcome in ((active_id, "win"), (archived_id, "loss")):
+            session.add(
+                ModelCandidate(
+                    paper_trading_epoch_id=epoch_id,
+                    mlb_game_id=game.id,
+                    evaluated_at=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
+                    features={},
+                    probability=Decimal("0.600000"),
+                    probability_calibrated=Decimal("0.600000"),
+                    target_date=date(2026, 7, 1),
+                    fee_estimate=Decimal("0.010000"),
+                    price_status="fresh_executable",
+                    time_to_start_minutes=420,
+                    decision="candidate_only",
+                    outcome=outcome,
+                    resolved_at=datetime(2026, 7, 2, 4, 0, tzinfo=UTC),
+                    model_version_tag=modeling.MATURE_MODEL_TAG,
+                    feature_version=features.FEATURE_VERSION,
+                    training_eligible=True,
+                    market_family="full_game_winner",
+                )
+            )
+        session.commit()
+
+        result = run_model_governance(session, now=datetime(2026, 7, 2, 12, 0, tzinfo=UTC))
+        training = session.get(TrainingRun, result["training_run_id"])
+
+    assert result["resolved_samples"] == 1
+    assert result["paper_trading_epoch_id"] == active_id
+    assert training is not None
+    assert training.candidate_count == 1
+
+
 def test_pr3c_feature_sync_records_source_statuses_and_no_umpire_fields(monkeypatch) -> None:
     _stub_public_feature_network(monkeypatch)
     engine = create_engine("sqlite+pysqlite:///:memory:")
@@ -7813,6 +7874,7 @@ def test_governance_trains_challenger_when_sample_threshold_met(monkeypatch) -> 
     target_date = date(2026, 7, 1)
 
     with Session(engine) as session:
+        epoch_id = _active_epoch_id(session)
         game = MlbGame(
             external_game_id="governance-train-1",
             home_team="Pittsburgh Pirates",
@@ -7829,6 +7891,7 @@ def test_governance_trains_challenger_when_sample_threshold_met(monkeypatch) -> 
         for index, outcome in enumerate(["win", "win", "loss", "win", "loss"], start=1):
             session.add(
                 ModelCandidate(
+                    paper_trading_epoch_id=epoch_id,
                     mlb_game_id=game.id,
                     evaluated_at=datetime(2026, 7, 1, 16, index, tzinfo=UTC),
                     features={},
