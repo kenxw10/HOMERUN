@@ -153,19 +153,20 @@ def acquire_job_lock(
 def _run_step(run: JobRun, name: str, fn: Callable[[], Any]) -> Any:
     started_at = utc_now()
     step: dict[str, object] = {"name": name, "status": "running", "started_at": started_at.isoformat()}
-    run.steps = [*list(run.steps or []), step]
+    steps = [*list(run.steps or []), step]
+    run.steps = steps
     try:
         result = fn()
     except Exception as exc:
         step["status"] = "failed"
         step["completed_at"] = utc_now().isoformat()
         step["error"] = {"message": str(exc), "type": exc.__class__.__name__}
-        run.steps = list(run.steps or [])
+        run.steps = steps
         raise
     step["status"] = "succeeded"
     step["completed_at"] = utc_now().isoformat()
     step["result"] = result if isinstance(result, dict) else {"value": result}
-    run.steps = list(run.steps or [])
+    run.steps = steps
     return result
 
 

@@ -251,6 +251,16 @@ def reset_paper_trading_epoch(
         archive_key=archive_current_as or PRE_PR3D_EPOCH_KEY,
         reason="admin_reset_epoch",
     )
+    active = create_new_active_epoch(
+        session,
+        epoch_key=new_epoch,
+        starting_balance=starting_balance,
+        notes={
+            "archive_current_as": archive_current_as,
+            "archive_open_positions": archive_open_positions,
+            "reset_dashboard_metrics": reset_dashboard_metrics,
+        },
+    )
     if not archive_open_positions:
         for trade in session.scalars(
             select(PaperTrade)
@@ -258,8 +268,10 @@ def reset_paper_trading_epoch(
             .where(PaperTrade.status == "archived")
             .where(PaperTrade.resolution == "EPOCH_ARCHIVED")
         ):
+            trade.paper_trading_epoch_id = active.id
             trade.status = "open"
             trade.resolution = None
+            trade.exit_time = None
             session.add(trade)
 
     counts = {
@@ -287,17 +299,6 @@ def reset_paper_trading_epoch(
             or 0
         ),
     }
-
-    active = create_new_active_epoch(
-        session,
-        epoch_key=new_epoch,
-        starting_balance=starting_balance,
-        notes={
-            "archive_current_as": archive_current_as,
-            "archive_open_positions": archive_open_positions,
-            "reset_dashboard_metrics": reset_dashboard_metrics,
-        },
-    )
     snapshot = BalanceSnapshot(
         paper_trading_epoch_id=active.id,
         captured_at=utc_now(),

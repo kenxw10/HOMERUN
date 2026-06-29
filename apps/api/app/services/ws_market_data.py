@@ -121,6 +121,22 @@ def _decimal(value: object) -> Decimal | None:
         return None
 
 
+LEGACY_CENT_PRICE_KEYS = {"yes_bid", "yes_ask", "no_bid", "no_ask", "last_price"}
+
+
+def _payload_price(payload: dict[str, Any], keys: tuple[str, ...]) -> Decimal | None:
+    for key in keys:
+        if payload.get(key) is None:
+            continue
+        value = _decimal(payload.get(key))
+        if value is None:
+            continue
+        if key in LEGACY_CENT_PRICE_KEYS:
+            return (value / Decimal("100")).quantize(Decimal("0.0001"))
+        return value
+    return None
+
+
 def apply_ws_market_update(session: Session, ticker: str, payload: dict[str, Any]) -> dict[str, object]:
     now = utc_now()
     market = session.scalar(select(KalshiMarket).where(KalshiMarket.ticker == ticker).limit(1))
@@ -138,7 +154,7 @@ def apply_ws_market_update(session: Session, ticker: str, payload: dict[str, Any
         "implied_yes_ask": ("implied_yes_ask", "yes_ask_dollars", "yes_ask"),
         "implied_no_ask": ("implied_no_ask", "no_ask_dollars", "no_ask"),
     }.items():
-        value = next((_decimal(payload.get(key)) for key in keys if payload.get(key) is not None), None)
+        value = _payload_price(payload, keys)
         if value is not None:
             setattr(market, attr, value)
     market.websocket_updated_at = now

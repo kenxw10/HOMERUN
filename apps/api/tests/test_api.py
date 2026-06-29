@@ -293,6 +293,45 @@ def test_paper_epoch_reset_archives_old_rows_and_starts_at_500() -> None:
     assert summary.performance.profit_loss == 0.0
 
 
+def test_paper_epoch_reset_carries_open_positions_into_new_epoch() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        epoch = get_or_create_active_paper_epoch(session, starting_balance=Decimal("1000.00"))
+        trade = PaperTrade(
+            paper_trading_epoch_id=epoch.id,
+            market_ticker="KXMLBGAME-CARRY-PIT",
+            contract_side="yes",
+            entry_price=Decimal("0.4000"),
+            current_price=Decimal("0.4500"),
+            quantity=1,
+            entry_time=datetime(2026, 7, 1, 12, 0, tzinfo=UTC),
+            status="open",
+        )
+        session.add(trade)
+        session.commit()
+
+        result = reset_paper_trading_epoch(
+            session,
+            archive_current_as="pre_pr3d_validation",
+            new_epoch="pr3d_paper_observation_v1",
+            starting_balance=Decimal("500.00"),
+            archive_open_positions=False,
+            reset_dashboard_metrics=True,
+            confirmation=RESET_CONFIRMATION,
+        )
+        active = get_or_create_active_paper_epoch(session, starting_balance=Decimal("500.00"))
+        carried_trade = session.scalar(select(PaperTrade).where(PaperTrade.market_ticker == "KXMLBGAME-CARRY-PIT"))
+
+    assert result["archived_trades_count"] == 0
+    assert carried_trade is not None
+    assert carried_trade.paper_trading_epoch_id == active.id
+    assert carried_trade.status == "open"
+    assert carried_trade.resolution is None
+    assert carried_trade.exit_time is None
+
+
 def test_dashboard_job_status_is_scoped_to_active_epoch() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
@@ -884,6 +923,31 @@ def test_running_job_lock_key_is_database_unique() -> None:
             session.commit()
 
 
+def test_run_step_preserves_completed_details_after_nested_commit_reload() -> None:
+    now = datetime(2026, 7, 2, 12, 0, tzinfo=UTC)
+    run = JobRun(
+        job_name="price-refresh",
+        job_type="paper_ops",
+        status="running",
+        started_at=now,
+        lock_key="price-refresh:2026-07-02",
+        triggered_by="api",
+        steps=[],
+    )
+
+    def fn():
+        run.steps = [{"name": "price_refresh", "status": "running", "started_at": now.isoformat()}]
+        return {"updated": 1}
+
+    result = job_runs._run_step(run, "price_refresh", fn)
+
+    assert result == {"updated": 1}
+    assert len(run.steps) == 1
+    assert run.steps[0]["name"] == "price_refresh"
+    assert run.steps[0]["status"] == "succeeded"
+    assert run.steps[0]["result"] == {"updated": 1}
+
+
 def test_websocket_market_update_only_marks_active_epoch_trade() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
@@ -950,6 +1014,58 @@ def test_websocket_market_update_only_marks_active_epoch_trade() -> None:
     assert market_source == "websocket"
     assert status_row is not None
     assert status_source == "websocket"
+
+
+def test_websocket_market_update_converts_legacy_cent_prices() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+
+    with Session(engine) as session:
+        active = get_or_create_active_paper_epoch(session, starting_balance=Decimal("500.00"))
+        market = KalshiMarket(
+            kalshi_market_id="KX-WS-CENTS",
+            ticker="KXMLBGAME-WS-CENTS-PIT",
+            title="Will Pittsburgh win?",
+            status="open",
+        )
+        trade = PaperTrade(
+            paper_trading_epoch_id=active.id,
+            market_ticker="KXMLBGAME-WS-CENTS-PIT",
+            contract_side="yes",
+            entry_price=Decimal("0.4000"),
+            current_price=Decimal("0.4000"),
+            quantity=1,
+            entry_time=now,
+            status="open",
+        )
+        session.add_all([market, trade])
+        session.commit()
+
+        result = ws_market_data.apply_ws_market_update(
+            session,
+            "KXMLBGAME-WS-CENTS-PIT",
+            {"market_ticker": "KXMLBGAME-WS-CENTS-PIT", "yes_bid": 55, "yes_ask": 56, "last_price": 54},
+        )
+        session.commit()
+        market_values = {
+            "yes_bid": market.yes_bid,
+            "yes_ask": market.yes_ask,
+            "best_yes_bid": market.best_yes_bid,
+            "implied_yes_ask": market.implied_yes_ask,
+            "last_price": market.last_price,
+        }
+        trade_price = trade.current_price
+
+    assert result["updated"] is True
+    assert market_values == {
+        "yes_bid": Decimal("0.5500"),
+        "yes_ask": Decimal("0.5600"),
+        "best_yes_bid": Decimal("0.5500"),
+        "implied_yes_ask": Decimal("0.5600"),
+        "last_price": Decimal("0.5400"),
+    }
+    assert trade_price == Decimal("0.5500")
 
 
 def test_ws_worker_uses_ticker_channel_and_nested_msg_payload() -> None:
