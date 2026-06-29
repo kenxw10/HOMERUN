@@ -66,7 +66,7 @@ from app.services import (
     pybaseball_client,
     ws_market_data,
 )
-from app.services.contracts import selected_team_from_ticker
+from app.services.contracts import contract_labels, selected_team_from_ticker
 from app.services.http_json import HttpJsonError
 from app.services.kalshi import KalshiAPIError, KalshiClient, derive_orderbook_prices
 from app.services.kalshi_mlb_resolver import (
@@ -2117,6 +2117,51 @@ def test_websocket_inverse_ask_update_clears_stale_direct_yes_ask(monkeypatch) -
     assert values["market_price_updated_at"] is not None
     assert values["market_price_updated_at"].replace(tzinfo=UTC) == now
     assert values["price_context"].source == "orderbook_implied_yes_ask"
+    assert values["price_context"].executable_price == Decimal("0.5700")
+
+
+def test_websocket_direct_implied_no_ask_update_refreshes_no_price_freshness(monkeypatch) -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+    stale = now - timedelta(minutes=30)
+    monkeypatch.setattr(ws_market_data, "utc_now", lambda: now)
+
+    with Session(engine) as session:
+        get_or_create_active_paper_epoch(session, starting_balance=Decimal("500.00"))
+        market = KalshiMarket(
+            kalshi_market_id="KX-WS-INVERSE-NO-ASK",
+            ticker="KXMLBGAME-WS-INVERSE-NO-ASK-PIT",
+            title="Will Pittsburgh win?",
+            status="open",
+            no_ask=Decimal("0.7000"),
+            implied_no_ask=Decimal("0.6900"),
+            market_price_updated_at=stale,
+            market_data_source="rest",
+        )
+        session.add(market)
+        session.commit()
+
+        result = ws_market_data.apply_ws_market_update(
+            session,
+            "KXMLBGAME-WS-INVERSE-NO-ASK-PIT",
+            {"market_ticker": "KXMLBGAME-WS-INVERSE-NO-ASK-PIT", "implied_no_ask": "0.5700"},
+        )
+        session.commit()
+        price_context = candidates._market_side_price_context(market, "no", now)
+        values = {
+            "no_ask": market.no_ask,
+            "implied_no_ask": market.implied_no_ask,
+            "market_price_updated_at": market.market_price_updated_at,
+            "price_context": price_context,
+        }
+
+    assert result["updated"] is True
+    assert values["no_ask"] is None
+    assert values["implied_no_ask"] == Decimal("0.5700")
+    assert values["market_price_updated_at"] is not None
+    assert values["market_price_updated_at"].replace(tzinfo=UTC) == now
+    assert values["price_context"].source == "orderbook_implied_no_ask"
     assert values["price_context"].executable_price == Decimal("0.5700")
 
 
@@ -4964,6 +5009,30 @@ def test_paper_settlement_sync_settles_wins_losses_and_is_idempotent() -> None:
     assert no_trade.outcome == "win"
     assert no_trade.outcome_source == "mlb_results_sync"
     assert no_trade.market_type == "full_game_winner"
+
+
+def test_contract_labels_normalize_no_on_first_five_tie_as_either_team_wins() -> None:
+    game = MlbGame(
+        external_game_id="label-f5-tie",
+        home_team="Pittsburgh Pirates",
+        away_team="Seattle Mariners",
+        home_abbreviation="PIT",
+        away_abbreviation="SEA",
+        scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+        status="Scheduled",
+    )
+
+    labels = contract_labels(
+        game=game,
+        market=None,
+        market_ticker="KXMLBF5-26JUL011900SEAPIT-TIE",
+        market_type="first_five_winner",
+        selection_code="TIE",
+        contract_side="no",
+    )
+
+    assert labels.actual_contract_display == "NO ON TIE FIRST 5 INNINGS WINNER"
+    assert labels.normalized_equivalent_display == "PITTSBURGH PIRATES OR SEATTLE MARINERS WIN FIRST 5 INNINGS EQUIVALENT"
 
 
 def test_paper_settlement_charges_stored_trade_fee_estimates() -> None:

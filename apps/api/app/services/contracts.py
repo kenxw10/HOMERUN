@@ -190,7 +190,15 @@ def contract_labels(
             actual_display = f"{side} on {team} {scope} winner".upper()
             if contract_side.lower() == "no":
                 if market_type == FIRST_FIVE_WINNER:
-                    normalized_display = f"{team} does not win first 5 innings (opponent or tie)".upper()
+                    if selection.upper() == "TIE":
+                        home = _team_display(game, getattr(game, "home_abbreviation", None)) or getattr(game, "home_team", None)
+                        away = _team_display(game, getattr(game, "away_abbreviation", None)) or getattr(game, "away_team", None)
+                        if home and away:
+                            normalized_display = f"{home} or {away} win first 5 innings equivalent".upper()
+                        else:
+                            normalized_display = "EITHER TEAM WINS FIRST 5 INNINGS EQUIVALENT"
+                    else:
+                        normalized_display = f"{team} does not win first 5 innings (opponent or tie)".upper()
                 else:
                     opponent = _opponent_code(game, selection)
                     opponent_display = _team_display(game, opponent) or opponent

@@ -137,8 +137,11 @@ PRICE_FIELD_KEYS = {
     "implied_no_ask": ("implied_no_ask", "no_ask_dollars", "no_ask"),
 }
 EXECUTABLE_YES_PRICE_ATTRS = {"yes_ask", "implied_yes_ask", "no_bid", "best_no_bid"}
+EXECUTABLE_NO_PRICE_ATTRS = {"no_ask", "implied_no_ask"}
+EXECUTABLE_PRICE_ATTRS = EXECUTABLE_YES_PRICE_ATTRS | EXECUTABLE_NO_PRICE_ATTRS
 POSITION_MARK_PRICE_ATTRS = {"yes_bid", "best_yes_bid", "no_bid", "best_no_bid", "last_price"}
 INVERSE_YES_PRICE_ATTRS = {"implied_yes_ask", "no_bid", "best_no_bid"}
+INVERSE_NO_PRICE_ATTRS = {"implied_no_ask", "yes_bid", "best_yes_bid"}
 YES_POSITION_MARK_ATTRS = {"yes_bid", "best_yes_bid"}
 NO_POSITION_MARK_ATTRS = {"no_bid", "best_no_bid"}
 ORDERBOOK_SNAPSHOT_LEVEL_KEYS = {
@@ -284,6 +287,14 @@ def _clear_stale_yes_ask_fields(market: KalshiMarket, executable_attrs: set[str]
         market.implied_yes_ask = None
 
 
+def _clear_stale_no_ask_fields(market: KalshiMarket, executable_attrs: set[str]) -> None:
+    if not executable_attrs.intersection(INVERSE_NO_PRICE_ATTRS) or "no_ask" in executable_attrs:
+        return
+    market.no_ask = None
+    if "implied_no_ask" not in executable_attrs:
+        market.implied_no_ask = None
+
+
 def _orderbook_snapshot_prices(market: KalshiMarket, payload: dict[str, Any]) -> dict[str, Decimal | None]:
     orderbook = {
         target_key: payload[source_key]
@@ -378,7 +389,7 @@ def apply_ws_market_update(session: Session, ticker: str, payload: dict[str, Any
         if value is not None:
             setattr(market, attr, value)
             price_applied = True
-            if attr in EXECUTABLE_YES_PRICE_ATTRS:
+            if attr in EXECUTABLE_PRICE_ATTRS:
                 executable_attrs_applied.add(attr)
             mark_sides_applied.update(_mark_sides_for_attr(attr, value))
     for attr, value in {
@@ -391,6 +402,7 @@ def apply_ws_market_update(session: Session, ticker: str, payload: dict[str, Any
             executable_attrs_applied.add(attr)
         mark_sides_applied.update(_mark_sides_for_attr(attr, value))
     _clear_stale_yes_ask_fields(market, executable_attrs_applied)
+    _clear_stale_no_ask_fields(market, executable_attrs_applied)
     market.websocket_updated_at = now
     if price_applied:
         market.market_data_source = "websocket"
