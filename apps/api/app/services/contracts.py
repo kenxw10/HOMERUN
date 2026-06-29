@@ -37,6 +37,8 @@ class ContractLabels:
     selection_display: str
     matchup_display: str
     contract_display: str
+    actual_contract_display: str | None = None
+    normalized_equivalent_display: str | None = None
 
 
 def selected_team_from_ticker(ticker: str | None) -> str | None:
@@ -85,6 +87,34 @@ def matchup_display(game: MlbGame | None) -> str | None:
     return f"{away} @ {home}"
 
 
+def _team_display(game: MlbGame | None, code: str | None) -> str | None:
+    if game is None or not code:
+        return code
+    normalized = code.upper()
+    if normalized == (game.home_abbreviation or "").upper():
+        return game.home_team or game.home_abbreviation
+    if normalized == (game.away_abbreviation or "").upper():
+        return game.away_team or game.away_abbreviation
+    return code
+
+
+def _opponent_code(game: MlbGame | None, code: str | None) -> str | None:
+    if game is None or not code:
+        return None
+    normalized = code.upper()
+    home = (game.home_abbreviation or "").upper()
+    away = (game.away_abbreviation or "").upper()
+    if normalized == home:
+        return away or None
+    if normalized == away:
+        return home or None
+    return None
+
+
+def _scope_display(market_type: str | None) -> str:
+    return "first 5 innings" if (market_type or "").startswith("first_five") else "full game"
+
+
 def contract_labels(
     *,
     game: MlbGame | None,
@@ -92,6 +122,7 @@ def contract_labels(
     market_ticker: str,
     market_type: str | None,
     selection_code: str | None = None,
+    contract_side: str = "yes",
 ) -> ContractLabels:
     ticker = market_ticker.upper()
     matchup = matchup_display(game)
@@ -138,11 +169,49 @@ def contract_labels(
     if market_type in family_labels and matchup:
         family_label, selection_label = family_labels[market_type]
         market_display = f"{family_label} - {matchup} - {selection_label}"
+        side = contract_side.upper()
+        actual_display = market_display
+        normalized_display: str | None = None
+        scope = _scope_display(market_type)
+        if market_type in {FULL_GAME_SPREAD, FIRST_FIVE_SPREAD} and line_value is not None:
+            team = _team_display(game, selection) or selection
+            actual_display = f"{side} on {team} {fmt_line()} {scope}".upper()
+            if contract_side.lower() == "no":
+                opponent = _opponent_code(game, selection)
+                opponent_display = _team_display(game, opponent) or opponent
+                if opponent_display:
+                    equivalent_line = -float(line_value)
+                    equivalent = f"+{equivalent_line:g}" if equivalent_line > 0 else f"{equivalent_line:g}"
+                    normalized_display = f"{opponent_display} {equivalent} {scope} equivalent".upper()
+            else:
+                normalized_display = f"{team} {fmt_line()} {scope}".upper()
+        elif market_type in {FULL_GAME_WINNER, FIRST_FIVE_WINNER}:
+            team = _team_display(game, selection) or selection
+            actual_display = f"{side} on {team} {scope} winner".upper()
+            if contract_side.lower() == "no":
+                if market_type == FIRST_FIVE_WINNER:
+                    normalized_display = f"{team} does not win first 5 innings (opponent or tie)".upper()
+                else:
+                    opponent = _opponent_code(game, selection)
+                    opponent_display = _team_display(game, opponent) or opponent
+                    if opponent_display:
+                        normalized_display = f"{opponent_display} full game winner equivalent".upper()
+            else:
+                normalized_display = f"{team} {scope} winner".upper()
+        elif market_type in {FULL_GAME_TOTAL, FIRST_FIVE_TOTAL}:
+            total_label = total_selection()
+            actual_display = f"{side} on {total_label} {scope}".upper()
+            if contract_side.lower() == "no":
+                normalized_display = f"INVERSE OF {total_label} {scope}".upper()
+            else:
+                normalized_display = f"{total_label} {scope}".upper()
         return ContractLabels(
             market_display=market_display,
             selection_display=selection_label,
             matchup_display=matchup,
             contract_display=market_display,
+            actual_contract_display=actual_display,
+            normalized_equivalent_display=normalized_display,
         )
 
     fallback = ticker if title.upper() == ticker else f"{ticker} - {title}".upper()

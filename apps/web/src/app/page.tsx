@@ -56,6 +56,7 @@ type PositionSummary = {
   selection_display: string | null;
   matchup_display: string | null;
   contract_display: string | null;
+  normalized_equivalent_display: string | null;
   side: "yes" | "no";
   entry_price: number;
   exit_price: number | null;
@@ -704,6 +705,9 @@ function PositionsTable({ positions }: { positions: PositionSummary[] }) {
                   <td>{position.time_entered_display ?? formatEastern(position.time_entered)}</td>
                   <td>
                     <span className="market-primary">{position.contract_display ?? position.market}</span>
+                    {position.normalized_equivalent_display ? (
+                      <span className="market-secondary">{position.normalized_equivalent_display}</span>
+                    ) : null}
                     <span className="market-secondary" title={position.market_ticker ?? position.market}>
                       {position.market_ticker ?? position.market}
                     </span>
@@ -802,6 +806,9 @@ function ClosedPositionsTable({
                   <td>{position.time_closed_display ?? formatEastern(position.time_closed)}</td>
                   <td>
                     <span className="market-primary">{position.contract_display ?? position.market}</span>
+                    {position.normalized_equivalent_display ? (
+                      <span className="market-secondary">{position.normalized_equivalent_display}</span>
+                    ) : null}
                     <span className="market-secondary" title={position.market_ticker ?? position.market}>
                       {position.market_ticker ?? position.market}
                     </span>
@@ -1020,6 +1027,39 @@ export default function DashboardPage() {
       label: "TRADES USED / MAX TODAY",
       value: `${formatUnknown(summary.model_status.trade_caps_used.paper_trades)} / ${formatUnknown(
         summary.model_status.trade_policy.paper_max_trades_per_slate,
+      )}`,
+    },
+    {
+      label: "YES / NO CANDIDATES",
+      value: `${formatUnknown(summary.model_status.trade_caps_used.candidates_yes)} / ${formatUnknown(
+        summary.model_status.trade_caps_used.candidates_no,
+      )}`,
+    },
+    {
+      label: "SPREAD TRADING",
+      value: summary.model_status.trade_policy.paper_spread_trading_enabled ? "ENABLED" : "DISABLED",
+      tone: summary.model_status.trade_policy.paper_spread_trading_enabled ? "amber" : "green",
+    },
+    {
+      label: "SIDE-AWARE CANDIDATES",
+      value: summary.model_status.trade_policy.side_aware_candidates_enabled === false ? "DISABLED" : "ENABLED",
+      tone: summary.model_status.trade_policy.side_aware_candidates_enabled === false ? "red" : "green",
+    },
+    {
+      label: "RISK CAPS",
+      value: summary.model_status.trade_policy.aggregate_risk_caps_enabled === false ? "DISABLED" : "ENABLED",
+      tone: summary.model_status.trade_policy.aggregate_risk_caps_enabled === false ? "red" : "green",
+    },
+    {
+      label: "DAILY RISK USED / MAX",
+      value: `${formatUnknown(summary.model_status.trade_caps_used.daily_risk_used)} / ${formatUnknown(
+        summary.model_status.trade_caps_used.daily_risk_max,
+      )}`,
+    },
+    {
+      label: "OPEN RISK USED / MAX",
+      value: `${formatUnknown(summary.model_status.trade_caps_used.open_risk_used)} / ${formatUnknown(
+        summary.model_status.trade_caps_used.open_risk_max,
       )}`,
     },
     { label: "GOVERNANCE STATUS", value: summary.model_status.governance_status ?? "NOT RUN" },

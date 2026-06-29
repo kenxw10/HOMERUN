@@ -231,6 +231,13 @@ def _candidate_summary(candidate: ModelCandidate, game: MlbGame | None, market: 
         game=game_label,
         market_ticker=market.ticker if market else None,
         market_type=candidate.market_type,
+        contract_side=candidate.contract_side,
+        contract_display=candidate.contract_display,
+        normalized_equivalent_display=(
+            (candidate.scoring_rationale or {}).get("normalized_equivalent_display")
+            if isinstance(candidate.scoring_rationale, dict)
+            else None
+        ),
         time_bucket=candidate.time_bucket,
         time_to_start_minutes=candidate.time_to_start_minutes,
         model_probability=_decimal_float(_prefer_not_none(candidate.model_probability, candidate.probability)),

@@ -59,9 +59,9 @@ class Settings(BaseSettings):
     open_position_price_refresh_max_per_run: int = Field(default=100, alias="OPEN_POSITION_PRICE_REFRESH_MAX_PER_RUN")
     paper_candidate_engine_enabled: bool = Field(default=True, alias="PAPER_CANDIDATE_ENGINE_ENABLED")
     default_paper_contracts: int = Field(default=1, alias="DEFAULT_PAPER_CONTRACTS")
-    paper_max_trades_per_slate: int = Field(default=30, alias="PAPER_MAX_TRADES_PER_SLATE")
+    paper_max_trades_per_slate: int = Field(default=8, alias="PAPER_MAX_TRADES_PER_SLATE")
     paper_max_trades_per_game: int = Field(default=3, alias="PAPER_MAX_TRADES_PER_GAME")
-    paper_max_trades_per_market_family: int = Field(default=15, alias="PAPER_MAX_TRADES_PER_MARKET_FAMILY")
+    paper_max_trades_per_market_family: int = Field(default=4, alias="PAPER_MAX_TRADES_PER_MARKET_FAMILY")
     paper_max_trades_per_game_family: int = Field(default=1, alias="PAPER_MAX_TRADES_PER_GAME_FAMILY")
     paper_allow_multiple_lines_per_game_family: bool = Field(
         default=False, alias="PAPER_ALLOW_MULTIPLE_LINES_PER_GAME_FAMILY"
@@ -69,7 +69,15 @@ class Settings(BaseSettings):
     paper_allow_multiple_f5_winner_outcomes: bool = Field(
         default=False, alias="PAPER_ALLOW_MULTIPLE_F5_WINNER_OUTCOMES"
     )
-    paper_max_open_positions: int = Field(default=50, alias="PAPER_MAX_OPEN_POSITIONS")
+    paper_max_open_positions: int = Field(default=12, alias="PAPER_MAX_OPEN_POSITIONS")
+    paper_spread_trading_enabled: bool = Field(default=False, alias="PAPER_SPREAD_TRADING_ENABLED")
+    paper_max_daily_new_risk_pct: Decimal = Field(default=Decimal("0.20"), alias="PAPER_MAX_DAILY_NEW_RISK_PCT")
+    paper_max_open_risk_pct: Decimal = Field(default=Decimal("0.25"), alias="PAPER_MAX_OPEN_RISK_PCT")
+    paper_max_market_family_risk_pct: Decimal = Field(default=Decimal("0.10"), alias="PAPER_MAX_MARKET_FAMILY_RISK_PCT")
+    paper_max_scope_risk_pct: Decimal = Field(default=Decimal("0.15"), alias="PAPER_MAX_SCOPE_RISK_PCT")
+    paper_max_price_bucket_risk_pct_under_20c: Decimal = Field(
+        default=Decimal("0.08"), alias="PAPER_MAX_PRICE_BUCKET_RISK_PCT_UNDER_20C"
+    )
     paper_min_net_ev: Decimal = Field(default=Decimal("0.05"), alias="PAPER_MIN_NET_EV")
     paper_min_prob_edge: Decimal = Field(default=Decimal("0.03"), alias="PAPER_MIN_PROB_EDGE")
     paper_min_data_quality: Decimal = Field(default=Decimal("0.60"), alias="PAPER_MIN_DATA_QUALITY")
@@ -214,6 +222,11 @@ class Settings(BaseSettings):
         "paper_observation_min_data_quality",
         "live_min_data_quality",
         "paper_risk_per_trade_pct",
+        "paper_max_daily_new_risk_pct",
+        "paper_max_open_risk_pct",
+        "paper_max_market_family_risk_pct",
+        "paper_max_scope_risk_pct",
+        "paper_max_price_bucket_risk_pct_under_20c",
         "kalshi_trade_fee_rate",
         "model_promotion_min_logloss_improvement",
         "model_promotion_max_ece",
