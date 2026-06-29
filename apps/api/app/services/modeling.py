@@ -828,6 +828,59 @@ def _combine_probability_offsets(
     }
 
 
+def _metadata_epoch_id(metadata: dict[str, object] | None) -> int | None:
+    if not isinstance(metadata, dict):
+        return None
+    value = metadata.get("paper_trading_epoch_id")
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _latest_row_by_metrics_epoch(session: Session, model, order_column, paper_trading_epoch_id: int):
+    for row in session.scalars(select(model).order_by(order_column.desc(), model.id.desc())):
+        if _metadata_epoch_id(getattr(row, "metrics", None)) == paper_trading_epoch_id:
+            return row
+    return None
+
+
+def _threshold_matches_epoch(
+    session: Session,
+    threshold: ModelThresholdVersion,
+    paper_trading_epoch_id: int,
+) -> bool:
+    if _metadata_epoch_id(threshold.metrics) == paper_trading_epoch_id:
+        return True
+    if threshold.source_training_run_id is None:
+        return False
+    training = session.get(TrainingRun, threshold.source_training_run_id)
+    return training is not None and _metadata_epoch_id(training.metrics) == paper_trading_epoch_id
+
+
+def latest_governance_artifacts(
+    session: Session,
+    paper_trading_epoch_id: int,
+) -> tuple[TrainingRun | None, CalibrationRun | None, ModelThresholdVersion | None]:
+    last_training = _latest_row_by_metrics_epoch(session, TrainingRun, TrainingRun.started_at, paper_trading_epoch_id)
+    last_calibration = _latest_row_by_metrics_epoch(
+        session, CalibrationRun, CalibrationRun.started_at, paper_trading_epoch_id
+    )
+    last_threshold = next(
+        (
+            threshold
+            for threshold in session.scalars(
+                select(ModelThresholdVersion).order_by(ModelThresholdVersion.created_at.desc(), ModelThresholdVersion.id.desc())
+            )
+            if _threshold_matches_epoch(session, threshold, paper_trading_epoch_id)
+        ),
+        None,
+    )
+    return last_training, last_calibration, last_threshold
+
+
 def run_model_governance(
     session: Session,
     now: datetime | None = None,
@@ -954,6 +1007,7 @@ def run_model_governance(
             },
             metrics={
                 "sample_count": sample_count,
+                "paper_trading_epoch_id": paper_trading_epoch_id,
                 "note": "Threshold tuning is evaluated separately from probability training.",
             },
         )
@@ -1047,9 +1101,7 @@ def governance_status(session: Session, paper_trading_epoch_id: int | None = Non
     active_parameters = session.scalar(
         select(ModelParameterVersion).where(ModelParameterVersion.is_active.is_(True))
     )
-    last_training = session.scalar(select(TrainingRun).order_by(TrainingRun.started_at.desc()))
-    last_calibration = session.scalar(select(CalibrationRun).order_by(CalibrationRun.started_at.desc()))
-    last_threshold = session.scalar(select(ModelThresholdVersion).order_by(ModelThresholdVersion.created_at.desc()))
+    last_training, last_calibration, last_threshold = latest_governance_artifacts(session, paper_trading_epoch_id)
     mature_count = session.scalar(
         select(func.count(ModelCandidate.id))
         .where(ModelCandidate.paper_trading_epoch_id == paper_trading_epoch_id)

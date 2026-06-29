@@ -33,6 +33,7 @@ from app.models import (
     ModelParameterVersion,
     ModelPredictionOutput,
     ModelPredictionRun,
+    ModelThresholdVersion,
     ModelVersion,
     JobRun,
     MarketDataWorkerStatus,
@@ -5734,13 +5735,74 @@ def test_model_governance_status_counts_active_epoch_only() -> None:
                     market_family="full_game_winner",
                 )
             )
+        active_training = TrainingRun(
+            started_at=datetime(2026, 7, 2, 12, 0, tzinfo=UTC),
+            completed_at=datetime(2026, 7, 2, 12, 1, tzinfo=UTC),
+            status="active_epoch_training",
+            candidate_count=1,
+            metrics={"paper_trading_epoch_id": active_id},
+        )
+        archived_training = TrainingRun(
+            started_at=datetime(2026, 7, 3, 12, 0, tzinfo=UTC),
+            completed_at=datetime(2026, 7, 3, 12, 1, tzinfo=UTC),
+            status="archived_epoch_training",
+            candidate_count=1,
+            metrics={"paper_trading_epoch_id": archived_id},
+        )
+        active_calibration = CalibrationRun(
+            started_at=datetime(2026, 7, 2, 12, 0, tzinfo=UTC),
+            completed_at=datetime(2026, 7, 2, 12, 1, tzinfo=UTC),
+            status="active_epoch_calibration",
+            method="test",
+            metrics={"paper_trading_epoch_id": active_id},
+        )
+        archived_calibration = CalibrationRun(
+            started_at=datetime(2026, 7, 3, 12, 0, tzinfo=UTC),
+            completed_at=datetime(2026, 7, 3, 12, 1, tzinfo=UTC),
+            status="archived_epoch_calibration",
+            method="test",
+            metrics={"paper_trading_epoch_id": archived_id},
+        )
+        session.add_all([active_training, archived_training, active_calibration, archived_calibration])
+        session.flush()
+        session.add_all(
+            [
+                ModelThresholdVersion(
+                    version_tag="active_epoch_threshold",
+                    role="evaluation",
+                    status="recorded",
+                    is_active=False,
+                    created_at_snapshot=datetime(2026, 7, 2, 12, 0, tzinfo=UTC),
+                    source_training_run_id=active_training.id,
+                    thresholds={"policy": "active_epoch_threshold"},
+                    metrics={"paper_trading_epoch_id": active_id},
+                ),
+                ModelThresholdVersion(
+                    version_tag="archived_epoch_threshold",
+                    role="evaluation",
+                    status="recorded",
+                    is_active=False,
+                    created_at_snapshot=datetime(2026, 7, 3, 12, 0, tzinfo=UTC),
+                    source_training_run_id=archived_training.id,
+                    thresholds={"policy": "archived_epoch_threshold"},
+                    metrics={"paper_trading_epoch_id": archived_id},
+                ),
+            ]
+        )
         session.commit()
 
         result = modeling.governance_status(session)
+        summary = dashboard.dashboard_summary_from_db(session)
 
     assert result["paper_trading_epoch_id"] == active_id
     assert result["resolved_mature_samples"] == 1
     assert result["training_eligible_count"] == 1
+    assert result["last_governance_status"] == "active_epoch_training"
+    assert result["calibration_status"] == "active_epoch_calibration"
+    assert result["trade_threshold_policy"] == {"policy": "active_epoch_threshold"}
+    assert summary.model_status.last_governance_status == "active_epoch_training"
+    assert summary.model_status.calibration_status == "active_epoch_calibration"
+    assert summary.model_status.trade_threshold_policy == {"policy": "active_epoch_threshold"}
 
 
 def test_pr3c_feature_sync_records_source_statuses_and_no_umpire_fields(monkeypatch) -> None:

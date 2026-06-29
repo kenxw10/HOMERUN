@@ -9,7 +9,6 @@ from sqlalchemy.orm import Session
 from app.config import get_settings
 from app.models import (
     BalanceSnapshot,
-    CalibrationRun,
     JobRun,
     KalshiMarket,
     MarketMapping,
@@ -18,13 +17,11 @@ from app.models import (
     ModelCandidate,
     ModelParameterVersion,
     ModelPredictionRun,
-    ModelThresholdVersion,
     ModelVersion,
     PaperTrade,
     PaperTradingEpoch,
     Position,
     MarketDataWorkerStatus,
-    TrainingRun,
 )
 from app.schemas import (
     BotMode,
@@ -39,6 +36,7 @@ from app.schemas import (
 )
 from app.services.contracts import contract_labels, market_type_from_ticker
 from app.services.features import FEATURE_VERSION, source_status_report
+from app.services.modeling import latest_governance_artifacts
 from app.services.portfolio import calculate_paper_portfolio, paper_trade_fee
 from app.services.paper_epoch import resolve_epoch_filter
 from app.services.ws_market_data import ws_status_running_is_fresh
@@ -505,9 +503,7 @@ def dashboard_summary_from_db(
     active_parameter_version = session.scalar(
         select(ModelParameterVersion).where(ModelParameterVersion.is_active.is_(True))
     )
-    last_training = session.scalar(select(TrainingRun).order_by(TrainingRun.started_at.desc()))
-    last_calibration = session.scalar(select(CalibrationRun).order_by(CalibrationRun.started_at.desc()))
-    last_threshold = session.scalar(select(ModelThresholdVersion).order_by(ModelThresholdVersion.created_at.desc()))
+    last_training, last_calibration, last_threshold = latest_governance_artifacts(session, active_epoch.id)
     last_prediction = session.scalar(
         select(ModelPredictionRun)
         .where(ModelPredictionRun.paper_trading_epoch_id == active_epoch.id)
