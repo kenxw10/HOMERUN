@@ -1269,6 +1269,45 @@ def test_price_refresh_lock_key_is_date_insensitive() -> None:
     assert skipped.result["existing_run_id"] == running_id
 
 
+def test_default_date_scoped_job_lock_uses_today(monkeypatch) -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    target = date(2026, 7, 2)
+    monkeypatch.setattr(job_runs, "today_eastern", lambda: target)
+
+    def fake_execute_steps(*_args, **_kwargs):
+        return {"should_not_run": True}
+
+    monkeypatch.setattr(job_runs, "_execute_job_steps", fake_execute_steps)
+
+    with Session(engine) as session:
+        epoch = get_or_create_active_paper_epoch(session)
+        running = JobRun(
+            job_name="daily-setup",
+            job_type="paper_ops",
+            target_date=target,
+            paper_trading_epoch_id=epoch.id,
+            status="running",
+            started_at=datetime(2026, 7, 2, 12, 0, tzinfo=UTC),
+            heartbeat_at=datetime(2026, 7, 2, 12, 0, tzinfo=UTC),
+            lock_key="daily-setup:2026-07-02",
+            triggered_by="cron",
+        )
+        session.add(running)
+        session.commit()
+        running_id = running.id
+
+        result = run_job(session, job_name="daily-setup", target_date=None, triggered_by="api")
+        skipped = session.scalar(select(JobRun).where(JobRun.status == "skipped"))
+
+    assert result["status"] == "skipped"
+    assert result["skipped_reason"] == "skipped_existing_run"
+    assert skipped is not None
+    assert skipped.lock_key == "daily-setup:2026-07-02"
+    assert skipped.target_date == target
+    assert skipped.result["existing_run_id"] == running_id
+
+
 def test_governance_job_scopes_resolved_samples_to_active_epoch() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)

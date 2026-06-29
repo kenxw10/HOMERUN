@@ -30,12 +30,19 @@ JOB_NAMES = {
     "full-paper-cycle",
 }
 DATE_INSENSITIVE_LOCK_JOBS = {"price-refresh"}
+TODAY_DEFAULT_LOCK_JOBS = {"daily-setup", "candidate-sweep", "settlement", "full-paper-cycle"}
 
 
 def _job_lock_key(job_name: str, target_date: date | None) -> str:
     if job_name in DATE_INSENSITIVE_LOCK_JOBS:
         return f"{job_name}:global"
     return f"{job_name}:{target_date.isoformat() if target_date else 'none'}"
+
+
+def _effective_job_target_date(job_name: str, target_date: date | None) -> date | None:
+    if target_date is not None or job_name not in TODAY_DEFAULT_LOCK_JOBS:
+        return target_date
+    return today_eastern()
 
 
 def resolve_job_target_date(value: str | date | None) -> date | None:
@@ -86,6 +93,7 @@ def acquire_job_lock(
     if job_name not in JOB_NAMES:
         raise ValueError(f"Unknown job: {job_name}")
     epoch = get_or_create_active_paper_epoch(session)
+    target_date = _effective_job_target_date(job_name, target_date)
     mark_stale_running_jobs(session, max_runtime_minutes=max_runtime_minutes)
     lock_key = _job_lock_key(job_name, target_date)
 
@@ -292,7 +300,7 @@ def run_job(
     run_id = run.id
     session.commit()
     try:
-        result = _execute_job_steps(session, run, job_name, target_date)
+        result = _execute_job_steps(session, run, job_name, run.target_date)
         run.status = "succeeded"
         run.result = result
         errors: list[object] = []
