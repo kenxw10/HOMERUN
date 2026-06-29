@@ -332,6 +332,72 @@ def test_paper_epoch_reset_carries_open_positions_into_new_epoch() -> None:
     assert carried_trade.exit_time is None
 
 
+def test_paper_epoch_reset_does_not_resurrect_old_archived_positions() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        now = datetime(2026, 7, 1, 12, 0, tzinfo=UTC)
+        active_epoch = get_or_create_active_paper_epoch(session, starting_balance=Decimal("1000.00"))
+        old_archive = PaperTradingEpoch(
+            epoch_key="pre_pr3d_validation",
+            display_name="PRE PR3D VALIDATION",
+            status="archived",
+            mode="paper",
+            starting_balance=Decimal("1000.00"),
+            started_at=now - timedelta(days=2),
+            archived_at=now - timedelta(days=1),
+            archive_reason="previous_reset",
+        )
+        current_trade = PaperTrade(
+            paper_trading_epoch_id=active_epoch.id,
+            market_ticker="KXMLBGAME-CURRENT-PIT",
+            contract_side="yes",
+            entry_price=Decimal("0.4000"),
+            current_price=Decimal("0.4500"),
+            quantity=1,
+            entry_time=now,
+            status="open",
+        )
+        old_trade = PaperTrade(
+            paper_trading_epoch_id=None,
+            market_ticker="KXMLBGAME-OLD-PIT",
+            contract_side="yes",
+            entry_price=Decimal("0.3000"),
+            current_price=Decimal("0.3000"),
+            quantity=1,
+            entry_time=now - timedelta(days=2),
+            exit_time=now - timedelta(days=1),
+            status="archived",
+            resolution="EPOCH_ARCHIVED",
+        )
+        session.add_all([old_archive, current_trade, old_trade])
+        session.flush()
+        old_trade.paper_trading_epoch_id = old_archive.id
+        session.commit()
+
+        reset_paper_trading_epoch(
+            session,
+            archive_current_as="pre_pr3d_validation",
+            new_epoch="pr3d_paper_observation_v1",
+            starting_balance=Decimal("500.00"),
+            archive_open_positions=False,
+            reset_dashboard_metrics=True,
+            confirmation=RESET_CONFIRMATION,
+        )
+        active = get_or_create_active_paper_epoch(session, starting_balance=Decimal("500.00"))
+        carried_trade = session.scalar(select(PaperTrade).where(PaperTrade.market_ticker == "KXMLBGAME-CURRENT-PIT"))
+        stale_trade = session.scalar(select(PaperTrade).where(PaperTrade.market_ticker == "KXMLBGAME-OLD-PIT"))
+
+    assert carried_trade is not None
+    assert carried_trade.paper_trading_epoch_id == active.id
+    assert carried_trade.status == "open"
+    assert stale_trade is not None
+    assert stale_trade.paper_trading_epoch_id == old_archive.id
+    assert stale_trade.status == "archived"
+    assert stale_trade.resolution == "EPOCH_ARCHIVED"
+
+
 def test_dashboard_job_status_is_scoped_to_active_epoch() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
@@ -1109,7 +1175,7 @@ def test_ws_auth_headers_sign_handshake_path() -> None:
     assert headers["KALSHI-ACCESS-SIGNATURE"]
 
 
-def test_ws_worker_skips_ack_before_ticker_update(monkeypatch) -> None:
+def test_ws_worker_continues_after_first_ticker_update(monkeypatch) -> None:
     from cryptography.hazmat.primitives.asymmetric import rsa
     from cryptography.hazmat.primitives import serialization
 
@@ -1123,6 +1189,7 @@ def test_ws_worker_skips_ack_before_ticker_update(monkeypatch) -> None:
     monkeypatch.setenv("KALSHI_API_KEY", "test-key")
     monkeypatch.setenv("KALSHI_API_SECRET", pem)
     monkeypatch.setenv("KALSHI_WS_BASE_URL", "wss://demo-api.kalshi.co/trade-api/ws/v2")
+    monkeypatch.setenv("WS_HEARTBEAT_TIMEOUT_SECONDS", "1")
     get_settings.cache_clear()
 
     engine = create_engine("sqlite+pysqlite:///:memory:", connect_args={"check_same_thread": False}, poolclass=StaticPool)
@@ -1163,6 +1230,12 @@ def test_ws_worker_skips_ack_before_ticker_update(monkeypatch) -> None:
                         "msg": {"market_ticker": "KXMLBGAME-WS-LOOP-PIT", "yes_bid_dollars": "0.6100"},
                     }
                 ),
+                json.dumps(
+                    {
+                        "type": "ticker",
+                        "msg": {"market_ticker": "KXMLBGAME-WS-LOOP-PIT", "yes_bid_dollars": "0.6200"},
+                    }
+                ),
             ]
 
         async def __aenter__(self):
@@ -1175,6 +1248,8 @@ def test_ws_worker_skips_ack_before_ticker_update(monkeypatch) -> None:
             captured["subscribe"] = json.loads(message)
 
         async def recv(self) -> str:
+            if not self.messages:
+                raise asyncio.TimeoutError
             return self.messages.pop(0)
 
     def fake_connect(uri: str, **kwargs):
@@ -1193,11 +1268,12 @@ def test_ws_worker_skips_ack_before_ticker_update(monkeypatch) -> None:
         get_settings.cache_clear()
 
     assert result["status"] == "message_applied"
+    assert result["applied_updates"] == 2
     assert result["skipped_messages"] == 1
     assert captured["subscribe"]["params"]["channels"] == ["ticker", "orderbook_delta"]
     assert captured["headers"]["KALSHI-ACCESS-KEY"] == "test-key"
     assert refreshed_trade is not None
-    assert refreshed_trade.current_price == Decimal("0.6100")
+    assert refreshed_trade.current_price == Decimal("0.6200")
 
 
 def test_generate_candidates_does_not_reuse_archived_epoch_candidate(monkeypatch) -> None:

@@ -246,6 +246,16 @@ def reset_paper_trading_epoch(
     if starting_balance <= Decimal("0"):
         raise ValueError("starting_balance must be greater than zero.")
 
+    source_epoch_ids = [epoch.id for epoch in _active_epochs(session)]
+    carry_open_trade_query = select(PaperTrade.id).where(PaperTrade.status == "open")
+    if source_epoch_ids:
+        carry_open_trade_query = carry_open_trade_query.where(
+            (PaperTrade.paper_trading_epoch_id.is_(None)) | (PaperTrade.paper_trading_epoch_id.in_(source_epoch_ids))
+        )
+    else:
+        carry_open_trade_query = carry_open_trade_query.where(PaperTrade.paper_trading_epoch_id.is_(None))
+    carry_open_trade_ids = set(session.scalars(carry_open_trade_query)) if not archive_open_positions else set()
+
     archived_epoch = archive_current_epoch(
         session,
         archive_key=archive_current_as or PRE_PR3D_EPOCH_KEY,
@@ -264,6 +274,7 @@ def reset_paper_trading_epoch(
     if not archive_open_positions:
         for trade in session.scalars(
             select(PaperTrade)
+            .where(PaperTrade.id.in_(carry_open_trade_ids))
             .where(PaperTrade.paper_trading_epoch_id == archived_epoch.id)
             .where(PaperTrade.status == "archived")
             .where(PaperTrade.resolution == "EPOCH_ARCHIVED")

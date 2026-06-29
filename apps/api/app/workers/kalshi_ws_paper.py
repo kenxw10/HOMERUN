@@ -128,26 +128,38 @@ async def _run_worker_once() -> dict[str, object]:
                 mark_ws_status(session, running=True, subscribed_market_count=len(tickers), source="websocket")
                 session.commit()
             skipped_messages = 0
+            applied_updates = 0
+            last_ticker: str | None = None
+            last_result: dict[str, object] | None = None
             loop = asyncio.get_running_loop()
             deadline = loop.time() + settings.ws_heartbeat_timeout_seconds
             while True:
                 remaining = deadline - loop.time()
                 if remaining <= 0:
                     break
-                raw = await asyncio.wait_for(websocket.recv(), timeout=remaining)
+                try:
+                    raw = await asyncio.wait_for(websocket.recv(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    break
                 payload = json.loads(raw)
                 ticker, update_payload = _market_update_payload(payload if isinstance(payload, dict) else {})
                 if ticker:
                     with session_factory() as session:
                         result = apply_ws_market_update(session, ticker, update_payload)
                         session.commit()
-                    return {
-                        "status": "message_applied",
-                        "ticker": ticker,
-                        "result": result,
-                        "skipped_messages": skipped_messages,
-                    }
+                    applied_updates += 1
+                    last_ticker = ticker
+                    last_result = result
+                    continue
                 skipped_messages += 1
+            if applied_updates:
+                return {
+                    "status": "message_applied",
+                    "ticker": last_ticker,
+                    "result": last_result or {},
+                    "applied_updates": applied_updates,
+                    "skipped_messages": skipped_messages,
+                }
             return {
                 "status": "message_without_ticker",
                 "subscribed_market_count": len(tickers),
