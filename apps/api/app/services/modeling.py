@@ -952,6 +952,7 @@ def run_model_governance(
             **metrics,
             "minimum_samples_calibrate": calibrate_min,
             "minimum_samples_for_isotonic": settings.model_min_samples_for_isotonic,
+            "paper_trading_epoch_id": paper_trading_epoch_id,
             "calibration_policy": "bounded family/global offsets; isotonic requires higher sample threshold",
         },
     )
@@ -1048,6 +1049,7 @@ def run_model_governance(
         "reason": reason,
         "method_selected": "platt_sigmoid" if sample_count >= calibrate_min else "none",
         "isotonic_allowed": sample_count >= settings.model_min_samples_for_isotonic,
+        "paper_trading_epoch_id": paper_trading_epoch_id,
     }
     event = ModelGovernanceEvent(
         occurred_at=started,

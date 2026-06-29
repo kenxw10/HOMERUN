@@ -232,8 +232,8 @@ def _execute_job_steps(session: Session, run: JobRun, job_name: str, target_date
             "market_family_mappings": _run_step(
                 run, "market_family_mappings", lambda: sync_market_family_mappings(session, target)
             ),
-            "price_refresh": _run_step(run, "price_refresh", lambda: refresh_open_position_prices(session)),
             "candidate_engine": _run_step(run, "paper_candidate_engine", lambda: generate_candidates(session, target)),
+            "price_refresh": _run_step(run, "price_refresh", lambda: refresh_open_position_prices(session)),
             "balance_snapshot": _run_step(
                 run, "balance_snapshot", lambda: {"snapshot_id": create_balance_snapshot(session, source="candidate_sweep").id}
             ),

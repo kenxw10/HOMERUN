@@ -1309,6 +1309,55 @@ def test_default_date_scoped_job_lock_uses_today(monkeypatch) -> None:
     assert skipped.result["existing_run_id"] == running_id
 
 
+def test_candidate_sweep_refreshes_marks_after_candidate_engine(monkeypatch) -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    target = date(2026, 7, 2)
+    call_order: list[str] = []
+
+    def record(name: str, result: object) -> object:
+        call_order.append(name)
+        return result
+
+    monkeypatch.setattr(job_runs, "sync_schedule", lambda *_args, **_kwargs: record("schedule", 0))
+    monkeypatch.setattr(job_runs, "sync_mlb_features", lambda *_args, **_kwargs: record("features", {}))
+    monkeypatch.setattr(
+        job_runs,
+        "sync_market_family_mappings",
+        lambda *_args, **_kwargs: record("market_family_mappings", {}),
+    )
+    monkeypatch.setattr(job_runs, "generate_candidates", lambda *_args, **_kwargs: record("candidate_engine", {}))
+    monkeypatch.setattr(job_runs, "refresh_open_position_prices", lambda *_args, **_kwargs: record("price_refresh", {}))
+    monkeypatch.setattr(
+        job_runs,
+        "create_balance_snapshot",
+        lambda *_args, **_kwargs: record("balance_snapshot", SimpleNamespace(id=123)),
+    )
+
+    with Session(engine) as session:
+        run = JobRun(
+            job_name="candidate-sweep",
+            job_type="paper_ops",
+            target_date=target,
+            status="running",
+            started_at=datetime(2026, 7, 2, 12, 0, tzinfo=UTC),
+            lock_key="candidate-sweep:2026-07-02",
+            triggered_by="api",
+            steps=[],
+        )
+        result = job_runs._execute_job_steps(session, run, "candidate-sweep", target)
+
+    assert call_order == [
+        "schedule",
+        "features",
+        "market_family_mappings",
+        "candidate_engine",
+        "price_refresh",
+        "balance_snapshot",
+    ]
+    assert result["balance_snapshot"] == {"snapshot_id": 123}
+
+
 def test_governance_job_scopes_resolved_samples_to_active_epoch() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
@@ -5497,6 +5546,7 @@ def test_model_governance_skips_training_and_records_runs_when_samples_are_too_s
         result = run_model_governance(session, now=datetime(2026, 7, 1, 12, 0, tzinfo=UTC))
         training = session.scalar(select(TrainingRun))
         calibration = session.scalar(select(CalibrationRun))
+        status = modeling.governance_status(session)
 
     assert result["status"] == "skipped_insufficient_samples"
     assert result["resolved_samples"] == 0
@@ -5504,6 +5554,8 @@ def test_model_governance_skips_training_and_records_runs_when_samples_are_too_s
     assert calibration is not None
     assert training.status == "skipped_insufficient_samples"
     assert calibration.status == "skipped_insufficient_samples"
+    assert calibration.metrics["paper_trading_epoch_id"] == result["paper_trading_epoch_id"]
+    assert status["calibration_status"] == "skipped_insufficient_samples"
     assert "INSUFFICIENT_MATURE_RESOLVED_SAMPLES" in training.metrics["reason"]
 
 
