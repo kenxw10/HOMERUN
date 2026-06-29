@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.models import KalshiMarket, MarketDataWorkerStatus, ModelCandidate, PaperTrade
+from app.services.kalshi import derive_orderbook_prices
 from app.services.paper_epoch import get_or_create_active_paper_epoch
 from app.time_utils import ensure_aware_utc, utc_now
 
@@ -136,6 +137,16 @@ PRICE_FIELD_KEYS = {
     "implied_no_ask": ("implied_no_ask", "no_ask_dollars", "no_ask"),
 }
 EXECUTABLE_YES_PRICE_ATTRS = {"yes_ask", "implied_yes_ask", "no_bid", "best_no_bid"}
+ORDERBOOK_SNAPSHOT_LEVEL_KEYS = {
+    "yes_dollars_fp": "yes_dollars",
+    "no_dollars_fp": "no_dollars",
+    "yes_dollars": "yes_dollars",
+    "no_dollars": "no_dollars",
+    "yes": "yes",
+    "no": "no",
+    "yes_bids": "yes_bids",
+    "no_bids": "no_bids",
+}
 
 
 def _payload_price(payload: dict[str, Any], keys: tuple[str, ...]) -> Decimal | None:
@@ -151,6 +162,45 @@ def _payload_price(payload: dict[str, Any], keys: tuple[str, ...]) -> Decimal | 
     return None
 
 
+def _orderbook_snapshot_prices(payload: dict[str, Any]) -> dict[str, Decimal | None]:
+    orderbook = {
+        target_key: payload[source_key]
+        for source_key, target_key in ORDERBOOK_SNAPSHOT_LEVEL_KEYS.items()
+        if source_key in payload
+    }
+    if not orderbook:
+        return {}
+    return derive_orderbook_prices(orderbook)
+
+
+def _positive_delta(payload: dict[str, Any]) -> bool:
+    for key in ("delta_fp", "delta", "quantity_delta"):
+        value = _decimal(payload.get(key))
+        if value is not None:
+            return value > 0
+    return False
+
+
+def _orderbook_delta_prices(market: KalshiMarket, payload: dict[str, Any]) -> dict[str, Decimal | None]:
+    side = str(payload.get("side") or "").strip().lower()
+    price = _payload_price(payload, ("price_dollars", "price"))
+    if side not in {"yes", "no"} or price is None or not _positive_delta(payload):
+        return {}
+    if side == "yes":
+        if market.best_yes_bid is not None and price < market.best_yes_bid:
+            return {}
+        return {
+            "best_yes_bid": price,
+            "implied_no_ask": (Decimal("1.0000") - price).quantize(Decimal("0.0001")),
+        }
+    if market.best_no_bid is not None and price < market.best_no_bid:
+        return {}
+    return {
+        "best_no_bid": price,
+        "implied_yes_ask": (Decimal("1.0000") - price).quantize(Decimal("0.0001")),
+    }
+
+
 def apply_ws_market_update(session: Session, ticker: str, payload: dict[str, Any]) -> dict[str, object]:
     now = utc_now()
     market = session.scalar(select(KalshiMarket).where(KalshiMarket.ticker == ticker).limit(1))
@@ -161,6 +211,15 @@ def apply_ws_market_update(session: Session, ticker: str, payload: dict[str, Any
     executable_price_applied = False
     for attr, keys in PRICE_FIELD_KEYS.items():
         value = _payload_price(payload, keys)
+        if value is not None:
+            setattr(market, attr, value)
+            price_applied = True
+            if attr in EXECUTABLE_YES_PRICE_ATTRS:
+                executable_price_applied = True
+    for attr, value in {
+        **_orderbook_snapshot_prices(payload),
+        **_orderbook_delta_prices(market, payload),
+    }.items():
         if value is not None:
             setattr(market, attr, value)
             price_applied = True
@@ -192,7 +251,13 @@ def apply_ws_market_update(session: Session, ticker: str, payload: dict[str, Any
             trade.current_price_updated_at = now
             session.add(trade)
             updated_trades += 1
-    mark_ws_status(session, running=True, subscribed_market_count=len(active_ws_tickers(session)), last_message=True, source="websocket")
+    mark_ws_status(
+        session,
+        running=True,
+        subscribed_market_count=len(active_ws_tickers(session)),
+        last_message=price_applied,
+        source="websocket",
+    )
     return {"updated": price_applied, "ticker": ticker, "updated_trades": updated_trades}
 
 

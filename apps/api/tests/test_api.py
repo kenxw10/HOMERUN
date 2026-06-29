@@ -1337,7 +1337,69 @@ def test_websocket_market_update_converts_legacy_cent_prices() -> None:
     assert trade_price == Decimal("0.5500")
 
 
-def test_websocket_market_update_does_not_freshen_non_price_delta(monkeypatch) -> None:
+def test_websocket_orderbook_snapshot_updates_marks_and_executable_freshness(monkeypatch) -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+    monkeypatch.setattr(ws_market_data, "utc_now", lambda: now)
+
+    with Session(engine) as session:
+        active = get_or_create_active_paper_epoch(session, starting_balance=Decimal("500.00"))
+        market = KalshiMarket(
+            kalshi_market_id="KX-WS-SNAPSHOT",
+            ticker="KXMLBGAME-WS-SNAPSHOT-PIT",
+            title="Will Pittsburgh win?",
+            status="open",
+        )
+        trade = PaperTrade(
+            paper_trading_epoch_id=active.id,
+            market_ticker="KXMLBGAME-WS-SNAPSHOT-PIT",
+            contract_side="yes",
+            entry_price=Decimal("0.4000"),
+            current_price=Decimal("0.4000"),
+            quantity=1,
+            entry_time=now,
+            status="open",
+        )
+        session.add_all([market, trade])
+        session.commit()
+
+        result = ws_market_data.apply_ws_market_update(
+            session,
+            "KXMLBGAME-WS-SNAPSHOT-PIT",
+            {
+                "market_ticker": "KXMLBGAME-WS-SNAPSHOT-PIT",
+                "yes_dollars_fp": [["0.5500", "12"]],
+                "no_dollars_fp": [["0.4300", "8"]],
+            },
+        )
+        status_row = session.scalar(select(MarketDataWorkerStatus).where(MarketDataWorkerStatus.status_key == "kalshi_ws_paper"))
+        session.commit()
+        values = {
+            "best_yes_bid": market.best_yes_bid,
+            "best_no_bid": market.best_no_bid,
+            "implied_yes_ask": market.implied_yes_ask,
+            "implied_no_ask": market.implied_no_ask,
+            "market_price_updated_at": market.market_price_updated_at,
+            "trade_price": trade.current_price,
+            "status_last_message_at": status_row.last_message_at if status_row else None,
+            "status_stale_count": status_row.stale_count if status_row else None,
+        }
+
+    assert result["updated"] is True
+    assert result["updated_trades"] == 1
+    assert values["best_yes_bid"] == Decimal("0.5500")
+    assert values["best_no_bid"] == Decimal("0.4300")
+    assert values["implied_yes_ask"] == Decimal("0.5700")
+    assert values["implied_no_ask"] == Decimal("0.4500")
+    assert values["market_price_updated_at"] is not None
+    assert values["market_price_updated_at"].replace(tzinfo=UTC) == now
+    assert values["trade_price"] == Decimal("0.5500")
+    assert values["status_last_message_at"] is not None
+    assert values["status_stale_count"] == 0
+
+
+def test_websocket_orderbook_delta_updates_bid_without_freshening_ask(monkeypatch) -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
     now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
@@ -1372,10 +1434,11 @@ def test_websocket_market_update_does_not_freshen_non_price_delta(monkeypatch) -
         result = ws_market_data.apply_ws_market_update(
             session,
             "KXMLBGAME-WS-DELTA-PIT",
-            {"market_ticker": "KXMLBGAME-WS-DELTA-PIT", "side": "yes", "price_dollars": "0.5500", "delta": 1},
+            {"market_ticker": "KXMLBGAME-WS-DELTA-PIT", "side": "yes", "price_dollars": "0.5500", "delta_fp": 1},
         )
         session.commit()
         values = {
+            "best_yes_bid": market.best_yes_bid,
             "websocket_updated_at": market.websocket_updated_at,
             "market_price_updated_at": market.market_price_updated_at,
             "market_data_source": market.market_data_source,
@@ -1383,16 +1446,74 @@ def test_websocket_market_update_does_not_freshen_non_price_delta(monkeypatch) -
             "trade_price_updated_at": trade.current_price_updated_at,
         }
 
-    assert result["updated"] is False
-    assert result["updated_trades"] == 0
+    assert result["updated"] is True
+    assert result["updated_trades"] == 1
+    assert values["best_yes_bid"] == Decimal("0.5500")
     assert values["websocket_updated_at"] is not None
     assert values["websocket_updated_at"].replace(tzinfo=UTC) == now
     assert values["market_price_updated_at"] is not None
     assert values["market_price_updated_at"].replace(tzinfo=UTC) == stale
-    assert values["market_data_source"] == "rest"
-    assert values["trade_price"] == Decimal("0.4000")
+    assert values["market_data_source"] == "websocket"
+    assert values["trade_price"] == Decimal("0.5500")
     assert values["trade_price_updated_at"] is not None
-    assert values["trade_price_updated_at"].replace(tzinfo=UTC) == stale
+    assert values["trade_price_updated_at"].replace(tzinfo=UTC) == now
+
+
+def test_websocket_market_update_does_not_mark_non_price_message_fresh(monkeypatch) -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+    stale = now - timedelta(minutes=30)
+    monkeypatch.setattr(ws_market_data, "utc_now", lambda: now)
+
+    with Session(engine) as session:
+        get_or_create_active_paper_epoch(session, starting_balance=Decimal("500.00"))
+        market = KalshiMarket(
+            kalshi_market_id="KX-WS-NON-PRICE",
+            ticker="KXMLBGAME-WS-NON-PRICE-PIT",
+            title="Will Pittsburgh win?",
+            status="open",
+            best_yes_bid=Decimal("0.4000"),
+            market_price_updated_at=stale,
+            market_data_source="rest",
+        )
+        status = MarketDataWorkerStatus(
+            status_key="kalshi_ws_paper",
+            enabled=True,
+            running=True,
+            source="websocket",
+            subscribed_market_count=1,
+            reconnect_count=0,
+            stale_count=1,
+            last_seen_at=stale,
+            heartbeat_at=stale,
+            last_message_at=stale,
+            raw_status={},
+        )
+        session.add_all([market, status])
+        session.commit()
+
+        result = ws_market_data.apply_ws_market_update(
+            session,
+            "KXMLBGAME-WS-NON-PRICE-PIT",
+            {"market_ticker": "KXMLBGAME-WS-NON-PRICE-PIT", "side": "yes", "delta_fp": 1},
+        )
+        session.commit()
+        values = {
+            "market_price_updated_at": market.market_price_updated_at,
+            "market_data_source": market.market_data_source,
+            "last_message_at": status.last_message_at,
+            "stale_count": status.stale_count,
+        }
+
+    assert result["updated"] is False
+    assert result["updated_trades"] == 0
+    assert values["market_price_updated_at"] is not None
+    assert values["market_price_updated_at"].replace(tzinfo=UTC) == stale
+    assert values["market_data_source"] == "rest"
+    assert values["last_message_at"] is not None
+    assert values["last_message_at"].replace(tzinfo=UTC) == stale
+    assert values["stale_count"] == 1
 
 
 def test_websocket_bid_update_does_not_freshen_executable_ask(monkeypatch) -> None:
