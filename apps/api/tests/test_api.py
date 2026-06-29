@@ -1154,6 +1154,64 @@ def test_websocket_market_update_converts_legacy_cent_prices() -> None:
     assert trade_price == Decimal("0.5500")
 
 
+def test_websocket_market_update_does_not_freshen_non_price_delta(monkeypatch) -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+    stale = now - timedelta(minutes=30)
+    monkeypatch.setattr(ws_market_data, "utc_now", lambda: now)
+
+    with Session(engine) as session:
+        active = get_or_create_active_paper_epoch(session, starting_balance=Decimal("500.00"))
+        market = KalshiMarket(
+            kalshi_market_id="KX-WS-DELTA",
+            ticker="KXMLBGAME-WS-DELTA-PIT",
+            title="Will Pittsburgh win?",
+            status="open",
+            best_yes_bid=Decimal("0.4000"),
+            market_price_updated_at=stale,
+            market_data_source="rest",
+        )
+        trade = PaperTrade(
+            paper_trading_epoch_id=active.id,
+            market_ticker="KXMLBGAME-WS-DELTA-PIT",
+            contract_side="yes",
+            entry_price=Decimal("0.4000"),
+            current_price=Decimal("0.4000"),
+            current_price_updated_at=stale,
+            quantity=1,
+            entry_time=now,
+            status="open",
+        )
+        session.add_all([market, trade])
+        session.commit()
+
+        result = ws_market_data.apply_ws_market_update(
+            session,
+            "KXMLBGAME-WS-DELTA-PIT",
+            {"market_ticker": "KXMLBGAME-WS-DELTA-PIT", "side": "yes", "price_dollars": "0.5500", "delta": 1},
+        )
+        session.commit()
+        values = {
+            "websocket_updated_at": market.websocket_updated_at,
+            "market_price_updated_at": market.market_price_updated_at,
+            "market_data_source": market.market_data_source,
+            "trade_price": trade.current_price,
+            "trade_price_updated_at": trade.current_price_updated_at,
+        }
+
+    assert result["updated"] is False
+    assert result["updated_trades"] == 0
+    assert values["websocket_updated_at"] is not None
+    assert values["websocket_updated_at"].replace(tzinfo=UTC) == now
+    assert values["market_price_updated_at"] is not None
+    assert values["market_price_updated_at"].replace(tzinfo=UTC) == stale
+    assert values["market_data_source"] == "rest"
+    assert values["trade_price"] == Decimal("0.4000")
+    assert values["trade_price_updated_at"] is not None
+    assert values["trade_price_updated_at"].replace(tzinfo=UTC) == stale
+
+
 def test_ws_worker_uses_ticker_channel_and_nested_msg_payload() -> None:
     subscribe_message = kalshi_ws_paper._subscribe_message(["KXMLBGAME-WS-PIT"])
     assert subscribe_message["params"]["channels"] == ["ticker", "orderbook_delta"]
@@ -1623,6 +1681,9 @@ def test_generate_candidates_uses_contract_subtitles_for_market_type(monkeypatch
     assert candidate is not None
     assert candidate.market_type == "full_game_winner"
     assert candidate.decision == "no_trade_untrusted_selection"
+    assert candidate.gate_diagnostics["gate_selection_trusted_ok"] is False
+    assert candidate.gate_diagnostics["gate_final_trade_eligible"] is False
+    assert candidate.gate_diagnostics["counterfactual_trade_eligible_after_quality"] is False
     assert trade is None
 
 

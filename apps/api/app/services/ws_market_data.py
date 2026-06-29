@@ -122,6 +122,17 @@ def _decimal(value: object) -> Decimal | None:
 
 
 LEGACY_CENT_PRICE_KEYS = {"yes_bid", "yes_ask", "no_bid", "no_ask", "last_price"}
+PRICE_FIELD_KEYS = {
+    "yes_bid": ("yes_bid_dollars", "yes_bid"),
+    "yes_ask": ("yes_ask_dollars", "yes_ask"),
+    "no_bid": ("no_bid_dollars", "no_bid"),
+    "no_ask": ("no_ask_dollars", "no_ask"),
+    "last_price": ("last_price_dollars", "last_price"),
+    "best_yes_bid": ("best_yes_bid", "yes_bid_dollars", "yes_bid"),
+    "best_no_bid": ("best_no_bid", "no_bid_dollars", "no_bid"),
+    "implied_yes_ask": ("implied_yes_ask", "yes_ask_dollars", "yes_ask"),
+    "implied_no_ask": ("implied_no_ask", "no_ask_dollars", "no_ask"),
+}
 
 
 def _payload_price(payload: dict[str, Any], keys: tuple[str, ...]) -> Decimal | None:
@@ -143,45 +154,39 @@ def apply_ws_market_update(session: Session, ticker: str, payload: dict[str, Any
     if market is None:
         return {"updated": False, "reason": "unknown_market", "ticker": ticker}
 
-    for attr, keys in {
-        "yes_bid": ("yes_bid_dollars", "yes_bid"),
-        "yes_ask": ("yes_ask_dollars", "yes_ask"),
-        "no_bid": ("no_bid_dollars", "no_bid"),
-        "no_ask": ("no_ask_dollars", "no_ask"),
-        "last_price": ("last_price_dollars", "last_price"),
-        "best_yes_bid": ("best_yes_bid", "yes_bid_dollars", "yes_bid"),
-        "best_no_bid": ("best_no_bid", "no_bid_dollars", "no_bid"),
-        "implied_yes_ask": ("implied_yes_ask", "yes_ask_dollars", "yes_ask"),
-        "implied_no_ask": ("implied_no_ask", "no_ask_dollars", "no_ask"),
-    }.items():
+    price_applied = False
+    for attr, keys in PRICE_FIELD_KEYS.items():
         value = _payload_price(payload, keys)
         if value is not None:
             setattr(market, attr, value)
+            price_applied = True
     market.websocket_updated_at = now
-    market.market_price_updated_at = now
-    market.market_data_source = "websocket"
+    if price_applied:
+        market.market_price_updated_at = now
+        market.market_data_source = "websocket"
     session.add(market)
 
     epoch = get_or_create_active_paper_epoch(session)
     updated_trades = 0
-    for trade in session.scalars(
-        select(PaperTrade)
-        .where(PaperTrade.paper_trading_epoch_id == epoch.id)
-        .where(PaperTrade.market_ticker == ticker)
-        .where(PaperTrade.status == "open")
-    ):
-        if trade.contract_side == "no":
-            mark = market.best_no_bid or market.no_bid or ((Decimal("1.0000") - market.last_price) if market.last_price else None)
-        else:
-            mark = market.best_yes_bid or market.yes_bid or market.last_price
-        if mark is None:
-            continue
-        trade.current_price = mark
-        trade.current_price_updated_at = now
-        session.add(trade)
-        updated_trades += 1
+    if price_applied:
+        for trade in session.scalars(
+            select(PaperTrade)
+            .where(PaperTrade.paper_trading_epoch_id == epoch.id)
+            .where(PaperTrade.market_ticker == ticker)
+            .where(PaperTrade.status == "open")
+        ):
+            if trade.contract_side == "no":
+                mark = market.best_no_bid or market.no_bid or ((Decimal("1.0000") - market.last_price) if market.last_price else None)
+            else:
+                mark = market.best_yes_bid or market.yes_bid or market.last_price
+            if mark is None:
+                continue
+            trade.current_price = mark
+            trade.current_price_updated_at = now
+            session.add(trade)
+            updated_trades += 1
     mark_ws_status(session, running=True, subscribed_market_count=len(active_ws_tickers(session)), last_message=True, source="websocket")
-    return {"updated": True, "ticker": ticker, "updated_trades": updated_trades}
+    return {"updated": price_applied, "ticker": ticker, "updated_trades": updated_trades}
 
 
 def ws_status_payload(session: Session) -> dict[str, object]:

@@ -332,11 +332,20 @@ def _diagnostics_payload(
     net_ev_ok = net_ev is not None and net_ev >= settings.paper_min_net_ev
     calibration_ok = not settings.paper_require_calibrated_for_trade or calibration_status == "calibrated"
     open_position_ok = not open_trade_exists
+    selection_code = (mapping.selection_code or market.selection_code or "").upper()
+    trusted_tie_selection = market_type == "first_five_winner" and selection_code == "TIE"
+    selection_trusted_ok = (
+        not settings.safe_execution_posture
+        or market_type not in SELECTION_REQUIRED_FAMILIES
+        or trusted_tie_selection
+        or _has_trusted_candidate_selection(mapping, game, market)
+    )
     pre_quality_gates = [
         mapping_ok,
         supported_ok,
         game_not_started,
         market_open,
+        selection_trusted_ok,
         price_ok,
         push_ok,
         probability_present,
@@ -354,6 +363,7 @@ def _diagnostics_payload(
         "gate_mapping_ok": mapping_ok and supported_ok,
         "gate_market_open": market_open,
         "gate_game_not_started": game_not_started,
+        "gate_selection_trusted_ok": selection_trusted_ok,
         "gate_price_fresh_executable": price_ok,
         "gate_data_quality_ok": data_quality_ok,
         "gate_push_ok": push_ok,
@@ -403,6 +413,7 @@ def _update_gate(candidate: ModelCandidate, key: str, value: bool) -> None:
             "gate_mapping_ok",
             "gate_market_open",
             "gate_game_not_started",
+            "gate_selection_trusted_ok",
             "gate_price_fresh_executable",
             "gate_data_quality_ok",
             "gate_push_ok",
