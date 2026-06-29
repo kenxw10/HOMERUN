@@ -323,6 +323,7 @@ def test_paper_epoch_reset_carries_open_positions_into_new_epoch() -> None:
         )
         active = get_or_create_active_paper_epoch(session, starting_balance=Decimal("500.00"))
         carried_trade = session.scalar(select(PaperTrade).where(PaperTrade.market_ticker == "KXMLBGAME-CARRY-PIT"))
+        reset_snapshot = session.get(BalanceSnapshot, result["new_balance_snapshot_id"])
 
     assert result["archived_trades_count"] == 0
     assert carried_trade is not None
@@ -330,6 +331,9 @@ def test_paper_epoch_reset_carries_open_positions_into_new_epoch() -> None:
     assert carried_trade.status == "open"
     assert carried_trade.resolution is None
     assert carried_trade.exit_time is None
+    assert reset_snapshot is not None
+    assert reset_snapshot.cash_balance == Decimal("499.60")
+    assert reset_snapshot.portfolio_value == Decimal("500.05")
 
 
 def test_paper_epoch_reset_does_not_resurrect_old_archived_positions() -> None:
@@ -7575,31 +7579,60 @@ def test_model_predictions_today_filters_by_prediction_run_target_date(monkeypat
     monkeypatch.setattr(main_module, "get_session_factory", lambda: SessionLocal)
 
     with SessionLocal() as session:
+        active_epoch = get_or_create_active_paper_epoch(session)
+        archived_epoch = PaperTradingEpoch(
+            epoch_key="archived-predictions",
+            display_name="ARCHIVED PREDICTIONS",
+            status="archived",
+            mode="paper",
+            starting_balance=Decimal("1000.00"),
+            started_at=datetime(2026, 7, 1, 12, 0, tzinfo=UTC),
+            archived_at=datetime(2026, 7, 2, 12, 0, tzinfo=UTC),
+        )
+        session.add(archived_epoch)
+        session.flush()
         old_run = ModelPredictionRun(
+            paper_trading_epoch_id=active_epoch.id,
             started_at=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
             target_date=date(2026, 7, 1),
             status="completed",
         )
         today_run = ModelPredictionRun(
+            paper_trading_epoch_id=active_epoch.id,
             started_at=datetime(2026, 7, 2, 16, 0, tzinfo=UTC),
             target_date=date(2026, 7, 2),
             status="completed",
         )
-        session.add_all([old_run, today_run])
+        archived_today_run = ModelPredictionRun(
+            paper_trading_epoch_id=archived_epoch.id,
+            started_at=datetime(2026, 7, 2, 15, 0, tzinfo=UTC),
+            target_date=date(2026, 7, 2),
+            status="completed",
+        )
+        session.add_all([old_run, today_run, archived_today_run])
         session.flush()
         session.add_all(
             [
                 ModelPredictionOutput(
+                    paper_trading_epoch_id=active_epoch.id,
                     prediction_run_id=old_run.id,
                     market_family="full_game_winner",
                     probability_calibrated=Decimal("0.610000"),
                     decision_reason="yesterday",
                 ),
                 ModelPredictionOutput(
+                    paper_trading_epoch_id=active_epoch.id,
                     prediction_run_id=today_run.id,
                     market_family="full_game_total",
                     probability_calibrated=Decimal("0.550000"),
                     decision_reason="today",
+                ),
+                ModelPredictionOutput(
+                    paper_trading_epoch_id=archived_epoch.id,
+                    prediction_run_id=archived_today_run.id,
+                    market_family="full_game_total",
+                    probability_calibrated=Decimal("0.530000"),
+                    decision_reason="archived_today",
                 ),
             ]
         )

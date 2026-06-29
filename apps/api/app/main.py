@@ -61,7 +61,7 @@ from app.services.market_sync import resolve_preview_for_date, sync_kalshi_marke
 from app.services.mlb import sync_results, sync_schedule
 from app.services.position_refresh import refresh_open_position_prices
 from app.services.portfolio import create_balance_snapshot
-from app.services.paper_epoch import reset_paper_trading_epoch
+from app.services.paper_epoch import get_or_create_active_paper_epoch, reset_paper_trading_epoch
 from app.services.settlement import settle_paper_trades
 from app.services.ws_market_data import ws_status_payload
 from app.time_utils import eastern_display, today_eastern, to_eastern_iso
@@ -521,6 +521,7 @@ def model_training_latest(_: None = Depends(require_internal_api_key)) -> RunRes
 
 def _model_predictions_for_date(target_date: date) -> dict[str, object]:
     with _db_session_or_503() as session:
+        active_epoch = get_or_create_active_paper_epoch(session)
         rows = list(
             session.execute(
                 select(ModelPredictionOutput, ModelCandidate, KalshiMarket, ModelPredictionRun)
@@ -528,6 +529,7 @@ def _model_predictions_for_date(target_date: date) -> dict[str, object]:
                 .outerjoin(ModelCandidate, ModelPredictionOutput.candidate_id == ModelCandidate.id)
                 .outerjoin(KalshiMarket, ModelCandidate.kalshi_market_id == KalshiMarket.id)
                 .where(ModelPredictionRun.target_date == target_date)
+                .where(ModelPredictionOutput.paper_trading_epoch_id == active_epoch.id)
                 .order_by(ModelPredictionOutput.id.desc())
                 .limit(500)
             )

@@ -284,6 +284,7 @@ def reset_paper_trading_epoch(
             trade.resolution = None
             trade.exit_time = None
             session.add(trade)
+    session.flush()
 
     counts = {
         "archived_trades_count": int(
@@ -310,11 +311,14 @@ def reset_paper_trading_epoch(
             or 0
         ),
     }
+    from app.services.portfolio import calculate_paper_portfolio
+
+    totals = calculate_paper_portfolio(session, epoch=active)
     snapshot = BalanceSnapshot(
         paper_trading_epoch_id=active.id,
         captured_at=utc_now(),
-        cash_balance=_money(starting_balance),
-        portfolio_value=_money(starting_balance),
+        cash_balance=totals.cash_balance,
+        portfolio_value=totals.portfolio_value,
         source="paper",
         snapshot_type="epoch_reset",
     )
