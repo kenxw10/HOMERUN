@@ -1009,6 +1009,51 @@ def test_running_job_lock_key_is_database_unique() -> None:
             session.commit()
 
 
+def test_run_job_rolls_back_failed_transaction_before_marking_failed(monkeypatch) -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    target = date(2026, 7, 2)
+    now = datetime(2026, 7, 2, 12, 0, tzinfo=UTC)
+
+    def fake_execute_steps(session, run, job_name, target_date):
+        session.add(
+            JobRun(
+                job_name=job_name,
+                job_type="paper_ops",
+                target_date=target_date,
+                paper_trading_epoch_id=run.paper_trading_epoch_id,
+                status="running",
+                started_at=now,
+                lock_key=run.lock_key,
+                triggered_by="duplicate",
+                steps=[],
+                result={},
+                errors=[],
+                warnings=[],
+                idempotency_key=f"{run.lock_key}:duplicate",
+            )
+        )
+        session.flush()
+
+    monkeypatch.setattr(job_runs, "_execute_job_steps", fake_execute_steps)
+
+    with Session(engine) as session:
+        result = job_runs.run_job(
+            session,
+            job_name="price-refresh",
+            target_date=target,
+            triggered_by="api",
+        )
+        stored_run = session.get(JobRun, result["job_run_id"])
+
+    assert result["status"] == "failed"
+    assert result["errors"][0]["type"] == "IntegrityError"
+    assert stored_run is not None
+    assert stored_run.status == "failed"
+    assert stored_run.completed_at is not None
+    assert stored_run.errors[0]["type"] == "IntegrityError"
+
+
 def test_run_step_preserves_completed_details_after_nested_commit_reload() -> None:
     now = datetime(2026, 7, 2, 12, 0, tzinfo=UTC)
     run = JobRun(
@@ -1210,6 +1255,65 @@ def test_websocket_market_update_does_not_freshen_non_price_delta(monkeypatch) -
     assert values["trade_price"] == Decimal("0.4000")
     assert values["trade_price_updated_at"] is not None
     assert values["trade_price_updated_at"].replace(tzinfo=UTC) == stale
+
+
+def test_websocket_bid_update_does_not_freshen_executable_ask(monkeypatch) -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+    stale = now - timedelta(minutes=30)
+    monkeypatch.setattr(ws_market_data, "utc_now", lambda: now)
+
+    with Session(engine) as session:
+        active = get_or_create_active_paper_epoch(session, starting_balance=Decimal("500.00"))
+        market = KalshiMarket(
+            kalshi_market_id="KX-WS-BID",
+            ticker="KXMLBGAME-WS-BID-PIT",
+            title="Will Pittsburgh win?",
+            status="open",
+            yes_ask=Decimal("0.7000"),
+            market_price_updated_at=stale,
+            market_data_source="rest",
+        )
+        trade = PaperTrade(
+            paper_trading_epoch_id=active.id,
+            market_ticker="KXMLBGAME-WS-BID-PIT",
+            contract_side="yes",
+            entry_price=Decimal("0.4000"),
+            current_price=Decimal("0.4000"),
+            current_price_updated_at=stale,
+            quantity=1,
+            entry_time=now,
+            status="open",
+        )
+        session.add_all([market, trade])
+        session.commit()
+
+        result = ws_market_data.apply_ws_market_update(
+            session,
+            "KXMLBGAME-WS-BID-PIT",
+            {"market_ticker": "KXMLBGAME-WS-BID-PIT", "yes_bid_dollars": "0.5500"},
+        )
+        session.commit()
+        values = {
+            "yes_bid": market.yes_bid,
+            "best_yes_bid": market.best_yes_bid,
+            "market_price_updated_at": market.market_price_updated_at,
+            "market_data_source": market.market_data_source,
+            "trade_price": trade.current_price,
+            "trade_price_updated_at": trade.current_price_updated_at,
+        }
+
+    assert result["updated"] is True
+    assert result["updated_trades"] == 1
+    assert values["yes_bid"] == Decimal("0.5500")
+    assert values["best_yes_bid"] == Decimal("0.5500")
+    assert values["market_price_updated_at"] is not None
+    assert values["market_price_updated_at"].replace(tzinfo=UTC) == stale
+    assert values["market_data_source"] == "websocket"
+    assert values["trade_price"] == Decimal("0.5500")
+    assert values["trade_price_updated_at"] is not None
+    assert values["trade_price_updated_at"].replace(tzinfo=UTC) == now
 
 
 def test_ws_worker_uses_ticker_channel_and_nested_msg_payload() -> None:

@@ -272,6 +272,7 @@ def run_job(
         session.commit()
         return {"job_run_id": run.id, "status": run.status, **(run.result or {})}
 
+    run_id = run.id
     session.commit()
     try:
         result = _execute_job_steps(session, run, job_name, target_date)
@@ -279,6 +280,10 @@ def run_job(
         run.result = result
         errors: list[object] = []
     except Exception as exc:
+        session.rollback()
+        run = session.get(JobRun, run_id)
+        if run is None:
+            raise
         run.status = "failed"
         run.result = {"status": "failed"}
         errors = [{"message": str(exc), "type": exc.__class__.__name__}]

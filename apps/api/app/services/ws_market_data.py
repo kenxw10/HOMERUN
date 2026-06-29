@@ -133,6 +133,7 @@ PRICE_FIELD_KEYS = {
     "implied_yes_ask": ("implied_yes_ask", "yes_ask_dollars", "yes_ask"),
     "implied_no_ask": ("implied_no_ask", "no_ask_dollars", "no_ask"),
 }
+EXECUTABLE_YES_PRICE_ATTRS = {"yes_ask", "implied_yes_ask", "no_bid", "best_no_bid"}
 
 
 def _payload_price(payload: dict[str, Any], keys: tuple[str, ...]) -> Decimal | None:
@@ -155,15 +156,19 @@ def apply_ws_market_update(session: Session, ticker: str, payload: dict[str, Any
         return {"updated": False, "reason": "unknown_market", "ticker": ticker}
 
     price_applied = False
+    executable_price_applied = False
     for attr, keys in PRICE_FIELD_KEYS.items():
         value = _payload_price(payload, keys)
         if value is not None:
             setattr(market, attr, value)
             price_applied = True
+            if attr in EXECUTABLE_YES_PRICE_ATTRS:
+                executable_price_applied = True
     market.websocket_updated_at = now
     if price_applied:
-        market.market_price_updated_at = now
         market.market_data_source = "websocket"
+    if executable_price_applied:
+        market.market_price_updated_at = now
     session.add(market)
 
     epoch = get_or_create_active_paper_epoch(session)
