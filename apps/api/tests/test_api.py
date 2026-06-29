@@ -309,6 +309,33 @@ def test_active_paper_epoch_uses_bankroll_starting_balance_by_default(monkeypatc
     assert epoch.starting_balance == Decimal("500.00")
 
 
+def test_paper_epoch_reset_rejects_matching_archive_and_new_keys() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        active = get_or_create_active_paper_epoch(session, starting_balance=Decimal("500.00"))
+        session.commit()
+        active_id = active.id
+
+        with pytest.raises(ValueError, match="must be different"):
+            reset_paper_trading_epoch(
+                session,
+                archive_current_as="same_epoch",
+                new_epoch="same_epoch",
+                starting_balance=Decimal("500.00"),
+                archive_open_positions=True,
+                reset_dashboard_metrics=True,
+                confirmation=RESET_CONFIRMATION,
+            )
+        session.rollback()
+        active_after = session.get(PaperTradingEpoch, active_id)
+
+    assert active_after is not None
+    assert active_after.status == "active"
+    assert active_after.epoch_key == "pr3d_paper_observation_v1"
+
+
 def test_archive_current_epoch_preserves_source_starting_balance(monkeypatch) -> None:
     monkeypatch.setenv("PAPER_STARTING_BALANCE", "1000.00")
     monkeypatch.setenv("PAPER_BANKROLL_STARTING_BALANCE", "500.00")
@@ -1229,6 +1256,36 @@ def test_run_job_rolls_back_failed_transaction_before_marking_failed(monkeypatch
     assert stored_run.status == "failed"
     assert stored_run.completed_at is not None
     assert stored_run.errors[0]["type"] == "IntegrityError"
+
+
+def test_run_job_preserves_failed_step_details_after_rollback(monkeypatch) -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    target = date(2026, 7, 2)
+
+    def fake_execute_steps(_session, run, _job_name, _target_date):
+        def fail_step():
+            raise RuntimeError("forced step failure")
+
+        return job_runs._run_step(run, "forced_failure", fail_step)
+
+    monkeypatch.setattr(job_runs, "_execute_job_steps", fake_execute_steps)
+
+    with Session(engine) as session:
+        result = job_runs.run_job(
+            session,
+            job_name="price-refresh",
+            target_date=target,
+            triggered_by="api",
+        )
+        stored_run = session.get(JobRun, result["job_run_id"])
+
+    assert result["status"] == "failed"
+    assert result["steps"][0]["name"] == "forced_failure"
+    assert result["steps"][0]["status"] == "failed"
+    assert result["steps"][0]["error"]["type"] == "RuntimeError"
+    assert stored_run is not None
+    assert stored_run.steps == result["steps"]
 
 
 def test_run_step_preserves_completed_details_after_nested_commit_reload() -> None:

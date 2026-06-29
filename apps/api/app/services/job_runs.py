@@ -290,12 +290,15 @@ def run_job(
         run.result = result
         errors: list[object] = []
     except Exception as exc:
+        failed_steps = list(run.__dict__.get("steps") or [])
         session.rollback()
         run = session.get(JobRun, run_id)
         if run is None:
             raise
         run.status = "failed"
         run.result = {"status": "failed"}
+        if failed_steps:
+            run.steps = failed_steps
         errors = [{"message": str(exc), "type": exc.__class__.__name__}]
         run.errors = [*list(run.errors or []), *errors]
     run.completed_at = utc_now()

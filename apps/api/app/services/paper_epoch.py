@@ -249,6 +249,9 @@ def reset_paper_trading_epoch(
         raise ValueError("Confirmation must be RESET_PAPER_EPOCH.")
     if starting_balance <= Decimal("0"):
         raise ValueError("starting_balance must be greater than zero.")
+    archive_key = archive_current_as or PRE_PR3D_EPOCH_KEY
+    if archive_key == new_epoch:
+        raise ValueError("archive_current_as and new_epoch must be different.")
 
     source_epoch_ids = [epoch.id for epoch in _active_epochs(session)]
     carry_open_trade_query = select(PaperTrade.id).where(PaperTrade.status == "open")
@@ -262,7 +265,7 @@ def reset_paper_trading_epoch(
 
     archived_epoch = archive_current_epoch(
         session,
-        archive_key=archive_current_as or PRE_PR3D_EPOCH_KEY,
+        archive_key=archive_key,
         reason="admin_reset_epoch",
     )
     active = create_new_active_epoch(
