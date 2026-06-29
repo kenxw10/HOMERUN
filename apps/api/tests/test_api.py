@@ -1913,7 +1913,7 @@ def test_websocket_orderbook_delta_updates_yes_bid_as_no_executable_price(monkey
     assert result["updated_trades"] == 1
     assert values["best_yes_bid"] == Decimal("0.5500")
     assert values["implied_no_ask"] == Decimal("0.4500")
-    assert values["yes_ask"] is None
+    assert values["yes_ask"] == Decimal("0.7000")
     assert values["no_ask"] is None
     assert values["websocket_updated_at"] is not None
     assert values["websocket_updated_at"].replace(tzinfo=UTC) == now
@@ -1925,7 +1925,9 @@ def test_websocket_orderbook_delta_updates_yes_bid_as_no_executable_price(monkey
     assert values["trade_price_updated_at"].replace(tzinfo=UTC) == now
     assert values["no_price_context"].source == "orderbook_implied_no_ask"
     assert values["no_price_context"].executable_price == Decimal("0.4500")
-    assert values["yes_price_context"].status == "missing"
+    assert values["yes_price_context"].source == "yes_ask"
+    assert values["yes_price_context"].status == "stale"
+    assert values["yes_price_context"].executable_price is None
 
 
 def test_websocket_orderbook_delta_clears_removed_best_bid_without_freshening_price(monkeypatch) -> None:
@@ -2180,6 +2182,104 @@ def test_websocket_direct_implied_no_ask_update_refreshes_no_price_freshness(mon
     assert values["price_context"].executable_price == Decimal("0.5700")
 
 
+def test_websocket_direct_no_ask_preserves_yes_ask_without_freshening_it(monkeypatch) -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+    stale = now - timedelta(minutes=30)
+    monkeypatch.setattr(ws_market_data, "utc_now", lambda: now)
+
+    with Session(engine) as session:
+        get_or_create_active_paper_epoch(session, starting_balance=Decimal("500.00"))
+        market = KalshiMarket(
+            kalshi_market_id="KX-WS-DIRECT-NO-ASK",
+            ticker="KXMLBGAME-WS-DIRECT-NO-ASK-PIT",
+            title="Will Pittsburgh win?",
+            status="open",
+            yes_ask=Decimal("0.7000"),
+            market_price_updated_at=stale,
+            market_data_source="rest",
+        )
+        session.add(market)
+        session.commit()
+
+        result = ws_market_data.apply_ws_market_update(
+            session,
+            "KXMLBGAME-WS-DIRECT-NO-ASK-PIT",
+            {"market_ticker": "KXMLBGAME-WS-DIRECT-NO-ASK-PIT", "no_ask_dollars": "0.5800"},
+        )
+        session.commit()
+        no_price_context = candidates._market_side_price_context(market, "no", now)
+        yes_price_context = candidates._market_yes_price_context(market, now)
+        values = {
+            "no_ask": market.no_ask,
+            "yes_ask": market.yes_ask,
+            "market_price_updated_at": market.market_price_updated_at,
+            "no_price_context": no_price_context,
+            "yes_price_context": yes_price_context,
+        }
+
+    assert result["updated"] is True
+    assert values["no_ask"] == Decimal("0.5800")
+    assert values["yes_ask"] == Decimal("0.7000")
+    assert values["market_price_updated_at"] is not None
+    assert values["market_price_updated_at"].replace(tzinfo=UTC) == now
+    assert values["no_price_context"].source == "no_ask"
+    assert values["no_price_context"].executable_price == Decimal("0.5800")
+    assert values["yes_price_context"].source == "yes_ask"
+    assert values["yes_price_context"].status == "stale"
+    assert values["yes_price_context"].executable_price is None
+
+
+def test_websocket_direct_yes_ask_preserves_no_ask_without_freshening_it(monkeypatch) -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+    stale = now - timedelta(minutes=30)
+    monkeypatch.setattr(ws_market_data, "utc_now", lambda: now)
+
+    with Session(engine) as session:
+        get_or_create_active_paper_epoch(session, starting_balance=Decimal("500.00"))
+        market = KalshiMarket(
+            kalshi_market_id="KX-WS-DIRECT-YES-ASK",
+            ticker="KXMLBGAME-WS-DIRECT-YES-ASK-PIT",
+            title="Will Pittsburgh win?",
+            status="open",
+            no_ask=Decimal("0.6200"),
+            market_price_updated_at=stale,
+            market_data_source="rest",
+        )
+        session.add(market)
+        session.commit()
+
+        result = ws_market_data.apply_ws_market_update(
+            session,
+            "KXMLBGAME-WS-DIRECT-YES-ASK-PIT",
+            {"market_ticker": "KXMLBGAME-WS-DIRECT-YES-ASK-PIT", "yes_ask_dollars": "0.4100"},
+        )
+        session.commit()
+        yes_price_context = candidates._market_yes_price_context(market, now)
+        no_price_context = candidates._market_side_price_context(market, "no", now)
+        values = {
+            "yes_ask": market.yes_ask,
+            "no_ask": market.no_ask,
+            "market_price_updated_at": market.market_price_updated_at,
+            "yes_price_context": yes_price_context,
+            "no_price_context": no_price_context,
+        }
+
+    assert result["updated"] is True
+    assert values["yes_ask"] == Decimal("0.4100")
+    assert values["no_ask"] == Decimal("0.6200")
+    assert values["market_price_updated_at"] is not None
+    assert values["market_price_updated_at"].replace(tzinfo=UTC) == now
+    assert values["yes_price_context"].source == "yes_ask"
+    assert values["yes_price_context"].executable_price == Decimal("0.4100")
+    assert values["no_price_context"].source == "no_ask"
+    assert values["no_price_context"].status == "stale"
+    assert values["no_price_context"].executable_price is None
+
+
 def test_websocket_mark_update_refreshes_only_matching_trade_side(monkeypatch) -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
@@ -2364,7 +2464,7 @@ def test_websocket_bid_update_does_not_freshen_executable_ask(monkeypatch) -> No
     assert result["updated_trades"] == 1
     assert values["yes_bid"] == Decimal("0.5500")
     assert values["best_yes_bid"] == Decimal("0.5500")
-    assert values["yes_ask"] is None
+    assert values["yes_ask"] == Decimal("0.7000")
     assert values["no_ask"] is None
     assert values["market_price_updated_at"] is not None
     assert values["market_price_updated_at"].replace(tzinfo=UTC) == now
@@ -2374,7 +2474,9 @@ def test_websocket_bid_update_does_not_freshen_executable_ask(monkeypatch) -> No
     assert values["trade_price_updated_at"].replace(tzinfo=UTC) == now
     assert values["no_price_context"].source == "orderbook_best_yes_bid_inverse"
     assert values["no_price_context"].executable_price == Decimal("0.4500")
-    assert values["yes_price_context"].status == "missing"
+    assert values["yes_price_context"].source == "yes_ask"
+    assert values["yes_price_context"].status == "stale"
+    assert values["yes_price_context"].executable_price is None
 
 
 def test_websocket_status_payload_expires_stale_running_worker(monkeypatch) -> None:

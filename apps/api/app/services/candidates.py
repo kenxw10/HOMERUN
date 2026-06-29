@@ -126,7 +126,44 @@ def _is_executable_price(value: Decimal | None) -> bool:
     return value is not None and Decimal("0") < value < Decimal("1")
 
 
-def _market_price_timestamp(market: KalshiMarket, now: datetime) -> datetime:
+WS_PRICE_UPDATED_AT_KEY = "websocket_price_updated_at"
+PRICE_SOURCE_TIMESTAMP_ATTRS = {
+    "yes_ask": "yes_ask",
+    "orderbook_implied_yes_ask": "implied_yes_ask",
+    "orderbook_best_no_bid_inverse": "best_no_bid",
+    "no_ask": "no_ask",
+    "orderbook_implied_no_ask": "implied_no_ask",
+    "orderbook_best_yes_bid_inverse": "best_yes_bid",
+    "last_price_fallback": "last_price",
+}
+
+
+def _parse_price_timestamp(value: object) -> datetime | None:
+    if isinstance(value, datetime):
+        return ensure_aware_utc(value)
+    if isinstance(value, str):
+        try:
+            return ensure_aware_utc(datetime.fromisoformat(value))
+        except ValueError:
+            return None
+    return None
+
+
+def _websocket_price_timestamp(market: KalshiMarket, source: str | None) -> datetime | None:
+    if market.market_data_source != "websocket" or source is None:
+        return None
+    attr = PRICE_SOURCE_TIMESTAMP_ATTRS.get(source)
+    raw = market.orderbook_raw if isinstance(market.orderbook_raw, dict) else {}
+    timestamps = raw.get(WS_PRICE_UPDATED_AT_KEY)
+    if attr is None or not isinstance(timestamps, dict):
+        return None
+    return _parse_price_timestamp(timestamps.get(attr))
+
+
+def _market_price_timestamp(market: KalshiMarket, now: datetime, source: str | None = None) -> datetime:
+    websocket_timestamp = _websocket_price_timestamp(market, source)
+    if websocket_timestamp is not None:
+        return websocket_timestamp
     value = market.market_price_updated_at or market.updated_at or now
     return ensure_aware_utc(value)
 
@@ -144,9 +181,6 @@ def _market_side_price_context(market: KalshiMarket, side: str, now: datetime) -
     normalized_side = side.strip().lower()
     if normalized_side not in {"yes", "no"}:
         raise ValueError(f"Unsupported contract side: {side}")
-    updated_at = _market_price_timestamp(market, now)
-    staleness = max(0, int((ensure_aware_utc(now) - updated_at).total_seconds()))
-
     if normalized_side == "yes":
         candidates: tuple[tuple[str, Decimal | None], ...] = (
             ("yes_ask", market.yes_ask),
@@ -168,6 +202,8 @@ def _market_side_price_context(market: KalshiMarket, side: str, now: datetime) -
     for source, value in candidates:
         if value is None:
             continue
+        updated_at = _market_price_timestamp(market, now, source)
+        staleness = max(0, int((ensure_aware_utc(now) - updated_at).total_seconds()))
         price = value.quantize(Decimal("0.0001"))
         if not _is_executable_price(price):
             return PriceContext(price, None, source, updated_at, staleness, "non_executable", normalized_side)
@@ -178,12 +214,16 @@ def _market_side_price_context(market: KalshiMarket, side: str, now: datetime) -
     if normalized_side == "yes" and market.last_price is not None:
         price = market.last_price.quantize(Decimal("0.0001"))
         source = "last_price_fallback"
+        updated_at = _market_price_timestamp(market, now, source)
+        staleness = max(0, int((ensure_aware_utc(now) - updated_at).total_seconds()))
         if settings.paper_allow_last_price_fallback_for_trade and _is_executable_price(price):
             status = "fresh_executable" if staleness <= settings.paper_max_price_staleness_seconds else "stale"
             executable = price if status == "fresh_executable" else None
             return PriceContext(price, executable, source, updated_at, staleness, status, normalized_side)
         return PriceContext(price, None, source, updated_at, staleness, "non_executable", normalized_side)
 
+    updated_at = _market_price_timestamp(market, now)
+    staleness = max(0, int((ensure_aware_utc(now) - updated_at).total_seconds()))
     return PriceContext(None, None, None, updated_at, staleness, "missing", normalized_side)
 
 
