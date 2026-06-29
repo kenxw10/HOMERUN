@@ -2079,6 +2079,8 @@ def test_ws_auth_headers_sign_handshake_path() -> None:
     assert headers["KALSHI-ACCESS-KEY"] == "test-key"
     assert headers["KALSHI-ACCESS-TIMESTAMP"] == "1234567890000"
     assert headers["KALSHI-ACCESS-SIGNATURE"]
+    assert kalshi_ws_paper._websocket_path("wss://demo-api.kalshi.co/trade-api/ws/v2?env=demo") == "/trade-api/ws/v2"
+    assert kalshi_ws_paper._websocket_path("wss://demo-api.kalshi.co?env=demo") == "/trade-api/ws/v2"
 
 
 def test_ws_connect_kwargs_supports_legacy_extra_headers() -> None:

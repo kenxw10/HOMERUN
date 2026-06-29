@@ -86,8 +86,7 @@ def _market_update_payload(payload: dict[str, object]) -> tuple[str | None, dict
 
 def _websocket_path(ws_url: str) -> str:
     parsed = urlparse(ws_url)
-    path = parsed.path or "/trade-api/ws/v2"
-    return f"{path}?{parsed.query}" if parsed.query else path
+    return parsed.path or "/trade-api/ws/v2"
 
 
 def _websocket_auth_headers(api_key: str, api_secret: str, ws_url: str, *, timestamp_ms: str | None = None) -> dict[str, str]:
