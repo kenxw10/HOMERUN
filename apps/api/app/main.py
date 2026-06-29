@@ -117,6 +117,8 @@ def dashboard_summary(
                 epoch_key=epoch_key,
                 include_archived=include_archived,
             )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     except Exception:
         return empty_dashboard_summary(closed_date)
 

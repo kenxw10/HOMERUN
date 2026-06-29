@@ -500,6 +500,43 @@ def test_archived_epoch_key_requires_include_archived() -> None:
     assert summary.active_epoch.epoch_key == "archived-dashboard"
 
 
+def test_dashboard_endpoint_returns_bad_request_for_invalid_epoch_filter(monkeypatch) -> None:
+    engine = create_engine("sqlite+pysqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    SessionLocal = sessionmaker(bind=engine)
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+
+    with SessionLocal() as session:
+        get_or_create_active_paper_epoch(session, starting_balance=Decimal("500.00"))
+        session.add(
+            PaperTradingEpoch(
+                epoch_key="archived-dashboard-api",
+                display_name="ARCHIVED DASHBOARD API",
+                status="archived",
+                mode="paper",
+                starting_balance=Decimal("1000.00"),
+                started_at=now - timedelta(days=1),
+                archived_at=now,
+            )
+        )
+        session.commit()
+
+    monkeypatch.setattr(
+        main_module,
+        "database_status",
+        lambda: {"ready": True, "configured": True, "dialect": "sqlite", "message": "ok"},
+    )
+    monkeypatch.setattr(main_module, "get_session_factory", lambda: SessionLocal)
+
+    archived_response = client.get("/v1/dashboard/summary?epoch_key=archived-dashboard-api")
+    missing_response = client.get("/v1/dashboard/summary?epoch_key=missing-dashboard-api")
+
+    assert archived_response.status_code == 400
+    assert "include_archived=true" in archived_response.json()["detail"]
+    assert missing_response.status_code == 400
+    assert missing_response.json()["detail"] == "Unknown paper trading epoch: missing-dashboard-api"
+
+
 def test_dashboard_job_status_is_scoped_to_active_epoch() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
@@ -5419,6 +5456,65 @@ def test_model_governance_defaults_to_active_epoch_when_scope_omitted() -> None:
     assert result["paper_trading_epoch_id"] == active_id
     assert training is not None
     assert training.candidate_count == 1
+
+
+def test_model_governance_status_counts_active_epoch_only() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        active = get_or_create_active_paper_epoch(session, starting_balance=Decimal("500.00"))
+        archived = PaperTradingEpoch(
+            epoch_key="archived-governance-status",
+            display_name="ARCHIVED GOVERNANCE STATUS",
+            status="archived",
+            mode="paper",
+            starting_balance=Decimal("1000.00"),
+            started_at=datetime(2026, 7, 1, 12, 0, tzinfo=UTC),
+            archived_at=datetime(2026, 7, 2, 12, 0, tzinfo=UTC),
+        )
+        game = MlbGame(
+            external_game_id="governance-status-epoch",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+            status="Final",
+        )
+        session.add_all([archived, game])
+        session.flush()
+        active_id = active.id
+        archived_id = archived.id
+        for epoch_id, outcome in ((active_id, "win"), (archived_id, "loss")):
+            session.add(
+                ModelCandidate(
+                    paper_trading_epoch_id=epoch_id,
+                    mlb_game_id=game.id,
+                    evaluated_at=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
+                    features={},
+                    probability=Decimal("0.600000"),
+                    probability_calibrated=Decimal("0.600000"),
+                    target_date=date(2026, 7, 1),
+                    fee_estimate=Decimal("0.010000"),
+                    price_status="fresh_executable",
+                    time_to_start_minutes=420,
+                    decision="candidate_only",
+                    outcome=outcome,
+                    resolved_at=datetime(2026, 7, 2, 4, 0, tzinfo=UTC),
+                    model_version_tag=modeling.MATURE_MODEL_TAG,
+                    feature_version=features.FEATURE_VERSION,
+                    training_eligible=True,
+                    market_family="full_game_winner",
+                )
+            )
+        session.commit()
+
+        result = modeling.governance_status(session)
+
+    assert result["paper_trading_epoch_id"] == active_id
+    assert result["resolved_mature_samples"] == 1
+    assert result["training_eligible_count"] == 1
 
 
 def test_pr3c_feature_sync_records_source_statuses_and_no_umpire_fields(monkeypatch) -> None:

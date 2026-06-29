@@ -1040,7 +1040,9 @@ def run_model_governance(
     }
 
 
-def governance_status(session: Session) -> dict[str, object]:
+def governance_status(session: Session, paper_trading_epoch_id: int | None = None) -> dict[str, object]:
+    if paper_trading_epoch_id is None:
+        paper_trading_epoch_id = get_or_create_active_paper_epoch(session).id
     active = session.scalar(select(ModelVersion).where(ModelVersion.is_active.is_(True)))
     active_parameters = session.scalar(
         select(ModelParameterVersion).where(ModelParameterVersion.is_active.is_(True))
@@ -1050,14 +1052,16 @@ def governance_status(session: Session) -> dict[str, object]:
     last_threshold = session.scalar(select(ModelThresholdVersion).order_by(ModelThresholdVersion.created_at.desc()))
     mature_count = session.scalar(
         select(func.count(ModelCandidate.id))
+        .where(ModelCandidate.paper_trading_epoch_id == paper_trading_epoch_id)
         .where(ModelCandidate.feature_version == FEATURE_VERSION)
         .where(ModelCandidate.training_eligible.is_(True))
     ) or 0
-    resolved_count = len(_resolved_mature_candidates(session))
+    resolved_count = len(_resolved_mature_candidates(session, paper_trading_epoch_id=paper_trading_epoch_id))
     return {
         "active_model_version": active.version_tag if active else None,
         "active_parameter_version": active_parameters.version_tag if active_parameters else None,
         "active_calibration_version": active_parameters.version_tag if active_parameters else None,
+        "paper_trading_epoch_id": paper_trading_epoch_id,
         "feature_version": FEATURE_VERSION,
         "calibration_status": last_calibration.status if last_calibration else "not_run",
         "last_training_run": last_training.started_at.isoformat() if last_training else None,
