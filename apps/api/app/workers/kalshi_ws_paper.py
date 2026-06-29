@@ -129,6 +129,12 @@ async def _run_worker_once() -> dict[str, object]:
                 session.commit()
             skipped_messages = 0
             applied_updates = 0
+            subscription_refreshes = 0
+            active_subscription_count = len(tickers)
+            subscribed_tickers = {ticker.upper() for ticker in tickers}
+            subscription_refresh_interval = max(1, settings.ws_heartbeat_timeout_seconds)
+            loop = asyncio.get_running_loop()
+            next_subscription_refresh = loop.time() + subscription_refresh_interval
             last_ticker: str | None = None
             last_result: dict[str, object] | None = None
             while True:
@@ -148,8 +154,27 @@ async def _run_worker_once() -> dict[str, object]:
                     applied_updates += 1
                     last_ticker = ticker
                     last_result = result
-                    continue
-                skipped_messages += 1
+                else:
+                    skipped_messages += 1
+                if loop.time() >= next_subscription_refresh:
+                    with session_factory() as session:
+                        refreshed_tickers = active_ws_tickers(session)
+                        mark_ws_status(
+                            session,
+                            running=True,
+                            subscribed_market_count=len(refreshed_tickers),
+                            source="websocket",
+                        )
+                        session.commit()
+                    active_subscription_count = len(refreshed_tickers)
+                    new_tickers = [ticker for ticker in refreshed_tickers if ticker.upper() not in subscribed_tickers]
+                    if new_tickers:
+                        await websocket.send(json.dumps(_subscribe_message(new_tickers)))
+                        subscribed_tickers.update(ticker.upper() for ticker in new_tickers)
+                        subscription_refreshes += 1
+                    if not refreshed_tickers:
+                        break
+                    next_subscription_refresh = loop.time() + subscription_refresh_interval
             if applied_updates:
                 return {
                     "status": "message_applied",
@@ -157,11 +182,14 @@ async def _run_worker_once() -> dict[str, object]:
                     "result": last_result or {},
                     "applied_updates": applied_updates,
                     "skipped_messages": skipped_messages,
+                    "subscription_refreshes": subscription_refreshes,
+                    "subscribed_market_count": active_subscription_count,
                 }
             return {
                 "status": "message_without_ticker",
-                "subscribed_market_count": len(tickers),
+                "subscribed_market_count": active_subscription_count,
                 "skipped_messages": skipped_messages,
+                "subscription_refreshes": subscription_refreshes,
             }
     except Exception as exc:
         with session_factory() as session:

@@ -1495,6 +1495,49 @@ def test_websocket_status_payload_expires_stale_running_worker(monkeypatch) -> N
     assert dashboard_status.source == "rest_fallback"
 
 
+def test_websocket_status_clears_stale_count_after_fresh_message(monkeypatch) -> None:
+    monkeypatch.setenv("WEBSOCKET_MARKET_DATA_ENABLED", "true")
+    get_settings.cache_clear()
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+    stale = now - timedelta(minutes=5)
+    monkeypatch.setattr(ws_market_data, "utc_now", lambda: now)
+
+    try:
+        with Session(engine) as session:
+            session.add(
+                MarketDataWorkerStatus(
+                    status_key="kalshi_ws_paper",
+                    enabled=True,
+                    running=True,
+                    source="websocket",
+                    subscribed_market_count=3,
+                    reconnect_count=0,
+                    stale_count=3,
+                    last_seen_at=stale,
+                    heartbeat_at=stale,
+                    last_message_at=stale,
+                    raw_status={},
+                )
+            )
+            session.commit()
+
+            row = ws_market_data.mark_ws_status(
+                session,
+                running=True,
+                subscribed_market_count=3,
+                last_message=True,
+                source="websocket",
+            )
+            session.commit()
+            stale_count = row.stale_count
+    finally:
+        get_settings.cache_clear()
+
+    assert stale_count == 0
+
+
 def test_ws_worker_uses_ticker_channel_and_nested_msg_payload() -> None:
     subscribe_message = kalshi_ws_paper._subscribe_message(["KXMLBGAME-WS-PIT"])
     assert subscribe_message["params"]["channels"] == ["ticker", "orderbook_delta"]
@@ -1643,6 +1686,131 @@ def test_ws_worker_continues_after_first_ticker_update(monkeypatch) -> None:
     assert captured["headers"]["KALSHI-ACCESS-KEY"] == "test-key"
     assert refreshed_trade is not None
     assert refreshed_trade.current_price == Decimal("0.6200")
+
+
+def test_ws_worker_subscribes_new_active_tickers_without_reconnect(monkeypatch) -> None:
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.hazmat.primitives import serialization
+
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode("utf-8")
+    monkeypatch.setenv("WEBSOCKET_MARKET_DATA_ENABLED", "true")
+    monkeypatch.setenv("KALSHI_API_KEY", "test-key")
+    monkeypatch.setenv("KALSHI_API_SECRET", pem)
+    monkeypatch.setenv("KALSHI_WS_BASE_URL", "wss://demo-api.kalshi.co/trade-api/ws/v2")
+    monkeypatch.setenv("WS_HEARTBEAT_TIMEOUT_SECONDS", "1")
+    get_settings.cache_clear()
+
+    engine = create_engine("sqlite+pysqlite:///:memory:", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    SessionLocal = sessionmaker(bind=engine)
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+    sent_messages: list[dict[str, object]] = []
+
+    with SessionLocal() as session:
+        epoch = get_or_create_active_paper_epoch(session, starting_balance=Decimal("500.00"))
+        market = KalshiMarket(
+            kalshi_market_id="KX-WS-REFRESH-PIT",
+            ticker="KXMLBGAME-WS-REFRESH-PIT",
+            title="Will Pittsburgh win?",
+            status="open",
+        )
+        trade = PaperTrade(
+            paper_trading_epoch_id=epoch.id,
+            market_ticker="KXMLBGAME-WS-REFRESH-PIT",
+            contract_side="yes",
+            entry_price=Decimal("0.4000"),
+            current_price=Decimal("0.4000"),
+            quantity=1,
+            entry_time=now,
+            status="open",
+        )
+        session.add_all([market, trade])
+        session.commit()
+        epoch_id = epoch.id
+
+    class FakeWebSocket:
+        def __init__(self) -> None:
+            self.created_new_ticker = False
+            self.messages = [
+                (0, json.dumps({"type": "subscribed", "msg": {"channel": "ticker"}})),
+                (
+                    0.6,
+                    json.dumps(
+                        {
+                            "type": "ticker",
+                            "msg": {"market_ticker": "KXMLBGAME-WS-REFRESH-PIT", "yes_bid_dollars": "0.6100"},
+                        }
+                    ),
+                ),
+                (
+                    0.6,
+                    json.dumps(
+                        {
+                            "type": "ticker",
+                            "msg": {"market_ticker": "KXMLBGAME-WS-REFRESH-PIT", "yes_bid_dollars": "0.6200"},
+                        }
+                    ),
+                ),
+            ]
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def send(self, message: str) -> None:
+            sent_messages.append(json.loads(message))
+
+        async def recv(self) -> str:
+            if not self.messages:
+                raise asyncio.TimeoutError
+            delay, message = self.messages.pop(0)
+            if "KXMLBGAME-WS-REFRESH-PIT" in message and not self.created_new_ticker:
+                with SessionLocal() as session:
+                    new_market = KalshiMarket(
+                        kalshi_market_id="KX-WS-REFRESH-SEA",
+                        ticker="KXMLBGAME-WS-REFRESH-SEA",
+                        title="Will Seattle win?",
+                        status="open",
+                    )
+                    new_trade = PaperTrade(
+                        paper_trading_epoch_id=epoch_id,
+                        market_ticker="KXMLBGAME-WS-REFRESH-SEA",
+                        contract_side="yes",
+                        entry_price=Decimal("0.4000"),
+                        current_price=Decimal("0.4000"),
+                        quantity=1,
+                        entry_time=now,
+                        status="open",
+                    )
+                    session.add_all([new_market, new_trade])
+                    session.commit()
+                self.created_new_ticker = True
+            await asyncio.sleep(delay)
+            return message
+
+    def fake_connect(_uri: str, **_kwargs):
+        return FakeWebSocket()
+
+    monkeypatch.setattr(kalshi_ws_paper, "get_session_factory", lambda: SessionLocal)
+    monkeypatch.setitem(sys.modules, "websockets", SimpleNamespace(connect=fake_connect))
+
+    try:
+        result = asyncio.run(kalshi_ws_paper._run_worker_once())
+    finally:
+        get_settings.cache_clear()
+
+    assert result["status"] == "message_applied"
+    assert result["subscription_refreshes"] == 1
+    assert result["subscribed_market_count"] == 2
+    assert sent_messages[0]["params"]["market_tickers"] == ["KXMLBGAME-WS-REFRESH-PIT"]
+    assert sent_messages[1]["params"]["market_tickers"] == ["KXMLBGAME-WS-REFRESH-SEA"]
 
 
 def test_generate_candidates_does_not_reuse_archived_epoch_candidate(monkeypatch) -> None:

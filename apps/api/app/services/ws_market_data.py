@@ -94,13 +94,15 @@ def mark_ws_status(
     row.heartbeat_at = now
     if last_message:
         row.last_message_at = now
+        row.stale_count = 0
     if reconnect_increment:
         row.reconnect_count += 1
     if error is not None:
         row.last_error = error
     timeout = timedelta(seconds=settings.ws_price_stale_after_seconds)
     stale_cutoff = now - timeout
-    if row.last_message_at is None or row.last_message_at < stale_cutoff:
+    last_message_at = ensure_aware_utc(row.last_message_at) if row.last_message_at is not None else None
+    if last_message_at is None or last_message_at < stale_cutoff:
         row.stale_count = subscribed_market_count if subscribed_market_count else row.stale_count
     row.raw_status = {
         "heartbeat_at": now.isoformat(),
