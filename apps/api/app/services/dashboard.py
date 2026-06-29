@@ -151,6 +151,7 @@ def _position_from_trade(
         market_ticker=trade.market_ticker,
         market_type=market_type_from_ticker(trade.market_ticker),
         selection_code=trade.selection_code or (market.selection_code if market else None),
+        contract_side=trade.contract_side,
     )
     display = trade.contract_display or trade.market_display or fallback_labels.contract_display
     return PositionSummary(
@@ -164,6 +165,7 @@ def _position_from_trade(
         selection_display=trade.selection_display or fallback_labels.selection_display,
         matchup_display=trade.matchup_display or fallback_labels.matchup_display,
         contract_display=display,
+        normalized_equivalent_display=fallback_labels.normalized_equivalent_display,
         side=trade.contract_side,
         entry_price=float(trade.entry_price),
         exit_price=float(trade.exit_price) if trade.exit_price is not None else None,
@@ -190,6 +192,7 @@ def _position_from_position(position: Position) -> PositionSummary:
         market=None,
         market_ticker=position.market_ticker,
         market_type=market_type_from_ticker(position.market_ticker),
+        contract_side=position.contract_side,
     )
     return PositionSummary(
         time_entered=to_eastern_iso(position.opened_at),
@@ -202,6 +205,7 @@ def _position_from_position(position: Position) -> PositionSummary:
         selection_display=fallback_labels.selection_display,
         matchup_display=fallback_labels.matchup_display,
         contract_display=fallback_labels.contract_display,
+        normalized_equivalent_display=fallback_labels.normalized_equivalent_display,
         side=position.contract_side,
         entry_price=float(position.entry_price),
         exit_price=None,
@@ -593,6 +597,12 @@ def dashboard_summary_from_db(
         trade_caps_used=(
             {
                 **((last_prediction.summary or {}).get("cap_counts", {}) if last_prediction else {}),
+                **((last_prediction.summary or {}).get("risk_caps", {}) if last_prediction else {}),
+                **{
+                    key: (last_prediction.summary or {}).get(key)
+                    for key in ("candidates_yes", "candidates_no", "paper_trades_yes", "paper_trades_no")
+                    if last_prediction and key in (last_prediction.summary or {})
+                },
                 "paper_trades": last_prediction.trades_created if last_prediction else 0,
             }
         ),

@@ -67,6 +67,7 @@ class PositionSummary(BaseModel):
     selection_display: str | None = None
     matchup_display: str | None = None
     contract_display: str | None = None
+    normalized_equivalent_display: str | None = None
     side: Literal["yes", "no"]
     entry_price: float
     exit_price: float | None = None
@@ -218,6 +219,9 @@ class CandidateSummary(BaseModel):
     game: str | None
     market_ticker: str | None
     market_type: str | None
+    contract_side: str | None = None
+    contract_display: str | None = None
+    normalized_equivalent_display: str | None = None
     time_bucket: str | None
     time_to_start_minutes: int | None
     model_probability: float | None

@@ -77,7 +77,7 @@ The jobs currently cover:
 - Orderbook snapshots for targeted relevant markets only.
 - Auditable MLB game to Kalshi market mapping.
 - Candidate scoring with the `mature_mlb_run_distribution_v2` paper model.
-- Conservative paper-trade simulation.
+- Conservative side-aware paper-trade simulation. YES candidates use YES-side executable prices; NO candidates use NO-side executable prices.
 - MLB results updates for completed games.
 - Full-game winner paper settlement and hold-to-settlement P/L.
 - Paper balance snapshots.
@@ -86,7 +86,8 @@ The jobs currently cover:
 - Deterministic market-family audit reports for `KXMLBGAME`, `KXMLBSPREAD`, `KXMLBTOTAL`, `KXMLBF5`, `KXMLBF5SPREAD`, and `KXMLBF5TOTAL`. Normal discovery does not redundantly probe `KXMLBGAME`; full-game winner remains handled by targeted sync/resolve.
 - Market-family mapping sync that promotes only cleanly parsed supported families to `paper_supported`.
 - REST last-mark refresh for open paper positions.
-- Strict paper trade caps by slate, game, market family, open-position count, and correlated game/family exposure.
+- Strict paper trade caps by slate, game, market family, open-position count, correlated game/family exposure, and aggregate bankroll risk. Defaults are 8 trades per slate, 4 per family, 12 open positions, 20% daily new risk, 25% open risk, 10% family risk, 15% scope risk, and 8% sub-20c low-price bucket risk.
+- Spread markets are diagnostics-only unless `PAPER_SPREAD_TRADING_ENABLED=true`. Do not enable spread paper trading until side-aware spread parsing and settlement have been manually verified against the Kalshi UI.
 
 They do not cover scheduled automation or live execution.
 They also do not fake spread, total, or first-five market tickers.
@@ -102,8 +103,8 @@ Use this protected reset exactly when starting the PR3d observation period:
 
 ```powershell
 $body = @{
-  archive_current_as = "pre_pr3d_validation"
-  new_epoch = "pr3d_paper_observation_v1"
+  archive_current_as = "pr3d_bad_spread_parser_validation"
+  new_epoch = "pr3d_paper_observation_v2"
   starting_balance = 500.00
   archive_open_positions = $true
   reset_dashboard_metrics = $true
@@ -115,7 +116,7 @@ Invoke-RestMethod -Method Post -Headers @{"X-API-Key"="YOUR_KEY"; "Content-Type"
 
 Expected reset result:
 
-- `new_epoch_key=pr3d_paper_observation_v1`
+- `new_epoch_key=pr3d_paper_observation_v2`
 - `starting_balance=500`
 - `new_balance_snapshot_id` is present
 - old active/unassigned paper rows are archived, not deleted
@@ -128,7 +129,9 @@ Expected dashboard immediately after reset:
 - Closed positions for today/yesterday/selected dates: `0`
 - P/L: `$0.00`
 - Record: `0-0-0`
-- Active epoch: `PR3D PAPER OBSERVATION V1`
+- Active epoch: `PR3D PAPER OBSERVATION V2`
+- Candidate sweep reports YES/NO candidate counts, spread trading disabled, and aggregate risk-cap usage.
+- Spread candidates remain diagnostics-only unless `PAPER_SPREAD_TRADING_ENABLED=true`.
 
 Do not add a frontend reset button. Reset remains protected API-only.
 

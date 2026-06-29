@@ -66,7 +66,7 @@ from app.services import (
     pybaseball_client,
     ws_market_data,
 )
-from app.services.contracts import selected_team_from_ticker
+from app.services.contracts import contract_labels, selected_team_from_ticker
 from app.services.http_json import HttpJsonError
 from app.services.kalshi import KalshiAPIError, KalshiClient, derive_orderbook_prices
 from app.services.kalshi_mlb_resolver import (
@@ -1178,6 +1178,53 @@ def test_fixed_risk_sizing_uses_active_epoch_bankroll(monkeypatch) -> None:
     assert candidate.sized_expected_value is not None
 
 
+def test_generate_candidates_blocks_excess_daily_risk(monkeypatch) -> None:
+    _relax_data_quality_gate(monkeypatch)
+    monkeypatch.setenv("PAPER_MAX_DAILY_NEW_RISK_PCT", "0.025")
+    get_settings.cache_clear()
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+    monkeypatch.setattr(candidates, "utc_now", lambda: now)
+    monkeypatch.setattr(candidates, "score_mature_candidate", lambda *_args, **_kwargs: _fixed_model_score("0.900000"))
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        get_or_create_active_paper_epoch(session, starting_balance=Decimal("500.00"))
+        for index, team in enumerate(("PIT", "SEA"), start=1):
+            game = MlbGame(
+                external_game_id=f"daily-risk-{index}",
+                home_team="Pittsburgh Pirates" if team == "PIT" else "Seattle Mariners",
+                away_team="Boston Red Sox",
+                home_abbreviation=team,
+                away_abbreviation="BOS",
+                scheduled_start=datetime(2026, 7, 1, 23, index, tzinfo=UTC),
+                status="scheduled",
+            )
+            market = KalshiMarket(
+                kalshi_market_id=f"KX-DAILY-RISK-{index}",
+                ticker=f"KXMLBGAME-DAILY-RISK-{team}",
+                title=f"Will {team} win?",
+                status="open",
+                yes_ask=Decimal("0.5000"),
+                market_price_updated_at=now,
+            )
+            session.add_all([game, market])
+            _add_candidate_mapping(session, game, market, market_family="full_game_winner", market_type="full_game_winner")
+        session.commit()
+
+        result = candidates.generate_candidates(session)
+        trades = list(session.scalars(select(PaperTrade)))
+        rejected = list(
+            session.scalars(select(ModelCandidate).where(ModelCandidate.decision == "no_trade_daily_risk_cap"))
+        )
+
+    assert result["paper_trades"] == 1
+    assert result["cap_counts"]["no_trade_daily_risk_cap"] == 1
+    assert len(trades) == 1
+    assert len(rejected) == 1
+
+
 def test_paper_portfolio_charges_open_trade_fee_estimates() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
@@ -1806,7 +1853,7 @@ def test_websocket_orderbook_snapshot_updates_marks_and_executable_freshness(mon
     assert values["status_stale_count"] == 0
 
 
-def test_websocket_orderbook_delta_updates_bid_without_freshening_ask(monkeypatch) -> None:
+def test_websocket_orderbook_delta_updates_yes_bid_as_no_executable_price(monkeypatch) -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
     now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
@@ -1821,6 +1868,8 @@ def test_websocket_orderbook_delta_updates_bid_without_freshening_ask(monkeypatc
             title="Will Pittsburgh win?",
             status="open",
             best_yes_bid=Decimal("0.4000"),
+            yes_ask=Decimal("0.7000"),
+            no_ask=Decimal("0.6200"),
             market_price_updated_at=stale,
             market_data_source="rest",
         )
@@ -1844,26 +1893,41 @@ def test_websocket_orderbook_delta_updates_bid_without_freshening_ask(monkeypatc
             {"market_ticker": "KXMLBGAME-WS-DELTA-PIT", "side": "yes", "price_dollars": "0.5500", "delta_fp": 1},
         )
         session.commit()
+        no_price_context = candidates._market_side_price_context(market, "no", now)
+        yes_price_context = candidates._market_yes_price_context(market, now)
         values = {
             "best_yes_bid": market.best_yes_bid,
+            "implied_no_ask": market.implied_no_ask,
+            "yes_ask": market.yes_ask,
+            "no_ask": market.no_ask,
             "websocket_updated_at": market.websocket_updated_at,
             "market_price_updated_at": market.market_price_updated_at,
             "market_data_source": market.market_data_source,
             "trade_price": trade.current_price,
             "trade_price_updated_at": trade.current_price_updated_at,
+            "no_price_context": no_price_context,
+            "yes_price_context": yes_price_context,
         }
 
     assert result["updated"] is True
     assert result["updated_trades"] == 1
     assert values["best_yes_bid"] == Decimal("0.5500")
+    assert values["implied_no_ask"] == Decimal("0.4500")
+    assert values["yes_ask"] == Decimal("0.7000")
+    assert values["no_ask"] is None
     assert values["websocket_updated_at"] is not None
     assert values["websocket_updated_at"].replace(tzinfo=UTC) == now
     assert values["market_price_updated_at"] is not None
-    assert values["market_price_updated_at"].replace(tzinfo=UTC) == stale
+    assert values["market_price_updated_at"].replace(tzinfo=UTC) == now
     assert values["market_data_source"] == "websocket"
     assert values["trade_price"] == Decimal("0.5500")
     assert values["trade_price_updated_at"] is not None
     assert values["trade_price_updated_at"].replace(tzinfo=UTC) == now
+    assert values["no_price_context"].source == "orderbook_implied_no_ask"
+    assert values["no_price_context"].executable_price == Decimal("0.4500")
+    assert values["yes_price_context"].source == "yes_ask"
+    assert values["yes_price_context"].status == "stale"
+    assert values["yes_price_context"].executable_price is None
 
 
 def test_websocket_orderbook_delta_clears_removed_best_bid_without_freshening_price(monkeypatch) -> None:
@@ -2073,6 +2137,149 @@ def test_websocket_inverse_ask_update_clears_stale_direct_yes_ask(monkeypatch) -
     assert values["price_context"].executable_price == Decimal("0.5700")
 
 
+def test_websocket_direct_implied_no_ask_update_refreshes_no_price_freshness(monkeypatch) -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+    stale = now - timedelta(minutes=30)
+    monkeypatch.setattr(ws_market_data, "utc_now", lambda: now)
+
+    with Session(engine) as session:
+        get_or_create_active_paper_epoch(session, starting_balance=Decimal("500.00"))
+        market = KalshiMarket(
+            kalshi_market_id="KX-WS-INVERSE-NO-ASK",
+            ticker="KXMLBGAME-WS-INVERSE-NO-ASK-PIT",
+            title="Will Pittsburgh win?",
+            status="open",
+            no_ask=Decimal("0.7000"),
+            implied_no_ask=Decimal("0.6900"),
+            market_price_updated_at=stale,
+            market_data_source="rest",
+        )
+        session.add(market)
+        session.commit()
+
+        result = ws_market_data.apply_ws_market_update(
+            session,
+            "KXMLBGAME-WS-INVERSE-NO-ASK-PIT",
+            {"market_ticker": "KXMLBGAME-WS-INVERSE-NO-ASK-PIT", "implied_no_ask": "0.5700"},
+        )
+        session.commit()
+        price_context = candidates._market_side_price_context(market, "no", now)
+        values = {
+            "no_ask": market.no_ask,
+            "implied_no_ask": market.implied_no_ask,
+            "market_price_updated_at": market.market_price_updated_at,
+            "price_context": price_context,
+        }
+
+    assert result["updated"] is True
+    assert values["no_ask"] is None
+    assert values["implied_no_ask"] == Decimal("0.5700")
+    assert values["market_price_updated_at"] is not None
+    assert values["market_price_updated_at"].replace(tzinfo=UTC) == now
+    assert values["price_context"].source == "orderbook_implied_no_ask"
+    assert values["price_context"].executable_price == Decimal("0.5700")
+
+
+def test_websocket_direct_no_ask_preserves_yes_ask_without_freshening_it(monkeypatch) -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+    stale = now - timedelta(minutes=30)
+    monkeypatch.setattr(ws_market_data, "utc_now", lambda: now)
+
+    with Session(engine) as session:
+        get_or_create_active_paper_epoch(session, starting_balance=Decimal("500.00"))
+        market = KalshiMarket(
+            kalshi_market_id="KX-WS-DIRECT-NO-ASK",
+            ticker="KXMLBGAME-WS-DIRECT-NO-ASK-PIT",
+            title="Will Pittsburgh win?",
+            status="open",
+            yes_ask=Decimal("0.7000"),
+            market_price_updated_at=stale,
+            market_data_source="rest",
+        )
+        session.add(market)
+        session.commit()
+
+        result = ws_market_data.apply_ws_market_update(
+            session,
+            "KXMLBGAME-WS-DIRECT-NO-ASK-PIT",
+            {"market_ticker": "KXMLBGAME-WS-DIRECT-NO-ASK-PIT", "no_ask_dollars": "0.5800"},
+        )
+        session.commit()
+        no_price_context = candidates._market_side_price_context(market, "no", now)
+        yes_price_context = candidates._market_yes_price_context(market, now)
+        values = {
+            "no_ask": market.no_ask,
+            "yes_ask": market.yes_ask,
+            "market_price_updated_at": market.market_price_updated_at,
+            "no_price_context": no_price_context,
+            "yes_price_context": yes_price_context,
+        }
+
+    assert result["updated"] is True
+    assert values["no_ask"] == Decimal("0.5800")
+    assert values["yes_ask"] == Decimal("0.7000")
+    assert values["market_price_updated_at"] is not None
+    assert values["market_price_updated_at"].replace(tzinfo=UTC) == now
+    assert values["no_price_context"].source == "no_ask"
+    assert values["no_price_context"].executable_price == Decimal("0.5800")
+    assert values["yes_price_context"].source == "yes_ask"
+    assert values["yes_price_context"].status == "stale"
+    assert values["yes_price_context"].executable_price is None
+
+
+def test_websocket_direct_yes_ask_preserves_no_ask_without_freshening_it(monkeypatch) -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+    stale = now - timedelta(minutes=30)
+    monkeypatch.setattr(ws_market_data, "utc_now", lambda: now)
+
+    with Session(engine) as session:
+        get_or_create_active_paper_epoch(session, starting_balance=Decimal("500.00"))
+        market = KalshiMarket(
+            kalshi_market_id="KX-WS-DIRECT-YES-ASK",
+            ticker="KXMLBGAME-WS-DIRECT-YES-ASK-PIT",
+            title="Will Pittsburgh win?",
+            status="open",
+            no_ask=Decimal("0.6200"),
+            market_price_updated_at=stale,
+            market_data_source="rest",
+        )
+        session.add(market)
+        session.commit()
+
+        result = ws_market_data.apply_ws_market_update(
+            session,
+            "KXMLBGAME-WS-DIRECT-YES-ASK-PIT",
+            {"market_ticker": "KXMLBGAME-WS-DIRECT-YES-ASK-PIT", "yes_ask_dollars": "0.4100"},
+        )
+        session.commit()
+        yes_price_context = candidates._market_yes_price_context(market, now)
+        no_price_context = candidates._market_side_price_context(market, "no", now)
+        values = {
+            "yes_ask": market.yes_ask,
+            "no_ask": market.no_ask,
+            "market_price_updated_at": market.market_price_updated_at,
+            "yes_price_context": yes_price_context,
+            "no_price_context": no_price_context,
+        }
+
+    assert result["updated"] is True
+    assert values["yes_ask"] == Decimal("0.4100")
+    assert values["no_ask"] == Decimal("0.6200")
+    assert values["market_price_updated_at"] is not None
+    assert values["market_price_updated_at"].replace(tzinfo=UTC) == now
+    assert values["yes_price_context"].source == "yes_ask"
+    assert values["yes_price_context"].executable_price == Decimal("0.4100")
+    assert values["no_price_context"].source == "no_ask"
+    assert values["no_price_context"].status == "stale"
+    assert values["no_price_context"].executable_price is None
+
+
 def test_websocket_mark_update_refreshes_only_matching_trade_side(monkeypatch) -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
@@ -2214,6 +2421,7 @@ def test_websocket_bid_update_does_not_freshen_executable_ask(monkeypatch) -> No
             title="Will Pittsburgh win?",
             status="open",
             yes_ask=Decimal("0.7000"),
+            no_ask=Decimal("0.6200"),
             market_price_updated_at=stale,
             market_data_source="rest",
         )
@@ -2237,25 +2445,38 @@ def test_websocket_bid_update_does_not_freshen_executable_ask(monkeypatch) -> No
             {"market_ticker": "KXMLBGAME-WS-BID-PIT", "yes_bid_dollars": "0.5500"},
         )
         session.commit()
+        no_price_context = candidates._market_side_price_context(market, "no", now)
+        yes_price_context = candidates._market_yes_price_context(market, now)
         values = {
             "yes_bid": market.yes_bid,
             "best_yes_bid": market.best_yes_bid,
+            "yes_ask": market.yes_ask,
+            "no_ask": market.no_ask,
             "market_price_updated_at": market.market_price_updated_at,
             "market_data_source": market.market_data_source,
             "trade_price": trade.current_price,
             "trade_price_updated_at": trade.current_price_updated_at,
+            "no_price_context": no_price_context,
+            "yes_price_context": yes_price_context,
         }
 
     assert result["updated"] is True
     assert result["updated_trades"] == 1
     assert values["yes_bid"] == Decimal("0.5500")
     assert values["best_yes_bid"] == Decimal("0.5500")
+    assert values["yes_ask"] == Decimal("0.7000")
+    assert values["no_ask"] is None
     assert values["market_price_updated_at"] is not None
-    assert values["market_price_updated_at"].replace(tzinfo=UTC) == stale
+    assert values["market_price_updated_at"].replace(tzinfo=UTC) == now
     assert values["market_data_source"] == "websocket"
     assert values["trade_price"] == Decimal("0.5500")
     assert values["trade_price_updated_at"] is not None
     assert values["trade_price_updated_at"].replace(tzinfo=UTC) == now
+    assert values["no_price_context"].source == "orderbook_best_yes_bid_inverse"
+    assert values["no_price_context"].executable_price == Decimal("0.4500")
+    assert values["yes_price_context"].source == "yes_ask"
+    assert values["yes_price_context"].status == "stale"
+    assert values["yes_price_context"].executable_price is None
 
 
 def test_websocket_status_payload_expires_stale_running_worker(monkeypatch) -> None:
@@ -2878,6 +3099,7 @@ def test_generate_candidates_refreshes_existing_open_trade_price(monkeypatch) ->
             status="open",
             occurrence_datetime=datetime(2026, 7, 4, 0, 0, tzinfo=UTC),
             implied_yes_ask=Decimal("0.4000"),
+            best_yes_bid=Decimal("0.3800"),
         )
         session.add_all([game, market])
         _add_candidate_mapping(session, game, market)
@@ -2890,6 +3112,7 @@ def test_generate_candidates_refreshes_existing_open_trade_price(monkeypatch) ->
 
         current_time["now"] = datetime(2026, 7, 2, 16, 0, tzinfo=UTC)
         market.implied_yes_ask = Decimal("0.3200")
+        market.best_yes_bid = Decimal("0.2800")
         market.market_price_updated_at = current_time["now"]
         session.add(market)
         session.commit()
@@ -2903,7 +3126,63 @@ def test_generate_candidates_refreshes_existing_open_trade_price(monkeypatch) ->
     assert len(all_trades) == 1
     assert refreshed_trade is not None
     assert refreshed_trade.entry_price == Decimal("0.4000")
-    assert refreshed_trade.current_price == Decimal("0.3200")
+    assert refreshed_trade.current_price == Decimal("0.2800")
+
+
+def test_generate_candidates_refreshes_existing_no_trade_with_no_bid_mark(monkeypatch) -> None:
+    _relax_data_quality_gate(monkeypatch)
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+    monkeypatch.setattr(candidates, "utc_now", lambda: now)
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        epoch_id = _active_epoch_id(session)
+        game = MlbGame(
+            external_game_id="refresh-no-1",
+            home_team="New York Yankees",
+            away_team="Boston Red Sox",
+            home_abbreviation="NYY",
+            away_abbreviation="BOS",
+            scheduled_start=datetime(2026, 7, 4, 0, 0, tzinfo=UTC),
+            status="scheduled",
+        )
+        market = KalshiMarket(
+            kalshi_market_id="KX-REFRESH-NO",
+            ticker="KXMLBGAME-REFRESH-NO-NYY",
+            title="Will the New York Yankees win the game against the Boston Red Sox?",
+            status="open",
+            occurrence_datetime=datetime(2026, 7, 4, 0, 0, tzinfo=UTC),
+            no_ask=Decimal("0.4500"),
+            best_no_bid=Decimal("0.3100"),
+            market_price_updated_at=now,
+        )
+        session.add_all([game, market])
+        _add_candidate_mapping(session, game, market)
+        trade = PaperTrade(
+            paper_trading_epoch_id=epoch_id,
+            market_ticker=market.ticker,
+            contract_side="no",
+            entry_price=Decimal("0.4500"),
+            current_price=Decimal("0.4500"),
+            quantity=1,
+            entry_time=now - timedelta(minutes=30),
+            status="open",
+        )
+        session.add(trade)
+        session.commit()
+
+        result = candidates.generate_candidates(session, target_date=date(2026, 7, 3))
+        refreshed_trade = session.get(PaperTrade, trade.id)
+        no_candidate = session.scalar(select(ModelCandidate).where(ModelCandidate.contract_side == "no"))
+
+    assert result["paper_trades"] == 0
+    assert refreshed_trade is not None
+    assert refreshed_trade.entry_price == Decimal("0.4500")
+    assert refreshed_trade.current_price == Decimal("0.3100")
+    assert no_candidate is not None
+    assert no_candidate.executable_price == Decimal("0.4500")
 
 
 def test_generate_candidates_blocks_unknown_market_type_from_paper_trading(monkeypatch) -> None:
@@ -3076,6 +3355,97 @@ def test_generate_candidates_requires_executable_yes_ask(monkeypatch) -> None:
     assert candidate.price_status == "non_executable"
     assert candidate.decision == "no_trade_non_executable_price"
     assert all_trades == []
+
+
+def test_market_side_price_context_uses_side_specific_quotes() -> None:
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+    market = KalshiMarket(
+        kalshi_market_id="KX-SIDE-PRICE",
+        ticker="KXMLBGAME-SIDE-PRICE-PIT",
+        title="Will Pittsburgh win?",
+        status="open",
+        yes_ask=Decimal("0.6100"),
+        no_ask=Decimal("0.4200"),
+        implied_yes_ask=Decimal("0.5900"),
+        implied_no_ask=Decimal("0.4000"),
+        market_price_updated_at=now,
+    )
+
+    yes_context = candidates._market_side_price_context(market, "yes", now)
+    no_context = candidates._market_side_price_context(market, "no", now)
+
+    assert yes_context.side == "yes"
+    assert yes_context.executable_price == Decimal("0.6100")
+    assert yes_context.source == "yes_ask"
+    assert no_context.side == "no"
+    assert no_context.executable_price == Decimal("0.4200")
+    assert no_context.source == "no_ask"
+
+
+def test_market_side_price_context_no_side_never_uses_yes_price() -> None:
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+    market = KalshiMarket(
+        kalshi_market_id="KX-NO-SIDE-NO-PRICE",
+        ticker="KXMLBGAME-NO-SIDE-NO-PRICE-PIT",
+        title="Will Pittsburgh win?",
+        status="open",
+        yes_ask=Decimal("0.6100"),
+        implied_yes_ask=Decimal("0.5900"),
+        market_price_updated_at=now,
+    )
+
+    no_context = candidates._market_side_price_context(market, "no", now)
+
+    assert no_context.side == "no"
+    assert no_context.market_price is None
+    assert no_context.executable_price is None
+    assert no_context.status == "missing"
+
+
+def test_generate_candidates_creates_side_specific_no_candidate(monkeypatch) -> None:
+    _relax_data_quality_gate(monkeypatch)
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+    monkeypatch.setattr(candidates, "utc_now", lambda: now)
+    monkeypatch.setattr(candidates, "score_mature_candidate", lambda *_args, **_kwargs: _fixed_model_score("0.200000"))
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        get_or_create_active_paper_epoch(session, starting_balance=Decimal("500.00"))
+        game = MlbGame(
+            external_game_id="side-aware-no-1",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+            status="scheduled",
+        )
+        market = KalshiMarket(
+            kalshi_market_id="KX-SIDE-AWARE-NO",
+            ticker="KXMLBGAME-SIDE-AWARE-NO-PIT",
+            title="Will Pittsburgh win?",
+            status="open",
+            yes_ask=Decimal("0.9500"),
+            no_ask=Decimal("0.0500"),
+            market_price_updated_at=now,
+        )
+        session.add_all([game, market])
+        _add_candidate_mapping(session, game, market, market_family="full_game_winner", market_type="full_game_winner")
+        session.commit()
+
+        result = candidates.generate_candidates(session)
+        rows = list(session.scalars(select(ModelCandidate).order_by(ModelCandidate.contract_side.asc())))
+        trade = session.scalar(select(PaperTrade))
+
+    assert result["candidates_yes"] == 1
+    assert result["candidates_no"] == 1
+    assert {row.contract_side for row in rows} == {"yes", "no"}
+    assert next(row for row in rows if row.contract_side == "yes").executable_price == Decimal("0.9500")
+    assert next(row for row in rows if row.contract_side == "no").executable_price == Decimal("0.0500")
+    assert trade is not None
+    assert trade.contract_side == "no"
 
 
 def test_generate_candidates_uses_yes_ask_before_orderbook_implied_price(monkeypatch) -> None:
@@ -4828,6 +5198,30 @@ def test_paper_settlement_sync_settles_wins_losses_and_is_idempotent() -> None:
     assert no_trade.market_type == "full_game_winner"
 
 
+def test_contract_labels_normalize_no_on_first_five_tie_as_either_team_wins() -> None:
+    game = MlbGame(
+        external_game_id="label-f5-tie",
+        home_team="Pittsburgh Pirates",
+        away_team="Seattle Mariners",
+        home_abbreviation="PIT",
+        away_abbreviation="SEA",
+        scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+        status="Scheduled",
+    )
+
+    labels = contract_labels(
+        game=game,
+        market=None,
+        market_ticker="KXMLBF5-26JUL011900SEAPIT-TIE",
+        market_type="first_five_winner",
+        selection_code="TIE",
+        contract_side="no",
+    )
+
+    assert labels.actual_contract_display == "NO ON TIE FIRST 5 INNINGS WINNER"
+    assert labels.normalized_equivalent_display == "PITTSBURGH PIRATES OR SEATTLE MARINERS WIN FIRST 5 INNINGS EQUIVALENT"
+
+
 def test_paper_settlement_charges_stored_trade_fee_estimates() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
@@ -5531,7 +5925,7 @@ def test_generate_candidates_uses_heuristic_probability_and_feature_snapshot(mon
     assert candidate.model_version_tag == modeling.MATURE_MODEL_TAG
     assert candidate.feature_version == features.FEATURE_VERSION
     assert candidate.market_type == "full_game_winner"
-    assert candidate.contract_display == "FULL GAME WINNER - SEA @ PIT - PIT"
+    assert candidate.contract_display == "YES ON PITTSBURGH PIRATES FULL GAME WINNER"
     assert candidate.features["park_weather"]["source_status"] == "missing"
     assert candidate.scoring_rationale["uses_market_price"] is False
     assert feature_snapshot is not None
@@ -10790,7 +11184,8 @@ def test_paper_supported_market_family_can_create_pre_model_paper_trade(monkeypa
     assert candidate.model_probability != Decimal("0.500000")
     assert candidate.model_version_tag == modeling.MATURE_MODEL_TAG
     assert candidate.training_eligible is False
-    assert candidate.decision in {"no_trade_edge_too_low", "no_trade_probability_edge_low"}
+    assert candidate.training_exclusion_reason == "spread_trading_disabled"
+    assert candidate.decision == "no_trade_spread_trading_disabled"
     assert feature_snapshot is not None
     assert feature_snapshot.source == features.FEATURE_VERSION
     assert trade is None
@@ -10849,7 +11244,9 @@ def test_event_level_spread_with_parsed_selection_can_create_paper_trade(monkeyp
 
     assert result["paper_trades"] == 0
     assert candidate is not None
-    assert candidate.decision in {"no_trade_edge_too_low", "no_trade_probability_edge_low"}
+    assert candidate.decision == "no_trade_spread_trading_disabled"
+    assert candidate.training_eligible is False
+    assert candidate.training_exclusion_reason == "spread_trading_disabled"
     assert candidate.selection_code == "PIT"
     assert candidate.selection_display == "PIT -1.5"
     assert trade is None

@@ -39,7 +39,7 @@ from app.services.modeling import (
     get_or_create_mature_model_version,
     score_mature_candidate,
 )
-from app.services.portfolio import calculate_paper_portfolio, create_balance_snapshot
+from app.services.portfolio import calculate_paper_portfolio, create_balance_snapshot, paper_trade_fee
 from app.services.paper_epoch import get_or_create_active_paper_epoch
 from app.time_utils import classify_time_bucket, ensure_aware_utc, get_dashboard_zone, utc_now
 
@@ -68,6 +68,7 @@ class PriceContext:
     updated_at: datetime | None
     staleness_seconds: int | None
     status: str
+    side: str
 
 
 @dataclass(frozen=True)
@@ -125,7 +126,44 @@ def _is_executable_price(value: Decimal | None) -> bool:
     return value is not None and Decimal("0") < value < Decimal("1")
 
 
-def _market_price_timestamp(market: KalshiMarket, now: datetime) -> datetime:
+WS_PRICE_UPDATED_AT_KEY = "websocket_price_updated_at"
+PRICE_SOURCE_TIMESTAMP_ATTRS = {
+    "yes_ask": "yes_ask",
+    "orderbook_implied_yes_ask": "implied_yes_ask",
+    "orderbook_best_no_bid_inverse": "best_no_bid",
+    "no_ask": "no_ask",
+    "orderbook_implied_no_ask": "implied_no_ask",
+    "orderbook_best_yes_bid_inverse": "best_yes_bid",
+    "last_price_fallback": "last_price",
+}
+
+
+def _parse_price_timestamp(value: object) -> datetime | None:
+    if isinstance(value, datetime):
+        return ensure_aware_utc(value)
+    if isinstance(value, str):
+        try:
+            return ensure_aware_utc(datetime.fromisoformat(value))
+        except ValueError:
+            return None
+    return None
+
+
+def _websocket_price_timestamp(market: KalshiMarket, source: str | None) -> datetime | None:
+    if market.market_data_source != "websocket" or source is None:
+        return None
+    attr = PRICE_SOURCE_TIMESTAMP_ATTRS.get(source)
+    raw = market.orderbook_raw if isinstance(market.orderbook_raw, dict) else {}
+    timestamps = raw.get(WS_PRICE_UPDATED_AT_KEY)
+    if attr is None or not isinstance(timestamps, dict):
+        return None
+    return _parse_price_timestamp(timestamps.get(attr))
+
+
+def _market_price_timestamp(market: KalshiMarket, now: datetime, source: str | None = None) -> datetime:
+    websocket_timestamp = _websocket_price_timestamp(market, source)
+    if websocket_timestamp is not None:
+        return websocket_timestamp
     value = market.market_price_updated_at or market.updated_at or now
     return ensure_aware_utc(value)
 
@@ -135,35 +173,74 @@ def _market_yes_price(market: KalshiMarket, now: datetime | None = None) -> Deci
 
 
 def _market_yes_price_context(market: KalshiMarket, now: datetime) -> PriceContext:
-    settings = get_settings()
-    updated_at = _market_price_timestamp(market, now)
-    staleness = max(0, int((ensure_aware_utc(now) - updated_at).total_seconds()))
+    return _market_side_price_context(market, "yes", now)
 
-    candidates: tuple[tuple[str, Decimal | None], ...] = (
-        ("yes_ask", market.yes_ask),
-        ("orderbook_implied_yes_ask", market.implied_yes_ask),
-        ("orderbook_best_no_bid_inverse", (Decimal("1.0000") - market.best_no_bid) if market.best_no_bid is not None else None),
-    )
+
+def _open_trade_mark_price(market: KalshiMarket, side: str) -> Decimal | None:
+    if side.strip().lower() == "yes":
+        for value in (market.best_yes_bid, market.yes_bid, market.last_price):
+            if value is not None:
+                return value.quantize(Decimal("0.0001"))
+    else:
+        for value in (market.best_no_bid, market.no_bid):
+            if value is not None:
+                return value.quantize(Decimal("0.0001"))
+        if market.last_price is not None:
+            complement = (Decimal("1.0000") - market.last_price).quantize(Decimal("0.0001"))
+            if complement >= Decimal("0"):
+                return complement
+    return None
+
+
+def _market_side_price_context(market: KalshiMarket, side: str, now: datetime) -> PriceContext:
+    settings = get_settings()
+    normalized_side = side.strip().lower()
+    if normalized_side not in {"yes", "no"}:
+        raise ValueError(f"Unsupported contract side: {side}")
+    if normalized_side == "yes":
+        candidates: tuple[tuple[str, Decimal | None], ...] = (
+            ("yes_ask", market.yes_ask),
+            ("orderbook_implied_yes_ask", market.implied_yes_ask),
+            (
+                "orderbook_best_no_bid_inverse",
+                (Decimal("1.0000") - market.best_no_bid) if market.best_no_bid is not None else None,
+            ),
+        )
+    else:
+        candidates = (
+            ("no_ask", market.no_ask),
+            ("orderbook_implied_no_ask", market.implied_no_ask),
+            (
+                "orderbook_best_yes_bid_inverse",
+                (Decimal("1.0000") - market.best_yes_bid) if market.best_yes_bid is not None else None,
+            ),
+        )
     for source, value in candidates:
         if value is None:
             continue
+        updated_at = _market_price_timestamp(market, now, source)
+        staleness = max(0, int((ensure_aware_utc(now) - updated_at).total_seconds()))
         price = value.quantize(Decimal("0.0001"))
         if not _is_executable_price(price):
-            return PriceContext(price, None, source, updated_at, staleness, "non_executable")
+            return PriceContext(price, None, source, updated_at, staleness, "non_executable", normalized_side)
         if staleness > settings.paper_max_price_staleness_seconds:
-            return PriceContext(price, None, source, updated_at, staleness, "stale")
-        return PriceContext(price, price, source, updated_at, staleness, "fresh_executable")
+            return PriceContext(price, None, source, updated_at, staleness, "stale", normalized_side)
+        return PriceContext(price, price, source, updated_at, staleness, "fresh_executable", normalized_side)
 
-    if market.last_price is not None:
+    if normalized_side == "yes" and market.last_price is not None:
         price = market.last_price.quantize(Decimal("0.0001"))
         source = "last_price_fallback"
+        updated_at = _market_price_timestamp(market, now, source)
+        staleness = max(0, int((ensure_aware_utc(now) - updated_at).total_seconds()))
         if settings.paper_allow_last_price_fallback_for_trade and _is_executable_price(price):
             status = "fresh_executable" if staleness <= settings.paper_max_price_staleness_seconds else "stale"
             executable = price if status == "fresh_executable" else None
-            return PriceContext(price, executable, source, updated_at, staleness, status)
-        return PriceContext(price, None, source, updated_at, staleness, "non_executable")
+            return PriceContext(price, executable, source, updated_at, staleness, status, normalized_side)
+        return PriceContext(price, None, source, updated_at, staleness, "non_executable", normalized_side)
 
-    return PriceContext(None, None, None, updated_at, staleness, "missing")
+    updated_at = _market_price_timestamp(market, now)
+    staleness = max(0, int((ensure_aware_utc(now) - updated_at).total_seconds()))
+    return PriceContext(None, None, None, updated_at, staleness, "missing", normalized_side)
 
 
 def _round_up(value: Decimal, step: Decimal) -> Decimal:
@@ -323,6 +400,7 @@ def _diagnostics_payload(
     game_not_started = minutes_to_start > 0 and _eastern_date(game.scheduled_start) == target_date
     market_open = market.status.strip().lower() in TRADABLE_MARKET_STATUSES
     price_ok = price_context.status == "fresh_executable"
+    spread_trading_ok = settings.paper_spread_trading_enabled or market_type not in {FULL_GAME_SPREAD, FIRST_FIVE_SPREAD}
     data_quality_ok = data_quality is not None and data_quality >= _paper_quality_threshold()
     push_ok = not (push_probability is not None and push_probability > Decimal("0") and market_type.endswith(("spread", "total")))
     probability_present = probability is not None
@@ -346,6 +424,7 @@ def _diagnostics_payload(
         game_not_started,
         market_open,
         selection_trusted_ok,
+        spread_trading_ok,
         price_ok,
         push_ok,
         probability_present,
@@ -364,6 +443,7 @@ def _diagnostics_payload(
         "gate_market_open": market_open,
         "gate_game_not_started": game_not_started,
         "gate_selection_trusted_ok": selection_trusted_ok,
+        "gate_spread_trading_enabled": spread_trading_ok,
         "gate_price_fresh_executable": price_ok,
         "gate_data_quality_ok": data_quality_ok,
         "gate_push_ok": push_ok,
@@ -384,6 +464,7 @@ def _diagnostics_payload(
         "counterfactual_trade_eligible_before_quality": before_quality,
         "counterfactual_trade_eligible_after_quality": after_quality,
         "market_type_supported": supported_ok,
+        "contract_side": price_context.side,
         "paper_quality_threshold": float(_paper_quality_threshold()),
     }
     return flags
@@ -414,6 +495,7 @@ def _update_gate(candidate: ModelCandidate, key: str, value: bool) -> None:
             "gate_market_open",
             "gate_game_not_started",
             "gate_selection_trusted_ok",
+            "gate_spread_trading_enabled",
             "gate_price_fresh_executable",
             "gate_data_quality_ok",
             "gate_push_ok",
@@ -477,6 +559,17 @@ def _open_trade_for_market(
     return session.scalar(query.order_by(PaperTrade.entry_time.desc(), PaperTrade.id.desc()).limit(1))
 
 
+def _open_trade_for_ticker(session: Session, market_ticker: str, epoch_id: int | None) -> PaperTrade | None:
+    query = (
+        select(PaperTrade)
+        .where(PaperTrade.market_ticker == market_ticker)
+        .where(PaperTrade.status == "open")
+    )
+    if epoch_id is not None:
+        query = query.where(PaperTrade.paper_trading_epoch_id == epoch_id)
+    return session.scalar(query.order_by(PaperTrade.entry_time.desc(), PaperTrade.id.desc()).limit(1))
+
+
 def _has_trusted_candidate_selection(mapping: MarketMapping, game: MlbGame, market: KalshiMarket) -> bool:
     if has_trusted_selection(game, market.ticker):
         return True
@@ -515,6 +608,8 @@ def _base_decision(
         if mapping.line_value is None and market.line_value is None and market_type.endswith(("spread", "total")):
             return "no_trade_missing_line"
         return "no_trade_parse_uncertain"
+    if market_type in {FULL_GAME_SPREAD, FIRST_FIVE_SPREAD} and not settings.paper_spread_trading_enabled:
+        return "no_trade_spread_trading_disabled"
     if minutes_to_start <= 0:
         return "no_trade_game_started"
     if _eastern_date(game.scheduled_start) != target_date:
@@ -674,6 +769,25 @@ def _apply_line_selection(intents: list[TradeIntent]) -> tuple[list[TradeIntent]
     return selected, counts
 
 
+def _apply_side_conflict_guard(intents: list[TradeIntent]) -> tuple[list[TradeIntent], dict[str, int]]:
+    counts = {"no_trade_conflicting_side_signals": 0}
+    grouped: dict[str, list[TradeIntent]] = {}
+    for intent in intents:
+        grouped.setdefault(intent.market.ticker, []).append(intent)
+
+    selected: list[TradeIntent] = []
+    for group in grouped.values():
+        sides = {str(intent.candidate.contract_side or "").lower() for intent in group}
+        if {"yes", "no"}.issubset(sides):
+            for intent in group:
+                intent.candidate.decision = "no_trade_conflicting_side_signals"
+                _update_gate(intent.candidate, "gate_caps_ok", False)
+                counts["no_trade_conflicting_side_signals"] += 1
+            continue
+        selected.extend(group)
+    return selected, counts
+
+
 def _apply_trade_caps(
     session: Session,
     intents: list[TradeIntent],
@@ -738,6 +852,186 @@ def _apply_trade_caps(
         session.add(candidate)
 
     return selected, cap_counts
+
+
+def _trade_risk_cost(trade: PaperTrade) -> Decimal:
+    if trade.estimated_total_cost is not None:
+        return Decimal(trade.estimated_total_cost).quantize(Decimal("0.01"))
+    return ((trade.entry_price * Decimal(trade.quantity)) + paper_trade_fee(trade)).quantize(Decimal("0.01"))
+
+
+def _risk_scope(value: str | None) -> str:
+    return "first_five" if (value or "").startswith("first_five") else "full_game"
+
+
+def _risk_family(candidate: ModelCandidate | None, trade: PaperTrade | None = None) -> str:
+    return (trade.market_family if trade else None) or (candidate.market_family if candidate else None) or "unknown"
+
+
+def _daily_and_open_risk_usage(
+    session: Session,
+    target_date: date,
+    day_start: datetime,
+    day_end: datetime,
+    epoch_id: int | None,
+) -> dict[str, object]:
+    query = select(PaperTrade, ModelCandidate).outerjoin(ModelCandidate, PaperTrade.candidate_id == ModelCandidate.id)
+    if epoch_id is not None:
+        query = query.where(PaperTrade.paper_trading_epoch_id == epoch_id)
+    daily = Decimal("0.00")
+    open_risk = Decimal("0.00")
+    family: dict[str, Decimal] = {}
+    scope: dict[str, Decimal] = {}
+    low_price = Decimal("0.00")
+    for trade, candidate in session.execute(query):
+        cost = _trade_risk_cost(trade)
+        is_target_day_trade = (
+            candidate is not None
+            and candidate.target_date == target_date
+        ) or (day_start <= ensure_aware_utc(trade.entry_time) < day_end)
+        if is_target_day_trade:
+            daily += cost
+        if trade.status == "open":
+            open_risk += cost
+            family_key = _risk_family(candidate, trade)
+            scope_key = trade.inning_scope or (candidate.inning_scope if candidate else None) or _risk_scope(family_key)
+            family[family_key] = family.get(family_key, Decimal("0.00")) + cost
+            scope[scope_key] = scope.get(scope_key, Decimal("0.00")) + cost
+            if trade.entry_price < Decimal("0.2000"):
+                low_price += cost
+    return {
+        "daily": daily,
+        "open": open_risk,
+        "family": family,
+        "scope": scope,
+        "low_price": low_price,
+    }
+
+
+def _risk_limit(bankroll: Decimal, pct: Decimal) -> Decimal:
+    return (bankroll * pct).quantize(Decimal("0.01"))
+
+
+def _intent_cost(intent: TradeIntent) -> Decimal:
+    value = intent.candidate.estimated_total_cost
+    if value is not None:
+        return Decimal(value).quantize(Decimal("0.01"))
+    return (intent.price * Decimal(intent.quantity)).quantize(Decimal("0.01"))
+
+
+def _adjust_intent_quantity(intent: TradeIntent, quantity: int) -> None:
+    candidate = intent.candidate
+    intent.quantity = quantity
+    one_fee = candidate.one_contract_fee_estimate or _estimate_trade_fee(intent.price, 1) or Decimal("0")
+    total_fee = _estimate_trade_fee(intent.price, quantity) or Decimal("0")
+    total_cost = ((intent.price * Decimal(quantity)) + total_fee).quantize(Decimal("0.01"))
+    one_ev = candidate.one_contract_expected_value or candidate.net_expected_value or Decimal("0")
+    sized_ev = ((one_ev + one_fee) * Decimal(quantity) - total_fee).quantize(Decimal("0.000001"))
+    candidate.contracts = quantity
+    candidate.estimated_cost_per_contract = (intent.price + one_fee).quantize(Decimal("0.000001"))
+    candidate.estimated_total_cost = total_cost
+    candidate.sized_expected_value = sized_ev
+    candidate.total_fee_estimate = total_fee
+    sizing = dict(intent.sizing or {})
+    sizing.update(
+        {
+            "contracts": quantity,
+            "estimated_total_cost": float(total_cost),
+            "sized_expected_value": float(sized_ev),
+            "total_fee_estimate": float(total_fee),
+            "adjusted_by_aggregate_risk_cap": True,
+        }
+    )
+    intent.sizing = sizing
+
+
+def _apply_aggregate_risk_caps(
+    session: Session,
+    intents: list[TradeIntent],
+    *,
+    target_date: date,
+    day_start: datetime,
+    day_end: datetime,
+    epoch_id: int | None,
+    bankroll: Decimal,
+) -> tuple[list[TradeIntent], dict[str, int], dict[str, object]]:
+    settings = get_settings()
+    usage = _daily_and_open_risk_usage(session, target_date, day_start, day_end, epoch_id)
+    daily_used = Decimal(usage["daily"])
+    open_used = Decimal(usage["open"])
+    family_used: dict[str, Decimal] = dict(usage["family"])  # type: ignore[arg-type]
+    scope_used: dict[str, Decimal] = dict(usage["scope"])  # type: ignore[arg-type]
+    low_price_used = Decimal(usage["low_price"])
+    limits = {
+        "daily": _risk_limit(bankroll, settings.paper_max_daily_new_risk_pct),
+        "open": _risk_limit(bankroll, settings.paper_max_open_risk_pct),
+        "family": _risk_limit(bankroll, settings.paper_max_market_family_risk_pct),
+        "scope": _risk_limit(bankroll, settings.paper_max_scope_risk_pct),
+        "low_price": _risk_limit(bankroll, settings.paper_max_price_bucket_risk_pct_under_20c),
+    }
+    cap_counts = {
+        "no_trade_daily_risk_cap": 0,
+        "no_trade_open_risk_cap": 0,
+        "no_trade_family_risk_cap": 0,
+        "no_trade_scope_risk_cap": 0,
+        "no_trade_low_price_bucket_risk_cap": 0,
+        "aggregate_risk_quantity_reduced": 0,
+    }
+    selected: list[TradeIntent] = []
+
+    for intent in intents:
+        candidate = intent.candidate
+        family = candidate.market_family or "unknown"
+        scope = candidate.inning_scope or _risk_scope(family)
+        cost = _intent_cost(intent)
+        available = {
+            "no_trade_daily_risk_cap": limits["daily"] - daily_used,
+            "no_trade_open_risk_cap": limits["open"] - open_used,
+            "no_trade_family_risk_cap": limits["family"] - family_used.get(family, Decimal("0.00")),
+            "no_trade_scope_risk_cap": limits["scope"] - scope_used.get(scope, Decimal("0.00")),
+        }
+        if intent.price < Decimal("0.2000"):
+            available["no_trade_low_price_bucket_risk_cap"] = limits["low_price"] - low_price_used
+        blocking_reason = next((reason for reason, remaining in available.items() if remaining < cost), None)
+        if blocking_reason:
+            cost_per_contract = candidate.estimated_cost_per_contract or (intent.price + (_estimate_trade_fee(intent.price, 1) or Decimal("0")))
+            remaining = min(available.values())
+            adjusted_quantity = int((max(remaining, Decimal("0")) / cost_per_contract).to_integral_value(rounding=ROUND_FLOOR))
+            adjusted_quantity = min(adjusted_quantity, intent.quantity)
+            if adjusted_quantity >= settings.paper_min_contracts:
+                _adjust_intent_quantity(intent, adjusted_quantity)
+                cost = _intent_cost(intent)
+                cap_counts["aggregate_risk_quantity_reduced"] += 1
+            else:
+                candidate.decision = blocking_reason
+                _update_gate(candidate, "gate_caps_ok", False)
+                cap_counts[blocking_reason] = cap_counts.get(blocking_reason, 0) + 1
+                session.add(candidate)
+                continue
+
+        candidate.decision = "paper_trade"
+        _update_gate(candidate, "gate_caps_ok", True)
+        selected.append(intent)
+        daily_used += cost
+        open_used += cost
+        family_used[family] = family_used.get(family, Decimal("0.00")) + cost
+        scope_used[scope] = scope_used.get(scope, Decimal("0.00")) + cost
+        if intent.price < Decimal("0.2000"):
+            low_price_used += cost
+
+    summary = {
+        "daily_risk_used": float(daily_used),
+        "daily_risk_max": float(limits["daily"]),
+        "open_risk_used": float(open_used),
+        "open_risk_max": float(limits["open"]),
+        "family_risk_used": {key: float(value) for key, value in family_used.items()},
+        "family_risk_max": float(limits["family"]),
+        "scope_risk_used": {key: float(value) for key, value in scope_used.items()},
+        "scope_risk_max": float(limits["scope"]),
+        "low_price_bucket_risk_used": float(low_price_used),
+        "low_price_bucket_risk_max": float(limits["low_price"]),
+    }
+    return selected, cap_counts, summary
 
 
 def _avg_decimal(values: list[Decimal]) -> float | None:
@@ -850,6 +1144,14 @@ def generate_candidates(session: Session, target_date: date | None = None) -> di
             "paper_allow_last_price_fallback_for_trade": settings.paper_allow_last_price_fallback_for_trade,
             "paper_allow_multiple_lines_per_game_family": settings.paper_allow_multiple_lines_per_game_family,
             "paper_allow_multiple_f5_winner_outcomes": settings.paper_allow_multiple_f5_winner_outcomes,
+            "paper_spread_trading_enabled": settings.paper_spread_trading_enabled,
+            "side_aware_candidates_enabled": True,
+            "aggregate_risk_caps_enabled": True,
+            "paper_max_daily_new_risk_pct": float(settings.paper_max_daily_new_risk_pct),
+            "paper_max_open_risk_pct": float(settings.paper_max_open_risk_pct),
+            "paper_max_market_family_risk_pct": float(settings.paper_max_market_family_risk_pct),
+            "paper_max_scope_risk_pct": float(settings.paper_max_scope_risk_pct),
+            "paper_max_price_bucket_risk_pct_under_20c": float(settings.paper_max_price_bucket_risk_pct_under_20c),
             "kalshi_trade_fee_rate": float(settings.kalshi_trade_fee_rate),
             "kalshi_fee_estimate_mode": settings.kalshi_fee_estimate_mode,
             "kalshi_fee_rounding_mode": settings.kalshi_fee_rounding_mode,
@@ -891,261 +1193,305 @@ def generate_candidates(session: Session, target_date: date | None = None) -> di
             or market.market_type
             or market_type_from_ticker(market.ticker, infer_market_type(_market_classification_text(market)))
         )
-        price_context = _market_yes_price_context(market, now)
-        price = price_context.executable_price
-        contract_side = "yes"
-        features = build_feature_snapshot(game, market, mapping, session=session, now=now)
-        labels = contract_labels(
-            game=game,
-            market=market,
-            market_ticker=market.ticker,
-            market_type=market_type,
-            selection_code=mapping.selection_code or market.selection_code,
-        )
+        base_features = build_feature_snapshot(game, market, mapping, session=session, now=now)
         model_score = score_mature_candidate(
-            features,
+            base_features,
             market_type=market_type,
             settlement_status=_settlement_status(mapping, market),
             parameters=parameter_version.parameters,
             parameter_version_tag=parameter_version.version_tag,
         )
-        probability = model_score.probability_calibrated or model_score.probability
-        fair_value = model_score.fair_value
-        gross_ev, fee, net_ev, probability_edge = _expected_values(probability, price, 1)
-        if price_context.status == "stale":
-            stale_price_count += 1
-        elif price_context.status not in {"fresh_executable", "missing"}:
-            non_executable_price_count += 1
-        market_context = features.get("market_context")
-        if isinstance(market_context, dict):
+        actual_yes_probability = model_score.probability_calibrated or model_score.probability
+        actual_no_probability = (Decimal("1.000000") - actual_yes_probability).quantize(Decimal("0.000001"))
+        price_contexts = {"yes": _market_side_price_context(market, "yes", now)}
+        no_price_context = _market_side_price_context(market, "no", now)
+        if no_price_context.market_price is not None:
+            price_contexts["no"] = no_price_context
+
+        for contract_side, price_context in price_contexts.items():
+            price = price_context.executable_price
+            probability = actual_yes_probability if contract_side == "yes" else actual_no_probability
+            probability_raw = (
+                model_score.probability_raw
+                if contract_side == "yes"
+                else (Decimal("1.000000") - model_score.probability_raw).quantize(Decimal("0.000001"))
+            )
+            fair_value = probability.quantize(Decimal("0.0001"))
+            features = {**base_features}
+            market_context = dict(features.get("market_context") or {})
+            market_context["contract_side"] = contract_side
+            market_context["side_probability"] = float(probability)
+            market_context["actual_yes_probability"] = float(actual_yes_probability)
+            market_context["actual_no_probability"] = float(actual_no_probability)
             market_context["executable_price"] = float(price) if price is not None else None
             market_context["executable_price_source"] = price_context.source
             market_context["market_price"] = float(price_context.market_price) if price_context.market_price is not None else None
             market_context["price_status"] = price_context.status
             market_context["price_staleness_seconds"] = price_context.staleness_seconds
+            features["market_context"] = market_context
+            labels = contract_labels(
+                game=game,
+                market=market,
+                market_ticker=market.ticker,
+                market_type=market_type,
+                selection_code=mapping.selection_code or market.selection_code,
+                contract_side=contract_side,
+            )
+            actual_display = labels.actual_contract_display or labels.contract_display
+            gross_ev, fee, net_ev, probability_edge = _expected_values(probability, price, 1)
             market_context["fee_estimate"] = float(fee) if fee is not None else None
-        decision = _base_decision(
-            mapping,
-            game,
-            market,
-            market_type,
-            day,
-            minutes_to_start,
-            price_context,
-            probability,
-            gross_ev,
-            fee,
-            net_ev,
-            probability_edge,
-            model_score.data_quality,
-            model_score.calibration_status,
-            model_score.push_probability,
-        )
+            if price_context.status == "stale":
+                stale_price_count += 1
+            elif price_context.status not in {"fresh_executable", "missing"}:
+                non_executable_price_count += 1
+            decision = _base_decision(
+                mapping,
+                game,
+                market,
+                market_type,
+                day,
+                minutes_to_start,
+                price_context,
+                probability,
+                gross_ev,
+                fee,
+                net_ev,
+                probability_edge,
+                model_score.data_quality,
+                model_score.calibration_status,
+                model_score.push_probability,
+            )
 
-        existing_candidates = list(
-            session.scalars(
-                select(ModelCandidate)
-                .where(ModelCandidate.mapping_id == mapping.id)
-                .where(ModelCandidate.paper_trading_epoch_id == active_epoch.id)
-                .where(ModelCandidate.time_bucket == bucket)
-                .where(ModelCandidate.target_date == day)
-                .order_by(ModelCandidate.evaluated_at.desc(), ModelCandidate.id.desc())
-            )
-        )
-        traded_candidate_ids = _candidate_ids_with_trades(
-            session, [candidate.id for candidate in existing_candidates if candidate.id is not None], active_epoch.id
-        )
-        existing = next(
-            (candidate for candidate in existing_candidates if candidate.id not in traded_candidate_ids),
-            None,
-        )
-        open_trade_for_market = _open_trade_for_market(session, market.ticker, contract_side, active_epoch.id)
-        candidate = existing or ModelCandidate(
-            paper_trading_epoch_id=active_epoch.id,
-            mapping_id=mapping.id,
-            mlb_game_id=game.id,
-            kalshi_market_id=market.id,
-            evaluated_at=now,
-        )
-        candidate.paper_trading_epoch_id = active_epoch.id
-        if open_trade_for_market is not None and price is not None:
-            open_trade_for_market.current_price = price
-            open_trade_for_market.market_display = open_trade_for_market.market_display or labels.market_display
-            open_trade_for_market.selection_display = open_trade_for_market.selection_display or labels.selection_display
-            open_trade_for_market.matchup_display = open_trade_for_market.matchup_display or labels.matchup_display
-            open_trade_for_market.contract_display = open_trade_for_market.contract_display or labels.contract_display
-            open_trade_for_market.market_family = open_trade_for_market.market_family or mapping.market_family or market.market_family
-            open_trade_for_market.line_value = (
-                open_trade_for_market.line_value
-                if open_trade_for_market.line_value is not None
-                else mapping.line_value if mapping.line_value is not None else market.line_value
-            )
-            open_trade_for_market.selection_code = (
-                open_trade_for_market.selection_code or mapping.selection_code or market.selection_code
-            )
-            open_trade_for_market.over_under_side = (
-                open_trade_for_market.over_under_side or mapping.over_under_side or market.over_under_side
-            )
-            open_trade_for_market.inning_scope = open_trade_for_market.inning_scope or mapping.inning_scope or market.inning_scope
-            open_trade_for_market.settlement_rule_status = (
-                open_trade_for_market.settlement_rule_status
-                or mapping.settlement_rule_status
-                or market.settlement_rule_status
-            )
-            session.add(open_trade_for_market)
-        if (traded_candidate_ids or open_trade_for_market is not None) and decision == "eligible_for_paper_trade":
-            decision = "candidate_only_existing_trade"
-            _update_gate(candidate, "gate_open_position_ok", False)
-
-        candidate.model_version_id = model_version.id
-        candidate.evaluated_at = now
-        candidate.features = features
-        candidate.probability = probability
-        candidate.model_probability = probability
-        candidate.probability_raw = model_score.probability_raw
-        candidate.probability_calibrated = probability
-        candidate.fair_value = fair_value
-        candidate.market_price = price_context.market_price
-        candidate.executable_price = price
-        candidate.expected_value = gross_ev
-        candidate.fee_estimate = fee
-        candidate.net_expected_value = net_ev
-        candidate.probability_edge = probability_edge
-        candidate.target_date = day
-        candidate.executable_price_source = price_context.source
-        candidate.market_price_updated_at = price_context.updated_at
-        candidate.price_staleness_seconds = price_context.staleness_seconds
-        candidate.price_status = price_context.status
-        candidate.market_type = market_type
-        candidate.time_bucket = bucket
-        candidate.time_to_start_minutes = minutes_to_start
-        candidate.contract_side = contract_side
-        candidate.decision = decision
-        candidate.model_version_tag = MATURE_MODEL_TAG
-        candidate.feature_version = FEATURE_VERSION
-        candidate.training_eligible = model_score.training_eligible
-        candidate.training_exclusion_reason = model_score.training_exclusion_reason
-        if _eastern_date(game.scheduled_start) != day:
-            candidate.training_eligible = False
-            candidate.training_exclusion_reason = "target_date_mismatch"
-        elif minutes_to_start <= 0:
-            candidate.training_eligible = False
-            candidate.training_exclusion_reason = "candidate_after_game_start"
-        elif price_context.status != "fresh_executable":
-            candidate.training_eligible = False
-            candidate.training_exclusion_reason = f"price_context_{price_context.status}"
-        elif fee is None:
-            candidate.training_eligible = False
-            candidate.training_exclusion_reason = "missing_fee_estimate"
-        elif decision == "no_trade_mapping_uncertain":
-            candidate.training_eligible = False
-            candidate.training_exclusion_reason = "mapping_uncertain"
-        candidate.data_quality = model_score.data_quality
-        candidate.calibration_status = model_score.calibration_status
-        candidate.scoring_rationale = model_score.rationale
-        candidate.market_display = labels.market_display
-        candidate.selection_display = labels.selection_display
-        candidate.matchup_display = labels.matchup_display
-        candidate.contract_display = labels.contract_display
-        candidate.market_family = mapping.market_family or market.market_family or market_type
-        candidate.line_value = mapping.line_value if mapping.line_value is not None else market.line_value
-        candidate.selection_code = mapping.selection_code or market.selection_code
-        candidate.over_under_side = mapping.over_under_side or market.over_under_side
-        candidate.inning_scope = mapping.inning_scope or market.inning_scope
-        candidate.settlement_rule_status = mapping.settlement_rule_status or market.settlement_rule_status
-        diagnostics = _diagnostics_payload(
-            mapping=mapping,
-            game=game,
-            market=market,
-            market_type=market_type,
-            target_date=day,
-            minutes_to_start=minutes_to_start,
-            price_context=price_context,
-            probability=probability,
-            gross_ev=gross_ev,
-            fee_estimate=fee,
-            net_ev=net_ev,
-            probability_edge=probability_edge,
-            data_quality=model_score.data_quality,
-            calibration_status=model_score.calibration_status,
-            push_probability=model_score.push_probability,
-            open_trade_exists=open_trade_for_market is not None,
-        )
-        if decision == "candidate_only_existing_trade":
-            diagnostics["gate_open_position_ok"] = False
-            diagnostics["gate_final_trade_eligible"] = False
-        _apply_gate_fields(candidate, diagnostics)
-        session.add(candidate)
-        session.flush()
-        session.add(
-            FeatureSnapshot(
-                candidate_id=candidate.id,
-                captured_at=now,
-                features=features,
-                source=FEATURE_VERSION,
-                feature_version=FEATURE_VERSION,
-                source_statuses=features.get("source_statuses"),
-            )
-        )
-        created_or_updated += 1
-        evaluated_candidates.append(candidate)
-
-        output = ModelPredictionOutput(
-            paper_trading_epoch_id=active_epoch.id,
-            prediction_run_id=prediction_run.id,
-            candidate_id=candidate.id,
-            market_family=candidate.market_family,
-            probability_raw=candidate.probability_raw,
-            probability_calibrated=candidate.probability_calibrated,
-            fair_value=candidate.fair_value,
-            executable_price=candidate.executable_price,
-            expected_value_gross=candidate.expected_value,
-            fee_estimate=candidate.fee_estimate,
-            expected_value_net=candidate.net_expected_value,
-            probability_edge=candidate.probability_edge,
-            executable_price_source=candidate.executable_price_source,
-            price_status=candidate.price_status,
-            data_quality=candidate.data_quality,
-            calibration_status=candidate.calibration_status,
-            decision_reason=decision,
-            raw_output={
-                **model_score.rationale,
-                "target_date": day.isoformat(),
-                "price_context": {
-                    "market_price": float(price_context.market_price) if price_context.market_price is not None else None,
-                    "executable_price": float(price) if price is not None else None,
-                    "source": price_context.source,
-                    "updated_at": price_context.updated_at.isoformat() if price_context.updated_at else None,
-                    "staleness_seconds": price_context.staleness_seconds,
-                    "status": price_context.status,
-                },
-                "fee_context": {
-                    "fee_estimate": float(fee) if fee is not None else None,
-                    "fee_rate": float(settings.kalshi_trade_fee_rate),
-                    "fee_estimate_mode": settings.kalshi_fee_estimate_mode,
-                    "fee_rounding_mode": settings.kalshi_fee_rounding_mode,
-                    "assume_taker": settings.kalshi_assume_taker,
-                    "quantity": 1,
-                },
-                "gate_diagnostics": diagnostics,
-            },
-        )
-        session.add(output)
-        outputs_by_candidate_id[candidate.id] = output
-
-        if decision == "eligible_for_paper_trade" and price is not None:
-            trade_intents.append(
-                TradeIntent(
-                    candidate=candidate,
-                    game=game,
-                    market=market,
-                    price=price,
-                    labels=labels,
-                    score=_trade_rank_score(candidate),
+            existing_candidates = list(
+                session.scalars(
+                    select(ModelCandidate)
+                    .where(ModelCandidate.mapping_id == mapping.id)
+                    .where(ModelCandidate.paper_trading_epoch_id == active_epoch.id)
+                    .where(ModelCandidate.time_bucket == bucket)
+                    .where(ModelCandidate.target_date == day)
+                    .where(ModelCandidate.contract_side == contract_side)
+                    .order_by(ModelCandidate.evaluated_at.desc(), ModelCandidate.id.desc())
                 )
             )
+            traded_candidate_ids = _candidate_ids_with_trades(
+                session, [candidate.id for candidate in existing_candidates if candidate.id is not None], active_epoch.id
+            )
+            existing = next(
+                (candidate for candidate in existing_candidates if candidate.id not in traded_candidate_ids),
+                None,
+            )
+            open_trade_for_market = _open_trade_for_market(session, market.ticker, contract_side, active_epoch.id)
+            open_trade_for_ticker = _open_trade_for_ticker(session, market.ticker, active_epoch.id)
+            opposite_open_trade = (
+                open_trade_for_ticker
+                if open_trade_for_ticker is not None and open_trade_for_ticker.contract_side != contract_side
+                else None
+            )
+            candidate = existing or ModelCandidate(
+                paper_trading_epoch_id=active_epoch.id,
+                mapping_id=mapping.id,
+                mlb_game_id=game.id,
+                kalshi_market_id=market.id,
+                evaluated_at=now,
+            )
+            candidate.paper_trading_epoch_id = active_epoch.id
+            if open_trade_for_market is not None:
+                mark_price = _open_trade_mark_price(market, contract_side)
+                if mark_price is not None:
+                    open_trade_for_market.current_price = mark_price
+                open_trade_for_market.market_display = open_trade_for_market.market_display or actual_display
+                open_trade_for_market.selection_display = open_trade_for_market.selection_display or labels.selection_display
+                open_trade_for_market.matchup_display = open_trade_for_market.matchup_display or labels.matchup_display
+                open_trade_for_market.contract_display = open_trade_for_market.contract_display or actual_display
+                open_trade_for_market.market_family = open_trade_for_market.market_family or mapping.market_family or market.market_family
+                open_trade_for_market.line_value = (
+                    open_trade_for_market.line_value
+                    if open_trade_for_market.line_value is not None
+                    else mapping.line_value if mapping.line_value is not None else market.line_value
+                )
+                open_trade_for_market.selection_code = (
+                    open_trade_for_market.selection_code or mapping.selection_code or market.selection_code
+                )
+                open_trade_for_market.over_under_side = (
+                    open_trade_for_market.over_under_side or mapping.over_under_side or market.over_under_side
+                )
+                open_trade_for_market.inning_scope = open_trade_for_market.inning_scope or mapping.inning_scope or market.inning_scope
+                open_trade_for_market.settlement_rule_status = (
+                    open_trade_for_market.settlement_rule_status
+                    or mapping.settlement_rule_status
+                    or market.settlement_rule_status
+                )
+                session.add(open_trade_for_market)
+            if decision == "eligible_for_paper_trade":
+                if traded_candidate_ids or open_trade_for_market is not None:
+                    decision = "candidate_only_existing_trade"
+                elif opposite_open_trade is not None:
+                    decision = "no_trade_opposite_side_open"
 
-    line_selected_trades, line_selection_counts = _apply_line_selection(trade_intents)
+            candidate.model_version_id = model_version.id
+            candidate.evaluated_at = now
+            candidate.features = features
+            candidate.probability = probability
+            candidate.model_probability = probability
+            candidate.probability_raw = probability_raw
+            candidate.probability_calibrated = probability
+            candidate.fair_value = fair_value
+            candidate.market_price = price_context.market_price
+            candidate.executable_price = price
+            candidate.expected_value = gross_ev
+            candidate.fee_estimate = fee
+            candidate.net_expected_value = net_ev
+            candidate.probability_edge = probability_edge
+            candidate.target_date = day
+            candidate.executable_price_source = price_context.source
+            candidate.market_price_updated_at = price_context.updated_at
+            candidate.price_staleness_seconds = price_context.staleness_seconds
+            candidate.price_status = price_context.status
+            candidate.market_type = market_type
+            candidate.time_bucket = bucket
+            candidate.time_to_start_minutes = minutes_to_start
+            candidate.contract_side = contract_side
+            candidate.decision = decision
+            candidate.model_version_tag = MATURE_MODEL_TAG
+            candidate.feature_version = FEATURE_VERSION
+            candidate.training_eligible = model_score.training_eligible
+            candidate.training_exclusion_reason = model_score.training_exclusion_reason
+            if _eastern_date(game.scheduled_start) != day:
+                candidate.training_eligible = False
+                candidate.training_exclusion_reason = "target_date_mismatch"
+            elif minutes_to_start <= 0:
+                candidate.training_eligible = False
+                candidate.training_exclusion_reason = "candidate_after_game_start"
+            elif price_context.status != "fresh_executable":
+                candidate.training_eligible = False
+                candidate.training_exclusion_reason = f"price_context_{price_context.status}"
+            elif fee is None:
+                candidate.training_eligible = False
+                candidate.training_exclusion_reason = "missing_fee_estimate"
+            elif decision == "no_trade_mapping_uncertain":
+                candidate.training_eligible = False
+                candidate.training_exclusion_reason = "mapping_uncertain"
+            elif decision == "no_trade_spread_trading_disabled":
+                candidate.training_eligible = False
+                candidate.training_exclusion_reason = "spread_trading_disabled"
+            candidate.data_quality = model_score.data_quality
+            candidate.calibration_status = model_score.calibration_status
+            candidate.scoring_rationale = {
+                **model_score.rationale,
+                "contract_side": contract_side,
+                "side_probability": float(probability),
+                "actual_yes_probability": float(actual_yes_probability),
+                "actual_no_probability": float(actual_no_probability),
+                "actual_contract_display": labels.actual_contract_display,
+                "normalized_equivalent_display": labels.normalized_equivalent_display,
+            }
+            candidate.market_display = actual_display
+            candidate.selection_display = labels.selection_display
+            candidate.matchup_display = labels.matchup_display
+            candidate.contract_display = actual_display
+            candidate.market_family = mapping.market_family or market.market_family or market_type
+            candidate.line_value = mapping.line_value if mapping.line_value is not None else market.line_value
+            candidate.selection_code = mapping.selection_code or market.selection_code
+            candidate.over_under_side = mapping.over_under_side or market.over_under_side
+            candidate.inning_scope = mapping.inning_scope or market.inning_scope
+            candidate.settlement_rule_status = mapping.settlement_rule_status or market.settlement_rule_status
+            diagnostics = _diagnostics_payload(
+                mapping=mapping,
+                game=game,
+                market=market,
+                market_type=market_type,
+                target_date=day,
+                minutes_to_start=minutes_to_start,
+                price_context=price_context,
+                probability=probability,
+                gross_ev=gross_ev,
+                fee_estimate=fee,
+                net_ev=net_ev,
+                probability_edge=probability_edge,
+                data_quality=model_score.data_quality,
+                calibration_status=model_score.calibration_status,
+                push_probability=model_score.push_probability,
+                open_trade_exists=open_trade_for_market is not None or opposite_open_trade is not None,
+            )
+            diagnostics["actual_contract_display"] = labels.actual_contract_display
+            diagnostics["normalized_equivalent_display"] = labels.normalized_equivalent_display
+            if decision in {"candidate_only_existing_trade", "no_trade_opposite_side_open"}:
+                diagnostics["gate_open_position_ok"] = False
+                diagnostics["gate_final_trade_eligible"] = False
+            _apply_gate_fields(candidate, diagnostics)
+            session.add(candidate)
+            session.flush()
+            session.add(
+                FeatureSnapshot(
+                    candidate_id=candidate.id,
+                    captured_at=now,
+                    features=features,
+                    source=FEATURE_VERSION,
+                    feature_version=FEATURE_VERSION,
+                    source_statuses=features.get("source_statuses"),
+                )
+            )
+            created_or_updated += 1
+            evaluated_candidates.append(candidate)
+
+            output = ModelPredictionOutput(
+                paper_trading_epoch_id=active_epoch.id,
+                prediction_run_id=prediction_run.id,
+                candidate_id=candidate.id,
+                market_family=candidate.market_family,
+                probability_raw=candidate.probability_raw,
+                probability_calibrated=candidate.probability_calibrated,
+                fair_value=candidate.fair_value,
+                executable_price=candidate.executable_price,
+                expected_value_gross=candidate.expected_value,
+                fee_estimate=candidate.fee_estimate,
+                expected_value_net=candidate.net_expected_value,
+                probability_edge=candidate.probability_edge,
+                executable_price_source=candidate.executable_price_source,
+                price_status=candidate.price_status,
+                data_quality=candidate.data_quality,
+                calibration_status=candidate.calibration_status,
+                decision_reason=decision,
+                raw_output={
+                    **(candidate.scoring_rationale or {}),
+                    "target_date": day.isoformat(),
+                    "price_context": {
+                        "side": contract_side,
+                        "market_price": float(price_context.market_price) if price_context.market_price is not None else None,
+                        "executable_price": float(price) if price is not None else None,
+                        "source": price_context.source,
+                        "updated_at": price_context.updated_at.isoformat() if price_context.updated_at else None,
+                        "staleness_seconds": price_context.staleness_seconds,
+                        "status": price_context.status,
+                    },
+                    "fee_context": {
+                        "fee_estimate": float(fee) if fee is not None else None,
+                        "fee_rate": float(settings.kalshi_trade_fee_rate),
+                        "fee_estimate_mode": settings.kalshi_fee_estimate_mode,
+                        "fee_rounding_mode": settings.kalshi_fee_rounding_mode,
+                        "assume_taker": settings.kalshi_assume_taker,
+                        "quantity": 1,
+                    },
+                    "gate_diagnostics": diagnostics,
+                },
+            )
+            session.add(output)
+            outputs_by_candidate_id[candidate.id] = output
+
+            if decision == "eligible_for_paper_trade" and price is not None:
+                trade_intents.append(
+                    TradeIntent(
+                        candidate=candidate,
+                        game=game,
+                        market=market,
+                        price=price,
+                        labels=labels,
+                        score=_trade_rank_score(candidate),
+                    )
+                )
+
+    side_guarded_trades, side_conflict_counts = _apply_side_conflict_guard(trade_intents)
+    line_selected_trades, line_selection_counts = _apply_line_selection(side_guarded_trades)
     for intent in trade_intents:
         output = outputs_by_candidate_id.get(intent.candidate.id)
         if output is not None:
@@ -1215,7 +1561,31 @@ def generate_candidates(session: Session, target_date: date | None = None) -> di
         intent.candidate.total_fee_estimate = sizing.total_fee_estimate
         sized_selected_trades.append(intent)
 
-    for rank, intent in enumerate(sized_selected_trades, start=1):
+    risk_selected_trades, risk_cap_counts, risk_cap_summary = _apply_aggregate_risk_caps(
+        session,
+        sized_selected_trades,
+        target_date=day,
+        day_start=day_start,
+        day_end=day_end,
+        epoch_id=active_epoch.id,
+        bankroll=bankroll_for_sizing,
+    )
+    for intent in sized_selected_trades:
+        output = outputs_by_candidate_id.get(intent.candidate.id)
+        if output is not None:
+            output.decision_reason = intent.candidate.decision
+            raw = dict(output.raw_output or {})
+            raw["sizing"] = {
+                **(intent.sizing or {}),
+                "contracts": intent.quantity,
+            }
+            raw["gate_diagnostics"] = intent.candidate.gate_diagnostics or {}
+            output.raw_output = raw
+            session.add(output)
+        session.add(intent.candidate)
+
+    paper_trade_side_counts = {"yes": 0, "no": 0}
+    for rank, intent in enumerate(risk_selected_trades, start=1):
         candidate = intent.candidate
         existing_trade = session.scalar(
             select(PaperTrade)
@@ -1235,17 +1605,17 @@ def generate_candidates(session: Session, target_date: date | None = None) -> di
             paper_trading_epoch_id=active_epoch.id,
             candidate_id=candidate.id,
             market_ticker=intent.market.ticker,
-            contract_side="yes",
+            contract_side=candidate.contract_side or "yes",
             entry_price=intent.price,
             current_price=intent.price,
             quantity=intent.quantity,
             entry_time=now,
             status="open",
             expected_value=candidate.sized_expected_value or candidate.net_expected_value,
-            market_display=intent.labels.market_display,
+            market_display=intent.labels.actual_contract_display or intent.labels.market_display,
             selection_display=intent.labels.selection_display,
             matchup_display=intent.labels.matchup_display,
-            contract_display=intent.labels.contract_display,
+            contract_display=intent.labels.actual_contract_display or intent.labels.contract_display,
             market_family=candidate.market_family,
             line_value=candidate.line_value,
             selection_code=candidate.selection_code,
@@ -1277,12 +1647,25 @@ def generate_candidates(session: Session, target_date: date | None = None) -> di
             output.raw_output = raw
             session.add(output)
         paper_trades += 1
+        side_key = (candidate.contract_side or "unknown").lower()
+        if side_key in paper_trade_side_counts:
+            paper_trade_side_counts[side_key] += 1
 
     session.flush()
     decision_counts: dict[str, int] = {}
+    decision_counts_by_side: dict[str, dict[str, int]] = {}
+    edge_values_by_side: dict[str, list[Decimal]] = {"yes": [], "no": []}
+    net_ev_values_by_side: dict[str, list[Decimal]] = {"yes": [], "no": []}
     for candidate in evaluated_candidates:
         decision = candidate.decision or "unknown"
         decision_counts[decision] = decision_counts.get(decision, 0) + 1
+        side = (candidate.contract_side or "unknown").lower()
+        side_bucket = decision_counts_by_side.setdefault(side, {})
+        side_bucket[decision] = side_bucket.get(decision, 0) + 1
+        if side in edge_values_by_side and candidate.probability_edge is not None:
+            edge_values_by_side[side].append(candidate.probability_edge)
+        if side in net_ev_values_by_side and candidate.net_expected_value is not None:
+            net_ev_values_by_side[side].append(candidate.net_expected_value)
     decision_breakdown_by_family, decision_breakdown_by_scope = _decision_breakdowns(evaluated_candidates)
     gate_summary = _gate_summary(evaluated_candidates)
     edge_values = [candidate.probability_edge for candidate in evaluated_candidates if candidate.probability_edge is not None]
@@ -1297,7 +1680,14 @@ def generate_candidates(session: Session, target_date: date | None = None) -> di
         "no_trade_missing_fee_estimate",
     }
     trades_blocked_by_edge_or_fee = sum(decision_counts.get(reason, 0) for reason in edge_or_fee_reasons)
-    trades_blocked_by_caps = sum(cap_counts.values()) + sizing_rejections
+    all_cap_counts = {**cap_counts}
+    for key, value in side_conflict_counts.items():
+        all_cap_counts[key] = all_cap_counts.get(key, 0) + value
+    for key, value in risk_cap_counts.items():
+        all_cap_counts[key] = all_cap_counts.get(key, 0) + value
+    trades_blocked_by_caps = sum(
+        value for key, value in all_cap_counts.items() if key != "aggregate_risk_quantity_reduced"
+    ) + sizing_rejections
 
     snapshot = create_balance_snapshot(session, source="candidate_engine")
     prediction_run.completed_at = now
@@ -1306,13 +1696,33 @@ def generate_candidates(session: Session, target_date: date | None = None) -> di
     prediction_run.trades_created = paper_trades
     prediction_run.summary = {
         "decision_counts": decision_counts,
+        "decision_counts_by_side": decision_counts_by_side,
         "candidate_diagnostics": gate_summary,
         "by_family": decision_breakdown_by_family,
         "by_scope": decision_breakdown_by_scope,
-        "cap_counts": cap_counts,
+        "cap_counts": all_cap_counts,
+        "risk_caps": risk_cap_summary,
+        "spread_trading_enabled": settings.paper_spread_trading_enabled,
+        "side_aware_candidates_enabled": True,
+        "risk_caps_enabled": True,
+        "candidates_yes": len([candidate for candidate in evaluated_candidates if candidate.contract_side == "yes"]),
+        "candidates_no": len([candidate for candidate in evaluated_candidates if candidate.contract_side == "no"]),
+        "paper_trades_yes": paper_trade_side_counts["yes"],
+        "paper_trades_no": paper_trade_side_counts["no"],
+        "avg_net_ev_by_side": {
+            "yes": _avg_decimal(net_ev_values_by_side["yes"]),
+            "no": _avg_decimal(net_ev_values_by_side["no"]),
+        },
+        "avg_probability_edge_by_side": {
+            "yes": _avg_decimal(edge_values_by_side["yes"]),
+            "no": _avg_decimal(edge_values_by_side["no"]),
+        },
+        "actual_contract_parse_failures": 0,
+        "side_aware_verified_count": created_or_updated,
         "line_selection": line_selection_counts,
         "warnings": warnings,
         "eligible_trade_intents": len(trade_intents),
+        "trade_eligible_after_side_conflict_guard": len(side_guarded_trades),
         "trade_eligible_after_line_selection": len(line_selected_trades),
         "trade_eligible_before_caps": len(line_selected_trades),
         "trades_blocked_by_edge_or_fee": trades_blocked_by_edge_or_fee,
@@ -1346,10 +1756,29 @@ def generate_candidates(session: Session, target_date: date | None = None) -> di
         "prediction_run_target_date": prediction_run.target_date.isoformat() if prediction_run.target_date else None,
         "snapshot_id": snapshot.id,
         "decision_counts": decision_counts,
+        "decision_counts_by_side": decision_counts_by_side,
         "candidate_diagnostics": gate_summary,
         "decision_breakdown_by_family": decision_breakdown_by_family,
         "decision_breakdown_by_scope": decision_breakdown_by_scope,
-        "cap_counts": cap_counts,
+        "cap_counts": all_cap_counts,
+        "risk_caps": risk_cap_summary,
+        "spread_trading_enabled": settings.paper_spread_trading_enabled,
+        "side_aware_candidates_enabled": True,
+        "risk_caps_enabled": True,
+        "candidates_yes": len([candidate for candidate in evaluated_candidates if candidate.contract_side == "yes"]),
+        "candidates_no": len([candidate for candidate in evaluated_candidates if candidate.contract_side == "no"]),
+        "paper_trades_yes": paper_trade_side_counts["yes"],
+        "paper_trades_no": paper_trade_side_counts["no"],
+        "avg_net_ev_by_side": {
+            "yes": _avg_decimal(net_ev_values_by_side["yes"]),
+            "no": _avg_decimal(net_ev_values_by_side["no"]),
+        },
+        "avg_probability_edge_by_side": {
+            "yes": _avg_decimal(edge_values_by_side["yes"]),
+            "no": _avg_decimal(edge_values_by_side["no"]),
+        },
+        "actual_contract_parse_failures": 0,
+        "side_aware_verified_count": created_or_updated,
         "trade_eligible_before_quality": gate_summary["trade_eligible_before_quality"],
         "trade_eligible_after_quality": gate_summary["trade_eligible_after_quality"],
         "blocked_by_quality_only": gate_summary["blocked_by_quality_only"],
@@ -1363,6 +1792,7 @@ def generate_candidates(session: Session, target_date: date | None = None) -> di
         "blocked_by_push": gate_summary["blocked_by_push"],
         "blocked_by_line_selection": gate_summary["blocked_by_line_selection"],
         "blocked_by_caps": gate_summary["blocked_by_caps"],
+        "trade_eligible_after_side_conflict_guard": len(side_guarded_trades),
         "trade_eligible_before_caps": len(line_selected_trades),
         "trade_eligible_after_ev_filters": len(trade_intents),
         "trade_eligible_after_line_selection": len(line_selected_trades),
@@ -1370,7 +1800,7 @@ def generate_candidates(session: Session, target_date: date | None = None) -> di
         "trades_blocked_by_edge_or_fee": trades_blocked_by_edge_or_fee,
         "trades_blocked_by_line_selection": line_selection_counts["line_selection_candidates_rejected"],
         "trades_blocked_by_line_selection_or_correlation": line_selection_counts["line_selection_candidates_rejected"]
-        + cap_counts.get("no_trade_correlated_market_cap", 0),
+        + all_cap_counts.get("no_trade_correlated_market_cap", 0),
         "stale_price_count": stale_price_count,
         "non_executable_price_count": non_executable_price_count,
         "line_selection_groups_considered": line_selection_counts["line_selection_groups_considered"],

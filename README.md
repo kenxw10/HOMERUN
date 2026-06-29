@@ -22,10 +22,12 @@ This is not a sportsbook app. It does not use DraftKings, FanDuel, Odds API, or 
 - Broad Kalshi discovery is diagnostic-only and disabled by default with `KALSHI_ENABLE_BROAD_DISCOVERY=false`.
 - PR 3c scores validated MLB market-family rows with `mature_mlb_run_distribution_v2` and `mature_mlb_features_v2`.
 - Team totals, multivariate/MVE markets, sportsbook data, and guessed/retired prefixes remain out of scope.
-- Paper candidates are explicitly target-date scoped, priced from executable YES asks or orderbook-implied YES asks, filtered by conservative fee-adjusted EV before caps, and capped by slate, game, market family, open-position count, and correlated game/family exposure.
+- Paper candidates are explicitly target-date scoped and side-aware: YES uses executable YES asks/orderbook-implied YES asks, and NO uses executable NO asks/orderbook-implied NO asks. The engine must not price a NO candidate from a YES ask.
+- Spread paper trading is disabled by default with `PAPER_SPREAD_TRADING_ENABLED=false`. Spread rows can still be discovered, mapped, priced, and scored for diagnostics until the side-aware parser is manually verified.
+- Paper trade caps default to `PAPER_MAX_TRADES_PER_SLATE=8`, `PAPER_MAX_TRADES_PER_MARKET_FAMILY=4`, and `PAPER_MAX_OPEN_POSITIONS=12`, plus aggregate bankroll caps for daily new risk, open risk, market-family risk, scope risk, and sub-20c low-price risk.
 - Open-position current price uses REST last marks by default. PR3d adds an optional paper-only WebSocket market-data worker; it is disabled unless `WEBSOCKET_MARKET_DATA_ENABLED=true`.
 - `PAPER_STARTING_BALANCE=1000.00` by default.
-- Active PR3d observation epochs can be reset to a $500 paper bankroll through the protected reset endpoint. Archived validation rows stay in the database but are hidden from the main dashboard.
+- Active PR3d observation epochs can be reset to a $500 paper bankroll through the protected reset endpoint. Archived validation rows stay in the database but are hidden from the main dashboard. The PR3d contaminated spread-validation epoch should be archived as `pr3d_bad_spread_parser_validation`, followed by a clean `pr3d_paper_observation_v2` epoch.
 - PR3d paper trades use fixed-risk sizing by default: `PAPER_RISK_PER_TRADE_PCT=0.025` of the active epoch portfolio, bounded by `PAPER_MIN_CONTRACTS` and `PAPER_MAX_CONTRACTS_PER_TRADE`.
 - Paper observation data quality uses `PAPER_OBSERVATION_MIN_DATA_QUALITY=0.55`; future live quality should remain `LIVE_MIN_DATA_QUALITY=0.60` or stricter.
 - Governance skips training/calibration/promotion until clean resolved-sample thresholds are met.
@@ -206,8 +208,8 @@ After deploy and migration, reset the active paper observation epoch:
 
 ```powershell
 $body = @{
-  archive_current_as = "pre_pr3d_validation"
-  new_epoch = "pr3d_paper_observation_v1"
+  archive_current_as = "pr3d_bad_spread_parser_validation"
+  new_epoch = "pr3d_paper_observation_v2"
   starting_balance = 500.00
   archive_open_positions = $true
   reset_dashboard_metrics = $true
@@ -230,7 +232,7 @@ Invoke-RestMethod -Method Post -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-
 Invoke-RestMethod -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-RAILWAY-API/v1/ws/status"
 ```
 
-Expected dashboard result after reset: active epoch `PR3D PAPER OBSERVATION V1`, portfolio value `500.00`, cash `500.00`, open positions `0`, closed positions `0`, P/L `$0.00`, record `0-0-0`, and archived validation rows absent from active metrics. Candidate-sweep responses should include independent gate diagnostics and by-family/by-scope breakdowns. Paper trades should only occur when the active candidate clears data quality `0.55`, executable price freshness, EV, edge, line-selection, and caps.
+Expected dashboard result after reset: active epoch `PR3D PAPER OBSERVATION V2`, portfolio value `500.00`, cash `500.00`, open positions `0`, closed positions `0`, P/L `$0.00`, record `0-0-0`, and archived contaminated spread-validation rows absent from active metrics. Candidate-sweep responses should include independent gate diagnostics, by-side counts, by-family/by-scope breakdowns, and aggregate risk-cap usage. Spread candidates should not create paper trades unless `PAPER_SPREAD_TRADING_ENABLED=true`.
 
 ## PR 3c Production Validation
 

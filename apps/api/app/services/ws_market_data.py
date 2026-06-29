@@ -137,8 +137,11 @@ PRICE_FIELD_KEYS = {
     "implied_no_ask": ("implied_no_ask", "no_ask_dollars", "no_ask"),
 }
 EXECUTABLE_YES_PRICE_ATTRS = {"yes_ask", "implied_yes_ask", "no_bid", "best_no_bid"}
+EXECUTABLE_NO_PRICE_ATTRS = {"no_ask", "implied_no_ask", "yes_bid", "best_yes_bid"}
+EXECUTABLE_PRICE_ATTRS = EXECUTABLE_YES_PRICE_ATTRS | EXECUTABLE_NO_PRICE_ATTRS
 POSITION_MARK_PRICE_ATTRS = {"yes_bid", "best_yes_bid", "no_bid", "best_no_bid", "last_price"}
 INVERSE_YES_PRICE_ATTRS = {"implied_yes_ask", "no_bid", "best_no_bid"}
+INVERSE_NO_PRICE_ATTRS = {"implied_no_ask", "yes_bid", "best_yes_bid"}
 YES_POSITION_MARK_ATTRS = {"yes_bid", "best_yes_bid"}
 NO_POSITION_MARK_ATTRS = {"no_bid", "best_no_bid"}
 ORDERBOOK_SNAPSHOT_LEVEL_KEYS = {
@@ -152,6 +155,7 @@ ORDERBOOK_SNAPSHOT_LEVEL_KEYS = {
     "no_bids": "no_bids",
 }
 WS_ORDERBOOK_RAW_KEY = "websocket_orderbook"
+WS_PRICE_UPDATED_AT_KEY = "websocket_price_updated_at"
 YES_BOOK_KEYS = ("yes_dollars", "yes", "yes_bids")
 NO_BOOK_KEYS = ("no_dollars", "no", "no_bids")
 DOLLAR_BOOK_KEYS = {"yes_dollars", "no_dollars"}
@@ -220,6 +224,46 @@ def _store_ws_orderbook(market: KalshiMarket, book: dict[str, dict[str, str]]) -
     market.orderbook_raw = raw
 
 
+def _ws_price_timestamps(market: KalshiMarket) -> dict[str, str]:
+    raw = market.orderbook_raw if isinstance(market.orderbook_raw, dict) else {}
+    values = raw.get(WS_PRICE_UPDATED_AT_KEY)
+    if not isinstance(values, dict):
+        return {}
+    return {str(key): str(value) for key, value in values.items() if value is not None}
+
+
+def _store_ws_price_timestamps(market: KalshiMarket, timestamps: dict[str, str]) -> None:
+    raw = dict(market.orderbook_raw or {})
+    raw[WS_PRICE_UPDATED_AT_KEY] = dict(timestamps)
+    market.orderbook_raw = raw
+
+
+def _ensure_existing_price_timestamps(market: KalshiMarket) -> None:
+    baseline = market.market_price_updated_at or market.updated_at
+    if baseline is None:
+        return
+    timestamps = _ws_price_timestamps(market)
+    baseline_value = ensure_aware_utc(baseline).isoformat()
+    reset_existing = market.market_data_source != "websocket"
+    changed = False
+    for attr in PRICE_FIELD_KEYS:
+        if getattr(market, attr, None) is not None and (reset_existing or attr not in timestamps):
+            timestamps[attr] = baseline_value
+            changed = True
+    if changed:
+        _store_ws_price_timestamps(market, timestamps)
+
+
+def _record_price_timestamps(market: KalshiMarket, attrs: set[str], observed_at) -> None:
+    if not attrs:
+        return
+    timestamps = _ws_price_timestamps(market)
+    observed_value = ensure_aware_utc(observed_at).isoformat()
+    for attr in attrs:
+        timestamps[attr] = observed_value
+    _store_ws_price_timestamps(market, timestamps)
+
+
 def _snapshot_book_side(levels: object) -> dict[str, str]:
     if not isinstance(levels, list):
         return {}
@@ -282,6 +326,14 @@ def _clear_stale_yes_ask_fields(market: KalshiMarket, executable_attrs: set[str]
     market.yes_ask = None
     if "implied_yes_ask" not in executable_attrs:
         market.implied_yes_ask = None
+
+
+def _clear_stale_no_ask_fields(market: KalshiMarket, executable_attrs: set[str]) -> None:
+    if not executable_attrs.intersection(INVERSE_NO_PRICE_ATTRS) or "no_ask" in executable_attrs:
+        return
+    market.no_ask = None
+    if "implied_no_ask" not in executable_attrs:
+        market.implied_no_ask = None
 
 
 def _orderbook_snapshot_prices(market: KalshiMarket, payload: dict[str, Any]) -> dict[str, Decimal | None]:
@@ -370,15 +422,18 @@ def apply_ws_market_update(session: Session, ticker: str, payload: dict[str, Any
     if market is None:
         return {"updated": False, "reason": "unknown_market", "ticker": ticker}
 
+    _ensure_existing_price_timestamps(market)
     price_applied = False
     executable_attrs_applied: set[str] = set()
+    price_attrs_applied: set[str] = set()
     mark_sides_applied: set[str] = set()
     for attr, keys in PRICE_FIELD_KEYS.items():
         value = _payload_price(payload, keys)
         if value is not None:
             setattr(market, attr, value)
             price_applied = True
-            if attr in EXECUTABLE_YES_PRICE_ATTRS:
+            price_attrs_applied.add(attr)
+            if attr in EXECUTABLE_PRICE_ATTRS:
                 executable_attrs_applied.add(attr)
             mark_sides_applied.update(_mark_sides_for_attr(attr, value))
     for attr, value in {
@@ -387,10 +442,13 @@ def apply_ws_market_update(session: Session, ticker: str, payload: dict[str, Any
     }.items():
         setattr(market, attr, value)
         price_applied = True
-        if value is not None and attr in EXECUTABLE_YES_PRICE_ATTRS:
+        if value is not None and attr in EXECUTABLE_PRICE_ATTRS:
+            price_attrs_applied.add(attr)
             executable_attrs_applied.add(attr)
         mark_sides_applied.update(_mark_sides_for_attr(attr, value))
     _clear_stale_yes_ask_fields(market, executable_attrs_applied)
+    _clear_stale_no_ask_fields(market, executable_attrs_applied)
+    _record_price_timestamps(market, price_attrs_applied, now)
     market.websocket_updated_at = now
     if price_applied:
         market.market_data_source = "websocket"
