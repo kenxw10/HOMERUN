@@ -331,13 +331,27 @@ def _decision_breakdown(candidates: list[ModelCandidate]) -> tuple[dict[str, dic
 
 
 def _latest_job_status(session: Session, epoch: PaperTradingEpoch) -> dict[str, JobRunSummary]:
+    job_names = ["daily-setup", "candidate-sweep", "price-refresh", "settlement", "governance"]
+    ranked = (
+        select(
+            JobRun.id.label("job_run_id"),
+            func.row_number()
+            .over(
+                partition_by=JobRun.job_name,
+                order_by=(JobRun.started_at.desc(), JobRun.id.desc()),
+            )
+            .label("job_rank"),
+        )
+        .where(JobRun.job_name.in_(job_names))
+        .where(JobRun.paper_trading_epoch_id == epoch.id)
+        .subquery()
+    )
     rows = list(
         session.scalars(
             select(JobRun)
-            .where(JobRun.job_name.in_(["daily-setup", "candidate-sweep", "price-refresh", "settlement", "governance"]))
-            .where(JobRun.paper_trading_epoch_id == epoch.id)
-            .order_by(JobRun.started_at.desc(), JobRun.id.desc())
-            .limit(50)
+            .join(ranked, JobRun.id == ranked.c.job_run_id)
+            .where(ranked.c.job_rank == 1)
+            .order_by(JobRun.job_name.asc())
         )
     )
     latest: dict[str, JobRunSummary] = {}

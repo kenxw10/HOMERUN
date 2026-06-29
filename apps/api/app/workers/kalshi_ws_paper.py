@@ -131,14 +131,12 @@ async def _run_worker_once() -> dict[str, object]:
             applied_updates = 0
             last_ticker: str | None = None
             last_result: dict[str, object] | None = None
-            loop = asyncio.get_running_loop()
-            deadline = loop.time() + settings.ws_heartbeat_timeout_seconds
             while True:
-                remaining = deadline - loop.time()
-                if remaining <= 0:
-                    break
                 try:
-                    raw = await asyncio.wait_for(websocket.recv(), timeout=remaining)
+                    raw = await asyncio.wait_for(
+                        websocket.recv(),
+                        timeout=settings.ws_heartbeat_timeout_seconds,
+                    )
                 except asyncio.TimeoutError:
                     break
                 payload = json.loads(raw)

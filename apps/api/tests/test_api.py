@@ -493,6 +493,46 @@ def test_dashboard_job_status_is_scoped_to_active_epoch() -> None:
     assert summary.job_status["candidate-sweep"].result == {"epoch": "active"}
 
 
+def test_dashboard_job_status_fetches_latest_per_job_without_global_truncation() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+
+    with Session(engine) as session:
+        active = get_or_create_active_paper_epoch(session, starting_balance=Decimal("500.00"))
+        rows: list[JobRun] = []
+        for index in range(55):
+            rows.append(
+                JobRun(
+                    job_name="price-refresh",
+                    job_type="paper_ops",
+                    paper_trading_epoch_id=active.id,
+                    status="succeeded",
+                    started_at=now + timedelta(minutes=index),
+                    completed_at=now + timedelta(minutes=index, seconds=10),
+                    result={"refresh_index": index},
+                )
+            )
+        rows.append(
+            JobRun(
+                job_name="governance",
+                job_type="paper_ops",
+                paper_trading_epoch_id=active.id,
+                status="succeeded",
+                started_at=now - timedelta(hours=1),
+                completed_at=now - timedelta(minutes=59),
+                result={"governance": "present"},
+            )
+        )
+        session.add_all(rows)
+        session.commit()
+
+        summary = dashboard.dashboard_summary_from_db(session)
+
+    assert summary.job_status["price-refresh"].result == {"refresh_index": 54}
+    assert summary.job_status["governance"].result == {"governance": "present"}
+
+
 def test_system_status_redacts_secrets_and_allows_missing_database() -> None:
     response = client.get("/v1/system/status")
 
@@ -1473,18 +1513,24 @@ def test_ws_worker_continues_after_first_ticker_update(monkeypatch) -> None:
     class FakeWebSocket:
         def __init__(self) -> None:
             self.messages = [
-                json.dumps({"type": "subscribed", "msg": {"channel": "ticker"}}),
-                json.dumps(
-                    {
-                        "type": "ticker",
-                        "msg": {"market_ticker": "KXMLBGAME-WS-LOOP-PIT", "yes_bid_dollars": "0.6100"},
-                    }
+                (0, json.dumps({"type": "subscribed", "msg": {"channel": "ticker"}})),
+                (
+                    0.6,
+                    json.dumps(
+                        {
+                            "type": "ticker",
+                            "msg": {"market_ticker": "KXMLBGAME-WS-LOOP-PIT", "yes_bid_dollars": "0.6100"},
+                        }
+                    ),
                 ),
-                json.dumps(
-                    {
-                        "type": "ticker",
-                        "msg": {"market_ticker": "KXMLBGAME-WS-LOOP-PIT", "yes_bid_dollars": "0.6200"},
-                    }
+                (
+                    0.6,
+                    json.dumps(
+                        {
+                            "type": "ticker",
+                            "msg": {"market_ticker": "KXMLBGAME-WS-LOOP-PIT", "yes_bid_dollars": "0.6200"},
+                        }
+                    ),
                 ),
             ]
 
@@ -1500,7 +1546,9 @@ def test_ws_worker_continues_after_first_ticker_update(monkeypatch) -> None:
         async def recv(self) -> str:
             if not self.messages:
                 raise asyncio.TimeoutError
-            return self.messages.pop(0)
+            delay, message = self.messages.pop(0)
+            await asyncio.sleep(delay)
+            return message
 
     def fake_connect(uri: str, **kwargs):
         captured["uri"] = uri
