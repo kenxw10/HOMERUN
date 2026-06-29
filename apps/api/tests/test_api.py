@@ -309,6 +309,33 @@ def test_active_paper_epoch_uses_bankroll_starting_balance_by_default(monkeypatc
     assert epoch.starting_balance == Decimal("500.00")
 
 
+def test_archive_current_epoch_preserves_source_starting_balance(monkeypatch) -> None:
+    monkeypatch.setenv("PAPER_STARTING_BALANCE", "1000.00")
+    monkeypatch.setenv("PAPER_BANKROLL_STARTING_BALANCE", "500.00")
+    get_settings.cache_clear()
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    try:
+        with Session(engine) as session:
+            get_or_create_active_paper_epoch(session)
+            archived = reset_paper_trading_epoch(
+                session,
+                archive_current_as="pre_pr3d_validation",
+                new_epoch="pr3d_paper_observation_v1",
+                starting_balance=Decimal("500.00"),
+                archive_open_positions=True,
+                reset_dashboard_metrics=True,
+                confirmation=RESET_CONFIRMATION,
+            )
+            archived_epoch = session.scalar(select(PaperTradingEpoch).where(PaperTradingEpoch.epoch_key == archived["archived_epoch_key"]))
+    finally:
+        get_settings.cache_clear()
+
+    assert archived_epoch is not None
+    assert archived_epoch.starting_balance == Decimal("500.00")
+
+
 def test_paper_epoch_reset_carries_open_positions_into_new_epoch() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
@@ -524,6 +551,17 @@ def test_dashboard_job_status_fetches_latest_per_job_without_global_truncation()
                 result={"governance": "present"},
             )
         )
+        rows.append(
+            JobRun(
+                job_name="full-paper-cycle",
+                job_type="paper_ops",
+                paper_trading_epoch_id=active.id,
+                status="succeeded",
+                started_at=now - timedelta(minutes=30),
+                completed_at=now - timedelta(minutes=29),
+                result={"cycle": "present"},
+            )
+        )
         session.add_all(rows)
         session.commit()
 
@@ -531,6 +569,7 @@ def test_dashboard_job_status_fetches_latest_per_job_without_global_truncation()
 
     assert summary.job_status["price-refresh"].result == {"refresh_index": 54}
     assert summary.job_status["governance"].result == {"governance": "present"}
+    assert summary.job_status["full-paper-cycle"].result == {"cycle": "present"}
 
 
 def test_system_status_redacts_secrets_and_allows_missing_database() -> None:

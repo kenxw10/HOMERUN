@@ -331,7 +331,7 @@ def _decision_breakdown(candidates: list[ModelCandidate]) -> tuple[dict[str, dic
 
 
 def _latest_job_status(session: Session, epoch: PaperTradingEpoch) -> dict[str, JobRunSummary]:
-    job_names = ["daily-setup", "candidate-sweep", "price-refresh", "settlement", "governance"]
+    job_names = ["daily-setup", "candidate-sweep", "price-refresh", "settlement", "governance", "full-paper-cycle"]
     ranked = (
         select(
             JobRun.id.label("job_run_id"),

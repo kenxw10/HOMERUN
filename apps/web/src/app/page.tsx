@@ -925,6 +925,7 @@ function jobStatusRows(summary: DashboardSummary): StatusRow[] {
     ["LAST PRICE REFRESH", "price-refresh"],
     ["LAST SETTLEMENT", "settlement"],
     ["LAST GOVERNANCE", "governance"],
+    ["FULL PAPER CYCLE", "full-paper-cycle"],
   ];
   const rows = jobLabels.map(([label, key]) => {
     const job = summary.job_status[key];

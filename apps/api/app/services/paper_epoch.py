@@ -143,6 +143,8 @@ def archive_current_epoch(
     reason: str = "paper_epoch_reset",
 ) -> PaperTradingEpoch:
     now = utc_now()
+    active_epochs = _active_epochs(session)
+    archive_starting_balance = _money(active_epochs[0].starting_balance) if active_epochs else _money(get_settings().paper_bankroll_starting_balance)
     archive = session.scalar(select(PaperTradingEpoch).where(PaperTradingEpoch.epoch_key == archive_key))
     if archive is None:
         archive = PaperTradingEpoch(
@@ -150,7 +152,7 @@ def archive_current_epoch(
             display_name=_display_name(archive_key),
             status="archived",
             mode="paper",
-            starting_balance=_money(get_settings().paper_starting_balance),
+            starting_balance=archive_starting_balance,
             started_at=now,
             archived_at=now,
             archive_reason=reason,
@@ -166,7 +168,7 @@ def archive_current_epoch(
         session.add(archive)
         session.flush()
 
-    active_ids = [epoch.id for epoch in _active_epochs(session)]
+    active_ids = [epoch.id for epoch in active_epochs]
     source_ids = set(active_ids)
     for epoch_id in active_ids:
         epoch = session.get(PaperTradingEpoch, epoch_id)
