@@ -3099,6 +3099,7 @@ def test_generate_candidates_refreshes_existing_open_trade_price(monkeypatch) ->
             status="open",
             occurrence_datetime=datetime(2026, 7, 4, 0, 0, tzinfo=UTC),
             implied_yes_ask=Decimal("0.4000"),
+            best_yes_bid=Decimal("0.3800"),
         )
         session.add_all([game, market])
         _add_candidate_mapping(session, game, market)
@@ -3111,6 +3112,7 @@ def test_generate_candidates_refreshes_existing_open_trade_price(monkeypatch) ->
 
         current_time["now"] = datetime(2026, 7, 2, 16, 0, tzinfo=UTC)
         market.implied_yes_ask = Decimal("0.3200")
+        market.best_yes_bid = Decimal("0.2800")
         market.market_price_updated_at = current_time["now"]
         session.add(market)
         session.commit()
@@ -3124,7 +3126,63 @@ def test_generate_candidates_refreshes_existing_open_trade_price(monkeypatch) ->
     assert len(all_trades) == 1
     assert refreshed_trade is not None
     assert refreshed_trade.entry_price == Decimal("0.4000")
-    assert refreshed_trade.current_price == Decimal("0.3200")
+    assert refreshed_trade.current_price == Decimal("0.2800")
+
+
+def test_generate_candidates_refreshes_existing_no_trade_with_no_bid_mark(monkeypatch) -> None:
+    _relax_data_quality_gate(monkeypatch)
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+    monkeypatch.setattr(candidates, "utc_now", lambda: now)
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        epoch_id = _active_epoch_id(session)
+        game = MlbGame(
+            external_game_id="refresh-no-1",
+            home_team="New York Yankees",
+            away_team="Boston Red Sox",
+            home_abbreviation="NYY",
+            away_abbreviation="BOS",
+            scheduled_start=datetime(2026, 7, 4, 0, 0, tzinfo=UTC),
+            status="scheduled",
+        )
+        market = KalshiMarket(
+            kalshi_market_id="KX-REFRESH-NO",
+            ticker="KXMLBGAME-REFRESH-NO-NYY",
+            title="Will the New York Yankees win the game against the Boston Red Sox?",
+            status="open",
+            occurrence_datetime=datetime(2026, 7, 4, 0, 0, tzinfo=UTC),
+            no_ask=Decimal("0.4500"),
+            best_no_bid=Decimal("0.3100"),
+            market_price_updated_at=now,
+        )
+        session.add_all([game, market])
+        _add_candidate_mapping(session, game, market)
+        trade = PaperTrade(
+            paper_trading_epoch_id=epoch_id,
+            market_ticker=market.ticker,
+            contract_side="no",
+            entry_price=Decimal("0.4500"),
+            current_price=Decimal("0.4500"),
+            quantity=1,
+            entry_time=now - timedelta(minutes=30),
+            status="open",
+        )
+        session.add(trade)
+        session.commit()
+
+        result = candidates.generate_candidates(session, target_date=date(2026, 7, 3))
+        refreshed_trade = session.get(PaperTrade, trade.id)
+        no_candidate = session.scalar(select(ModelCandidate).where(ModelCandidate.contract_side == "no"))
+
+    assert result["paper_trades"] == 0
+    assert refreshed_trade is not None
+    assert refreshed_trade.entry_price == Decimal("0.4500")
+    assert refreshed_trade.current_price == Decimal("0.3100")
+    assert no_candidate is not None
+    assert no_candidate.executable_price == Decimal("0.4500")
 
 
 def test_generate_candidates_blocks_unknown_market_type_from_paper_trading(monkeypatch) -> None:

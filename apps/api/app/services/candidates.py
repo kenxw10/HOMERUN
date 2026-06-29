@@ -176,6 +176,22 @@ def _market_yes_price_context(market: KalshiMarket, now: datetime) -> PriceConte
     return _market_side_price_context(market, "yes", now)
 
 
+def _open_trade_mark_price(market: KalshiMarket, side: str) -> Decimal | None:
+    if side.strip().lower() == "yes":
+        for value in (market.best_yes_bid, market.yes_bid, market.last_price):
+            if value is not None:
+                return value.quantize(Decimal("0.0001"))
+    else:
+        for value in (market.best_no_bid, market.no_bid):
+            if value is not None:
+                return value.quantize(Decimal("0.0001"))
+        if market.last_price is not None:
+            complement = (Decimal("1.0000") - market.last_price).quantize(Decimal("0.0001"))
+            if complement >= Decimal("0"):
+                return complement
+    return None
+
+
 def _market_side_price_context(market: KalshiMarket, side: str, now: datetime) -> PriceContext:
     settings = get_settings()
     normalized_side = side.strip().lower()
@@ -1279,8 +1295,10 @@ def generate_candidates(session: Session, target_date: date | None = None) -> di
                 evaluated_at=now,
             )
             candidate.paper_trading_epoch_id = active_epoch.id
-            if open_trade_for_market is not None and price is not None:
-                open_trade_for_market.current_price = price
+            if open_trade_for_market is not None:
+                mark_price = _open_trade_mark_price(market, contract_side)
+                if mark_price is not None:
+                    open_trade_for_market.current_price = mark_price
                 open_trade_for_market.market_display = open_trade_for_market.market_display or actual_display
                 open_trade_for_market.selection_display = open_trade_for_market.selection_display or labels.selection_display
                 open_trade_for_market.matchup_display = open_trade_for_market.matchup_display or labels.matchup_display
