@@ -137,7 +137,7 @@ PRICE_FIELD_KEYS = {
     "implied_no_ask": ("implied_no_ask", "no_ask_dollars", "no_ask"),
 }
 EXECUTABLE_YES_PRICE_ATTRS = {"yes_ask", "implied_yes_ask", "no_bid", "best_no_bid"}
-EXECUTABLE_NO_PRICE_ATTRS = {"no_ask", "implied_no_ask"}
+EXECUTABLE_NO_PRICE_ATTRS = {"no_ask", "implied_no_ask", "yes_bid", "best_yes_bid"}
 EXECUTABLE_PRICE_ATTRS = EXECUTABLE_YES_PRICE_ATTRS | EXECUTABLE_NO_PRICE_ATTRS
 POSITION_MARK_PRICE_ATTRS = {"yes_bid", "best_yes_bid", "no_bid", "best_no_bid", "last_price"}
 INVERSE_YES_PRICE_ATTRS = {"implied_yes_ask", "no_bid", "best_no_bid"}
@@ -280,7 +280,7 @@ def _mark_sides_for_attr(attr: str, value: Decimal | None) -> set[str]:
 
 
 def _clear_stale_yes_ask_fields(market: KalshiMarket, executable_attrs: set[str]) -> None:
-    if not executable_attrs.intersection(INVERSE_YES_PRICE_ATTRS) or "yes_ask" in executable_attrs:
+    if not executable_attrs or "yes_ask" in executable_attrs:
         return
     market.yes_ask = None
     if "implied_yes_ask" not in executable_attrs:
@@ -288,7 +288,7 @@ def _clear_stale_yes_ask_fields(market: KalshiMarket, executable_attrs: set[str]
 
 
 def _clear_stale_no_ask_fields(market: KalshiMarket, executable_attrs: set[str]) -> None:
-    if not executable_attrs.intersection(INVERSE_NO_PRICE_ATTRS) or "no_ask" in executable_attrs:
+    if not executable_attrs or "no_ask" in executable_attrs:
         return
     market.no_ask = None
     if "implied_no_ask" not in executable_attrs:
@@ -398,7 +398,7 @@ def apply_ws_market_update(session: Session, ticker: str, payload: dict[str, Any
     }.items():
         setattr(market, attr, value)
         price_applied = True
-        if value is not None and attr in EXECUTABLE_YES_PRICE_ATTRS:
+        if value is not None and attr in EXECUTABLE_PRICE_ATTRS:
             executable_attrs_applied.add(attr)
         mark_sides_applied.update(_mark_sides_for_attr(attr, value))
     _clear_stale_yes_ask_fields(market, executable_attrs_applied)
