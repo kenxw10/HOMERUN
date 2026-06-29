@@ -1,11 +1,15 @@
+import asyncio
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 import json
+import sys
+from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -844,6 +848,42 @@ def test_job_lock_is_committed_before_steps_execute(monkeypatch, tmp_path) -> No
     assert result["result"] == {"lock_visible": True}
 
 
+def test_running_job_lock_key_is_database_unique() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    target = date(2026, 7, 2)
+    now = datetime(2026, 7, 2, 12, 0, tzinfo=UTC)
+
+    with Session(engine) as session:
+        epoch = get_or_create_active_paper_epoch(session)
+        session.add_all(
+            [
+                JobRun(
+                    job_name="price-refresh",
+                    job_type="paper_ops",
+                    target_date=target,
+                    paper_trading_epoch_id=epoch.id,
+                    status="running",
+                    started_at=now,
+                    lock_key="price-refresh:2026-07-02",
+                    triggered_by="api",
+                ),
+                JobRun(
+                    job_name="price-refresh",
+                    job_type="paper_ops",
+                    target_date=target,
+                    paper_trading_epoch_id=epoch.id,
+                    status="running",
+                    started_at=now,
+                    lock_key="price-refresh:2026-07-02",
+                    triggered_by="cron",
+                ),
+            ]
+        )
+        with pytest.raises(IntegrityError):
+            session.commit()
+
+
 def test_websocket_market_update_only_marks_active_epoch_trade() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
@@ -928,6 +968,120 @@ def test_ws_worker_uses_ticker_channel_and_nested_msg_payload() -> None:
 
     assert ticker == "KXMLBGAME-WS-PIT"
     assert update_payload == {"market_ticker": "KXMLBGAME-WS-PIT", "yes_bid_dollars": "0.5500"}
+
+
+def test_ws_auth_headers_sign_handshake_path() -> None:
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.hazmat.primitives import serialization
+
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode("utf-8")
+
+    headers = kalshi_ws_paper._websocket_auth_headers(
+        "test-key",
+        pem,
+        "wss://demo-api.kalshi.co/trade-api/ws/v2",
+        timestamp_ms="1234567890000",
+    )
+
+    assert headers["KALSHI-ACCESS-KEY"] == "test-key"
+    assert headers["KALSHI-ACCESS-TIMESTAMP"] == "1234567890000"
+    assert headers["KALSHI-ACCESS-SIGNATURE"]
+
+
+def test_ws_worker_skips_ack_before_ticker_update(monkeypatch) -> None:
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.hazmat.primitives import serialization
+
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode("utf-8")
+    monkeypatch.setenv("WEBSOCKET_MARKET_DATA_ENABLED", "true")
+    monkeypatch.setenv("KALSHI_API_KEY", "test-key")
+    monkeypatch.setenv("KALSHI_API_SECRET", pem)
+    monkeypatch.setenv("KALSHI_WS_BASE_URL", "wss://demo-api.kalshi.co/trade-api/ws/v2")
+    get_settings.cache_clear()
+
+    engine = create_engine("sqlite+pysqlite:///:memory:", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    SessionLocal = sessionmaker(bind=engine)
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+    captured: dict[str, object] = {}
+
+    with SessionLocal() as session:
+        epoch = get_or_create_active_paper_epoch(session, starting_balance=Decimal("500.00"))
+        market = KalshiMarket(
+            kalshi_market_id="KX-WS-LOOP",
+            ticker="KXMLBGAME-WS-LOOP-PIT",
+            title="Will Pittsburgh win?",
+            status="open",
+        )
+        trade = PaperTrade(
+            paper_trading_epoch_id=epoch.id,
+            market_ticker="KXMLBGAME-WS-LOOP-PIT",
+            contract_side="yes",
+            entry_price=Decimal("0.4000"),
+            current_price=Decimal("0.4000"),
+            quantity=1,
+            entry_time=now,
+            status="open",
+        )
+        session.add_all([market, trade])
+        session.commit()
+        trade_id = trade.id
+
+    class FakeWebSocket:
+        def __init__(self) -> None:
+            self.messages = [
+                json.dumps({"type": "subscribed", "msg": {"channel": "ticker"}}),
+                json.dumps(
+                    {
+                        "type": "ticker",
+                        "msg": {"market_ticker": "KXMLBGAME-WS-LOOP-PIT", "yes_bid_dollars": "0.6100"},
+                    }
+                ),
+            ]
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def send(self, message: str) -> None:
+            captured["subscribe"] = json.loads(message)
+
+        async def recv(self) -> str:
+            return self.messages.pop(0)
+
+    def fake_connect(uri: str, **kwargs):
+        captured["uri"] = uri
+        captured["headers"] = kwargs.get("additional_headers")
+        return FakeWebSocket()
+
+    monkeypatch.setattr(kalshi_ws_paper, "get_session_factory", lambda: SessionLocal)
+    monkeypatch.setitem(sys.modules, "websockets", SimpleNamespace(connect=fake_connect))
+
+    try:
+        result = asyncio.run(kalshi_ws_paper._run_worker_once())
+        with SessionLocal() as session:
+            refreshed_trade = session.get(PaperTrade, trade_id)
+    finally:
+        get_settings.cache_clear()
+
+    assert result["status"] == "message_applied"
+    assert result["skipped_messages"] == 1
+    assert captured["subscribe"]["params"]["channels"] == ["ticker", "orderbook_delta"]
+    assert captured["headers"]["KALSHI-ACCESS-KEY"] == "test-key"
+    assert refreshed_trade is not None
+    assert refreshed_trade.current_price == Decimal("0.6100")
 
 
 def test_generate_candidates_does_not_reuse_archived_epoch_candidate(monkeypatch) -> None:

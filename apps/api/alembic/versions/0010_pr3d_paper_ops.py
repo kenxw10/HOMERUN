@@ -209,6 +209,14 @@ def upgrade() -> None:
     op.create_index("ix_job_runs_lock_status", "job_runs", ["lock_key", "status"])
     op.create_index("ix_job_runs_started_at", "job_runs", ["started_at"])
     op.create_index("ix_job_runs_epoch", "job_runs", ["paper_trading_epoch_id"])
+    op.create_index(
+        "uq_job_runs_running_lock_key",
+        "job_runs",
+        ["lock_key"],
+        unique=True,
+        postgresql_where=sa.text("status = 'running'"),
+        sqlite_where=sa.text("status = 'running'"),
+    )
 
     op.create_table(
         "market_data_worker_status",
@@ -236,6 +244,7 @@ def downgrade() -> None:
     _set_fast_postgres_timeouts()
 
     op.drop_table("market_data_worker_status")
+    op.drop_index("uq_job_runs_running_lock_key", table_name="job_runs")
     op.drop_index("ix_job_runs_epoch", table_name="job_runs")
     op.drop_index("ix_job_runs_started_at", table_name="job_runs")
     op.drop_index("ix_job_runs_lock_status", table_name="job_runs")

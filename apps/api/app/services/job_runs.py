@@ -5,6 +5,7 @@ from datetime import date, timedelta
 from typing import Any
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models import JobRun
@@ -80,14 +81,8 @@ def acquire_job_lock(
     epoch = get_or_create_active_paper_epoch(session)
     mark_stale_running_jobs(session, max_runtime_minutes=max_runtime_minutes)
     lock_key = f"{job_name}:{target_date.isoformat() if target_date else 'none'}"
-    existing = session.scalar(
-        select(JobRun)
-        .where(JobRun.lock_key == lock_key)
-        .where(JobRun.status == "running")
-        .order_by(JobRun.started_at.desc(), JobRun.id.desc())
-        .limit(1)
-    )
-    if existing is not None:
+
+    def skipped_for_existing(existing: JobRun) -> tuple[JobRun, bool]:
         skipped = JobRun(
             job_name=job_name,
             job_type="paper_ops",
@@ -110,6 +105,16 @@ def acquire_job_lock(
         session.flush()
         return skipped, False
 
+    existing = session.scalar(
+        select(JobRun)
+        .where(JobRun.lock_key == lock_key)
+        .where(JobRun.status == "running")
+        .order_by(JobRun.started_at.desc(), JobRun.id.desc())
+        .limit(1)
+    )
+    if existing is not None:
+        return skipped_for_existing(existing)
+
     run = JobRun(
         job_name=job_name,
         job_type="paper_ops",
@@ -127,7 +132,21 @@ def acquire_job_lock(
         idempotency_key=lock_key,
     )
     session.add(run)
-    session.flush()
+    try:
+        session.flush()
+    except IntegrityError:
+        session.rollback()
+        epoch = get_or_create_active_paper_epoch(session)
+        existing = session.scalar(
+            select(JobRun)
+            .where(JobRun.lock_key == lock_key)
+            .where(JobRun.status == "running")
+            .order_by(JobRun.started_at.desc(), JobRun.id.desc())
+            .limit(1)
+        )
+        if existing is None:
+            raise
+        return skipped_for_existing(existing)
     return run, True
 
 

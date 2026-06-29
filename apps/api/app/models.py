@@ -5,7 +5,7 @@ from decimal import Decimal
 
 from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Index, Integer, JSON, Numeric, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
-from sqlalchemy.sql import func
+from sqlalchemy.sql import func, text
 
 from app.database import Base
 
@@ -644,6 +644,13 @@ class JobRun(TimestampMixin, Base):
         Index("ix_job_runs_lock_status", "lock_key", "status"),
         Index("ix_job_runs_started_at", "started_at"),
         Index("ix_job_runs_epoch", "paper_trading_epoch_id"),
+        Index(
+            "uq_job_runs_running_lock_key",
+            "lock_key",
+            unique=True,
+            postgresql_where=text("status = 'running'"),
+            sqlite_where=text("status = 'running'"),
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
