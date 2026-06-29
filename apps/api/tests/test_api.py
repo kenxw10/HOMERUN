@@ -11024,6 +11024,7 @@ def test_paper_supported_market_family_can_create_pre_model_paper_trade(monkeypa
     assert candidate.model_probability != Decimal("0.500000")
     assert candidate.model_version_tag == modeling.MATURE_MODEL_TAG
     assert candidate.training_eligible is False
+    assert candidate.training_exclusion_reason == "spread_trading_disabled"
     assert candidate.decision == "no_trade_spread_trading_disabled"
     assert feature_snapshot is not None
     assert feature_snapshot.source == features.FEATURE_VERSION
@@ -11084,6 +11085,8 @@ def test_event_level_spread_with_parsed_selection_can_create_paper_trade(monkeyp
     assert result["paper_trades"] == 0
     assert candidate is not None
     assert candidate.decision == "no_trade_spread_trading_disabled"
+    assert candidate.training_eligible is False
+    assert candidate.training_exclusion_reason == "spread_trading_disabled"
     assert candidate.selection_code == "PIT"
     assert candidate.selection_display == "PIT -1.5"
     assert trade is None

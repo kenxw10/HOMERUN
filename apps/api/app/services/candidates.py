@@ -1313,6 +1313,9 @@ def generate_candidates(session: Session, target_date: date | None = None) -> di
             elif decision == "no_trade_mapping_uncertain":
                 candidate.training_eligible = False
                 candidate.training_exclusion_reason = "mapping_uncertain"
+            elif decision == "no_trade_spread_trading_disabled":
+                candidate.training_eligible = False
+                candidate.training_exclusion_reason = "spread_trading_disabled"
             candidate.data_quality = model_score.data_quality
             candidate.calibration_status = model_score.calibration_status
             candidate.scoring_rationale = {
