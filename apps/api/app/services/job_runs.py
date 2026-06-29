@@ -18,7 +18,7 @@ from app.services.paper_epoch import get_or_create_active_paper_epoch
 from app.services.portfolio import create_balance_snapshot
 from app.services.position_refresh import refresh_open_position_prices
 from app.services.settlement import settle_paper_trades
-from app.time_utils import today_eastern, utc_now
+from app.time_utils import ensure_aware_utc, today_eastern, utc_now
 
 JOB_NAMES = {
     "daily-setup",
@@ -44,7 +44,7 @@ def resolve_job_target_date(value: str | date | None) -> date | None:
 
 
 def _duration_seconds(started_at) -> int:
-    return max(0, int((utc_now() - started_at).total_seconds()))
+    return max(0, int((utc_now() - ensure_aware_utc(started_at)).total_seconds()))
 
 
 def mark_stale_running_jobs(session: Session, *, max_runtime_minutes: int = 60) -> int:
@@ -252,6 +252,7 @@ def run_job(
         session.commit()
         return {"job_run_id": run.id, "status": run.status, **(run.result or {})}
 
+    session.commit()
     try:
         result = _execute_job_steps(session, run, job_name, target_date)
         run.status = "succeeded"

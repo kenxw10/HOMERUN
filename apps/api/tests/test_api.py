@@ -51,6 +51,7 @@ from app.services import (
     candidates,
     dashboard,
     features,
+    job_runs,
     market_family_discovery,
     market_family_mapping,
     market_sync,
@@ -782,6 +783,65 @@ def test_job_lock_skips_existing_running_job() -> None:
     assert result["skipped_reason"] == "skipped_existing_run"
     assert skipped is not None
     assert skipped.result["existing_run_id"] == running_id
+
+
+def test_job_endpoint_accepts_symbolic_target_date(monkeypatch) -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    SessionLocal = sessionmaker(bind=engine)
+    captured: dict[str, object] = {}
+
+    def fake_run_job(session, *, job_name, target_date, triggered_by, max_runtime_minutes=60):
+        captured["job_name"] = job_name
+        captured["target_date"] = target_date
+        captured["triggered_by"] = triggered_by
+        return {"status": "succeeded", "target_date": target_date.isoformat()}
+
+    monkeypatch.setattr(
+        main_module,
+        "database_status",
+        lambda: {"ready": True, "configured": True, "dialect": "sqlite", "message": "ok"},
+    )
+    monkeypatch.setattr(main_module, "get_session_factory", lambda: SessionLocal)
+    monkeypatch.setattr(main_module, "run_job", fake_run_job)
+    monkeypatch.setattr(job_runs, "today_eastern", lambda: date(2026, 7, 2))
+    app.dependency_overrides[require_internal_api_key] = lambda: None
+
+    try:
+        response = client.post("/v1/jobs/run/daily-setup?target_date=today_et")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert captured == {"job_name": "daily-setup", "target_date": date(2026, 7, 2), "triggered_by": "api"}
+    assert response.json()["result"]["target_date"] == "2026-07-02"
+
+
+def test_job_lock_is_committed_before_steps_execute(monkeypatch, tmp_path) -> None:
+    db_path = tmp_path / "job-lock.sqlite"
+    engine = create_engine(f"sqlite+pysqlite:///{db_path}")
+    Base.metadata.create_all(engine)
+    observed: dict[str, object] = {}
+
+    def fake_execute_steps(session, run, job_name, target_date):
+        with Session(engine) as verifier:
+            visible_run = verifier.scalar(select(JobRun).where(JobRun.id == run.id))
+        observed["visible_status"] = visible_run.status if visible_run else None
+        return {"lock_visible": visible_run is not None}
+
+    monkeypatch.setattr(job_runs, "_execute_job_steps", fake_execute_steps)
+
+    with Session(engine) as session:
+        result = job_runs.run_job(
+            session,
+            job_name="price-refresh",
+            target_date=date(2026, 7, 2),
+            triggered_by="api",
+        )
+
+    assert observed["visible_status"] == "running"
+    assert result["status"] == "succeeded"
+    assert result["result"] == {"lock_visible": True}
 
 
 def test_websocket_market_update_only_marks_active_epoch_trade() -> None:

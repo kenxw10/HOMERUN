@@ -56,7 +56,7 @@ from app.services.modeling import (
     repair_training_eligibility,
     run_model_governance,
 )
-from app.services.job_runs import run_job
+from app.services.job_runs import resolve_job_target_date, run_job
 from app.services.market_sync import resolve_preview_for_date, sync_kalshi_markets
 from app.services.mlb import sync_results, sync_schedule
 from app.services.position_refresh import refresh_open_position_prices
@@ -405,15 +405,22 @@ def websocket_status(_: None = Depends(require_internal_api_key)) -> RunResponse
     return RunResponse(ok=True, action="websocket_status", result=result)
 
 
-def _run_named_job(job_name: str, target_date: date | None, triggered_by: str = "api") -> RunResponse:
+def _run_named_job(job_name: str, target_date: str | date | None, triggered_by: str = "api") -> RunResponse:
+    try:
+        resolved_target_date = resolve_job_target_date(target_date)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Invalid target_date. Use YYYY-MM-DD, today_et, or yesterday_et.",
+        ) from exc
     with _db_session_or_503() as session:
-        result = run_job(session, job_name=job_name, target_date=target_date, triggered_by=triggered_by)
+        result = run_job(session, job_name=job_name, target_date=resolved_target_date, triggered_by=triggered_by)
     return RunResponse(ok=result.get("status") not in {"failed", "failed_stale"}, action=f"job_{job_name}", result=result)
 
 
 @app.post("/v1/jobs/run/daily-setup", response_model=RunResponse)
 def run_daily_setup_job(
-    target_date: date | None = Query(default=None),
+    target_date: str | None = Query(default=None),
     _: None = Depends(require_internal_api_key),
 ) -> RunResponse:
     return _run_named_job("daily-setup", target_date)
@@ -421,7 +428,7 @@ def run_daily_setup_job(
 
 @app.post("/v1/jobs/run/candidate-sweep", response_model=RunResponse)
 def run_candidate_sweep_job(
-    target_date: date | None = Query(default=None),
+    target_date: str | None = Query(default=None),
     _: None = Depends(require_internal_api_key),
 ) -> RunResponse:
     return _run_named_job("candidate-sweep", target_date)
@@ -429,7 +436,7 @@ def run_candidate_sweep_job(
 
 @app.post("/v1/jobs/run/price-refresh", response_model=RunResponse)
 def run_price_refresh_job(
-    target_date: date | None = Query(default=None),
+    target_date: str | None = Query(default=None),
     _: None = Depends(require_internal_api_key),
 ) -> RunResponse:
     return _run_named_job("price-refresh", target_date)
@@ -437,7 +444,7 @@ def run_price_refresh_job(
 
 @app.post("/v1/jobs/run/settlement", response_model=RunResponse)
 def run_settlement_job(
-    target_date: date | None = Query(default=None),
+    target_date: str | None = Query(default=None),
     _: None = Depends(require_internal_api_key),
 ) -> RunResponse:
     return _run_named_job("settlement", target_date)
@@ -450,7 +457,7 @@ def run_governance_job(_: None = Depends(require_internal_api_key)) -> RunRespon
 
 @app.post("/v1/jobs/run/full-paper-cycle", response_model=RunResponse)
 def run_full_paper_cycle_job(
-    target_date: date | None = Query(default=None),
+    target_date: str | None = Query(default=None),
     _: None = Depends(require_internal_api_key),
 ) -> RunResponse:
     return _run_named_job("full-paper-cycle", target_date)
