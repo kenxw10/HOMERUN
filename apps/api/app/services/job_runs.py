@@ -29,6 +29,13 @@ JOB_NAMES = {
     "governance",
     "full-paper-cycle",
 }
+DATE_INSENSITIVE_LOCK_JOBS = {"price-refresh"}
+
+
+def _job_lock_key(job_name: str, target_date: date | None) -> str:
+    if job_name in DATE_INSENSITIVE_LOCK_JOBS:
+        return f"{job_name}:global"
+    return f"{job_name}:{target_date.isoformat() if target_date else 'none'}"
 
 
 def resolve_job_target_date(value: str | date | None) -> date | None:
@@ -80,7 +87,7 @@ def acquire_job_lock(
         raise ValueError(f"Unknown job: {job_name}")
     epoch = get_or_create_active_paper_epoch(session)
     mark_stale_running_jobs(session, max_runtime_minutes=max_runtime_minutes)
-    lock_key = f"{job_name}:{target_date.isoformat() if target_date else 'none'}"
+    lock_key = _job_lock_key(job_name, target_date)
 
     def skipped_for_existing(existing: JobRun) -> tuple[JobRun, bool]:
         skipped = JobRun(

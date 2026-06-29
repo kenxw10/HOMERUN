@@ -39,7 +39,7 @@ from app.schemas import (
 )
 from app.services.contracts import contract_labels, market_type_from_ticker
 from app.services.features import FEATURE_VERSION, source_status_report
-from app.services.portfolio import calculate_paper_portfolio
+from app.services.portfolio import calculate_paper_portfolio, paper_trade_fee
 from app.services.paper_epoch import resolve_epoch_filter
 from app.services.ws_market_data import ws_status_running_is_fresh
 from app.time_utils import eastern_display, ensure_aware_utc, get_dashboard_zone, to_eastern_iso, today_eastern, utc_now
@@ -140,12 +140,13 @@ def _position_from_trade(
     market: KalshiMarket | None = None,
 ) -> PositionSummary:
     current = _first_decimal(trade.exit_price, trade.current_price, trade.entry_price)
+    cost_basis = (trade.entry_price * trade.quantity) + paper_trade_fee(trade)
     pnl = (
         trade.realized_pnl
         if trade.realized_pnl is not None
-        else ((current - trade.entry_price) * trade.quantity).quantize(Decimal("0.01"))
+        else ((current * trade.quantity) - cost_basis).quantize(Decimal("0.01"))
     )
-    pnl_percent = ((pnl / (trade.entry_price * trade.quantity)).quantize(Decimal("0.0001"))) if trade.entry_price else None
+    pnl_percent = (pnl / cost_basis).quantize(Decimal("0.0001")) if cost_basis else None
     fallback_labels = contract_labels(
         game=game,
         market=market,
@@ -307,7 +308,7 @@ def _performance_bucket(trades: list[PaperTrade], key_fn) -> dict[str, dict[str,
         losses = sum(1 for trade in rows if trade.outcome == "loss" or (trade.realized_pnl or Decimal("0")) < 0)
         pushes = sum(1 for trade in rows if trade.outcome in {"push", "void"})
         realized = sum((trade.realized_pnl or Decimal("0")) for trade in rows)
-        stake = sum((trade.entry_price * trade.quantity) for trade in rows)
+        stake = sum(((trade.entry_price * trade.quantity) + paper_trade_fee(trade)) for trade in rows)
         result[key] = {
             "trades": len(rows),
             "win_rate": (wins / len(rows)) if rows else None,
@@ -450,7 +451,7 @@ def dashboard_summary_from_db(
     losses = sum(1 for trade in settled if trade.outcome == "loss" or (trade.realized_pnl or Decimal("0")) < 0)
     pushes = sum(1 for trade in settled if trade.outcome in {"push", "void"})
     realized = sum((trade.realized_pnl or Decimal("0")) for trade in settled)
-    stake = sum((trade.entry_price * trade.quantity) for trade in settled)
+    stake = sum(((trade.entry_price * trade.quantity) + paper_trade_fee(trade)) for trade in settled)
     summary.performance = PerformanceMetrics(
         win_rate=(wins / len(settled)) if settled else None,
         roi=(float(realized / stake) if stake else None),

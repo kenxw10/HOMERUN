@@ -25,6 +25,11 @@ def _money(value: Decimal) -> Decimal:
     return value.quantize(Decimal("0.01"))
 
 
+def paper_trade_fee(trade: PaperTrade) -> Decimal:
+    value = trade.fee_paid if trade.fee_paid is not None else trade.total_fee_estimate
+    return _money(Decimal(value or "0"))
+
+
 def calculate_paper_portfolio(
     session: Session,
     *,
@@ -43,7 +48,9 @@ def calculate_paper_portfolio(
         (trade.realized_pnl or Decimal("0")) for trade in trades if trade.status != "open"
     ) or Decimal("0")
     open_trades = [trade for trade in trades if trade.status == "open"]
-    open_cost = sum(trade.entry_price * Decimal(trade.quantity) for trade in open_trades) or Decimal("0")
+    open_cost = sum(
+        (trade.entry_price * Decimal(trade.quantity)) + paper_trade_fee(trade) for trade in open_trades
+    ) or Decimal("0")
     open_mark = sum(
         (trade.current_price if trade.current_price is not None else trade.entry_price) * Decimal(trade.quantity)
         for trade in open_trades

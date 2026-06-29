@@ -79,6 +79,7 @@ from app.services.mapping import infer_market_type, score_mapping, sync_market_m
 from app.services.modeling import run_model_governance
 from app.services.job_runs import run_job
 from app.services.paper_epoch import RESET_CONFIRMATION, get_or_create_active_paper_epoch, reset_paper_trading_epoch
+from app.services.portfolio import calculate_paper_portfolio
 from app.services.settlement import settle_paper_trades
 from app.time_utils import classify_time_bucket, eastern_display
 from app.workers import kalshi_ws_paper
@@ -1016,6 +1017,34 @@ def test_fixed_risk_sizing_uses_active_epoch_bankroll(monkeypatch) -> None:
     assert candidate.sized_expected_value is not None
 
 
+def test_paper_portfolio_charges_open_trade_fee_estimates() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        epoch = get_or_create_active_paper_epoch(session, starting_balance=Decimal("500.00"))
+        trade = PaperTrade(
+            paper_trading_epoch_id=epoch.id,
+            market_ticker="KXMLBGAME-FEE-OPEN-PIT",
+            contract_side="yes",
+            entry_price=Decimal("0.4000"),
+            current_price=Decimal("0.5000"),
+            quantity=2,
+            entry_time=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
+            status="open",
+            total_fee_estimate=Decimal("0.030000"),
+        )
+        session.add(trade)
+        session.commit()
+
+        totals = calculate_paper_portfolio(session, epoch=epoch)
+
+    assert totals.open_cost == Decimal("0.83")
+    assert totals.cash_balance == Decimal("499.17")
+    assert totals.open_mark_value == Decimal("1.00")
+    assert totals.portfolio_value == Decimal("500.17")
+
+
 def test_job_lock_skips_existing_running_job() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
@@ -1031,7 +1060,7 @@ def test_job_lock_skips_existing_running_job() -> None:
             status="running",
             started_at=datetime(2026, 7, 2, 12, 0, tzinfo=UTC),
             heartbeat_at=datetime(2026, 7, 2, 12, 0, tzinfo=UTC),
-            lock_key="price-refresh:2026-07-02",
+            lock_key="price-refresh:global",
             triggered_by="cron",
         )
         session.add(running)
@@ -1044,6 +1073,39 @@ def test_job_lock_skips_existing_running_job() -> None:
     assert result["status"] == "skipped"
     assert result["skipped_reason"] == "skipped_existing_run"
     assert skipped is not None
+    assert skipped.result["existing_run_id"] == running_id
+
+
+def test_price_refresh_lock_key_is_date_insensitive() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    target = date(2026, 7, 2)
+
+    with Session(engine) as session:
+        epoch = get_or_create_active_paper_epoch(session)
+        running = JobRun(
+            job_name="price-refresh",
+            job_type="paper_ops",
+            target_date=target,
+            paper_trading_epoch_id=epoch.id,
+            status="running",
+            started_at=datetime(2026, 7, 2, 12, 0, tzinfo=UTC),
+            heartbeat_at=datetime(2026, 7, 2, 12, 0, tzinfo=UTC),
+            lock_key="price-refresh:global",
+            triggered_by="cron",
+        )
+        session.add(running)
+        session.commit()
+        running_id = running.id
+
+        result = run_job(session, job_name="price-refresh", target_date=None, triggered_by="api")
+        skipped = session.scalar(select(JobRun).where(JobRun.status == "skipped"))
+
+    assert result["status"] == "skipped"
+    assert result["skipped_reason"] == "skipped_existing_run"
+    assert skipped is not None
+    assert skipped.lock_key == "price-refresh:global"
+    assert skipped.target_date is None
     assert skipped.result["existing_run_id"] == running_id
 
 
@@ -1194,7 +1256,7 @@ def test_running_job_lock_key_is_database_unique() -> None:
                     paper_trading_epoch_id=epoch.id,
                     status="running",
                     started_at=now,
-                    lock_key="price-refresh:2026-07-02",
+                    lock_key="price-refresh:global",
                     triggered_by="api",
                 ),
                 JobRun(
@@ -1204,7 +1266,7 @@ def test_running_job_lock_key_is_database_unique() -> None:
                     paper_trading_epoch_id=epoch.id,
                     status="running",
                     started_at=now,
-                    lock_key="price-refresh:2026-07-02",
+                    lock_key="price-refresh:global",
                     triggered_by="cron",
                 ),
             ]
@@ -1295,7 +1357,7 @@ def test_run_step_preserves_completed_details_after_nested_commit_reload() -> No
         job_type="paper_ops",
         status="running",
         started_at=now,
-        lock_key="price-refresh:2026-07-02",
+        lock_key="price-refresh:global",
         triggered_by="api",
         steps=[],
     )
@@ -4333,6 +4395,87 @@ def test_paper_settlement_sync_settles_wins_losses_and_is_idempotent() -> None:
     assert no_trade.outcome == "win"
     assert no_trade.outcome_source == "mlb_results_sync"
     assert no_trade.market_type == "full_game_winner"
+
+
+def test_paper_settlement_charges_stored_trade_fee_estimates() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    settled_at = datetime(2026, 7, 2, 4, 0, tzinfo=UTC)
+
+    with Session(engine) as session:
+        epoch_id = _active_epoch_id(session)
+        game = MlbGame(
+            external_game_id="settle-fee-1",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+            status="Final",
+            home_score=5,
+            away_score=3,
+        )
+        market = KalshiMarket(
+            kalshi_market_id="KX-SETTLE-FEE",
+            ticker="KXMLBGAME-26JUL011900SEAPIT-PIT",
+            title="Will Pittsburgh win?",
+            status="closed",
+        )
+        session.add_all([game, market])
+        session.flush()
+        mapping = MarketMapping(
+            mlb_game_id=game.id,
+            kalshi_market_id=market.id,
+            mapping_status="confirmed",
+            confidence=Decimal("0.9700"),
+        )
+        session.add(mapping)
+        session.flush()
+        candidate = ModelCandidate(
+            paper_trading_epoch_id=epoch_id,
+            mlb_game_id=game.id,
+            kalshi_market_id=market.id,
+            mapping_id=mapping.id,
+            evaluated_at=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
+            features={},
+            decision="paper_trade",
+            market_type="full_game_winner",
+        )
+        session.add(candidate)
+        session.flush()
+        trade = PaperTrade(
+            paper_trading_epoch_id=epoch_id,
+            candidate_id=candidate.id,
+            market_ticker=market.ticker,
+            contract_side="yes",
+            entry_price=Decimal("0.4000"),
+            current_price=Decimal("0.4000"),
+            quantity=1,
+            entry_time=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
+            status="open",
+            total_fee_estimate=Decimal("0.040000"),
+        )
+        session.add(trade)
+        session.commit()
+
+        result = settle_paper_trades(session, date(2026, 7, 1), now=settled_at)
+        settlement = session.scalar(select(Settlement))
+        summary = dashboard.dashboard_summary_from_db(session)
+        trade_values = {
+            "fee_paid": trade.fee_paid,
+            "realized_pnl": trade.realized_pnl,
+        }
+
+    assert result["settled"] == 1
+    assert trade_values["fee_paid"] == Decimal("0.04")
+    assert trade_values["realized_pnl"] == Decimal("0.56")
+    assert settlement is not None
+    assert settlement.fee_paid == Decimal("0.04")
+    assert settlement.realized_pnl == Decimal("0.56")
+    assert summary.cash_balance == 500.56
+    assert summary.portfolio_value == 500.56
+    assert summary.performance.profit_loss == 0.56
+    assert summary.performance.roi == pytest.approx(float(Decimal("0.56") / Decimal("0.44")))
 
 
 def test_paper_settlement_leaves_untrusted_ticker_selection_unresolved() -> None:
@@ -8153,8 +8296,13 @@ def test_pr3c_trade_policy_caps_slate_trades(monkeypatch) -> None:
     assert prediction_run is not None
     assert prediction_run.trade_policy["paper_max_trades_per_slate"] == 2
     assert snapshot is not None
-    assert snapshot.cash_balance == Decimal("480.00")
-    assert snapshot.portfolio_value == Decimal("500.00")
+    open_cost_with_fees = sum(
+        (trade.entry_price * trade.quantity) + (trade.total_fee_estimate or Decimal("0")) for trade in trades
+    ).quantize(Decimal("0.01"))
+    open_mark_value = sum((trade.current_price or trade.entry_price) * trade.quantity for trade in trades).quantize(Decimal("0.01"))
+    assert open_cost_with_fees > Decimal("20.00")
+    assert snapshot.cash_balance == Decimal("500.00") - open_cost_with_fees
+    assert snapshot.portfolio_value == snapshot.cash_balance + open_mark_value
     assert result["cap_counts"]["no_trade_slate_cap"] == 3
     assert result["decision_counts"] == {"paper_trade": 2, "no_trade_slate_cap": 3}
     assert prediction_run.summary["decision_counts"] == {"paper_trade": 2, "no_trade_slate_cap": 3}

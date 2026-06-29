@@ -19,7 +19,7 @@ from app.services.contracts import (
     market_type_from_ticker,
     selected_team_from_ticker,
 )
-from app.services.portfolio import create_balance_snapshot
+from app.services.portfolio import create_balance_snapshot, paper_trade_fee
 from app.services.paper_epoch import get_or_create_active_paper_epoch
 from app.time_utils import ensure_aware_utc, get_dashboard_zone, utc_now
 
@@ -279,10 +279,10 @@ def _candidate_outcome(
     )
 
 
-def _settlement_amounts(trade: PaperTrade, outcome: str) -> tuple[Decimal, Decimal, Decimal]:
+def _settlement_amounts(trade: PaperTrade, outcome: str) -> tuple[Decimal, Decimal, Decimal, Decimal]:
     quantity = Decimal(trade.quantity)
     cost = trade.entry_price * quantity
-    fee = Decimal("0.00")
+    fee = paper_trade_fee(trade) if outcome in {"win", "loss"} else Decimal("0.00")
     if outcome == "win":
         payout = quantity
         realized = payout - cost - fee
@@ -295,7 +295,7 @@ def _settlement_amounts(trade: PaperTrade, outcome: str) -> tuple[Decimal, Decim
         payout = cost
         realized = Decimal("0.00")
         exit_price = trade.entry_price
-    return payout.quantize(Decimal("0.01")), realized.quantize(Decimal("0.01")), exit_price
+    return payout.quantize(Decimal("0.01")), realized.quantize(Decimal("0.01")), exit_price, fee
 
 
 def _open_position_for_trade(session: Session, trade: PaperTrade) -> Position | None:
@@ -460,8 +460,7 @@ def settle_paper_trades(
             continue
 
         outcome_value, resolution = outcome
-        payout, realized, exit_price = _settlement_amounts(trade, outcome_value)
-        fee = Decimal("0.00")
+        payout, realized, exit_price, fee = _settlement_amounts(trade, outcome_value)
         terminal_status = "void" if outcome_value == "void" else "settled"
 
         trade.status = terminal_status
