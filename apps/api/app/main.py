@@ -466,7 +466,8 @@ def run_full_paper_cycle_job(
 @app.post("/v1/run/model-governance", response_model=RunResponse)
 def run_model_governance_endpoint(_: None = Depends(require_internal_api_key)) -> RunResponse:
     with _db_session_or_503() as session:
-        result = run_model_governance(session)
+        active_epoch = get_or_create_active_paper_epoch(session)
+        result = run_model_governance(session, paper_trading_epoch_id=active_epoch.id)
     return RunResponse(ok=True, action="model_governance", result=result)
 
 

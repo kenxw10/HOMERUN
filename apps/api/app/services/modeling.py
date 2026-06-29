@@ -687,20 +687,24 @@ def _candidate_target_date_matches_game(candidate: ModelCandidate, game: MlbGame
     return candidate.target_date == game_day
 
 
-def _resolved_mature_candidates(session: Session) -> list[ModelCandidate]:
+def _resolved_mature_candidates(session: Session, paper_trading_epoch_id: int | None = None) -> list[ModelCandidate]:
+    stmt = (
+        select(ModelCandidate, MlbGame)
+        .outerjoin(MlbGame, ModelCandidate.mlb_game_id == MlbGame.id)
+        .where(ModelCandidate.outcome.in_(["win", "loss"]))
+        .where(ModelCandidate.training_eligible.is_(True))
+        .where(ModelCandidate.feature_version == FEATURE_VERSION)
+        .where(ModelCandidate.market_family.in_(PAPER_SUPPORTED_MARKET_FAMILIES))
+        .where(ModelCandidate.fee_estimate.is_not(None))
+        .where(ModelCandidate.price_status == "fresh_executable")
+        .where(ModelCandidate.time_to_start_minutes.is_not(None))
+        .where(ModelCandidate.time_to_start_minutes > 0)
+    )
+    if paper_trading_epoch_id is not None:
+        stmt = stmt.where(ModelCandidate.paper_trading_epoch_id == paper_trading_epoch_id)
     rows = list(
         session.execute(
-            select(ModelCandidate, MlbGame)
-            .outerjoin(MlbGame, ModelCandidate.mlb_game_id == MlbGame.id)
-            .where(ModelCandidate.outcome.in_(["win", "loss"]))
-            .where(ModelCandidate.training_eligible.is_(True))
-            .where(ModelCandidate.feature_version == FEATURE_VERSION)
-            .where(ModelCandidate.market_family.in_(PAPER_SUPPORTED_MARKET_FAMILIES))
-            .where(ModelCandidate.fee_estimate.is_not(None))
-            .where(ModelCandidate.price_status == "fresh_executable")
-            .where(ModelCandidate.time_to_start_minutes.is_not(None))
-            .where(ModelCandidate.time_to_start_minutes > 0)
-            .order_by(ModelCandidate.resolved_at.asc().nullslast(), ModelCandidate.evaluated_at.asc())
+            stmt.order_by(ModelCandidate.resolved_at.asc().nullslast(), ModelCandidate.evaluated_at.asc())
         )
     )
     return [candidate for candidate, game in rows if _candidate_target_date_matches_game(candidate, game)]
@@ -823,12 +827,17 @@ def _combine_probability_offsets(
     }
 
 
-def run_model_governance(session: Session, now: datetime | None = None) -> dict[str, object]:
+def run_model_governance(
+    session: Session,
+    now: datetime | None = None,
+    *,
+    paper_trading_epoch_id: int | None = None,
+) -> dict[str, object]:
     settings = get_settings()
     started = now or utc_now()
     active = get_or_create_mature_model_version(session)
     active_parameters = get_or_create_active_parameter_version(session)
-    candidates = _resolved_mature_candidates(session)
+    candidates = _resolved_mature_candidates(session, paper_trading_epoch_id=paper_trading_epoch_id)
     sample_count = len(candidates)
     train_min = settings.model_min_samples_train
     calibrate_min = settings.model_min_samples_calibrate
@@ -847,6 +856,7 @@ def run_model_governance(session: Session, now: datetime | None = None) -> dict[
             "model_version": active.version_tag,
             "feature_version": FEATURE_VERSION,
             "active_parameter_version": active_parameters.version_tag,
+            "paper_trading_epoch_id": paper_trading_epoch_id,
             "minimum_samples_train": train_min,
             "minimum_samples_promote": promote_min,
             "split_policy": "chronological_holdout",
@@ -872,6 +882,7 @@ def run_model_governance(session: Session, now: datetime | None = None) -> dict[
             "post_start": "excluded",
             "void_push": "excluded",
             "unsupported_mapping": "excluded",
+            "paper_trading_epoch_id": paper_trading_epoch_id,
         },
         candidate_ids=[candidate.id for candidate in candidates if candidate.id is not None],
     )
@@ -993,6 +1004,7 @@ def run_model_governance(session: Session, now: datetime | None = None) -> dict[
                 challenger.version_tag if promoted and challenger else active_parameters.version_tag
             ),
             "challenger_parameter_version": challenger.version_tag if challenger else None,
+            "paper_trading_epoch_id": paper_trading_epoch_id,
             "promoted": promoted,
             "metrics": metrics,
             "holdout_metrics": holdout_metrics,
@@ -1013,6 +1025,7 @@ def run_model_governance(session: Session, now: datetime | None = None) -> dict[
             challenger.version_tag if promoted and challenger else active_parameters.version_tag
         ),
         "challenger_parameter_version": challenger.version_tag if challenger else None,
+        "paper_trading_epoch_id": paper_trading_epoch_id,
         "feature_version": FEATURE_VERSION,
         "training_run_id": training.id,
         "calibration_run_id": calibration.id,

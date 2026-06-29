@@ -981,6 +981,77 @@ def test_job_lock_skips_existing_running_job() -> None:
     assert skipped.result["existing_run_id"] == running_id
 
 
+def test_governance_job_scopes_resolved_samples_to_active_epoch() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    target = date(2026, 7, 2)
+
+    with Session(engine) as session:
+        active = get_or_create_active_paper_epoch(session)
+        archived = PaperTradingEpoch(
+            epoch_key="pre_pr3d_validation_test",
+            display_name="Pre-PR3d validation",
+            status="archived",
+            mode="paper",
+            starting_balance=Decimal("500.00"),
+            started_at=datetime(2026, 7, 1, 12, 0, tzinfo=UTC),
+            archived_at=datetime(2026, 7, 2, 12, 0, tzinfo=UTC),
+        )
+        game = MlbGame(
+            external_game_id="governance-epoch-scope",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+            status="Final",
+        )
+        session.add_all([archived, game])
+        session.flush()
+        active_id = active.id
+        archived_id = archived.id
+
+        for epoch_id, outcome in ((active_id, "win"), (archived_id, "loss")):
+            session.add(
+                ModelCandidate(
+                    paper_trading_epoch_id=epoch_id,
+                    mlb_game_id=game.id,
+                    evaluated_at=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
+                    features={},
+                    probability=Decimal("0.600000"),
+                    model_probability=Decimal("0.600000"),
+                    probability_calibrated=Decimal("0.600000"),
+                    target_date=date(2026, 7, 1),
+                    fee_estimate=Decimal("0.010000"),
+                    price_status="fresh_executable",
+                    market_type="full_game_winner",
+                    market_family="full_game_winner",
+                    time_bucket="4H",
+                    time_to_start_minutes=420,
+                    decision="candidate_only",
+                    outcome=outcome,
+                    outcome_source="test",
+                    resolved_at=datetime(2026, 7, 2, 4, 0, tzinfo=UTC),
+                    feature_version=features.FEATURE_VERSION,
+                    training_eligible=True,
+                )
+            )
+        session.commit()
+
+        result = run_job(session, job_name="governance", target_date=target, triggered_by="api")
+        governance_result = result["result"]["governance"]
+        training = session.get(TrainingRun, governance_result["training_run_id"])
+        training_candidate_count = training.candidate_count if training else None
+        training_metrics = training.metrics if training else None
+
+    assert result["status"] == "succeeded"
+    assert governance_result["resolved_samples"] == 1
+    assert governance_result["paper_trading_epoch_id"] == active_id
+    assert training is not None
+    assert training_candidate_count == 1
+    assert training_metrics["paper_trading_epoch_id"] == active_id
+
+
 def test_job_endpoint_accepts_symbolic_target_date(monkeypatch) -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)

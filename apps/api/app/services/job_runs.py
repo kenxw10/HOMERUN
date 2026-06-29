@@ -239,7 +239,13 @@ def _execute_job_steps(session: Session, run: JobRun, job_name: str, target_date
             ),
         }
     if job_name == "governance":
-        return {"governance": _run_step(run, "model_governance", lambda: run_model_governance(session))}
+        return {
+            "governance": _run_step(
+                run,
+                "model_governance",
+                lambda: run_model_governance(session, paper_trading_epoch_id=run.paper_trading_epoch_id),
+            )
+        }
     if job_name == "full-paper-cycle":
         return {
             "daily_setup": _run_step(run, "daily_setup", lambda: _daily_setup_steps(session, target)),
@@ -248,7 +254,11 @@ def _execute_job_steps(session: Session, run: JobRun, job_name: str, target_date
             "settlement_yesterday": _run_step(
                 run, "settlement_yesterday", lambda: settle_paper_trades(session, target - timedelta(days=1))
             ),
-            "governance": _run_step(run, "model_governance", lambda: run_model_governance(session)),
+            "governance": _run_step(
+                run,
+                "model_governance",
+                lambda: run_model_governance(session, paper_trading_epoch_id=run.paper_trading_epoch_id),
+            ),
         }
     raise ValueError(f"Unknown job: {job_name}")
 
