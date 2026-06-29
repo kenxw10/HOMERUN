@@ -935,6 +935,7 @@ def generate_candidates(session: Session, target_date: date | None = None) -> di
             session.scalars(
                 select(ModelCandidate)
                 .where(ModelCandidate.mapping_id == mapping.id)
+                .where(ModelCandidate.paper_trading_epoch_id == active_epoch.id)
                 .where(ModelCandidate.time_bucket == bucket)
                 .where(ModelCandidate.target_date == day)
                 .order_by(ModelCandidate.evaluated_at.desc(), ModelCandidate.id.desc())

@@ -334,6 +334,7 @@ def _latest_job_status(session: Session, epoch: PaperTradingEpoch) -> dict[str, 
         session.scalars(
             select(JobRun)
             .where(JobRun.job_name.in_(["daily-setup", "candidate-sweep", "price-refresh", "settlement", "governance"]))
+            .where(JobRun.paper_trading_epoch_id == epoch.id)
             .order_by(JobRun.started_at.desc(), JobRun.id.desc())
             .limit(50)
         )

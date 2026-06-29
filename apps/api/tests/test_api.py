@@ -76,6 +76,7 @@ from app.services.job_runs import run_job
 from app.services.paper_epoch import RESET_CONFIRMATION, get_or_create_active_paper_epoch, reset_paper_trading_epoch
 from app.services.settlement import settle_paper_trades
 from app.time_utils import classify_time_bucket, eastern_display
+from app.workers import kalshi_ws_paper
 
 client = TestClient(app)
 
@@ -285,6 +286,54 @@ def test_paper_epoch_reset_archives_old_rows_and_starts_at_500() -> None:
     assert summary.closed_positions == []
     assert summary.performance.record == "0-0-0"
     assert summary.performance.profit_loss == 0.0
+
+
+def test_dashboard_job_status_is_scoped_to_active_epoch() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+
+    with Session(engine) as session:
+        active = get_or_create_active_paper_epoch(session, starting_balance=Decimal("500.00"))
+        archived = PaperTradingEpoch(
+            epoch_key="archived-job-status",
+            display_name="ARCHIVED JOB STATUS",
+            status="archived",
+            mode="paper",
+            starting_balance=Decimal("1000.00"),
+            started_at=now - timedelta(days=1),
+            archived_at=now,
+        )
+        session.add(archived)
+        session.flush()
+        session.add_all(
+            [
+                JobRun(
+                    job_name="candidate-sweep",
+                    job_type="candidate-sweep",
+                    paper_trading_epoch_id=active.id,
+                    status="succeeded",
+                    started_at=now,
+                    completed_at=now + timedelta(minutes=1),
+                    result={"epoch": "active"},
+                ),
+                JobRun(
+                    job_name="candidate-sweep",
+                    job_type="candidate-sweep",
+                    paper_trading_epoch_id=archived.id,
+                    status="failed",
+                    started_at=now + timedelta(hours=1),
+                    completed_at=now + timedelta(hours=1, minutes=1),
+                    result={"epoch": "archived"},
+                ),
+            ]
+        )
+        session.commit()
+
+        summary = dashboard.dashboard_summary_from_db(session)
+
+    assert summary.job_status["candidate-sweep"].status == "succeeded"
+    assert summary.job_status["candidate-sweep"].result == {"epoch": "active"}
 
 
 def test_system_status_redacts_secrets_and_allows_missing_database() -> None:
@@ -801,6 +850,102 @@ def test_websocket_market_update_only_marks_active_epoch_trade() -> None:
     assert market_source == "websocket"
     assert status_row is not None
     assert status_source == "websocket"
+
+
+def test_ws_worker_uses_ticker_channel_and_nested_msg_payload() -> None:
+    subscribe_message = kalshi_ws_paper._subscribe_message(["KXMLBGAME-WS-PIT"])
+    assert subscribe_message["params"]["channels"] == ["ticker", "orderbook_delta"]
+
+    ticker, update_payload = kalshi_ws_paper._market_update_payload(
+        {
+            "type": "ticker",
+            "msg": {
+                "market_ticker": "KXMLBGAME-WS-PIT",
+                "yes_bid_dollars": "0.5500",
+            },
+        }
+    )
+
+    assert ticker == "KXMLBGAME-WS-PIT"
+    assert update_payload == {"market_ticker": "KXMLBGAME-WS-PIT", "yes_bid_dollars": "0.5500"}
+
+
+def test_generate_candidates_does_not_reuse_archived_epoch_candidate(monkeypatch) -> None:
+    _relax_data_quality_gate(monkeypatch)
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+    monkeypatch.setattr(candidates, "utc_now", lambda: now)
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        active = get_or_create_active_paper_epoch(session, starting_balance=Decimal("500.00"))
+        archived = PaperTradingEpoch(
+            epoch_key="archived-candidate-reuse",
+            display_name="ARCHIVED CANDIDATE REUSE",
+            status="archived",
+            mode="paper",
+            starting_balance=Decimal("1000.00"),
+            started_at=now - timedelta(days=1),
+            archived_at=now,
+        )
+        game = MlbGame(
+            external_game_id="archived-reuse-1",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+            status="scheduled",
+        )
+        market = KalshiMarket(
+            kalshi_market_id="KX-ARCHIVED-REUSE",
+            ticker="KXMLBGAME-ARCHIVED-REUSE-PIT",
+            title="Will the Pittsburgh Pirates win?",
+            status="open",
+            implied_yes_ask=Decimal("0.1000"),
+        )
+        session.add_all([archived, game, market])
+        session.flush()
+        archived_id = archived.id
+        mapping = _add_candidate_mapping(
+            session,
+            game,
+            market,
+            mapping_status="confirmed",
+            market_family="full_game_winner",
+            market_type="full_game_winner",
+            selection_code="PIT",
+            settlement_rule_status="paper_supported",
+        )
+        session.flush()
+        archived_candidate = ModelCandidate(
+            paper_trading_epoch_id=archived.id,
+            mapping_id=mapping.id,
+            mlb_game_id=game.id,
+            kalshi_market_id=market.id,
+            evaluated_at=now - timedelta(hours=1),
+            target_date=date(2026, 7, 1),
+            time_bucket=classify_time_bucket(420),
+            features={},
+            decision="archived_original",
+            market_type="full_game_winner",
+        )
+        session.add(archived_candidate)
+        session.commit()
+
+        result = candidates.generate_candidates(session, target_date=date(2026, 7, 1))
+        archived_after = session.get(ModelCandidate, archived_candidate.id)
+        active_candidates = list(
+            session.scalars(select(ModelCandidate).where(ModelCandidate.paper_trading_epoch_id == active.id))
+            )
+
+    assert result["candidates"] == 1
+    assert archived_after is not None
+    assert archived_after.paper_trading_epoch_id == archived_id
+    assert archived_after.decision == "archived_original"
+    assert len(active_candidates) == 1
+    assert active_candidates[0].id != archived_candidate.id
 
 
 def test_generate_candidates_avoids_duplicate_open_trade_across_days(monkeypatch) -> None:

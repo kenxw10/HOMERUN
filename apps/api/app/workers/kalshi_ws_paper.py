@@ -20,6 +20,23 @@ def _extract_ticker(payload: dict[str, object]) -> str | None:
     return None
 
 
+def _subscribe_message(tickers: list[str]) -> dict[str, object]:
+    return {
+        "id": 1,
+        "cmd": "subscribe",
+        "params": {
+            "channels": ["ticker", "orderbook_delta"],
+            "market_tickers": tickers,
+        },
+    }
+
+
+def _market_update_payload(payload: dict[str, object]) -> tuple[str | None, dict[str, object]]:
+    message = payload.get("msg")
+    update_payload = message if isinstance(message, dict) else payload
+    return _extract_ticker(update_payload) or _extract_ticker(payload), update_payload
+
+
 async def _run_worker_once() -> dict[str, object]:
     settings = get_settings()
     session_factory = get_session_factory()
@@ -52,14 +69,7 @@ async def _run_worker_once() -> dict[str, object]:
             session.commit()
         return {"status": "websocket_unavailable", "source": "rest_fallback", "error": str(exc)}
 
-    subscribe_message = {
-        "id": 1,
-        "cmd": "subscribe",
-        "params": {
-            "channels": ["market_ticker", "orderbook_delta"],
-            "market_tickers": tickers,
-        },
-    }
+    subscribe_message = _subscribe_message(tickers)
     try:
         async with websockets.connect(settings.kalshi_ws_base_url, ping_interval=20, ping_timeout=20) as websocket:
             await websocket.send(json.dumps(subscribe_message))
@@ -68,10 +78,10 @@ async def _run_worker_once() -> dict[str, object]:
                 session.commit()
             raw = await asyncio.wait_for(websocket.recv(), timeout=settings.ws_heartbeat_timeout_seconds)
             payload = json.loads(raw)
-            ticker = _extract_ticker(payload)
+            ticker, update_payload = _market_update_payload(payload if isinstance(payload, dict) else {})
             if ticker:
                 with session_factory() as session:
-                    result = apply_ws_market_update(session, ticker, payload if isinstance(payload, dict) else {})
+                    result = apply_ws_market_update(session, ticker, update_payload)
                     session.commit()
                 return {"status": "message_applied", "ticker": ticker, "result": result}
             return {"status": "message_without_ticker", "subscribed_market_count": len(tickers)}
