@@ -171,7 +171,15 @@ type StatusRow = {
 
 type ChartRange = "TODAY" | "1D" | "1W" | "1M" | "ALL";
 type ChartMode = "VALUE" | "P/L $" | "P/L %";
-type ChartTickFormat = "TIME" | "DAY_DATE" | "MONTH_DAY" | "DAY_TIME" | "FULL_TIME" | "SECOND_TIME";
+type ChartTickFormat =
+  | "TIME"
+  | "DAY_DATE"
+  | "MONTH_DAY"
+  | "DAY_TIME"
+  | "FULL_TIME"
+  | "YEAR_TIME"
+  | "SECOND_TIME"
+  | "YEAR_SECOND_TIME";
 
 type ChartDataPoint = {
   timestamp: string;
@@ -762,6 +770,19 @@ function formatChartTick(time: number, format: ChartTickFormat): string {
       .replace(",", "")
       .toUpperCase();
   }
+  if (format === "YEAR_TIME") {
+    return new Intl.DateTimeFormat("en-US", {
+      timeZone: EASTERN_TIME_ZONE,
+      year: "2-digit",
+      month: "short",
+      day: "2-digit",
+      hour: "numeric",
+      minute: "2-digit",
+    })
+      .format(date)
+      .replace(/,/g, "")
+      .toUpperCase();
+  }
   if (format === "SECOND_TIME") {
     return new Intl.DateTimeFormat("en-US", {
       timeZone: EASTERN_TIME_ZONE,
@@ -770,6 +791,20 @@ function formatChartTick(time: number, format: ChartTickFormat): string {
       second: "2-digit",
     })
       .format(date)
+      .toUpperCase();
+  }
+  if (format === "YEAR_SECOND_TIME") {
+    return new Intl.DateTimeFormat("en-US", {
+      timeZone: EASTERN_TIME_ZONE,
+      year: "2-digit",
+      month: "short",
+      day: "2-digit",
+      hour: "numeric",
+      minute: "2-digit",
+      second: "2-digit",
+    })
+      .format(date)
+      .replace(/,/g, "")
       .toUpperCase();
   }
   return new Intl.DateTimeFormat("en-US", {
@@ -818,10 +853,13 @@ function moreSpecificChartTickFormat(format: ChartTickFormat): ChartTickFormat {
   if (format === "DAY_DATE" || format === "MONTH_DAY") {
     return "FULL_TIME";
   }
-  if (format === "DAY_TIME" || format === "FULL_TIME") {
+  if (format === "DAY_TIME") {
     return "SECOND_TIME";
   }
-  return "SECOND_TIME";
+  if (format === "FULL_TIME") {
+    return "YEAR_TIME";
+  }
+  return "YEAR_SECOND_TIME";
 }
 
 function hasDuplicateChartLabels(labels: string[]): boolean {
