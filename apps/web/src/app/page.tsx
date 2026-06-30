@@ -578,13 +578,17 @@ function chartDomainForRange(
   points: ChartDataPoint[],
 ): ChartDomain {
   const latestPointMs = points.length ? points[points.length - 1].time : null;
+  const firstPointMs = points.length ? points[0].time : null;
   const end = Math.max(nowMs, latestPointMs ?? nowMs);
   let start: number;
 
   if (range === "TODAY") {
     start = easternMidnightMs(new Date(nowMs));
   } else if (range === "ALL") {
-    start = epochStartMs ?? points[0]?.time ?? end - trailingRangeMs["1D"];
+    start =
+      epochStartMs !== null && (firstPointMs === null || firstPointMs <= epochStartMs)
+        ? epochStartMs
+        : firstPointMs ?? epochStartMs ?? end - trailingRangeMs["1D"];
   } else {
     start = end - trailingRangeMs[range];
   }
@@ -601,10 +605,12 @@ function portfolioChartSeries(
   range: ChartRange,
   startingBalance: number,
   nowMs: number,
-): { domain: ChartDomain; series: ChartDataPoint[]; limitedData: boolean } {
+): { domain: ChartDomain; series: ChartDataPoint[]; limitedData: boolean; historyTruncated: boolean } {
   const rawPoints = normalizePortfolioSeries(summary.portfolio_series);
   const epochStartMs = parseChartTime(summary.active_epoch?.started_at);
   const domain = chartDomainForRange(range, nowMs, epochStartMs, rawPoints);
+  const historyTruncated =
+    range === "ALL" && epochStartMs !== null && rawPoints.length > 0 && rawPoints[0].time > epochStartMs;
   const anchorPoints = [...rawPoints];
 
   if (epochStartMs !== null && epochStartMs <= domain.end) {
@@ -656,6 +662,7 @@ function portfolioChartSeries(
     domain,
     series: uniquePoints,
     limitedData: rawPoints.length === 0 || rawPoints.some((point) => point.time < domain.start),
+    historyTruncated,
   };
 }
 
@@ -821,7 +828,9 @@ function PortfolioChart({ summary }: { summary: DashboardSummary }) {
               </button>
             ))}
           </div>
-          {chartSeries.limitedData ? (
+          {chartSeries.historyTruncated ? (
+            <span className="chart-limited-state">SHOWING RETURNED SNAPSHOT WINDOW</span>
+          ) : chartSeries.limitedData ? (
             <span className="chart-limited-state">CARRY-FORWARD VALUE FOR {chartRangeLabels[activeRange]}</span>
           ) : null}
         </div>
