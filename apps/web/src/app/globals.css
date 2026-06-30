@@ -285,7 +285,7 @@ button {
 .chart-stage polyline {
   fill: none;
   stroke: #04963f;
-  stroke-linecap: square;
+  stroke-linecap: butt;
   stroke-linejoin: miter;
   stroke-width: 2;
   vector-effect: non-scaling-stroke;
