@@ -169,18 +169,40 @@ type StatusRow = {
   tone?: "green" | "amber" | "red";
 };
 
-type ChartRange = "LIVE" | "30M" | "1D" | "1W" | "1M" | "ALL" | "12H";
-type ChartMode = "NORM" | "P/L $" | "P/L %";
+type ChartRange = "TODAY" | "1D" | "1W" | "1M" | "ALL";
+type ChartMode = "VALUE" | "P/L $" | "P/L %";
 
-const chartRanges: ChartRange[] = ["LIVE", "30M", "1D", "1W", "1M", "ALL", "12H"];
-const chartModes: ChartMode[] = ["NORM", "P/L $", "P/L %"];
-const rangeMs: Record<Exclude<ChartRange, "ALL">, number> = {
-  LIVE: 15 * 60 * 1000,
-  "30M": 30 * 60 * 1000,
+type ChartDataPoint = {
+  timestamp: string;
+  value: number;
+  time: number;
+  breakBefore?: boolean;
+};
+
+type ChartDomain = {
+  start: number;
+  end: number;
+};
+
+const EASTERN_TIME_ZONE = "America/New_York";
+const chartRanges: ChartRange[] = ["TODAY", "1D", "1W", "1M", "ALL"];
+const chartModes: ChartMode[] = ["VALUE", "P/L $", "P/L %"];
+const chartRangeLabels: Record<ChartRange, string> = {
+  TODAY: "Today",
+  "1D": "1D",
+  "1W": "1W",
+  "1M": "1M",
+  ALL: "All",
+};
+const chartModeLabels: Record<ChartMode, string> = {
+  VALUE: "Value",
+  "P/L $": "P/L $",
+  "P/L %": "P/L %",
+};
+const trailingRangeMs: Record<Exclude<ChartRange, "TODAY" | "ALL">, number> = {
   "1D": 24 * 60 * 60 * 1000,
   "1W": 7 * 24 * 60 * 60 * 1000,
   "1M": 30 * 24 * 60 * 60 * 1000,
-  "12H": 12 * 60 * 60 * 1000,
 };
 
 const emptySummary: DashboardSummary = {
@@ -486,26 +508,191 @@ function Header({
   );
 }
 
-function filterPortfolioSeries(series: PortfolioPoint[], range: ChartRange): PortfolioPoint[] {
-  if (range === "ALL" || series.length <= 1) {
-    return series;
+function parseChartTime(value: string | null | undefined): number | null {
+  if (!value) {
+    return null;
   }
-
-  const latestTimestamp = new Date(series[series.length - 1]?.timestamp ?? "").getTime();
-  if (!Number.isFinite(latestTimestamp)) {
-    return series;
-  }
-
-  const cutoff = latestTimestamp - rangeMs[range];
-  const filtered = series.filter((point) => {
-    const timestamp = new Date(point.timestamp).getTime();
-    return Number.isFinite(timestamp) && timestamp >= cutoff;
-  });
-
-  return filtered.length > 0 ? filtered : series.slice(-1);
+  const parsed = new Date(value).getTime();
+  return Number.isFinite(parsed) ? parsed : null;
 }
 
-function transformPortfolioSeries(series: PortfolioPoint[], mode: ChartMode, startingBalance: number): PortfolioPoint[] {
+function getTimeZoneOffsetMs(date: Date, timeZone: string): number {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(date);
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  const zonedAsUtc = Date.UTC(
+    Number(values.year),
+    Number(values.month) - 1,
+    Number(values.day),
+    Number(values.hour),
+    Number(values.minute),
+    Number(values.second),
+  );
+  return zonedAsUtc - date.getTime();
+}
+
+function easternMidnightMs(now: Date): number {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: EASTERN_TIME_ZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(now);
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  const utcGuess = Date.UTC(Number(values.year), Number(values.month) - 1, Number(values.day), 0, 0, 0);
+  return utcGuess - getTimeZoneOffsetMs(new Date(utcGuess), EASTERN_TIME_ZONE);
+}
+
+function normalizePortfolioSeries(series: PortfolioPoint[]): ChartDataPoint[] {
+  return series
+    .map((point) => {
+      const time = parseChartTime(point.timestamp);
+      return time === null || !Number.isFinite(point.value) ? null : { ...point, time };
+    })
+    .filter((point): point is ChartDataPoint => point !== null)
+    .sort((a, b) => a.time - b.time);
+}
+
+function latestKnownValue(points: ChartDataPoint[], time: number, fallback: number): number {
+  let value = fallback;
+  for (const point of points) {
+    if (point.time > time) {
+      break;
+    }
+    value = point.value;
+  }
+  return value;
+}
+
+function chartDomainForRange(
+  range: ChartRange,
+  nowMs: number,
+  epochStartMs: number | null,
+  points: ChartDataPoint[],
+): ChartDomain {
+  const latestPointMs = points.length ? points[points.length - 1].time : null;
+  const firstPointMs = points.length ? points[0].time : null;
+  const end = Math.max(nowMs, latestPointMs ?? nowMs);
+  let start: number;
+
+  if (range === "TODAY") {
+    start = easternMidnightMs(new Date(nowMs));
+  } else if (range === "ALL") {
+    start = epochStartMs ?? firstPointMs ?? end - trailingRangeMs["1D"];
+  } else {
+    start = end - trailingRangeMs[range];
+  }
+
+  if (!Number.isFinite(start) || start >= end) {
+    start = end - 60 * 60 * 1000;
+  }
+
+  return { start, end };
+}
+
+function portfolioChartSeries(
+  summary: DashboardSummary,
+  range: ChartRange,
+  startingBalance: number,
+  nowMs: number,
+): { domain: ChartDomain; series: ChartDataPoint[]; limitedData: boolean; historyTruncated: boolean } {
+  const rawPoints = normalizePortfolioSeries(summary.portfolio_series);
+  const epochStartMs = parseChartTime(summary.active_epoch?.started_at);
+  const domain = chartDomainForRange(range, nowMs, epochStartMs, rawPoints);
+  const hasRealPortfolioValue = typeof summary.portfolio_value === "number";
+
+  if (rawPoints.length === 0 && !hasRealPortfolioValue) {
+    return {
+      domain,
+      series: [],
+      limitedData: false,
+      historyTruncated: false,
+    };
+  }
+
+  const anchorPoints = [...rawPoints];
+  const firstRawPoint = rawPoints[0];
+  const epochAnchorInDomain = epochStartMs !== null && epochStartMs >= domain.start && epochStartMs <= domain.end;
+
+  if (epochStartMs !== null && epochStartMs <= domain.end && (rawPoints.length === 0 || epochStartMs >= domain.start || range === "ALL")) {
+    anchorPoints.push({
+      timestamp: new Date(epochStartMs).toISOString(),
+      time: epochStartMs,
+      value: startingBalance,
+    });
+  }
+
+  anchorPoints.sort((a, b) => a.time - b.time);
+
+  const hasPointAtOrBeforeStart = anchorPoints.some((point) => point.time <= domain.start);
+  const startsBeforeFirstReturnedSnapshot = rawPoints.length > 0 && !hasPointAtOrBeforeStart && !epochAnchorInDomain;
+  const lineStart =
+    startsBeforeFirstReturnedSnapshot
+      ? rawPoints[0].time
+      : epochAnchorInDomain && epochStartMs > domain.start
+        ? epochStartMs
+        : domain.start;
+  const likelyReturnedWindowIsTruncated = rawPoints.length >= 500;
+  const gapBeforeFirstReturnedSnapshot =
+    likelyReturnedWindowIsTruncated && firstRawPoint !== undefined && firstRawPoint.time > lineStart;
+  const historyTruncated =
+    startsBeforeFirstReturnedSnapshot ||
+    gapBeforeFirstReturnedSnapshot ||
+    (likelyReturnedWindowIsTruncated && range === "ALL" && epochStartMs !== null && rawPoints[0]?.time > epochStartMs);
+  const firstValue = startsBeforeFirstReturnedSnapshot ? rawPoints[0].value : latestKnownValue(anchorPoints, lineStart, startingBalance);
+  const currentValue =
+    typeof summary.portfolio_value === "number"
+      ? summary.portfolio_value
+      : latestKnownValue(anchorPoints, domain.end, firstValue);
+  const points: ChartDataPoint[] = [
+    {
+      timestamp: new Date(lineStart).toISOString(),
+      time: lineStart,
+      value: firstValue,
+    },
+  ];
+
+  for (const point of anchorPoints) {
+    if (point.time > lineStart && point.time < domain.end) {
+      points.push({
+        ...point,
+        breakBefore: gapBeforeFirstReturnedSnapshot && point.time === firstRawPoint?.time,
+      });
+    }
+  }
+
+  points.push({
+    timestamp: new Date(domain.end).toISOString(),
+    time: domain.end,
+    value: currentValue,
+  });
+
+  const uniquePoints = points.filter((point, index) => index === 0 || point.time !== points[index - 1].time);
+  if (uniquePoints.length === 1) {
+    uniquePoints.push({
+      timestamp: new Date(domain.end).toISOString(),
+      time: domain.end,
+      value: uniquePoints[0].value,
+    });
+  }
+
+  return {
+    domain,
+    series: uniquePoints,
+    limitedData: rawPoints.length === 0 || rawPoints.some((point) => point.time < domain.start),
+    historyTruncated,
+  };
+}
+
+function transformPortfolioSeries(series: ChartDataPoint[], mode: ChartMode, startingBalance: number): ChartDataPoint[] {
   return series.map((point) => {
     if (mode === "P/L $") {
       return { ...point, value: point.value - startingBalance };
@@ -527,25 +714,88 @@ function formatChartValue(value: number | null | undefined, mode: ChartMode): st
   return formatCurrency(value);
 }
 
-function buildChart(series: PortfolioPoint[], mode: ChartMode) {
+function formatChartTick(time: number, range: ChartRange): string {
+  const date = new Date(time);
+  if (range === "TODAY" || range === "1D") {
+    return new Intl.DateTimeFormat("en-US", {
+      timeZone: EASTERN_TIME_ZONE,
+      hour: "numeric",
+      minute: "2-digit",
+    })
+      .format(date)
+      .toUpperCase();
+  }
+  if (range === "1W") {
+    return new Intl.DateTimeFormat("en-US", {
+      timeZone: EASTERN_TIME_ZONE,
+      weekday: "short",
+      month: "2-digit",
+      day: "2-digit",
+    })
+      .format(date)
+      .toUpperCase();
+  }
+  return new Intl.DateTimeFormat("en-US", {
+    timeZone: EASTERN_TIME_ZONE,
+    month: "short",
+    day: "2-digit",
+  })
+    .format(date)
+    .toUpperCase();
+}
+
+function chartXTicks(domain: ChartDomain, range: ChartRange) {
+  const count = 7;
+  const span = domain.end - domain.start || 1;
+  return Array.from({ length: count }, (_, index) => {
+    const time = domain.start + (span * index) / (count - 1);
+    return { time, label: formatChartTick(time, range) };
+  });
+}
+
+function buildChart(series: ChartDataPoint[], mode: ChartMode, domain: ChartDomain, range: ChartRange) {
   const width = 1200;
   const height = 260;
   const padding = { top: 24, right: 28, bottom: 34, left: 54 };
   const values = series.map((point) => point.value);
-  const min = values.length ? Math.min(...values) : mode === "NORM" ? 24 : -1;
-  const max = values.length ? Math.max(...values) : mode === "NORM" ? 40 : 1;
+  const min = values.length ? Math.min(...values) : mode === "VALUE" ? 24 : -1;
+  const max = values.length ? Math.max(...values) : mode === "VALUE" ? 40 : 1;
   const paddingValue = mode === "P/L %" ? 0.005 : mode === "P/L $" ? 1 : 2;
   const yMin = Math.floor((min - paddingValue) / paddingValue) * paddingValue;
   const yMax = Math.ceil((max + paddingValue) / paddingValue) * paddingValue;
   const yRange = yMax - yMin || 1;
   const xRange = width - padding.left - padding.right;
   const yPixels = height - padding.top - padding.bottom;
+  const domainSpan = domain.end - domain.start || 1;
 
-  const points = series.map((point, index) => {
-    const x = series.length === 1 ? padding.left + xRange : padding.left + (index / (series.length - 1)) * xRange;
+  const points = series.map((point) => {
+    const x = padding.left + ((point.time - domain.start) / domainSpan) * xRange;
     const y = padding.top + ((yMax - point.value) / yRange) * yPixels;
     return { ...point, x, y };
   });
+  const polylines: string[] = [];
+  const singlePoints: { x: number; y: number }[] = [];
+  let segment: string[] = [];
+
+  for (const point of points) {
+    if (point.breakBefore && segment.length > 0) {
+      if (segment.length === 1) {
+        const [x, y] = segment[0].split(",").map(Number);
+        singlePoints.push({ x, y });
+      } else {
+        polylines.push(segment.join(" "));
+      }
+      segment = [];
+    }
+    segment.push(`${point.x.toFixed(2)},${point.y.toFixed(2)}`);
+  }
+
+  if (segment.length === 1) {
+    const [x, y] = segment[0].split(",").map(Number);
+    singlePoints.push({ x, y });
+  } else if (segment.length > 1) {
+    polylines.push(segment.join(" "));
+  }
 
   return {
     width,
@@ -553,27 +803,47 @@ function buildChart(series: PortfolioPoint[], mode: ChartMode) {
     yMin,
     yMax,
     points,
-    polyline: points.map((point) => `${point.x.toFixed(2)},${point.y.toFixed(2)}`).join(" "),
+    polylines,
+    singlePoints,
     latest: points[points.length - 1],
+    xTicks: chartXTicks(domain, range),
   };
 }
 
 function PortfolioChart({ summary }: { summary: DashboardSummary }) {
-  const [activeRange, setActiveRange] = useState<ChartRange>("12H");
-  const [activeMode, setActiveMode] = useState<ChartMode>("NORM");
-  const startingBalance = summary.paper_starting_balance ?? summary.portfolio_series[0]?.value ?? 0;
-  const rangedSeries = useMemo(
-    () => filterPortfolioSeries(summary.portfolio_series, activeRange),
-    [activeRange, summary.portfolio_series],
+  const [activeRange, setActiveRange] = useState<ChartRange>("TODAY");
+  const [activeMode, setActiveMode] = useState<ChartMode>("VALUE");
+  const [nowMs, setNowMs] = useState<number | null>(null);
+
+  useEffect(() => {
+    const updateClock = () => setNowMs(Date.now());
+    updateClock();
+    const timer = window.setInterval(updateClock, 60_000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  const startingBalance = summary.active_epoch?.starting_balance ?? summary.paper_starting_balance ?? summary.portfolio_series[0]?.value ?? 500;
+  const chartSeries = useMemo(
+    () =>
+      nowMs === null
+        ? {
+            domain: { start: 0, end: 1 },
+            series: [],
+            limitedData: false,
+            historyTruncated: false,
+          }
+        : portfolioChartSeries(summary, activeRange, startingBalance, nowMs),
+    [activeRange, nowMs, startingBalance, summary],
   );
   const displaySeries = useMemo(
-    () => transformPortfolioSeries(rangedSeries, activeMode, startingBalance),
-    [activeMode, rangedSeries, startingBalance],
+    () => transformPortfolioSeries(chartSeries.series, activeMode, startingBalance),
+    [activeMode, chartSeries.series, startingBalance],
   );
-  const chart = buildChart(displaySeries, activeMode);
-  const latestRaw = summary.portfolio_value ?? summary.portfolio_series[summary.portfolio_series.length - 1]?.value ?? null;
+  const chart = buildChart(displaySeries, activeMode, chartSeries.domain, activeRange);
+  const latestSnapshotValue = summary.portfolio_series[summary.portfolio_series.length - 1]?.value;
+  const latestRaw = summary.portfolio_value ?? latestSnapshotValue ?? null;
   const latest =
-    activeMode === "NORM"
+    activeMode === "VALUE"
       ? latestRaw
       : latestRaw !== null && startingBalance > 0
         ? activeMode === "P/L $"
@@ -582,10 +852,9 @@ function PortfolioChart({ summary }: { summary: DashboardSummary }) {
         : null;
   const changePct = latestRaw !== null && startingBalance > 0 ? (latestRaw - startingBalance) / startingBalance : null;
   const ticks = [chart.yMax, (chart.yMax + chart.yMin) / 2, chart.yMin];
-  const limitedData =
-    summary.portfolio_series.length > 0 && (rangedSeries.length < 2 || rangedSeries.length < summary.portfolio_series.length);
+  const latestTone = changePct !== null && changePct < 0 ? "value-negative" : "value-positive";
   const title =
-    activeMode === "NORM"
+    activeMode === "VALUE"
       ? "PORTFOLIO VALUE (PAPER TRADING)"
       : activeMode === "P/L $"
         ? "PORTFOLIO P/L $ (PAPER TRADING)"
@@ -610,7 +879,7 @@ function PortfolioChart({ summary }: { summary: DashboardSummary }) {
                 type="button"
                 onClick={() => setActiveRange(control)}
               >
-                {control}
+                {chartRangeLabels[control]}
               </button>
             ))}
           </div>
@@ -622,11 +891,15 @@ function PortfolioChart({ summary }: { summary: DashboardSummary }) {
                 type="button"
                 onClick={() => setActiveMode(control)}
               >
-                {control}
+                {chartModeLabels[control]}
               </button>
             ))}
           </div>
-          {limitedData ? <span className="chart-limited-state">LIMITED DATA FOR {activeRange}</span> : null}
+          {chartSeries.historyTruncated ? (
+            <span className="chart-limited-state">SHOWING RETURNED SNAPSHOT WINDOW</span>
+          ) : chartSeries.limitedData ? (
+            <span className="chart-limited-state">CARRY-FORWARD VALUE FOR {chartRangeLabels[activeRange]}</span>
+          ) : null}
         </div>
       </div>
 
@@ -642,12 +915,21 @@ function PortfolioChart({ summary }: { summary: DashboardSummary }) {
           })}
           {displaySeries.length > 0 ? (
             <>
-              <polyline points={chart.polyline} />
+              {chart.polylines.map((polyline) => (
+                <polyline key={polyline} points={polyline} />
+              ))}
+              {chart.singlePoints.map((point) => (
+                <circle key={`${point.x}-${point.y}`} cx={point.x} cy={point.y} r="3" className="chart-anchor-point" />
+              ))}
               {chart.latest ? (
                 <g>
                   <line x1={chart.latest.x} y1={chart.latest.y} x2="1172" y2={chart.latest.y} className="last-guide" />
-                  <rect x="1130" y={chart.latest.y - 11} width="56" height="22" className="last-tag-bg" />
-                  <text x="1138" y={chart.latest.y + 5} className="last-tag-text">
+                  <text
+                    x={chart.latest.x > 1040 ? chart.latest.x - 8 : chart.latest.x + 8}
+                    y={chart.latest.y - 7}
+                    textAnchor={chart.latest.x > 1040 ? "end" : "start"}
+                    className={`last-tag-text ${latestTone}`}
+                  >
                     {formatChartValue(chart.latest.value, activeMode)}
                   </text>
                 </g>
@@ -668,13 +950,9 @@ function PortfolioChart({ summary }: { summary: DashboardSummary }) {
           ))}
         </div>
         <div className="chart-x-axis">
-          <span>08:00</span>
-          <span>10:00</span>
-          <span>12:00</span>
-          <span>14:00</span>
-          <span>16:00</span>
-          <span>18:00</span>
-          <span>20:00</span>
+          {nowMs === null ? null : chart.xTicks.map((tick) => (
+            <span key={`${activeRange}-${tick.time}`}>{tick.label}</span>
+          ))}
         </div>
       </div>
     </section>
