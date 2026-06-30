@@ -774,7 +774,8 @@ function PortfolioChart({ summary }: { summary: DashboardSummary }) {
     [activeMode, chartSeries.series, startingBalance],
   );
   const chart = buildChart(displaySeries, activeMode, chartSeries.domain, activeRange);
-  const latestRaw = summary.portfolio_value ?? chartSeries.series[chartSeries.series.length - 1]?.value ?? startingBalance;
+  const latestSnapshotValue = summary.portfolio_series[summary.portfolio_series.length - 1]?.value;
+  const latestRaw = summary.portfolio_value ?? latestSnapshotValue ?? null;
   const latest =
     activeMode === "VALUE"
       ? latestRaw
