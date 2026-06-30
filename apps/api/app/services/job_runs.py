@@ -113,6 +113,81 @@ def _candidate_sweep_window_result(candidate_result: dict[str, object]) -> dict[
     return {key: candidate_result.get(key) for key in keys if key in candidate_result}
 
 
+def _feature_sync_skipped_result() -> dict[str, object]:
+    return {
+        "skipped": True,
+        "feature_sync_mode": "cache_only",
+        "reason": "candidate_sweep_uses_cached_feature_snapshots",
+    }
+
+
+def _cached_feature_status(session: Session, target_date: date) -> dict[str, object]:
+    coverage = feature_coverage(session, target_date)
+    snapshot_count = int(coverage.get("snapshot_count") or 0)
+    summary = coverage.get("completeness_summary") if isinstance(coverage.get("completeness_summary"), dict) else {}
+    available_pct = summary.get("available_pct")
+    warnings: list[str] = []
+    status = "cached_features_available"
+    zero_trade_reason = None
+    if snapshot_count == 0:
+        status = "missing_cached_feature_snapshots"
+        zero_trade_reason = "no_candidates_missing_feature_snapshots"
+        warnings.append(
+            "no_candidates_missing_feature_snapshots: run daily-setup or feature sync before candidate-sweep."
+        )
+    elif int(summary.get("available_module_observations") or 0) == 0:
+        status = "low_quality_missing_cached_features"
+        zero_trade_reason = "low_quality_missing_cached_features"
+        warnings.append("low_quality_missing_cached_features: cached feature snapshots have no available modules.")
+
+    return {
+        "status": status,
+        "feature_sync_mode": "cache_only",
+        "feature_sync_skipped": True,
+        "target_date": target_date.isoformat(),
+        "feature_version": coverage.get("feature_version"),
+        "snapshot_count": snapshot_count,
+        "available_pct": available_pct,
+        "available_module_observations": summary.get("available_module_observations"),
+        "partial_module_observations": summary.get("partial_module_observations"),
+        "missing_module_observations": summary.get("missing_module_observations"),
+        "unavailable_module_observations": summary.get("unavailable_module_observations"),
+        "zero_trade_reason": zero_trade_reason,
+        "warnings": warnings,
+    }
+
+
+def _missing_cached_feature_candidate_result(
+    target_date: date,
+    cache_status: dict[str, object],
+    *,
+    min_time_to_start_minutes: int | None,
+    max_time_to_start_minutes: int | None,
+    sweep_label: str | None,
+    dry_run_candidates_only: bool,
+) -> dict[str, object]:
+    warnings = list(cache_status.get("warnings") or [])
+    zero_trade_reason = str(cache_status.get("zero_trade_reason") or "no_candidates_missing_feature_snapshots")
+    return {
+        "status": "skipped_missing_cached_features",
+        "target_date": target_date.isoformat(),
+        "feature_sync_mode": "cache_only",
+        "feature_sync_skipped": True,
+        "cached_feature_snapshot_count": int(cache_status.get("snapshot_count") or 0),
+        "candidates": 0,
+        "candidates_evaluated": 0,
+        "paper_trades": 0,
+        "trades_created": 0,
+        "zero_trade_reason": zero_trade_reason,
+        "warnings": warnings,
+        "sweep_label": sweep_label,
+        "sweep_window_enabled": min_time_to_start_minutes is not None or max_time_to_start_minutes is not None,
+        "min_time_to_start_minutes": min_time_to_start_minutes,
+        "max_time_to_start_minutes": max_time_to_start_minutes,
+        "dry_run_candidates_only": dry_run_candidates_only,
+    }
+
+
 def _duration_seconds(started_at) -> int:
     return max(0, int((utc_now() - ensure_aware_utc(started_at)).total_seconds()))
 
@@ -291,13 +366,46 @@ def _execute_job_steps(
             "feature_coverage": _run_step(run, "feature_coverage", lambda: feature_coverage(session, target)),
         }
     if job_name == "candidate-sweep":
+        feature_sync = _feature_sync_skipped_result()
+        schedule_result = _run_step(run, "sync_mlb_schedule", lambda: {"games": sync_schedule(session, target)})
+        cached_features = _run_step(
+            run,
+            "feature_cache_status",
+            lambda: _cached_feature_status(session, target),
+        )
         result = {
-            "schedule": _run_step(run, "sync_mlb_schedule", lambda: {"games": sync_schedule(session, target)}),
-            "features": _run_step(run, "sync_mlb_features", lambda: sync_mlb_features(session, target, None, True)),
+            "schedule": schedule_result,
+            "feature_sync": feature_sync,
+            "cached_features": cached_features,
+            "feature_sync_mode": "cache_only",
+            "feature_sync_skipped": True,
+        }
+        if cached_features["status"] == "missing_cached_feature_snapshots":
+            candidate_result = _missing_cached_feature_candidate_result(
+                target,
+                cached_features,
+                min_time_to_start_minutes=min_time_to_start_minutes,
+                max_time_to_start_minutes=max_time_to_start_minutes,
+                sweep_label=sweep_label,
+                dry_run_candidates_only=dry_run_candidates_only,
+            )
+            result["candidate_engine"] = candidate_result
+            result["candidate_sweep_window"] = _candidate_sweep_window_result(candidate_result)
+            result["warnings"] = candidate_result["warnings"]
+            if dry_run_candidates_only:
+                result["price_refresh"] = {"skipped": True, "reason": "dry_run_candidates_only"}
+                result["balance_snapshot"] = {"skipped": True, "reason": "dry_run_candidates_only", "snapshot_id": None}
+            else:
+                result["price_refresh"] = _run_step(run, "price_refresh", lambda: refresh_open_position_prices(session))
+                result["balance_snapshot"] = _run_step(
+                    run, "balance_snapshot", lambda: {"snapshot_id": create_balance_snapshot(session, source="candidate_sweep").id}
+                )
+            return result
+        result.update({
             "market_family_mappings": _run_step(
                 run, "market_family_mappings", lambda: sync_market_family_mappings(session, target)
             ),
-        }
+        })
         candidate_result = _run_step(
             run,
             "paper_candidate_engine",
