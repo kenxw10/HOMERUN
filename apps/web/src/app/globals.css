@@ -303,14 +303,19 @@ button {
   vector-effect: non-scaling-stroke;
 }
 
-.last-tag-bg {
+.last-tag-text {
+  fill: #04963f;
+  font-size: 10px;
+  font-weight: 800;
+}
+
+.last-tag-text.value-positive,
+.last-tag-text.value-neutral {
   fill: #04963f;
 }
 
-.last-tag-text {
-  fill: #ffffff;
-  font-size: 10px;
-  font-weight: 800;
+.last-tag-text.value-negative {
+  fill: #dc2626;
 }
 
 .empty-chart-label {
