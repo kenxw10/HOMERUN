@@ -300,28 +300,6 @@ button {
   fill: #04963f;
 }
 
-.last-guide {
-  stroke: #04963f;
-  stroke-dasharray: 4 4;
-  stroke-width: 1;
-  vector-effect: non-scaling-stroke;
-}
-
-.last-tag-text {
-  fill: #04963f;
-  font-size: 10px;
-  font-weight: 800;
-}
-
-.last-tag-text.value-positive,
-.last-tag-text.value-neutral {
-  fill: #04963f;
-}
-
-.last-tag-text.value-negative {
-  fill: #dc2626;
-}
-
 .empty-chart-label {
   fill: #6b7280;
   font-size: 14px;
