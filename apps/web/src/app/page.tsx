@@ -607,6 +607,17 @@ function portfolioChartSeries(
   const rawPoints = normalizePortfolioSeries(summary.portfolio_series);
   const epochStartMs = parseChartTime(summary.active_epoch?.started_at);
   const domain = chartDomainForRange(range, nowMs, epochStartMs, rawPoints);
+  const hasRealPortfolioValue = typeof summary.portfolio_value === "number";
+
+  if (rawPoints.length === 0 && !hasRealPortfolioValue) {
+    return {
+      domain,
+      series: [],
+      limitedData: false,
+      historyTruncated: false,
+    };
+  }
+
   const anchorPoints = [...rawPoints];
   const firstRawPoint = rawPoints[0];
   const epochAnchorInDomain = epochStartMs !== null && epochStartMs >= domain.start && epochStartMs <= domain.end;
@@ -802,10 +813,26 @@ function buildChart(series: ChartDataPoint[], mode: ChartMode, domain: ChartDoma
 function PortfolioChart({ summary }: { summary: DashboardSummary }) {
   const [activeRange, setActiveRange] = useState<ChartRange>("TODAY");
   const [activeMode, setActiveMode] = useState<ChartMode>("VALUE");
-  const nowMs = Date.now();
+  const [nowMs, setNowMs] = useState<number | null>(null);
+
+  useEffect(() => {
+    const updateClock = () => setNowMs(Date.now());
+    updateClock();
+    const timer = window.setInterval(updateClock, 60_000);
+    return () => window.clearInterval(timer);
+  }, []);
+
   const startingBalance = summary.active_epoch?.starting_balance ?? summary.paper_starting_balance ?? summary.portfolio_series[0]?.value ?? 500;
   const chartSeries = useMemo(
-    () => portfolioChartSeries(summary, activeRange, startingBalance, nowMs),
+    () =>
+      nowMs === null
+        ? {
+            domain: { start: 0, end: 1 },
+            series: [],
+            limitedData: false,
+            historyTruncated: false,
+          }
+        : portfolioChartSeries(summary, activeRange, startingBalance, nowMs),
     [activeRange, nowMs, startingBalance, summary],
   );
   const displaySeries = useMemo(
@@ -923,7 +950,7 @@ function PortfolioChart({ summary }: { summary: DashboardSummary }) {
           ))}
         </div>
         <div className="chart-x-axis">
-          {chart.xTicks.map((tick) => (
+          {nowMs === null ? null : chart.xTicks.map((tick) => (
             <span key={`${activeRange}-${tick.time}`}>{tick.label}</span>
           ))}
         </div>
