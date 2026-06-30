@@ -51,6 +51,7 @@ from app.models import (
 from app.jobs import market_family_discovery as market_family_discovery_job
 from app.jobs import mlb_feature_sync as mlb_feature_sync_job
 from app.jobs import model_feature_snapshot_backfill as model_feature_snapshot_backfill_job
+from app.jobs import runner as job_runner
 from app.security import require_internal_api_key
 from app.services import (
     candidates,
@@ -1027,6 +1028,324 @@ def test_paper_candidate_engine_endpoint_uses_explicit_target_date(monkeypatch) 
     assert payload["result"]["candidates"] == 1
 
 
+def test_generate_candidates_time_window_filters_games(monkeypatch) -> None:
+    _relax_data_quality_gate(monkeypatch)
+    now = datetime(2026, 7, 2, 16, 0, tzinfo=UTC)
+    monkeypatch.setattr(candidates, "utc_now", lambda: now)
+    monkeypatch.setattr(candidates, "score_mature_candidate", lambda *_args, **_kwargs: _fixed_model_score("0.900000"))
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        game_specs = [
+            ("in-window", now + timedelta(minutes=60), "PIT"),
+            ("too-soon", now + timedelta(minutes=20), "SEA"),
+            ("too-late", now + timedelta(minutes=240), "BOS"),
+            ("started", now - timedelta(minutes=10), "NYY"),
+            ("wrong-date", now + timedelta(days=1, minutes=60), "LAD"),
+        ]
+        for slug, scheduled_start, team_code in game_specs:
+            game = MlbGame(
+                external_game_id=f"window-{slug}",
+                home_team="Pittsburgh Pirates",
+                away_team="Seattle Mariners",
+                home_abbreviation=team_code,
+                away_abbreviation="SEA" if team_code != "SEA" else "PIT",
+                scheduled_start=scheduled_start,
+                status="scheduled",
+            )
+            market = KalshiMarket(
+                kalshi_market_id=f"KX-WINDOW-{slug.upper()}",
+                ticker=f"KXMLBGAME-WINDOW-{slug.upper()}-{team_code}",
+                title=f"Will {team_code} win?",
+                status="open",
+                implied_yes_ask=Decimal("0.4000"),
+                market_price_updated_at=now,
+            )
+            session.add_all([game, market])
+            _add_candidate_mapping(
+                session,
+                game,
+                market,
+                mapping_status="confirmed",
+                market_family="full_game_winner",
+                market_type="full_game_winner",
+                selection_code=team_code,
+                settlement_rule_status="paper_supported",
+            )
+        session.commit()
+
+        result = candidates.generate_candidates(
+            session,
+            target_date=date(2026, 7, 2),
+            min_time_to_start_minutes=45,
+            max_time_to_start_minutes=180,
+            sweep_label="pregame_window",
+        )
+        all_candidates = list(session.scalars(select(ModelCandidate).order_by(ModelCandidate.id.asc())))
+        all_trades = list(session.scalars(select(PaperTrade).order_by(PaperTrade.id.asc())))
+
+    assert result["status"] == "completed"
+    assert result["sweep_window_enabled"] is True
+    assert result["sweep_label"] == "pregame_window"
+    assert result["games_total_for_date"] == 4
+    assert result["games_in_window"] == 1
+    assert result["games_excluded_too_soon"] == 1
+    assert result["games_excluded_too_late"] == 1
+    assert result["games_excluded_started"] == 1
+    assert result["games_excluded_wrong_date"] == 1
+    assert result["candidates"] == 1
+    assert result["candidates_in_window"] == 1
+    assert result["paper_trades"] == 1
+    assert result["paper_trades_in_window"] == 1
+    assert len(all_candidates) == 1
+    assert len(all_trades) == 1
+    assert all_trades[0].market_ticker == "KXMLBGAME-WINDOW-IN-WINDOW-PIT"
+
+
+def test_generate_candidates_time_window_returns_skipped_when_empty(monkeypatch) -> None:
+    _relax_data_quality_gate(monkeypatch)
+    now = datetime(2026, 7, 2, 16, 0, tzinfo=UTC)
+    monkeypatch.setattr(candidates, "utc_now", lambda: now)
+    monkeypatch.setattr(candidates, "score_mature_candidate", lambda *_args, **_kwargs: _fixed_model_score("0.900000"))
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        game = MlbGame(
+            external_game_id="window-empty-late",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=now + timedelta(minutes=240),
+            status="scheduled",
+        )
+        market = KalshiMarket(
+            kalshi_market_id="KX-WINDOW-EMPTY",
+            ticker="KXMLBGAME-WINDOW-EMPTY-PIT",
+            title="Will Pittsburgh win?",
+            status="open",
+            implied_yes_ask=Decimal("0.4000"),
+            market_price_updated_at=now,
+        )
+        session.add_all([game, market])
+        _add_candidate_mapping(
+            session,
+            game,
+            market,
+            mapping_status="confirmed",
+            market_family="full_game_winner",
+            market_type="full_game_winner",
+            selection_code="PIT",
+            settlement_rule_status="paper_supported",
+        )
+        session.commit()
+
+        result = candidates.generate_candidates(
+            session,
+            target_date=date(2026, 7, 2),
+            min_time_to_start_minutes=45,
+            max_time_to_start_minutes=180,
+        )
+        all_candidates = list(session.scalars(select(ModelCandidate)))
+        all_trades = list(session.scalars(select(PaperTrade)))
+
+    assert result["status"] == "skipped_no_games_in_window"
+    assert result["games_in_window"] == 0
+    assert result["games_excluded_too_late"] == 1
+    assert result["zero_trade_reason"] == "skipped_no_games_in_window"
+    assert result["candidates"] == 0
+    assert result["paper_trades"] == 0
+    assert all_candidates == []
+    assert all_trades == []
+
+
+def test_generate_candidates_dry_run_scores_without_opening_no_trade(monkeypatch) -> None:
+    _relax_data_quality_gate(monkeypatch)
+    now = datetime(2026, 7, 2, 16, 0, tzinfo=UTC)
+    monkeypatch.setattr(candidates, "utc_now", lambda: now)
+    monkeypatch.setattr(candidates, "score_mature_candidate", lambda *_args, **_kwargs: _fixed_model_score("0.200000"))
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        game = MlbGame(
+            external_game_id="window-dry-run-no",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=now + timedelta(minutes=90),
+            status="scheduled",
+        )
+        market = KalshiMarket(
+            kalshi_market_id="KX-WINDOW-DRY-NO",
+            ticker="KXMLBGAME-WINDOW-DRY-NO-PIT",
+            title="Will Pittsburgh win?",
+            status="open",
+            no_ask=Decimal("0.4000"),
+            market_price_updated_at=now,
+        )
+        session.add_all([game, market])
+        _add_candidate_mapping(
+            session,
+            game,
+            market,
+            mapping_status="confirmed",
+            market_family="full_game_winner",
+            market_type="full_game_winner",
+            selection_code="PIT",
+            settlement_rule_status="paper_supported",
+        )
+        session.commit()
+
+        result = candidates.generate_candidates(
+            session,
+            target_date=date(2026, 7, 2),
+            min_time_to_start_minutes=45,
+            max_time_to_start_minutes=180,
+            dry_run_candidates_only=True,
+        )
+        no_candidate = session.scalar(select(ModelCandidate).where(ModelCandidate.contract_side == "no"))
+        yes_candidate = session.scalar(select(ModelCandidate).where(ModelCandidate.contract_side == "yes"))
+        trades = list(session.scalars(select(PaperTrade)))
+
+    assert result["dry_run_candidates_only"] is True
+    assert result["candidates"] == 2
+    assert result["paper_trades"] == 0
+    assert result["snapshot_id"] is None
+    assert trades == []
+    assert no_candidate is not None
+    assert no_candidate.contract_side == "no"
+    assert no_candidate.decision == "candidate_only_dry_run"
+    assert no_candidate.training_eligible is False
+    assert no_candidate.training_exclusion_reason == "dry_run_candidates_only"
+    assert yes_candidate is not None
+    assert yes_candidate.decision == "no_trade_missing_price"
+
+
+def test_generate_candidates_window_uses_global_daily_trade_caps(monkeypatch) -> None:
+    _relax_data_quality_gate(monkeypatch)
+    monkeypatch.setenv("PAPER_MAX_TRADES_PER_SLATE", "1")
+    get_settings.cache_clear()
+    now = datetime(2026, 7, 2, 16, 0, tzinfo=UTC)
+    monkeypatch.setattr(candidates, "utc_now", lambda: now)
+    monkeypatch.setattr(candidates, "score_mature_candidate", lambda *_args, **_kwargs: _fixed_model_score("0.900000"))
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        epoch_id = _active_epoch_id(session)
+        existing_trade = PaperTrade(
+            paper_trading_epoch_id=epoch_id,
+            market_ticker="KXMLBGAME-EXISTING-CAP-PIT",
+            contract_side="yes",
+            entry_price=Decimal("0.4000"),
+            current_price=Decimal("1.0000"),
+            quantity=1,
+            entry_time=now - timedelta(hours=1),
+            status="settled",
+            market_family="full_game_winner",
+        )
+        game = MlbGame(
+            external_game_id="window-cap-in",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=now + timedelta(minutes=60),
+            status="scheduled",
+        )
+        market = KalshiMarket(
+            kalshi_market_id="KX-WINDOW-CAP",
+            ticker="KXMLBGAME-WINDOW-CAP-PIT",
+            title="Will Pittsburgh win?",
+            status="open",
+            implied_yes_ask=Decimal("0.4000"),
+            market_price_updated_at=now,
+        )
+        session.add_all([existing_trade, game, market])
+        _add_candidate_mapping(
+            session,
+            game,
+            market,
+            mapping_status="confirmed",
+            market_family="full_game_winner",
+            market_type="full_game_winner",
+            selection_code="PIT",
+            settlement_rule_status="paper_supported",
+        )
+        session.commit()
+
+        result = candidates.generate_candidates(
+            session,
+            target_date=date(2026, 7, 2),
+            min_time_to_start_minutes=45,
+            max_time_to_start_minutes=180,
+        )
+        candidate = session.scalar(select(ModelCandidate))
+        trades = list(session.scalars(select(PaperTrade).where(PaperTrade.market_ticker == "KXMLBGAME-WINDOW-CAP-PIT")))
+
+    assert result["games_in_window"] == 1
+    assert result["candidates"] == 1
+    assert result["paper_trades"] == 0
+    assert result["cap_counts"]["no_trade_slate_cap"] == 1
+    assert trades == []
+    assert candidate is not None
+    assert candidate.decision == "no_trade_slate_cap"
+
+
+def test_job_runner_forwards_candidate_sweep_window_args(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class DummySession:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+    def fake_run_job(session, **kwargs):
+        captured.update(kwargs)
+        return {"status": "succeeded"}
+
+    monkeypatch.setattr(job_runner, "get_session_factory", lambda: lambda: DummySession())
+    monkeypatch.setattr(job_runner, "run_job", fake_run_job)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "runner",
+            "--job",
+            "candidate-sweep",
+            "--target-date",
+            "2026-07-02",
+            "--min-time-to-start-minutes",
+            "45",
+            "--max-time-to-start-minutes",
+            "180",
+            "--sweep-label",
+            "pregame_window",
+            "--dry-run-candidates-only",
+            "false",
+        ],
+    )
+
+    job_runner.main()
+
+    assert captured["job_name"] == "candidate-sweep"
+    assert captured["target_date"] == date(2026, 7, 2)
+    assert captured["min_time_to_start_minutes"] == 45
+    assert captured["max_time_to_start_minutes"] == 180
+    assert captured["sweep_label"] == "pregame_window"
+    assert captured["dry_run_candidates_only"] is False
+
+
 def test_generate_candidates_preserves_traded_candidate_snapshot(monkeypatch) -> None:
     _relax_data_quality_gate(monkeypatch)
     now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
@@ -1405,6 +1724,67 @@ def test_candidate_sweep_refreshes_marks_after_candidate_engine(monkeypatch) -> 
     assert result["balance_snapshot"] == {"snapshot_id": 123}
 
 
+def test_candidate_sweep_dry_run_skips_price_refresh_and_snapshot(monkeypatch) -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    target = date(2026, 7, 2)
+    call_order: list[str] = []
+
+    def record(name: str, result: object) -> object:
+        call_order.append(name)
+        return result
+
+    monkeypatch.setattr(job_runs, "sync_schedule", lambda *_args, **_kwargs: record("schedule", 0))
+    monkeypatch.setattr(job_runs, "sync_mlb_features", lambda *_args, **_kwargs: record("features", {}))
+    monkeypatch.setattr(
+        job_runs,
+        "sync_market_family_mappings",
+        lambda *_args, **_kwargs: record("market_family_mappings", {}),
+    )
+    monkeypatch.setattr(
+        job_runs,
+        "generate_candidates",
+        lambda *_args, **_kwargs: record("candidate_engine", {"status": "completed", "dry_run_candidates_only": True}),
+    )
+    monkeypatch.setattr(
+        job_runs,
+        "refresh_open_position_prices",
+        lambda *_args, **_kwargs: pytest.fail("dry-run candidate sweep must not refresh open position marks"),
+    )
+    monkeypatch.setattr(
+        job_runs,
+        "create_balance_snapshot",
+        lambda *_args, **_kwargs: pytest.fail("dry-run candidate sweep must not create a balance snapshot"),
+    )
+
+    with Session(engine) as session:
+        run = JobRun(
+            job_name="candidate-sweep",
+            job_type="paper_ops",
+            target_date=target,
+            status="running",
+            started_at=datetime(2026, 7, 2, 12, 0, tzinfo=UTC),
+            lock_key="candidate-sweep:2026-07-02",
+            triggered_by="api",
+            steps=[],
+        )
+        result = job_runs._execute_job_steps(
+            session,
+            run,
+            "candidate-sweep",
+            target,
+            dry_run_candidates_only=True,
+        )
+
+    assert call_order == ["schedule", "features", "market_family_mappings", "candidate_engine"]
+    assert result["price_refresh"] == {"skipped": True, "reason": "dry_run_candidates_only"}
+    assert result["balance_snapshot"] == {
+        "skipped": True,
+        "reason": "dry_run_candidates_only",
+        "snapshot_id": None,
+    }
+
+
 def test_governance_job_scopes_resolved_samples_to_active_epoch() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
@@ -1482,7 +1862,18 @@ def test_job_endpoint_accepts_symbolic_target_date(monkeypatch) -> None:
     SessionLocal = sessionmaker(bind=engine)
     captured: dict[str, object] = {}
 
-    def fake_run_job(session, *, job_name, target_date, triggered_by, max_runtime_minutes=60):
+    def fake_run_job(
+        session,
+        *,
+        job_name,
+        target_date,
+        triggered_by,
+        max_runtime_minutes=60,
+        min_time_to_start_minutes=None,
+        max_time_to_start_minutes=None,
+        sweep_label=None,
+        dry_run_candidates_only=False,
+    ):
         captured["job_name"] = job_name
         captured["target_date"] = target_date
         captured["triggered_by"] = triggered_by

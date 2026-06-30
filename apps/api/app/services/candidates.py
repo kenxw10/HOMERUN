@@ -107,6 +107,15 @@ class SizingContext:
         }
 
 
+SWEEP_CLASSIFICATIONS = (
+    "in_window",
+    "excluded_too_soon",
+    "excluded_too_late",
+    "excluded_started",
+    "excluded_wrong_date",
+)
+
+
 def _candidate_day_bounds(now: datetime, target_date: date | None = None) -> tuple[date, datetime, datetime]:
     dashboard_zone = get_dashboard_zone()
     day = target_date or now.astimezone(dashboard_zone).date()
@@ -116,6 +125,119 @@ def _candidate_day_bounds(now: datetime, target_date: date | None = None) -> tup
 
 def _eastern_date(value: datetime) -> date:
     return ensure_aware_utc(value).astimezone(get_dashboard_zone()).date()
+
+
+def _validate_sweep_window(min_minutes: int | None, max_minutes: int | None) -> None:
+    if min_minutes is not None and min_minutes < 0:
+        raise ValueError("min_time_to_start_minutes must be greater than or equal to 0.")
+    if max_minutes is not None and max_minutes < 0:
+        raise ValueError("max_time_to_start_minutes must be greater than or equal to 0.")
+    if min_minutes is not None and max_minutes is not None and min_minutes > max_minutes:
+        raise ValueError("min_time_to_start_minutes must be less than or equal to max_time_to_start_minutes.")
+
+
+def _sweep_classification(
+    game: MlbGame,
+    *,
+    target_date: date,
+    now: datetime,
+    min_minutes: int | None,
+    max_minutes: int | None,
+) -> tuple[str, int]:
+    minutes_to_start = int((ensure_aware_utc(game.scheduled_start) - ensure_aware_utc(now)).total_seconds() / 60)
+    if _eastern_date(game.scheduled_start) != target_date:
+        return "excluded_wrong_date", minutes_to_start
+    if minutes_to_start <= 0:
+        return "excluded_started", minutes_to_start
+    if min_minutes is not None and minutes_to_start < min_minutes:
+        return "excluded_too_soon", minutes_to_start
+    if max_minutes is not None and minutes_to_start > max_minutes:
+        return "excluded_too_late", minutes_to_start
+    return "in_window", minutes_to_start
+
+
+def _eastern_iso(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    return ensure_aware_utc(value).astimezone(get_dashboard_zone()).isoformat()
+
+
+def _sweep_window_summary(
+    session: Session,
+    *,
+    target_date: date,
+    day_start: datetime,
+    day_end: datetime,
+    now: datetime,
+    min_minutes: int | None,
+    max_minutes: int | None,
+    sweep_label: str | None,
+    dry_run_candidates_only: bool,
+) -> tuple[dict[str, object], set[int]]:
+    target_games = list(
+        session.scalars(
+            select(MlbGame)
+            .where(MlbGame.scheduled_start >= day_start)
+            .where(MlbGame.scheduled_start < day_end)
+            .order_by(MlbGame.scheduled_start.asc(), MlbGame.id.asc())
+        )
+    )
+    wrong_date_mapped_games = list(
+        session.scalars(
+            select(MlbGame)
+            .join(MarketMapping, MarketMapping.mlb_game_id == MlbGame.id)
+            .where(MarketMapping.mapping_status.in_(["candidate", "confirmed", "needs_review"]))
+            .where(
+                (MlbGame.scheduled_start >= day_start - timedelta(days=1))
+                & (MlbGame.scheduled_start < day_end + timedelta(days=1))
+            )
+            .where((MlbGame.scheduled_start < day_start) | (MlbGame.scheduled_start >= day_end))
+            .order_by(MlbGame.scheduled_start.asc(), MlbGame.id.asc())
+        )
+    )
+    games_by_id = {game.id: game for game in target_games if game.id is not None}
+    for game in wrong_date_mapped_games:
+        if game.id is not None:
+            games_by_id.setdefault(game.id, game)
+
+    counts = {status: 0 for status in SWEEP_CLASSIFICATIONS}
+    in_window_ids: set[int] = set()
+    next_in_window: datetime | None = None
+    next_too_late: datetime | None = None
+    for game in games_by_id.values():
+        status, _minutes = _sweep_classification(
+            game,
+            target_date=target_date,
+            now=now,
+            min_minutes=min_minutes,
+            max_minutes=max_minutes,
+        )
+        counts[status] += 1
+        if status == "in_window" and game.id is not None:
+            in_window_ids.add(game.id)
+            if next_in_window is None or ensure_aware_utc(game.scheduled_start) < next_in_window:
+                next_in_window = ensure_aware_utc(game.scheduled_start)
+        elif status == "excluded_too_late":
+            if next_too_late is None or ensure_aware_utc(game.scheduled_start) < next_too_late:
+                next_too_late = ensure_aware_utc(game.scheduled_start)
+
+    summary = {
+        "sweep_label": sweep_label,
+        "sweep_window_enabled": min_minutes is not None or max_minutes is not None,
+        "min_time_to_start_minutes": min_minutes,
+        "max_time_to_start_minutes": max_minutes,
+        "dry_run_candidates_only": dry_run_candidates_only,
+        "sweep_started_at": now.isoformat(),
+        "games_total_for_date": len([game for game in games_by_id.values() if _eastern_date(game.scheduled_start) == target_date]),
+        "games_in_window": counts["in_window"],
+        "games_excluded_too_soon": counts["excluded_too_soon"],
+        "games_excluded_too_late": counts["excluded_too_late"],
+        "games_excluded_started": counts["excluded_started"],
+        "games_excluded_wrong_date": counts["excluded_wrong_date"],
+        "next_game_in_window_start_time_et": _eastern_iso(next_in_window),
+        "next_excluded_too_late_start_time_et": _eastern_iso(next_too_late),
+    }
+    return summary, in_window_ids
 
 
 def _quantized(value: Decimal, places: str = "0.000001") -> Decimal:
@@ -1112,10 +1234,32 @@ def _zero_trade_reason(decision_counts: dict[str, int]) -> str | None:
     return max(blocked.items(), key=lambda item: item[1])[0]
 
 
-def generate_candidates(session: Session, target_date: date | None = None) -> dict[str, object]:
+def generate_candidates(
+    session: Session,
+    target_date: date | None = None,
+    *,
+    min_time_to_start_minutes: int | None = None,
+    max_time_to_start_minutes: int | None = None,
+    sweep_label: str | None = None,
+    dry_run_candidates_only: bool = False,
+) -> dict[str, object]:
+    _validate_sweep_window(min_time_to_start_minutes, max_time_to_start_minutes)
     settings = get_settings()
     now = utc_now()
     day, day_start, day_end = _candidate_day_bounds(now, target_date)
+    normalized_sweep_label = sweep_label.strip() if isinstance(sweep_label, str) and sweep_label.strip() else None
+    sweep_summary, in_window_game_ids = _sweep_window_summary(
+        session,
+        target_date=day,
+        day_start=day_start,
+        day_end=day_end,
+        now=now,
+        min_minutes=min_time_to_start_minutes,
+        max_minutes=max_time_to_start_minutes,
+        sweep_label=normalized_sweep_label,
+        dry_run_candidates_only=dry_run_candidates_only,
+    )
+    sweep_window_enabled = bool(sweep_summary["sweep_window_enabled"])
     active_epoch = get_or_create_active_paper_epoch(session)
     created_or_updated = 0
     paper_trades = 0
@@ -1160,24 +1304,47 @@ def generate_candidates(session: Session, target_date: date | None = None) -> di
             "paper_risk_per_trade_pct": float(settings.paper_risk_per_trade_pct),
             "paper_min_contracts": settings.paper_min_contracts,
             "paper_max_contracts_per_trade": settings.paper_max_contracts_per_trade,
+            "sweep_label": normalized_sweep_label,
+            "sweep_window_enabled": sweep_window_enabled,
+            "min_time_to_start_minutes": min_time_to_start_minutes,
+            "max_time_to_start_minutes": max_time_to_start_minutes,
+            "dry_run_candidates_only": dry_run_candidates_only,
         },
     )
     session.add(prediction_run)
     session.flush()
 
-    mappings = session.execute(
+    mapping_query = (
         select(MarketMapping, MlbGame, KalshiMarket)
         .join(MlbGame, MarketMapping.mlb_game_id == MlbGame.id)
         .join(KalshiMarket, MarketMapping.kalshi_market_id == KalshiMarket.id)
         .where(MarketMapping.mapping_status.in_(["candidate", "confirmed", "needs_review"]))
         .where(func.lower(MlbGame.status).in_(PLAYABLE_GAME_STATUSES))
-        .where(MlbGame.scheduled_start > now)
-        .where(MlbGame.scheduled_start >= day_start)
-        .where(MlbGame.scheduled_start < day_end)
-    ).all()
+    )
+    if sweep_window_enabled:
+        source_mappings = session.execute(
+            mapping_query
+            .where(MlbGame.scheduled_start >= day_start - timedelta(days=1))
+            .where(MlbGame.scheduled_start < day_end + timedelta(days=1))
+        ).all()
+        mappings = [
+            (mapping, game, market)
+            for mapping, game, market in source_mappings
+            if game.id is not None and game.id in in_window_game_ids
+        ]
+    else:
+        mappings = session.execute(
+            mapping_query
+            .where(MlbGame.scheduled_start > now)
+            .where(MlbGame.scheduled_start >= day_start)
+            .where(MlbGame.scheduled_start < day_end)
+        ).all()
+        source_mappings = mappings
     warnings: list[str] = []
     if not mappings:
         warnings.append("no_candidates_missing_mappings: run Kalshi market discovery and mapping sync for this target date.")
+    if sweep_window_enabled and not in_window_game_ids:
+        warnings.append("skipped_no_games_in_window: no target-date games matched the requested time-to-start window.")
 
     trade_intents: list[TradeIntent] = []
     evaluated_candidates: list[ModelCandidate] = []
@@ -1228,6 +1395,8 @@ def generate_candidates(session: Session, target_date: date | None = None) -> di
             market_context["market_price"] = float(price_context.market_price) if price_context.market_price is not None else None
             market_context["price_status"] = price_context.status
             market_context["price_staleness_seconds"] = price_context.staleness_seconds
+            market_context["sweep_label"] = normalized_sweep_label
+            market_context["sweep_window_enabled"] = sweep_window_enabled
             features["market_context"] = market_context
             labels = contract_labels(
                 game=game,
@@ -1295,7 +1464,7 @@ def generate_candidates(session: Session, target_date: date | None = None) -> di
                 evaluated_at=now,
             )
             candidate.paper_trading_epoch_id = active_epoch.id
-            if open_trade_for_market is not None:
+            if open_trade_for_market is not None and not dry_run_candidates_only:
                 mark_price = _open_trade_mark_price(market, contract_side)
                 if mark_price is not None:
                     open_trade_for_market.current_price = mark_price
@@ -1323,7 +1492,9 @@ def generate_candidates(session: Session, target_date: date | None = None) -> di
                 )
                 session.add(open_trade_for_market)
             if decision == "eligible_for_paper_trade":
-                if traded_candidate_ids or open_trade_for_market is not None:
+                if dry_run_candidates_only:
+                    decision = "candidate_only_dry_run"
+                elif traded_candidate_ids or open_trade_for_market is not None:
                     decision = "candidate_only_existing_trade"
                 elif opposite_open_trade is not None:
                     decision = "no_trade_opposite_side_open"
@@ -1374,6 +1545,9 @@ def generate_candidates(session: Session, target_date: date | None = None) -> di
             elif decision == "no_trade_spread_trading_disabled":
                 candidate.training_eligible = False
                 candidate.training_exclusion_reason = "spread_trading_disabled"
+            elif dry_run_candidates_only:
+                candidate.training_eligible = False
+                candidate.training_exclusion_reason = "dry_run_candidates_only"
             candidate.data_quality = model_score.data_quality
             candidate.calibration_status = model_score.calibration_status
             candidate.scoring_rationale = {
@@ -1384,6 +1558,9 @@ def generate_candidates(session: Session, target_date: date | None = None) -> di
                 "actual_no_probability": float(actual_no_probability),
                 "actual_contract_display": labels.actual_contract_display,
                 "normalized_equivalent_display": labels.normalized_equivalent_display,
+                "sweep_label": normalized_sweep_label,
+                "sweep_window_enabled": sweep_window_enabled,
+                "dry_run_candidates_only": dry_run_candidates_only,
             }
             candidate.market_display = actual_display
             candidate.selection_display = labels.selection_display
@@ -1415,7 +1592,13 @@ def generate_candidates(session: Session, target_date: date | None = None) -> di
             )
             diagnostics["actual_contract_display"] = labels.actual_contract_display
             diagnostics["normalized_equivalent_display"] = labels.normalized_equivalent_display
+            diagnostics["sweep_label"] = normalized_sweep_label
+            diagnostics["sweep_window_enabled"] = sweep_window_enabled
+            diagnostics["dry_run_candidates_only"] = dry_run_candidates_only
             if decision in {"candidate_only_existing_trade", "no_trade_opposite_side_open"}:
+                diagnostics["gate_open_position_ok"] = False
+                diagnostics["gate_final_trade_eligible"] = False
+            if decision == "candidate_only_dry_run":
                 diagnostics["gate_open_position_ok"] = False
                 diagnostics["gate_final_trade_eligible"] = False
             _apply_gate_fields(candidate, diagnostics)
@@ -1473,6 +1656,7 @@ def generate_candidates(session: Session, target_date: date | None = None) -> di
                         "quantity": 1,
                     },
                     "gate_diagnostics": diagnostics,
+                    "sweep": sweep_summary,
                 },
             )
             session.add(output)
@@ -1689,12 +1873,28 @@ def generate_candidates(session: Session, target_date: date | None = None) -> di
         value for key, value in all_cap_counts.items() if key != "aggregate_risk_quantity_reduced"
     ) + sizing_rejections
 
-    snapshot = create_balance_snapshot(session, source="candidate_engine")
+    sweep_result = {
+        **sweep_summary,
+        "candidates_in_window": created_or_updated,
+        "paper_trades_in_window": paper_trades,
+        "mappings_considered": len(source_mappings),
+        "mappings_in_window": len(mappings),
+    }
+    result_status = (
+        "skipped_no_games_in_window"
+        if sweep_window_enabled and int(sweep_result["games_in_window"]) == 0
+        else "completed"
+    )
+
+    snapshot = None if dry_run_candidates_only else create_balance_snapshot(session, source="candidate_engine")
     prediction_run.completed_at = now
     prediction_run.status = "completed"
     prediction_run.candidates_evaluated = created_or_updated
     prediction_run.trades_created = paper_trades
     prediction_run.summary = {
+        "status": result_status,
+        **sweep_result,
+        "candidate_sweep_window": sweep_result,
         "decision_counts": decision_counts,
         "decision_counts_by_side": decision_counts_by_side,
         "candidate_diagnostics": gate_summary,
@@ -1734,19 +1934,26 @@ def generate_candidates(session: Session, target_date: date | None = None) -> di
     session.add(prediction_run)
     session.commit()
     zero_trade_reason = (
-        "no_candidates_missing_mappings"
+        "skipped_no_games_in_window"
+        if result_status == "skipped_no_games_in_window"
+        else "no_candidates_missing_mappings"
         if not mappings and paper_trades == 0
-        else _zero_trade_reason(decision_counts) if paper_trades == 0 else None
+        else _zero_trade_reason(decision_counts)
+        if paper_trades == 0
+        else None
     )
     return {
+        "status": result_status,
         "date": int(day.strftime("%Y%m%d")),
         "target_date": day.isoformat(),
         "current_eastern_date": _eastern_date(now).isoformat(),
+        **sweep_result,
         "candidates": created_or_updated,
         "candidates_evaluated": created_or_updated,
         "candidate_only_count": sum(count for reason, count in decision_counts.items() if reason.startswith("candidate_only")),
         "evaluated_game_count": len({game.id for _mapping, game, _market in mappings}),
-        "mappings_considered": len(mappings),
+        "mappings_considered": len(source_mappings),
+        "mappings_evaluated": len(mappings),
         "paper_trades": paper_trades,
         "trades_created": paper_trades,
         "model_version": model_version.version_tag,
@@ -1754,7 +1961,7 @@ def generate_candidates(session: Session, target_date: date | None = None) -> di
         "feature_version": FEATURE_VERSION,
         "prediction_run_id": prediction_run.id,
         "prediction_run_target_date": prediction_run.target_date.isoformat() if prediction_run.target_date else None,
-        "snapshot_id": snapshot.id,
+        "snapshot_id": snapshot.id if snapshot is not None else None,
         "decision_counts": decision_counts,
         "decision_counts_by_side": decision_counts_by_side,
         "candidate_diagnostics": gate_summary,

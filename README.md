@@ -76,7 +76,7 @@ From `apps/api` after installing backend dependencies:
 .\.venv\Scripts\python.exe -m app.jobs.market_family_mapping_sync
 .\.venv\Scripts\python.exe -m app.jobs.open_position_price_refresh
 .\.venv\Scripts\python.exe -m app.jobs.runner --job daily-setup --target-date today_et
-.\.venv\Scripts\python.exe -m app.jobs.runner --job candidate-sweep --target-date today_et
+.\.venv\Scripts\python.exe -m app.jobs.runner --job candidate-sweep --target-date today_et --min-time-to-start-minutes 45 --max-time-to-start-minutes 180 --sweep-label rolling_pregame_window
 .\.venv\Scripts\python.exe -m app.jobs.runner --job price-refresh --target-date today_et
 .\.venv\Scripts\python.exe -m app.jobs.runner --job settlement --target-date yesterday_et
 .\.venv\Scripts\python.exe -m app.jobs.runner --job governance
@@ -125,7 +125,7 @@ PR 3c exposes these internal API run endpoints:
 - `POST /v1/run/open-position-price-refresh`
 - `POST /v1/admin/paper-trading/reset-epoch`
 - `POST /v1/jobs/run/daily-setup?target_date=YYYY-MM-DD`
-- `POST /v1/jobs/run/candidate-sweep?target_date=YYYY-MM-DD`
+- `POST /v1/jobs/run/candidate-sweep?target_date=YYYY-MM-DD&min_time_to_start_minutes=45&max_time_to_start_minutes=180&sweep_label=rolling_pregame_window`
 - `POST /v1/jobs/run/price-refresh?target_date=YYYY-MM-DD`
 - `POST /v1/jobs/run/settlement?target_date=YYYY-MM-DD`
 - `POST /v1/jobs/run/governance`
@@ -137,6 +137,8 @@ PR 3c exposes these internal API run endpoints:
 - `GET /v1/market-families/discovery-preview?date=YYYY-MM-DD`
 - `GET /v1/market-families/mappings?date=YYYY-MM-DD`
 - `GET /v1/kalshi/resolve-preview?date=YYYY-MM-DD`
+
+PR3d hotfix 2 adds time-windowed candidate sweeps for production paper observation. When min/max are supplied, the sweep only scores games whose first pitch is inside that minutes-to-start window. Games outside the window are counted in the job result and dashboard, but they do not create candidates or paper trades. A dry-run option (`dry_run_candidates_only=true`) saves labeled candidate diagnostics without opening trades or refreshing open-position marks.
 
 For local development, these endpoints can run without a key when `APP_ENV=local` and `BACKEND_API_KEY` is empty. For any public or deployed backend, set `BACKEND_API_KEY` and call these endpoints with an `X-API-Key` header.
 

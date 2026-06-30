@@ -603,3 +603,12 @@ Every future PR must update this section with:
 - Reset payload remains protected API-only: `archive_open_positions=true`, `reset_dashboard_metrics=true`, and `confirmation=RESET_PAPER_EPOCH`. Archived rows must stay hidden from the main dashboard and active metrics.
 - No live execution, cron setup, sportsbook/Odds API logic, team totals, umpire factors, production credentials, secrets changes, admin page, or frontend reset button were added.
 - Validation target: default spread trading disabled; YES/NO side diagnostics present; NO prices sourced from NO-side quotes; no fake plus-spread YES labels; NO-side settlement remains inverted from the actual YES proposition; aggregate risk caps prevent excessive one-slate exposure; active dashboard starts clean after the v2 reset.
+
+### PR3d Hotfix 2 - Time-Windowed Candidate Sweeps
+
+- Added optional candidate-sweep window controls to the protected API and cron-safe runner: `min_time_to_start_minutes`, `max_time_to_start_minutes`, `sweep_label`, and `dry_run_candidates_only`.
+- The production paper-observation sweep is intended to run every 30 minutes with a 45-180 minute rolling pregame window. Games outside that window are counted as too soon, too late, started, or wrong date, but normal windowed sweeps do not score them or create paper trades.
+- Candidate-engine and job-run responses now include sweep diagnostics, including games in window, excluded counts, next eligible game, candidates in window, and paper trades created in the sweep. The dashboard model panel surfaces the latest sweep window and counts.
+- Dry-run candidate sweeps save labeled diagnostics without opening paper trades, refreshing open-position marks, or writing balance snapshots.
+- Risk caps remain active-epoch/global for the target date and are not reset per sweep. Price refresh remains unwindowed so all open paper positions continue to be marked.
+- Safety posture is unchanged: no live order placement, no live execution path, no sportsbook/Odds API logic, no team totals, no umpire factors, and no production credential changes.

@@ -994,6 +994,14 @@ export default function DashboardPage() {
   const summary = state.status === "ready" ? state.summary : state.status === "error" && state.summary ? state.summary : emptySummary;
   const system = state.status === "ready" ? state.system : state.status === "error" ? state.system : null;
   const connected = state.status === "ready";
+  const tradeCapsUsed = summary.model_status.trade_caps_used;
+  const sweepWindowEnabled = tradeCapsUsed.sweep_window_enabled === true;
+  const sweepLabel = typeof tradeCapsUsed.sweep_label === "string" && tradeCapsUsed.sweep_label ? tradeCapsUsed.sweep_label : "manual";
+  const sweepMin = tradeCapsUsed.min_time_to_start_minutes ?? "ANY";
+  const sweepMax = tradeCapsUsed.max_time_to_start_minutes ?? "ANY";
+  const sweepWindowLabel = sweepWindowEnabled
+    ? `${formatUnknown(sweepLabel)} ${formatUnknown(sweepMin)}-${formatUnknown(sweepMax)} MIN`
+    : "NO WINDOW";
 
   const modelRows: StatusRow[] = [
     { label: "ACTIVE MODEL VERSION", value: summary.model_status.active_model_version ?? "NONE" },
@@ -1025,14 +1033,24 @@ export default function DashboardPage() {
     { label: "DATA QUALITY AVG", value: formatNumber(summary.model_status.data_quality_summary.avg ?? null) },
     {
       label: "TRADES USED / MAX TODAY",
-      value: `${formatUnknown(summary.model_status.trade_caps_used.paper_trades)} / ${formatUnknown(
+      value: `${formatUnknown(tradeCapsUsed.paper_trades)} / ${formatUnknown(
         summary.model_status.trade_policy.paper_max_trades_per_slate,
       )}`,
     },
+    { label: "LAST CANDIDATE SWEEP WINDOW", value: sweepWindowLabel, tone: sweepWindowEnabled ? "green" : "amber" },
+    { label: "GAMES IN WINDOW", value: formatUnknown(tradeCapsUsed.games_in_window) },
+    {
+      label: "GAMES EXCLUDED TOO EARLY/LATE/STARTED",
+      value: `${formatUnknown(tradeCapsUsed.games_excluded_too_soon)} / ${formatUnknown(
+        tradeCapsUsed.games_excluded_too_late,
+      )} / ${formatUnknown(tradeCapsUsed.games_excluded_started)}`,
+    },
+    { label: "NEXT ELIGIBLE GAME", value: formatEastern(tradeCapsUsed.next_game_in_window_start_time_et as string | null | undefined) },
+    { label: "PAPER TRADES CREATED IN LAST SWEEP", value: formatUnknown(tradeCapsUsed.paper_trades_in_window) },
     {
       label: "YES / NO CANDIDATES",
-      value: `${formatUnknown(summary.model_status.trade_caps_used.candidates_yes)} / ${formatUnknown(
-        summary.model_status.trade_caps_used.candidates_no,
+      value: `${formatUnknown(tradeCapsUsed.candidates_yes)} / ${formatUnknown(
+        tradeCapsUsed.candidates_no,
       )}`,
     },
     {
@@ -1052,14 +1070,14 @@ export default function DashboardPage() {
     },
     {
       label: "DAILY RISK USED / MAX",
-      value: `${formatUnknown(summary.model_status.trade_caps_used.daily_risk_used)} / ${formatUnknown(
-        summary.model_status.trade_caps_used.daily_risk_max,
+      value: `${formatUnknown(tradeCapsUsed.daily_risk_used)} / ${formatUnknown(
+        tradeCapsUsed.daily_risk_max,
       )}`,
     },
     {
       label: "OPEN RISK USED / MAX",
-      value: `${formatUnknown(summary.model_status.trade_caps_used.open_risk_used)} / ${formatUnknown(
-        summary.model_status.trade_caps_used.open_risk_max,
+      value: `${formatUnknown(tradeCapsUsed.open_risk_used)} / ${formatUnknown(
+        tradeCapsUsed.open_risk_max,
       )}`,
     },
     { label: "GOVERNANCE STATUS", value: summary.model_status.governance_status ?? "NOT RUN" },

@@ -141,23 +141,46 @@ Use `app.jobs.runner` for Railway cron jobs. Each invocation opens a database se
 
 ```powershell
 python -m app.jobs.runner --job daily-setup --target-date today_et
-python -m app.jobs.runner --job candidate-sweep --target-date today_et
+python -m app.jobs.runner --job candidate-sweep --target-date today_et --min-time-to-start-minutes 45 --max-time-to-start-minutes 180 --sweep-label rolling_pregame_window
 python -m app.jobs.runner --job price-refresh --target-date today_et
 python -m app.jobs.runner --job settlement --target-date yesterday_et
 python -m app.jobs.runner --job governance
 python -m app.jobs.runner --job full-paper-cycle --target-date today_et
 ```
 
+Recommended production cadence:
+
+- Daily setup at 8:30 AM ET.
+- Candidate sweep every 30 minutes from 10:30 AM ET through 10:00 PM ET using the 45-180 minute rolling pregame window.
+- Price refresh every 15 minutes from 11:00 AM ET through 1:30 AM ET. Price refresh intentionally has no time-to-start filter because it marks all active open paper positions.
+- Settlement every 30 minutes from 2:30 PM ET through 1:30 AM ET for `today_et`, plus an 8:30 AM ET `yesterday_et` catch-up.
+- Governance at 9:00 AM ET after the settlement catch-up.
+
+Railway cron schedules are UTC. Adjust the UTC hours when New York changes between EDT and EST.
+
 Protected manual endpoints mirror the cron jobs:
 
 - `POST /v1/jobs/run/daily-setup?target_date=YYYY-MM-DD`
-- `POST /v1/jobs/run/candidate-sweep?target_date=YYYY-MM-DD`
+- `POST /v1/jobs/run/candidate-sweep?target_date=YYYY-MM-DD&min_time_to_start_minutes=45&max_time_to_start_minutes=180&sweep_label=rolling_pregame_window`
 - `POST /v1/jobs/run/price-refresh?target_date=YYYY-MM-DD`
 - `POST /v1/jobs/run/settlement?target_date=YYYY-MM-DD`
 - `POST /v1/jobs/run/governance`
 - `POST /v1/jobs/run/full-paper-cycle?target_date=YYYY-MM-DD`
 
-The dashboard shows the last setup, candidate sweep, price refresh, settlement, governance, and WebSocket/REST status.
+The dashboard shows the last setup, candidate sweep, price refresh, settlement, governance, WebSocket/REST status, and the last candidate sweep window. A windowed sweep with no games in range should return `status=skipped_no_games_in_window`, count excluded games, and still be a successful no-work run rather than an error.
+
+After deployment, validate:
+
+1. `POST /v1/jobs/run/candidate-sweep?target_date=today_et&min_time_to_start_minutes=45&max_time_to_start_minutes=180&sweep_label=rolling_pregame_window` returns the sweep diagnostics.
+2. Only in-window games create paper trades.
+3. Out-of-window games are counted as too soon, too late, started, or wrong date.
+4. Repeated sweeps do not duplicate paper trades.
+5. Spread trading remains disabled unless explicitly enabled.
+6. YES and NO candidates can still be scored in-window.
+7. Daily/open/family/scope risk caps still apply across the full active epoch, not only the current sweep.
+8. Price refresh updates all open positions.
+9. The dashboard shows the last sweep window and paper trades created in that sweep.
+10. No live execution path or live order placement is enabled.
 
 ## PR3d WebSocket Market Data Worker
 
