@@ -176,6 +176,7 @@ type ChartDataPoint = {
   timestamp: string;
   value: number;
   time: number;
+  breakBefore?: boolean;
 };
 
 type ChartDomain = {
@@ -585,10 +586,7 @@ function chartDomainForRange(
   if (range === "TODAY") {
     start = easternMidnightMs(new Date(nowMs));
   } else if (range === "ALL") {
-    start =
-      epochStartMs !== null && (firstPointMs === null || firstPointMs <= epochStartMs)
-        ? epochStartMs
-        : firstPointMs ?? epochStartMs ?? end - trailingRangeMs["1D"];
+    start = epochStartMs ?? firstPointMs ?? end - trailingRangeMs["1D"];
   } else {
     start = end - trailingRangeMs[range];
   }
@@ -610,8 +608,10 @@ function portfolioChartSeries(
   const epochStartMs = parseChartTime(summary.active_epoch?.started_at);
   const domain = chartDomainForRange(range, nowMs, epochStartMs, rawPoints);
   const anchorPoints = [...rawPoints];
+  const firstRawPoint = rawPoints[0];
+  const epochAnchorInDomain = epochStartMs !== null && epochStartMs >= domain.start && epochStartMs <= domain.end;
 
-  if (epochStartMs !== null && epochStartMs <= domain.end && (rawPoints.length === 0 || epochStartMs >= domain.start)) {
+  if (epochStartMs !== null && epochStartMs <= domain.end && (rawPoints.length === 0 || epochStartMs >= domain.start || range === "ALL")) {
     anchorPoints.push({
       timestamp: new Date(epochStartMs).toISOString(),
       time: epochStartMs,
@@ -622,11 +622,20 @@ function portfolioChartSeries(
   anchorPoints.sort((a, b) => a.time - b.time);
 
   const hasPointAtOrBeforeStart = anchorPoints.some((point) => point.time <= domain.start);
-  const startsBeforeFirstReturnedSnapshot = rawPoints.length > 0 && !hasPointAtOrBeforeStart;
+  const startsBeforeFirstReturnedSnapshot = rawPoints.length > 0 && !hasPointAtOrBeforeStart && !epochAnchorInDomain;
+  const lineStart =
+    startsBeforeFirstReturnedSnapshot
+      ? rawPoints[0].time
+      : epochAnchorInDomain && epochStartMs > domain.start
+        ? epochStartMs
+        : domain.start;
+  const likelyReturnedWindowIsTruncated = rawPoints.length >= 500;
+  const gapBeforeFirstReturnedSnapshot =
+    likelyReturnedWindowIsTruncated && firstRawPoint !== undefined && firstRawPoint.time > lineStart;
   const historyTruncated =
     startsBeforeFirstReturnedSnapshot ||
-    (range === "ALL" && epochStartMs !== null && rawPoints.length > 0 && rawPoints[0].time > epochStartMs);
-  const lineStart = startsBeforeFirstReturnedSnapshot ? rawPoints[0].time : domain.start;
+    gapBeforeFirstReturnedSnapshot ||
+    (likelyReturnedWindowIsTruncated && range === "ALL" && epochStartMs !== null && rawPoints[0]?.time > epochStartMs);
   const firstValue = startsBeforeFirstReturnedSnapshot ? rawPoints[0].value : latestKnownValue(anchorPoints, lineStart, startingBalance);
   const currentValue =
     typeof summary.portfolio_value === "number"
@@ -642,7 +651,10 @@ function portfolioChartSeries(
 
   for (const point of anchorPoints) {
     if (point.time > lineStart && point.time < domain.end) {
-      points.push(point);
+      points.push({
+        ...point,
+        breakBefore: gapBeforeFirstReturnedSnapshot && point.time === firstRawPoint?.time,
+      });
     }
   }
 
@@ -750,6 +762,29 @@ function buildChart(series: ChartDataPoint[], mode: ChartMode, domain: ChartDoma
     const y = padding.top + ((yMax - point.value) / yRange) * yPixels;
     return { ...point, x, y };
   });
+  const polylines: string[] = [];
+  const singlePoints: { x: number; y: number }[] = [];
+  let segment: string[] = [];
+
+  for (const point of points) {
+    if (point.breakBefore && segment.length > 0) {
+      if (segment.length === 1) {
+        const [x, y] = segment[0].split(",").map(Number);
+        singlePoints.push({ x, y });
+      } else {
+        polylines.push(segment.join(" "));
+      }
+      segment = [];
+    }
+    segment.push(`${point.x.toFixed(2)},${point.y.toFixed(2)}`);
+  }
+
+  if (segment.length === 1) {
+    const [x, y] = segment[0].split(",").map(Number);
+    singlePoints.push({ x, y });
+  } else if (segment.length > 1) {
+    polylines.push(segment.join(" "));
+  }
 
   return {
     width,
@@ -757,7 +792,8 @@ function buildChart(series: ChartDataPoint[], mode: ChartMode, domain: ChartDoma
     yMin,
     yMax,
     points,
-    polyline: points.map((point) => `${point.x.toFixed(2)},${point.y.toFixed(2)}`).join(" "),
+    polylines,
+    singlePoints,
     latest: points[points.length - 1],
     xTicks: chartXTicks(domain, range),
   };
@@ -852,7 +888,12 @@ function PortfolioChart({ summary }: { summary: DashboardSummary }) {
           })}
           {displaySeries.length > 0 ? (
             <>
-              <polyline points={chart.polyline} />
+              {chart.polylines.map((polyline) => (
+                <polyline key={polyline} points={polyline} />
+              ))}
+              {chart.singlePoints.map((point) => (
+                <circle key={`${point.x}-${point.y}`} cx={point.x} cy={point.y} r="3" className="chart-anchor-point" />
+              ))}
               {chart.latest ? (
                 <g>
                   <line x1={chart.latest.x} y1={chart.latest.y} x2="1172" y2={chart.latest.y} className="last-guide" />

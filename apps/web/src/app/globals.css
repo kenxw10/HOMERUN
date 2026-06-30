@@ -296,6 +296,10 @@ button {
   stroke-dasharray: 7 7;
 }
 
+.chart-anchor-point {
+  fill: #04963f;
+}
+
 .last-guide {
   stroke: #04963f;
   stroke-dasharray: 4 4;
