@@ -902,13 +902,15 @@ function buildChart(series: ChartDataPoint[], mode: ChartMode, domain: ChartDoma
   const yRange = yMax - yMin || 1;
   const plotLeft = padding.left;
   const plotRight = width - padding.right;
+  const plotTop = padding.top;
+  const plotBottom = height - padding.bottom;
   const xRange = plotRight - plotLeft;
-  const yPixels = height - padding.top - padding.bottom;
+  const yPixels = plotBottom - plotTop;
   const domainSpan = domain.end - domain.start || 1;
 
   const points = series.map((point) => {
     const x = plotLeft + ((point.time - domain.start) / domainSpan) * xRange;
-    const y = padding.top + ((yMax - point.value) / yRange) * yPixels;
+    const y = plotTop + ((yMax - point.value) / yRange) * yPixels;
     return { ...point, x, y };
   });
   const polylines: string[] = [];
@@ -945,6 +947,8 @@ function buildChart(series: ChartDataPoint[], mode: ChartMode, domain: ChartDoma
     singlePoints,
     plotLeft,
     plotRight,
+    plotTop,
+    plotBottom,
     latest: points[points.length - 1],
     xTicks: chartXTicks(domain, range),
   };
@@ -992,24 +996,14 @@ function PortfolioChart({ summary }: { summary: DashboardSummary }) {
         : null;
   const changePct = latestRaw !== null && startingBalance > 0 ? (latestRaw - startingBalance) / startingBalance : null;
   const ticks = [chart.yMax, (chart.yMax + chart.yMin) / 2, chart.yMin];
-  const latestTone = changePct !== null && changePct < 0 ? "value-negative" : "value-positive";
   const title =
     activeMode === "VALUE"
       ? "PORTFOLIO VALUE (PAPER TRADING)"
       : activeMode === "P/L $"
         ? "PORTFOLIO P/L $ (PAPER TRADING)"
         : "PORTFOLIO P/L % (PAPER TRADING)";
-  const latestGuideLength = 40;
-  const latestLabel = chart.latest
-    ? {
-        guideX: Math.max(chart.plotLeft, Math.min(chart.latest.x, chart.plotRight - latestGuideLength)),
-        textAnchor: chart.latest.x >= chart.plotRight - 120 ? ("end" as const) : ("start" as const),
-        x:
-          chart.latest.x >= chart.plotRight - 120
-            ? chart.plotRight - 8
-            : Math.min(chart.latest.x + 8, chart.plotRight - 8),
-      }
-    : null;
+  const chartClipId = `portfolio-chart-clip-${activeRange.replace(/\W/g, "-")}-${activeMode.replace(/\W/g, "-")}`;
+  const gridColumns = 6;
 
   return (
     <section className="panel chart-panel">
@@ -1056,45 +1050,39 @@ function PortfolioChart({ summary }: { summary: DashboardSummary }) {
 
       <div className="chart-stage" role="img" aria-label="Portfolio value line chart">
         <svg viewBox={`0 0 ${chart.width} ${chart.height}`} preserveAspectRatio="none" aria-hidden="true">
+          <defs>
+            <clipPath id={chartClipId}>
+              <rect
+                x={chart.plotLeft}
+                y={chart.plotTop}
+                width={chart.plotRight - chart.plotLeft}
+                height={chart.plotBottom - chart.plotTop}
+              />
+            </clipPath>
+          </defs>
           {[0, 1, 2, 3, 4].map((index) => {
             const y = 24 + index * 50;
-            return <line key={`h-${index}`} x1="54" y1={y} x2="1172" y2={y} className="chart-grid" />;
+            return <line key={`h-${index}`} x1={chart.plotLeft} y1={y} x2={chart.plotRight} y2={y} className="chart-grid" />;
           })}
           {[0, 1, 2, 3, 4, 5, 6].map((index) => {
-            const x = 54 + index * 186;
-            return <line key={`v-${index}`} x1={x} y1="24" x2={x} y2="226" className="chart-grid" />;
+            const x = chart.plotLeft + ((chart.plotRight - chart.plotLeft) * index) / gridColumns;
+            return <line key={`v-${index}`} x1={x} y1={chart.plotTop} x2={x} y2={chart.plotBottom} className="chart-grid" />;
           })}
           {displaySeries.length > 0 ? (
-            <>
+            <g clipPath={`url(#${chartClipId})`}>
               {chart.polylines.map((polyline) => (
                 <polyline key={polyline} points={polyline} />
               ))}
               {chart.singlePoints.map((point) => (
                 <circle key={`${point.x}-${point.y}`} cx={point.x} cy={point.y} r="3" className="chart-anchor-point" />
               ))}
-              {chart.latest && latestLabel ? (
-                <g>
-                  <line
-                    x1={latestLabel.guideX}
-                    y1={chart.latest.y}
-                    x2={chart.plotRight - 1}
-                    y2={chart.latest.y}
-                    className="last-guide"
-                  />
-                  <text
-                    x={latestLabel.x}
-                    y={chart.latest.y - 7}
-                    textAnchor={latestLabel.textAnchor}
-                    className={`last-tag-text ${latestTone}`}
-                  >
-                    {formatChartValue(chart.latest.value, activeMode)}
-                  </text>
-                </g>
-              ) : null}
-            </>
+            </g>
           ) : (
             <g>
-              <polyline points="54,158 240,152 426,156 612,150 798,154 984,151 1172,153" className="empty-line" />
+              <polyline
+                points={`${chart.plotLeft},158 240,152 426,156 612,150 798,154 984,151 ${chart.plotRight},153`}
+                className="empty-line"
+              />
               <text x="600" y="126" textAnchor="middle" className="empty-chart-label">
                 NO PORTFOLIO SNAPSHOTS
               </text>
