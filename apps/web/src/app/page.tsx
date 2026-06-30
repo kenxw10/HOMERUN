@@ -171,6 +171,7 @@ type StatusRow = {
 
 type ChartRange = "TODAY" | "1D" | "1W" | "1M" | "ALL";
 type ChartMode = "VALUE" | "P/L $" | "P/L %";
+type ChartTickFormat = "TIME" | "DAY_DATE" | "MONTH_DAY" | "DAY_TIME" | "FULL_TIME" | "SECOND_TIME";
 
 type ChartDataPoint = {
   timestamp: string;
@@ -204,6 +205,8 @@ const trailingRangeMs: Record<Exclude<ChartRange, "TODAY" | "ALL">, number> = {
   "1W": 7 * 24 * 60 * 60 * 1000,
   "1M": 30 * 24 * 60 * 60 * 1000,
 };
+const chartHourMs = 60 * 60 * 1000;
+const chartDayMs = 24 * chartHourMs;
 
 const emptySummary: DashboardSummary = {
   active_epoch: null,
@@ -714,9 +717,9 @@ function formatChartValue(value: number | null | undefined, mode: ChartMode): st
   return formatCurrency(value);
 }
 
-function formatChartTick(time: number, range: ChartRange): string {
+function formatChartTick(time: number, format: ChartTickFormat): string {
   const date = new Date(time);
-  if (range === "TODAY" || range === "1D") {
+  if (format === "TIME") {
     return new Intl.DateTimeFormat("en-US", {
       timeZone: EASTERN_TIME_ZONE,
       hour: "numeric",
@@ -725,12 +728,46 @@ function formatChartTick(time: number, range: ChartRange): string {
       .format(date)
       .toUpperCase();
   }
-  if (range === "1W") {
+  if (format === "DAY_DATE") {
     return new Intl.DateTimeFormat("en-US", {
       timeZone: EASTERN_TIME_ZONE,
       weekday: "short",
       month: "2-digit",
       day: "2-digit",
+    })
+      .format(date)
+      .replace(",", "")
+      .toUpperCase();
+  }
+  if (format === "DAY_TIME") {
+    return new Intl.DateTimeFormat("en-US", {
+      timeZone: EASTERN_TIME_ZONE,
+      weekday: "short",
+      hour: "numeric",
+      minute: "2-digit",
+    })
+      .format(date)
+      .replace(",", "")
+      .toUpperCase();
+  }
+  if (format === "FULL_TIME") {
+    return new Intl.DateTimeFormat("en-US", {
+      timeZone: EASTERN_TIME_ZONE,
+      month: "short",
+      day: "2-digit",
+      hour: "numeric",
+      minute: "2-digit",
+    })
+      .format(date)
+      .replace(",", "")
+      .toUpperCase();
+  }
+  if (format === "SECOND_TIME") {
+    return new Intl.DateTimeFormat("en-US", {
+      timeZone: EASTERN_TIME_ZONE,
+      hour: "numeric",
+      minute: "2-digit",
+      second: "2-digit",
     })
       .format(date)
       .toUpperCase();
@@ -744,13 +781,74 @@ function formatChartTick(time: number, range: ChartRange): string {
     .toUpperCase();
 }
 
+function formatChartTickTitle(time: number): string {
+  return new Intl.DateTimeFormat("en-US", {
+    timeZone: EASTERN_TIME_ZONE,
+    month: "short",
+    day: "2-digit",
+    hour: "numeric",
+    minute: "2-digit",
+    timeZoneName: "short",
+  }).format(new Date(time));
+}
+
+function primaryChartTickFormat(range: ChartRange, spanMs: number): ChartTickFormat {
+  if (range === "TODAY" || range === "1D") {
+    return "TIME";
+  }
+  if (range === "1W") {
+    return "DAY_DATE";
+  }
+  if (range === "1M") {
+    return "MONTH_DAY";
+  }
+  if (spanMs < 48 * chartHourMs) {
+    return "DAY_TIME";
+  }
+  if (spanMs < 14 * chartDayMs) {
+    return "FULL_TIME";
+  }
+  return "MONTH_DAY";
+}
+
+function moreSpecificChartTickFormat(format: ChartTickFormat): ChartTickFormat {
+  if (format === "TIME") {
+    return "DAY_TIME";
+  }
+  if (format === "DAY_DATE" || format === "MONTH_DAY") {
+    return "FULL_TIME";
+  }
+  if (format === "DAY_TIME" || format === "FULL_TIME") {
+    return "SECOND_TIME";
+  }
+  return "SECOND_TIME";
+}
+
+function hasDuplicateChartLabels(labels: string[]): boolean {
+  return new Set(labels).size !== labels.length;
+}
+
 function chartXTicks(domain: ChartDomain, range: ChartRange) {
   const count = 7;
   const span = domain.end - domain.start || 1;
-  return Array.from({ length: count }, (_, index) => {
-    const time = domain.start + (span * index) / (count - 1);
-    return { time, label: formatChartTick(time, range) };
-  });
+  const times = Array.from({ length: count }, (_, index) => domain.start + (span * index) / (count - 1));
+  let format = primaryChartTickFormat(range, span);
+  let labels = times.map((time) => formatChartTick(time, format));
+
+  if (hasDuplicateChartLabels(labels)) {
+    format = moreSpecificChartTickFormat(format);
+    labels = times.map((time) => formatChartTick(time, format));
+  }
+  if (hasDuplicateChartLabels(labels)) {
+    format = moreSpecificChartTickFormat(format);
+    labels = times.map((time) => formatChartTick(time, format));
+  }
+
+  return times.map((time, index) => ({
+    time,
+    label: labels[index],
+    title: formatChartTickTitle(time),
+  }));
 }
 
 function buildChart(series: ChartDataPoint[], mode: ChartMode, domain: ChartDomain, range: ChartRange) {
@@ -764,12 +862,14 @@ function buildChart(series: ChartDataPoint[], mode: ChartMode, domain: ChartDoma
   const yMin = Math.floor((min - paddingValue) / paddingValue) * paddingValue;
   const yMax = Math.ceil((max + paddingValue) / paddingValue) * paddingValue;
   const yRange = yMax - yMin || 1;
-  const xRange = width - padding.left - padding.right;
+  const plotLeft = padding.left;
+  const plotRight = width - padding.right;
+  const xRange = plotRight - plotLeft;
   const yPixels = height - padding.top - padding.bottom;
   const domainSpan = domain.end - domain.start || 1;
 
   const points = series.map((point) => {
-    const x = padding.left + ((point.time - domain.start) / domainSpan) * xRange;
+    const x = plotLeft + ((point.time - domain.start) / domainSpan) * xRange;
     const y = padding.top + ((yMax - point.value) / yRange) * yPixels;
     return { ...point, x, y };
   });
@@ -805,6 +905,8 @@ function buildChart(series: ChartDataPoint[], mode: ChartMode, domain: ChartDoma
     points,
     polylines,
     singlePoints,
+    plotLeft,
+    plotRight,
     latest: points[points.length - 1],
     xTicks: chartXTicks(domain, range),
   };
@@ -859,6 +961,16 @@ function PortfolioChart({ summary }: { summary: DashboardSummary }) {
       : activeMode === "P/L $"
         ? "PORTFOLIO P/L $ (PAPER TRADING)"
         : "PORTFOLIO P/L % (PAPER TRADING)";
+  const latestLabel = chart.latest
+    ? {
+        guideX: Math.min(Math.max(chart.latest.x, chart.plotLeft), chart.plotRight - 1),
+        textAnchor: chart.latest.x >= chart.plotRight - 120 ? ("end" as const) : ("start" as const),
+        x:
+          chart.latest.x >= chart.plotRight - 120
+            ? chart.plotRight - 8
+            : Math.min(chart.latest.x + 8, chart.plotRight - 8),
+      }
+    : null;
 
   return (
     <section className="panel chart-panel">
@@ -921,13 +1033,19 @@ function PortfolioChart({ summary }: { summary: DashboardSummary }) {
               {chart.singlePoints.map((point) => (
                 <circle key={`${point.x}-${point.y}`} cx={point.x} cy={point.y} r="3" className="chart-anchor-point" />
               ))}
-              {chart.latest ? (
+              {chart.latest && latestLabel ? (
                 <g>
-                  <line x1={chart.latest.x} y1={chart.latest.y} x2="1172" y2={chart.latest.y} className="last-guide" />
+                  <line
+                    x1={latestLabel.guideX}
+                    y1={chart.latest.y}
+                    x2={chart.plotRight - 1}
+                    y2={chart.latest.y}
+                    className="last-guide"
+                  />
                   <text
-                    x={chart.latest.x > 1040 ? chart.latest.x - 8 : chart.latest.x + 8}
+                    x={latestLabel.x}
                     y={chart.latest.y - 7}
-                    textAnchor={chart.latest.x > 1040 ? "end" : "start"}
+                    textAnchor={latestLabel.textAnchor}
                     className={`last-tag-text ${latestTone}`}
                   >
                     {formatChartValue(chart.latest.value, activeMode)}
@@ -951,7 +1069,9 @@ function PortfolioChart({ summary }: { summary: DashboardSummary }) {
         </div>
         <div className="chart-x-axis">
           {nowMs === null ? null : chart.xTicks.map((tick) => (
-            <span key={`${activeRange}-${tick.time}`}>{tick.label}</span>
+            <span key={`${activeRange}-${tick.time}`} title={tick.title}>
+              {tick.label}
+            </span>
           ))}
         </div>
       </div>
