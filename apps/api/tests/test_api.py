@@ -226,6 +226,36 @@ def test_health_uses_safe_defaults() -> None:
     assert "timestamp" in payload
 
 
+def test_pr3e_feature_hardening_preserves_paper_safety_defaults(monkeypatch) -> None:
+    for name in (
+        "PAPER_TRADING",
+        "LIVE_TRADING_ENABLED",
+        "EXECUTION_KILL_SWITCH",
+        "KALSHI_ENV",
+        "WEBSOCKET_MARKET_DATA_ENABLED",
+        "PAPER_SPREAD_TRADING_ENABLED",
+        "PAPER_MIN_DATA_QUALITY",
+        "PAPER_OBSERVATION_MIN_DATA_QUALITY",
+        "LIVE_MIN_DATA_QUALITY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    get_settings.cache_clear()
+
+    try:
+        settings = get_settings()
+        assert settings.paper_trading is True
+        assert settings.live_trading_enabled is False
+        assert settings.execution_kill_switch is True
+        assert settings.kalshi_env == "demo"
+        assert settings.websocket_market_data_enabled is False
+        assert settings.paper_spread_trading_enabled is False
+        assert settings.paper_min_data_quality == Decimal("0.60")
+        assert settings.paper_observation_min_data_quality == Decimal("0.55")
+        assert settings.live_min_data_quality == Decimal("0.60")
+    finally:
+        get_settings.cache_clear()
+
+
 def test_dashboard_summary_shape_is_empty_and_safe() -> None:
     response = client.get("/v1/dashboard/summary")
 
@@ -6710,6 +6740,106 @@ def test_feature_coverage_and_detail_filter_to_active_feature_version() -> None:
     assert coverage["items"][0]["source"] == features.FEATURE_VERSION
     assert detail["count"] == 1
     assert detail["items"][0]["source"] == features.FEATURE_VERSION
+
+
+def test_feature_coverage_detail_and_source_status_include_17_module_summary(monkeypatch) -> None:
+    monkeypatch.setattr(
+        features.pybaseball_client,
+        "import_status",
+        lambda: {
+            "available": False,
+            "version": None,
+            "module_path": None,
+            "import_error": {"error_type": "ImportError", "message": "pybaseball unavailable in this test"},
+        },
+    )
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    captured_at = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+    feature_payload = {
+        module_name: {
+            "source_status": "available",
+            "source": features.MLB_STATS_SOURCE,
+            "reason": "source populated",
+        }
+        for module_name in features.CORE_MODULES
+    }
+    feature_payload["lineup"] = {
+        "home": {
+            "source_status": "available",
+            "source": features.MLB_STATS_SOURCE,
+            "reason": "confirmed lineup",
+        },
+        "away": {
+            "source_status": "available",
+            "source": features.MLB_STATS_SOURCE,
+            "reason": "confirmed lineup",
+        },
+    }
+    feature_payload["injuries"] = {
+        "home": {
+            "source_status": "missing",
+            "source": "optional_provider",
+            "reason": "injury provider not configured",
+        },
+        "away": {
+            "source_status": "missing",
+            "source": "optional_provider",
+            "reason": "injury provider not configured",
+        },
+    }
+    feature_payload["park_weather"] = {
+        "source_status": "partial",
+        "source": features.DERIVED_SOURCE,
+        "reason": "static park profile available; weather missing",
+        "park": {
+            "source_status": "available",
+            "source": features.STATIC_SOURCE,
+            "reason": "park profile found",
+        },
+        "weather": {
+            "source_status": "missing",
+            "source": features.OPEN_METEO_SOURCE,
+            "reason": "weather forecast unavailable",
+        },
+    }
+    feature_payload["data_quality_summary"] = {
+        "module_scores": {module_name: 0.8 for module_name in features.CORE_MODULES}
+    }
+
+    with Session(engine) as session:
+        session.add(
+            MlbFeatureSnapshot(
+                mlb_game_id=1,
+                target_date=date(2026, 7, 1),
+                source=features.FEATURE_VERSION,
+                captured_at=captured_at,
+                data_quality=Decimal("0.7500"),
+                source_statuses=features._source_statuses(feature_payload),
+                features=feature_payload,
+            )
+        )
+        session.commit()
+
+        coverage = features.feature_coverage(session, date(2026, 7, 1))
+        detail = features.feature_detail(session, date(2026, 7, 1))
+        report = features.source_status_report(session)
+
+    assert len(coverage["core_modules"]) == 17
+    assert set(coverage["module_completeness"]) == set(features.CORE_MODULES)
+    assert coverage["completeness_summary"]["core_module_count"] == 17
+    assert coverage["completeness_summary"]["snapshot_count"] == 1
+    assert coverage["module_completeness"]["lineup"]["available"] == 1
+    assert coverage["module_completeness"]["injuries"]["missing"] == 1
+    assert coverage["module_completeness"]["park_weather"]["partial"] == 1
+    assert any(
+        "weather forecast unavailable" in reason
+        for reason in coverage["module_completeness"]["park_weather"]["reasons"]
+    )
+    assert detail["items"][0]["module_completeness"]["park_weather"]["status"] == "partial"
+    assert detail["items"][0]["module_completeness"]["injuries"]["status"] == "missing"
+    assert report["latest_feature_completeness"]["summary"]["core_module_count"] == 17
+    assert report["latest_feature_completeness"]["modules"]["lineup"]["available"] == 1
 
 
 def test_feature_sync_hydrates_final_games_for_backfill(monkeypatch) -> None:

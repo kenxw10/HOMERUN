@@ -84,6 +84,7 @@ CORE_MODULES = (
     "park_weather",
     "travel_schedule",
 )
+MODULE_STATUS_BUCKETS = ("available", "partial", "missing", "unavailable")
 
 QUALITY_WEIGHTS: dict[str, dict[str, Decimal]] = {
     FULL_GAME_WINNER: {
@@ -1624,6 +1625,140 @@ def _source_statuses(features: dict[str, object]) -> dict[str, object]:
             if nested:
                 statuses[key] = nested
     return statuses
+
+
+def _status_bucket(status: object) -> str:
+    normalized = str(status or "missing").strip().lower()
+    if normalized == "available":
+        return "available"
+    if normalized == "partial":
+        return "partial"
+    if "unavailable" in normalized or normalized in {"error", "failed"}:
+        return "unavailable"
+    return "missing"
+
+
+def _aggregate_status_value(value: object) -> str:
+    if isinstance(value, dict) and "source_status" in value:
+        return _status_bucket(value.get("source_status"))
+    if not isinstance(value, dict):
+        return _status_bucket(value)
+    child_statuses = [_aggregate_status_value(child) for child in value.values() if child is not None]
+    if not child_statuses:
+        return "missing"
+    if all(status == "available" for status in child_statuses):
+        return "available"
+    if any(status in {"available", "partial"} for status in child_statuses):
+        return "partial"
+    if any(status == "unavailable" for status in child_statuses):
+        return "unavailable"
+    return "missing"
+
+
+def _collect_module_reasons(value: object, *, prefix: str | None = None) -> list[str]:
+    if not isinstance(value, dict):
+        return []
+    reasons: list[str] = []
+    label = f"{prefix}: " if prefix else ""
+    for key in ("reason", "missing_reason", "limitation"):
+        reason = value.get(key)
+        if reason:
+            reasons.append(f"{label}{reason}")
+    for child_key, child_value in value.items():
+        if isinstance(child_value, dict):
+            child_prefix = str(child_key) if prefix is None else f"{prefix}.{child_key}"
+            reasons.extend(_collect_module_reasons(child_value, prefix=child_prefix))
+    deduped: list[str] = []
+    for reason in reasons:
+        if reason not in deduped:
+            deduped.append(reason)
+    return deduped
+
+
+def _collect_module_sources(value: object) -> list[str]:
+    if not isinstance(value, dict):
+        return []
+    sources: list[str] = []
+    source = value.get("source")
+    if source:
+        sources.append(str(source))
+    for child_value in value.values():
+        if isinstance(child_value, dict):
+            sources.extend(_collect_module_sources(child_value))
+    return sorted(set(sources))
+
+
+def _feature_module_state(row: MlbFeatureSnapshot, module_name: str) -> dict[str, object]:
+    row_features = row.features or {}
+    source_statuses = row.source_statuses or {}
+    module_value = row_features.get(module_name)
+    source_status = source_statuses.get(module_name)
+    status = _aggregate_status_value(module_value if module_value is not None else source_status)
+    quality_summary = row_features.get("data_quality_summary")
+    module_scores = quality_summary.get("module_scores") if isinstance(quality_summary, dict) else {}
+    module_score = module_scores.get(module_name) if isinstance(module_scores, dict) else None
+    reasons = _collect_module_reasons(module_value)
+    if module_value is None:
+        reasons.append("module not present in feature snapshot")
+    return {
+        "status": status,
+        "source_status": source_status,
+        "module_score": module_score,
+        "sources": _collect_module_sources(module_value),
+        "reasons": reasons[:8],
+    }
+
+
+def _feature_module_states(row: MlbFeatureSnapshot) -> dict[str, dict[str, object]]:
+    return {module_name: _feature_module_state(row, module_name) for module_name in CORE_MODULES}
+
+
+def _feature_completeness_summary(rows: list[MlbFeatureSnapshot]) -> dict[str, object]:
+    module_summary: dict[str, dict[str, object]] = {
+        module_name: {
+            "available": 0,
+            "partial": 0,
+            "missing": 0,
+            "unavailable": 0,
+            "snapshot_count": len(rows),
+            "coverage_pct": None,
+            "reasons": [],
+        }
+        for module_name in CORE_MODULES
+    }
+    totals = {status: 0 for status in MODULE_STATUS_BUCKETS}
+    total_observations = len(rows) * len(CORE_MODULES)
+    for row in rows:
+        for module_name, state in _feature_module_states(row).items():
+            status = _status_bucket(state.get("status"))
+            module_counts = module_summary[module_name]
+            module_counts[status] = int(module_counts.get(status, 0)) + 1
+            totals[status] += 1
+            if status != "available":
+                reasons = module_counts.setdefault("reasons", [])
+                state_reasons = state.get("reasons")
+                if isinstance(reasons, list) and isinstance(state_reasons, list):
+                    for reason in state_reasons:
+                        if reason not in reasons:
+                            reasons.append(reason)
+    for module_counts in module_summary.values():
+        if rows:
+            module_counts["coverage_pct"] = round(int(module_counts["available"]) / len(rows), 4)
+        reasons = module_counts.get("reasons")
+        if isinstance(reasons, list):
+            module_counts["reasons"] = reasons[:8]
+    available_pct = round(totals["available"] / total_observations, 4) if total_observations else None
+    return {
+        "core_module_count": len(CORE_MODULES),
+        "snapshot_count": len(rows),
+        "total_module_observations": total_observations,
+        "available_module_observations": totals["available"],
+        "partial_module_observations": totals["partial"],
+        "missing_module_observations": totals["missing"],
+        "unavailable_module_observations": totals["unavailable"],
+        "available_pct": available_pct,
+        "modules": module_summary,
+    }
 
 
 def _status_score(module: dict[str, object]) -> Decimal:
@@ -4407,6 +4542,7 @@ def source_status_report(session: Session) -> dict[str, object]:
             table = str(error.get("table") or "feature_sync")
             table_errors.setdefault(table, error)
     pybaseball_status = _pybaseball_db_status(session)
+    latest_feature_completeness = _latest_feature_completeness(session)
     return {
         "feature_sync_enable_network_sources": settings.feature_sync_enable_network_sources,
         "mlb_stats_base_url": settings.mlb_stats_base_url,
@@ -4432,38 +4568,86 @@ def source_status_report(session: Session) -> dict[str, object]:
         },
         "latest_errors": feature_audit["latest_errors"],
         "tables": table_status,
+        "latest_feature_completeness": latest_feature_completeness,
+    }
+
+
+def _feature_snapshot_rows(session: Session, day: date, *, limit: int | None = None) -> list[MlbFeatureSnapshot]:
+    statement = (
+        select(MlbFeatureSnapshot)
+        .where(MlbFeatureSnapshot.target_date == day)
+        .where(MlbFeatureSnapshot.source == FEATURE_VERSION)
+        .where(MlbFeatureSnapshot.mlb_game_id.is_not(None))
+        .order_by(MlbFeatureSnapshot.id.asc())
+    )
+    if limit is not None:
+        statement = statement.limit(limit)
+    return list(session.scalars(statement))
+
+
+def _latest_feature_completeness(session: Session) -> dict[str, object]:
+    latest_day = session.scalar(
+        select(MlbFeatureSnapshot.target_date)
+        .where(MlbFeatureSnapshot.source == FEATURE_VERSION)
+        .where(MlbFeatureSnapshot.mlb_game_id.is_not(None))
+        .order_by(MlbFeatureSnapshot.captured_at.desc(), MlbFeatureSnapshot.id.desc())
+        .limit(1)
+    )
+    if latest_day is None:
+        summary = _feature_completeness_summary([])
+        return {
+            "date": None,
+            "feature_version": FEATURE_VERSION,
+            "core_modules": list(CORE_MODULES),
+            "summary": {
+                key: value
+                for key, value in summary.items()
+                if key != "modules"
+            },
+            "modules": summary["modules"],
+        }
+    rows = _feature_snapshot_rows(session, latest_day)
+    summary = _feature_completeness_summary(rows)
+    return {
+        "date": latest_day.isoformat(),
+        "feature_version": FEATURE_VERSION,
+        "core_modules": list(CORE_MODULES),
+        "summary": {
+            key: value
+            for key, value in summary.items()
+            if key != "modules"
+        },
+        "modules": summary["modules"],
     }
 
 
 def feature_coverage(session: Session, target_date: date | None = None) -> dict[str, object]:
     day = target_date or today_eastern()
-    rows = list(
-        session.scalars(
-            select(MlbFeatureSnapshot)
-            .where(MlbFeatureSnapshot.target_date == day)
-            .where(MlbFeatureSnapshot.source == FEATURE_VERSION)
-            .order_by(MlbFeatureSnapshot.id.asc())
-        )
-    )
+    rows = _feature_snapshot_rows(session, day)
     avg_quality = None
     module_counts: dict[str, dict[str, int]] = {}
+    completeness = _feature_completeness_summary(rows)
     if rows:
         avg_quality = float(sum((row.data_quality or Decimal("0")) for row in rows) / Decimal(len(rows)))
-    for row in rows:
-        statuses = row.source_statuses or {}
-        for module_name, status in statuses.items():
-            bucket = module_counts.setdefault(module_name, {})
-            if isinstance(status, dict):
-                flattened = "partial" if any(value != "missing" for value in status.values()) else "missing"
-                bucket[flattened] = bucket.get(flattened, 0) + 1
-            else:
-                bucket[str(status)] = bucket.get(str(status), 0) + 1
+    for module_name, module_statuses in completeness["modules"].items():
+        module_counts[module_name] = {
+            status: int(module_statuses[status])
+            for status in MODULE_STATUS_BUCKETS
+            if int(module_statuses[status]) > 0
+        }
     return {
         "date": day.isoformat(),
         "feature_version": FEATURE_VERSION,
+        "core_modules": list(CORE_MODULES),
         "snapshot_count": len(rows),
         "data_quality_avg": avg_quality,
         "module_coverage": module_counts,
+        "completeness_summary": {
+            key: value
+            for key, value in completeness.items()
+            if key != "modules"
+        },
+        "module_completeness": completeness["modules"],
         "items": [
             {
                 "game_id": row.mlb_game_id,
@@ -4471,6 +4655,7 @@ def feature_coverage(session: Session, target_date: date | None = None) -> dict[
                 "captured_at": row.captured_at.isoformat(),
                 "data_quality": _float(row.data_quality),
                 "source_statuses": row.source_statuses,
+                "module_completeness": _feature_module_states(row),
                 "data_quality_reason": (row.features or {}).get("data_quality_reason"),
             }
             for row in rows[:200]
@@ -4480,18 +4665,18 @@ def feature_coverage(session: Session, target_date: date | None = None) -> dict[
 
 def feature_detail(session: Session, target_date: date | None = None) -> dict[str, object]:
     day = target_date or today_eastern()
-    rows = list(
-        session.scalars(
-            select(MlbFeatureSnapshot)
-            .where(MlbFeatureSnapshot.target_date == day)
-            .where(MlbFeatureSnapshot.source == FEATURE_VERSION)
-            .order_by(MlbFeatureSnapshot.id.asc())
-            .limit(100)
-        )
-    )
+    rows = _feature_snapshot_rows(session, day, limit=100)
+    completeness = _feature_completeness_summary(rows)
     return {
         "date": day.isoformat(),
         "feature_version": FEATURE_VERSION,
+        "core_modules": list(CORE_MODULES),
+        "completeness_summary": {
+            key: value
+            for key, value in completeness.items()
+            if key != "modules"
+        },
+        "module_completeness": completeness["modules"],
         "items": [
             {
                 "game_id": row.mlb_game_id,
@@ -4499,6 +4684,7 @@ def feature_detail(session: Session, target_date: date | None = None) -> dict[st
                 "captured_at": row.captured_at.isoformat(),
                 "data_quality": _float(row.data_quality),
                 "source_statuses": row.source_statuses,
+                "module_completeness": _feature_module_states(row),
                 "features": row.features,
             }
             for row in rows

@@ -304,7 +304,7 @@ After deploying PR 3c and running `alembic upgrade head`, validate in this order
 12. `POST /v1/run/model-governance` records a governance event and either skips with a clear mature-sample reason or reports calibration/promotion metrics.
 13. `GET /v1/model/governance/status` returns active model, feature version, calibration status, thresholds, and latest governance status.
 14. `POST /v1/sync/mlb-features?target_date=YYYY-MM-DD` records feature snapshots with explicit source statuses.
-15. `GET /v1/model/features/coverage?date=YYYY-MM-DD` reports coverage without inventing missing lineup, weather, injury, umpire, team-total, or sportsbook data.
+15. `GET /v1/model/features/coverage?date=YYYY-MM-DD` reports the 17-module `core_modules`, `completeness_summary`, and `module_completeness` without inventing missing lineup, weather, injury, umpire, team-total, or sportsbook data.
 16. `POST /v1/run/market-family-discovery?target_date=YYYY-MM-DD&force_refresh=false` returns structured `by_family` output, attempted event/market ticker counts, exact/fallback/event-filter attempt counts, no-match counts, request/rate-limit metrics, and persists a finalized `market_family_discovery_runs` row even when no candidate markets are found. Leave `force_refresh=false` for normal operations so a recent usable run or active cooldown is reused instead of repeatedly calling Kalshi.
 17. `GET /v1/market-families/discovery?date=YYYY-MM-DD` returns the latest finalized report with `run` not null after the POST succeeds.
 18. `POST /v1/sync/market-family-mappings?target_date=YYYY-MM-DD` promotes only parseable supported families to `paper_supported`; missing line/selection/settlement rows stay `needs_review`.
@@ -354,7 +354,7 @@ Invoke-RestMethod -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-RAILWAY-API/v
 Invoke-RestMethod -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-RAILWAY-API/v1/model/features/detail?date=2026-06-27"
 ```
 
-Expected: lineup snapshots where MLB posted lineups, weather rows for stadiums with coordinates, pitcher rows where probable starters are available, partial bullpen proxies when exact reliever data is unavailable, and `data_quality_reason` caps when critical modules remain missing.
+Expected: lineup snapshots where MLB posted lineups, weather rows for stadiums with coordinates, pitcher rows where probable starters are available, partial bullpen proxies when exact reliever data is unavailable, and `data_quality_reason` caps when critical modules remain missing. Coverage and detail responses should include all 17 mature modules under `core_modules`, per-date totals under `completeness_summary`, and per-module counts/reasons under `module_completeness`.
 
 PR3c fix4 idempotent feature-ingestion validation:
 
@@ -384,7 +384,7 @@ Expected: module syncs skip schedule hydration when target-date games already ex
 Invoke-RestMethod -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-RAILWAY-API/v1/model/sources/status"
 ```
 
-Expected: `last_attempted_sync`, `validation_status`, `last_error`, `latest_errors`, and per-table `status_counts` are present. `pybaseball_available`, `pybaseball_version`, `pybaseball_module_path`, import errors, attempted functions, DB cache status, and `advanced_stats_status` should be visible. When pybaseball succeeds and rows match, team/pitcher/bullpen rows should include `source=pybaseball_public_stats_v1`; when it fails, the response should expose the source error and fall back to partial derived rows instead of returning a blank 500.
+Expected: `last_attempted_sync`, `validation_status`, `last_error`, `latest_errors`, per-table `status_counts`, and `latest_feature_completeness` are present. `pybaseball_available`, `pybaseball_version`, `pybaseball_module_path`, import errors, attempted functions, DB cache status, and `advanced_stats_status` should be visible. When pybaseball succeeds and rows match, team/pitcher/bullpen rows should include `source=pybaseball_public_stats_v1`; when it fails, the response should expose the source error and fall back to partial derived rows instead of returning a blank 500.
 
 4. Confirm weather and lineup degraded behavior:
 
@@ -410,7 +410,7 @@ Invoke-RestMethod -Method Post -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-
 Invoke-RestMethod -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-RAILWAY-API/v1/model/features/detail?date=2026-06-27"
 ```
 
-4. Confirm `feature_version` is `mature_mlb_features_v2`, critical module warnings are explicit, and static park/travel features are separate from optional network weather/provider inputs.
+4. Confirm `feature_version` is `mature_mlb_features_v2`, `core_modules` lists the 17 mature modules, `completeness_summary` totals the selected slate, critical module warnings are explicit, and static park/travel features are separate from optional network weather/provider inputs.
 5. Fetch active model parameters:
 
 ```powershell
@@ -477,7 +477,7 @@ Invoke-RestMethod -Method Post -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-
 Invoke-RestMethod -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-RAILWAY-API/v1/model/features/detail?date=2026-06-27"
 ```
 
-5. Expected: team strength, handedness/platoon, starter recent, and starter workload modules prefer `source=mlb_stats_api_primary_v1` when those rows are available. Statcast/Savant contact quality is secondary enrichment, and `derived_homerun_v2` remains partial fallback.
+5. Expected: team strength, handedness/platoon, starter recent, and starter workload modules prefer `source=mlb_stats_api_primary_v1` when those rows are available. Detail responses should also expose each mature module under `module_completeness` with available/partial/missing/unavailable status and reasons. Statcast/Savant contact quality is secondary enrichment, and `derived_homerun_v2` remains partial fallback.
 6. Run market-family discovery with cache disabled only for deliberate validation:
 
 ```powershell
