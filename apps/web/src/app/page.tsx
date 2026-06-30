@@ -609,11 +609,9 @@ function portfolioChartSeries(
   const rawPoints = normalizePortfolioSeries(summary.portfolio_series);
   const epochStartMs = parseChartTime(summary.active_epoch?.started_at);
   const domain = chartDomainForRange(range, nowMs, epochStartMs, rawPoints);
-  const historyTruncated =
-    range === "ALL" && epochStartMs !== null && rawPoints.length > 0 && rawPoints[0].time > epochStartMs;
   const anchorPoints = [...rawPoints];
 
-  if (epochStartMs !== null && epochStartMs <= domain.end) {
+  if (epochStartMs !== null && epochStartMs <= domain.end && (rawPoints.length === 0 || epochStartMs >= domain.start)) {
     anchorPoints.push({
       timestamp: new Date(epochStartMs).toISOString(),
       time: epochStartMs,
@@ -623,8 +621,13 @@ function portfolioChartSeries(
 
   anchorPoints.sort((a, b) => a.time - b.time);
 
-  const lineStart = domain.start;
-  const firstValue = latestKnownValue(anchorPoints, lineStart, startingBalance);
+  const hasPointAtOrBeforeStart = anchorPoints.some((point) => point.time <= domain.start);
+  const startsBeforeFirstReturnedSnapshot = rawPoints.length > 0 && !hasPointAtOrBeforeStart;
+  const historyTruncated =
+    startsBeforeFirstReturnedSnapshot ||
+    (range === "ALL" && epochStartMs !== null && rawPoints.length > 0 && rawPoints[0].time > epochStartMs);
+  const lineStart = startsBeforeFirstReturnedSnapshot ? rawPoints[0].time : domain.start;
+  const firstValue = startsBeforeFirstReturnedSnapshot ? rawPoints[0].value : latestKnownValue(anchorPoints, lineStart, startingBalance);
   const currentValue =
     typeof summary.portfolio_value === "number"
       ? summary.portfolio_value
