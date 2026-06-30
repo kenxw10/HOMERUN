@@ -992,12 +992,24 @@ function PortfolioChart({ summary }: { summary: DashboardSummary }) {
         : null;
   const changePct = latestRaw !== null && startingBalance > 0 ? (latestRaw - startingBalance) / startingBalance : null;
   const ticks = [chart.yMax, (chart.yMax + chart.yMin) / 2, chart.yMin];
+  const latestTone = changePct !== null && changePct < 0 ? "value-negative" : "value-positive";
   const title =
     activeMode === "VALUE"
       ? "PORTFOLIO VALUE (PAPER TRADING)"
       : activeMode === "P/L $"
         ? "PORTFOLIO P/L $ (PAPER TRADING)"
         : "PORTFOLIO P/L % (PAPER TRADING)";
+  const latestGuideLength = 40;
+  const latestLabel = chart.latest
+    ? {
+        guideX: Math.max(chart.plotLeft, Math.min(chart.latest.x, chart.plotRight - latestGuideLength)),
+        textAnchor: chart.latest.x >= chart.plotRight - 120 ? ("end" as const) : ("start" as const),
+        x:
+          chart.latest.x >= chart.plotRight - 120
+            ? chart.plotRight - 8
+            : Math.min(chart.latest.x + 8, chart.plotRight - 8),
+      }
+    : null;
 
   return (
     <section className="panel chart-panel">
@@ -1060,6 +1072,25 @@ function PortfolioChart({ summary }: { summary: DashboardSummary }) {
               {chart.singlePoints.map((point) => (
                 <circle key={`${point.x}-${point.y}`} cx={point.x} cy={point.y} r="3" className="chart-anchor-point" />
               ))}
+              {chart.latest && latestLabel ? (
+                <g>
+                  <line
+                    x1={latestLabel.guideX}
+                    y1={chart.latest.y}
+                    x2={chart.plotRight - 1}
+                    y2={chart.latest.y}
+                    className="last-guide"
+                  />
+                  <text
+                    x={latestLabel.x}
+                    y={chart.latest.y - 7}
+                    textAnchor={latestLabel.textAnchor}
+                    className={`last-tag-text ${latestTone}`}
+                  >
+                    {formatChartValue(chart.latest.value, activeMode)}
+                  </text>
+                </g>
+              ) : null}
             </>
           ) : (
             <g>
