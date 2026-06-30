@@ -58,6 +58,59 @@ def resolve_job_target_date(value: str | date | None) -> date | None:
     return date.fromisoformat(value)
 
 
+def _validate_candidate_sweep_options(
+    min_time_to_start_minutes: int | None,
+    max_time_to_start_minutes: int | None,
+) -> None:
+    if min_time_to_start_minutes is not None and min_time_to_start_minutes < 0:
+        raise ValueError("min_time_to_start_minutes must be greater than or equal to 0.")
+    if max_time_to_start_minutes is not None and max_time_to_start_minutes < 0:
+        raise ValueError("max_time_to_start_minutes must be greater than or equal to 0.")
+    if (
+        min_time_to_start_minutes is not None
+        and max_time_to_start_minutes is not None
+        and min_time_to_start_minutes > max_time_to_start_minutes
+    ):
+        raise ValueError("min_time_to_start_minutes must be less than or equal to max_time_to_start_minutes.")
+
+
+def _candidate_sweep_options_enabled(
+    min_time_to_start_minutes: int | None,
+    max_time_to_start_minutes: int | None,
+    sweep_label: str | None,
+    dry_run_candidates_only: bool,
+) -> bool:
+    return (
+        min_time_to_start_minutes is not None
+        or max_time_to_start_minutes is not None
+        or bool(sweep_label)
+        or dry_run_candidates_only
+    )
+
+
+def _candidate_sweep_window_result(candidate_result: dict[str, object]) -> dict[str, object]:
+    keys = (
+        "sweep_label",
+        "sweep_window_enabled",
+        "min_time_to_start_minutes",
+        "max_time_to_start_minutes",
+        "dry_run_candidates_only",
+        "sweep_started_at",
+        "games_total_for_date",
+        "games_in_window",
+        "games_excluded_too_soon",
+        "games_excluded_too_late",
+        "games_excluded_started",
+        "games_excluded_wrong_date",
+        "candidates_in_window",
+        "paper_trades_in_window",
+        "next_game_in_window_start_time_et",
+        "next_excluded_too_late_start_time_et",
+        "status",
+    )
+    return {key: candidate_result.get(key) for key in keys if key in candidate_result}
+
+
 def _duration_seconds(started_at) -> int:
     return max(0, int((utc_now() - ensure_aware_utc(started_at)).total_seconds()))
 
@@ -203,7 +256,17 @@ def _run_inline(fn: Callable[[], Any]) -> Any:
     return fn()
 
 
-def _execute_job_steps(session: Session, run: JobRun, job_name: str, target_date: date | None) -> dict[str, object]:
+def _execute_job_steps(
+    session: Session,
+    run: JobRun,
+    job_name: str,
+    target_date: date | None,
+    *,
+    min_time_to_start_minutes: int | None = None,
+    max_time_to_start_minutes: int | None = None,
+    sweep_label: str | None = None,
+    dry_run_candidates_only: bool = False,
+) -> dict[str, object]:
     target = target_date or today_eastern()
     if job_name == "daily-setup":
         return {
@@ -226,18 +289,36 @@ def _execute_job_steps(session: Session, run: JobRun, job_name: str, target_date
             "feature_coverage": _run_step(run, "feature_coverage", lambda: feature_coverage(session, target)),
         }
     if job_name == "candidate-sweep":
-        return {
+        result = {
             "schedule": _run_step(run, "sync_mlb_schedule", lambda: {"games": sync_schedule(session, target)}),
             "features": _run_step(run, "sync_mlb_features", lambda: sync_mlb_features(session, target, None, True)),
             "market_family_mappings": _run_step(
                 run, "market_family_mappings", lambda: sync_market_family_mappings(session, target)
             ),
-            "candidate_engine": _run_step(run, "paper_candidate_engine", lambda: generate_candidates(session, target)),
-            "price_refresh": _run_step(run, "price_refresh", lambda: refresh_open_position_prices(session)),
-            "balance_snapshot": _run_step(
-                run, "balance_snapshot", lambda: {"snapshot_id": create_balance_snapshot(session, source="candidate_sweep").id}
-            ),
         }
+        candidate_result = _run_step(
+            run,
+            "paper_candidate_engine",
+            lambda: generate_candidates(
+                session,
+                target,
+                min_time_to_start_minutes=min_time_to_start_minutes,
+                max_time_to_start_minutes=max_time_to_start_minutes,
+                sweep_label=sweep_label,
+                dry_run_candidates_only=dry_run_candidates_only,
+            ),
+        )
+        result["candidate_engine"] = candidate_result
+        result["candidate_sweep_window"] = _candidate_sweep_window_result(candidate_result)
+        if dry_run_candidates_only:
+            result["price_refresh"] = {"skipped": True, "reason": "dry_run_candidates_only"}
+            result["balance_snapshot"] = {"skipped": True, "reason": "dry_run_candidates_only", "snapshot_id": None}
+        else:
+            result["price_refresh"] = _run_step(run, "price_refresh", lambda: refresh_open_position_prices(session))
+            result["balance_snapshot"] = _run_step(
+                run, "balance_snapshot", lambda: {"snapshot_id": create_balance_snapshot(session, source="candidate_sweep").id}
+            )
+        return result
     if job_name == "price-refresh":
         return {
             "price_refresh": _run_step(run, "price_refresh", lambda: refresh_open_position_prices(session)),
@@ -285,7 +366,12 @@ def run_job(
     target_date: date | None = None,
     triggered_by: str = "manual",
     max_runtime_minutes: int = 60,
+    min_time_to_start_minutes: int | None = None,
+    max_time_to_start_minutes: int | None = None,
+    sweep_label: str | None = None,
+    dry_run_candidates_only: bool = False,
 ) -> dict[str, object]:
+    _validate_candidate_sweep_options(min_time_to_start_minutes, max_time_to_start_minutes)
     run, acquired = acquire_job_lock(
         session,
         job_name=job_name,
@@ -300,7 +386,24 @@ def run_job(
     run_id = run.id
     session.commit()
     try:
-        result = _execute_job_steps(session, run, job_name, run.target_date)
+        if _candidate_sweep_options_enabled(
+            min_time_to_start_minutes,
+            max_time_to_start_minutes,
+            sweep_label,
+            dry_run_candidates_only,
+        ):
+            result = _execute_job_steps(
+                session,
+                run,
+                job_name,
+                run.target_date,
+                min_time_to_start_minutes=min_time_to_start_minutes,
+                max_time_to_start_minutes=max_time_to_start_minutes,
+                sweep_label=sweep_label,
+                dry_run_candidates_only=dry_run_candidates_only,
+            )
+        else:
+            result = _execute_job_steps(session, run, job_name, run.target_date)
         run.status = "succeeded"
         run.result = result
         errors: list[object] = []

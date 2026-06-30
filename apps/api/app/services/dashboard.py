@@ -598,6 +598,7 @@ def dashboard_summary_from_db(
             {
                 **((last_prediction.summary or {}).get("cap_counts", {}) if last_prediction else {}),
                 **((last_prediction.summary or {}).get("risk_caps", {}) if last_prediction else {}),
+                **((last_prediction.summary or {}).get("candidate_sweep_window", {}) if last_prediction else {}),
                 **{
                     key: (last_prediction.summary or {}).get(key)
                     for key in ("candidates_yes", "candidates_no", "paper_trades_yes", "paper_trades_no")

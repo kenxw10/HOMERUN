@@ -414,7 +414,16 @@ def websocket_status(_: None = Depends(require_internal_api_key)) -> RunResponse
     return RunResponse(ok=True, action="websocket_status", result=result)
 
 
-def _run_named_job(job_name: str, target_date: str | date | None, triggered_by: str = "api") -> RunResponse:
+def _run_named_job(
+    job_name: str,
+    target_date: str | date | None,
+    triggered_by: str = "api",
+    *,
+    min_time_to_start_minutes: int | None = None,
+    max_time_to_start_minutes: int | None = None,
+    sweep_label: str | None = None,
+    dry_run_candidates_only: bool = False,
+) -> RunResponse:
     try:
         resolved_target_date = resolve_job_target_date(target_date)
     except ValueError as exc:
@@ -423,7 +432,19 @@ def _run_named_job(job_name: str, target_date: str | date | None, triggered_by: 
             detail="Invalid target_date. Use YYYY-MM-DD, today_et, or yesterday_et.",
         ) from exc
     with _db_session_or_503() as session:
-        result = run_job(session, job_name=job_name, target_date=resolved_target_date, triggered_by=triggered_by)
+        try:
+            result = run_job(
+                session,
+                job_name=job_name,
+                target_date=resolved_target_date,
+                triggered_by=triggered_by,
+                min_time_to_start_minutes=min_time_to_start_minutes,
+                max_time_to_start_minutes=max_time_to_start_minutes,
+                sweep_label=sweep_label,
+                dry_run_candidates_only=dry_run_candidates_only,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
     return RunResponse(ok=result.get("status") not in {"failed", "failed_stale"}, action=f"job_{job_name}", result=result)
 
 
@@ -438,9 +459,20 @@ def run_daily_setup_job(
 @app.post("/v1/jobs/run/candidate-sweep", response_model=RunResponse)
 def run_candidate_sweep_job(
     target_date: str | None = Query(default=None),
+    min_time_to_start_minutes: int | None = Query(default=None),
+    max_time_to_start_minutes: int | None = Query(default=None),
+    sweep_label: str | None = Query(default=None),
+    dry_run_candidates_only: bool = Query(default=False),
     _: None = Depends(require_internal_api_key),
 ) -> RunResponse:
-    return _run_named_job("candidate-sweep", target_date)
+    return _run_named_job(
+        "candidate-sweep",
+        target_date,
+        min_time_to_start_minutes=min_time_to_start_minutes,
+        max_time_to_start_minutes=max_time_to_start_minutes,
+        sweep_label=sweep_label,
+        dry_run_candidates_only=dry_run_candidates_only,
+    )
 
 
 @app.post("/v1/jobs/run/price-refresh", response_model=RunResponse)

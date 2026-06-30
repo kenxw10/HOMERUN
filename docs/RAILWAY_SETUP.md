@@ -146,7 +146,7 @@ Run these from the Railway backend service shell after migrations succeed:
 
 ```powershell
 python -m app.jobs.runner --job daily-setup --target-date today_et
-python -m app.jobs.runner --job candidate-sweep --target-date today_et
+python -m app.jobs.runner --job candidate-sweep --target-date today_et --min-time-to-start-minutes 45 --max-time-to-start-minutes 180 --sweep-label rolling_pregame_window
 python -m app.jobs.runner --job price-refresh --target-date today_et
 python -m app.jobs.runner --job settlement --target-date yesterday_et
 python -m app.jobs.runner --job governance
@@ -155,16 +155,16 @@ python -m app.jobs.runner --job full-paper-cycle --target-date today_et
 
 These commands create database records for the dashboard and paper engine. They do not place live orders.
 
-Recommended Railway cron services should be separate short-lived services, not the main web server:
+Recommended Railway cron services should be separate short-lived services, not the main web server. Times below show the intended ET cadence and the equivalent UTC cron during EDT:
 
-| Service | Start command | UTC cron during EDT |
-| --- | --- | --- |
-| `homerun-job-daily-setup` | `python -m app.jobs.runner --job daily-setup --target-date today_et` | `30 13 * * *` |
-| `homerun-job-candidate-sweep` | `python -m app.jobs.runner --job candidate-sweep --target-date today_et` | `0 15-23 * * *` |
-| `homerun-job-price-refresh` | `python -m app.jobs.runner --job price-refresh --target-date today_et` | `*/15 15-23 * * *` |
-| `homerun-job-settlement-night` | `python -m app.jobs.runner --job settlement --target-date yesterday_et` | `30 6 * * *` |
-| `homerun-job-settlement-morning` | `python -m app.jobs.runner --job settlement --target-date yesterday_et` | `30 12 * * *` |
-| `homerun-job-governance` | `python -m app.jobs.runner --job governance` | `0 13 * * *` |
+| Service | Start command | ET cadence | UTC cron during EDT |
+| --- | --- | --- | --- |
+| `homerun-job-daily-setup` | `python -m app.jobs.runner --job daily-setup --target-date today_et` | 8:30 AM ET | `30 12 * * *` |
+| `homerun-job-candidate-sweep` | `python -m app.jobs.runner --job candidate-sweep --target-date today_et --min-time-to-start-minutes 45 --max-time-to-start-minutes 180 --sweep-label rolling_pregame_window` | every 30 minutes, 10:30 AM-10:00 PM ET | `30 14 * * *`; `0,30 15-23,0-1 * * *`; `0 2 * * *` |
+| `homerun-job-price-refresh` | `python -m app.jobs.runner --job price-refresh --target-date today_et` | every 15 minutes, 11:00 AM-1:30 AM ET | `0,15,30,45 15-23,0-4 * * *`; `0,15,30 5 * * *` |
+| `homerun-job-settlement-today` | `python -m app.jobs.runner --job settlement --target-date today_et` | every 30 minutes, 2:30 PM-1:30 AM ET | `30 18 * * *`; `0,30 19-23,0-4 * * *`; `0,30 5 * * *` |
+| `homerun-job-settlement-yesterday-catchup` | `python -m app.jobs.runner --job settlement --target-date yesterday_et` | 8:30 AM ET | `30 12 * * *` |
+| `homerun-job-governance` | `python -m app.jobs.runner --job governance` | 9:00 AM ET | `0 13 * * *` |
 
 Railway cron schedules use UTC. Adjust these schedules when EDT changes to EST. Railway may skip a run if the previous execution is still active; PR3d job locks also skip overlap or mark stale runs failed before starting safely.
 
