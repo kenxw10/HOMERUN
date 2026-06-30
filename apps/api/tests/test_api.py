@@ -1717,7 +1717,11 @@ def test_candidate_sweep_refreshes_marks_after_candidate_engine(monkeypatch) -> 
         return result
 
     monkeypatch.setattr(job_runs, "sync_schedule", lambda *_args, **_kwargs: record("schedule", 0))
-    monkeypatch.setattr(job_runs, "sync_mlb_features", lambda *_args, **_kwargs: record("features", {}))
+    monkeypatch.setattr(
+        job_runs,
+        "sync_mlb_features",
+        lambda *_args, **_kwargs: pytest.fail("candidate-sweep must not run full feature sync"),
+    )
     monkeypatch.setattr(
         job_runs,
         "sync_market_family_mappings",
@@ -1742,16 +1746,33 @@ def test_candidate_sweep_refreshes_marks_after_candidate_engine(monkeypatch) -> 
             triggered_by="api",
             steps=[],
         )
+        session.add(
+            MlbFeatureSnapshot(
+                mlb_game_id=1,
+                target_date=target,
+                source=features.FEATURE_VERSION,
+                captured_at=datetime(2026, 7, 2, 11, 45, tzinfo=UTC),
+                data_quality=Decimal("0.7500"),
+                source_statuses={},
+                features={},
+            )
+        )
         result = job_runs._execute_job_steps(session, run, "candidate-sweep", target)
 
     assert call_order == [
         "schedule",
-        "features",
         "market_family_mappings",
         "candidate_engine",
         "price_refresh",
         "balance_snapshot",
     ]
+    assert result["feature_sync"] == {
+        "skipped": True,
+        "feature_sync_mode": "cache_only",
+        "reason": "candidate_sweep_uses_cached_feature_snapshots",
+    }
+    assert result["cached_features"]["status"] == "low_quality_missing_cached_features"
+    assert result["cached_features"]["snapshot_count"] == 1
     assert result["balance_snapshot"] == {"snapshot_id": 123}
 
 
@@ -1766,16 +1787,26 @@ def test_candidate_sweep_dry_run_skips_price_refresh_and_snapshot(monkeypatch) -
         return result
 
     monkeypatch.setattr(job_runs, "sync_schedule", lambda *_args, **_kwargs: record("schedule", 0))
-    monkeypatch.setattr(job_runs, "sync_mlb_features", lambda *_args, **_kwargs: record("features", {}))
+    monkeypatch.setattr(
+        job_runs,
+        "sync_mlb_features",
+        lambda *_args, **_kwargs: pytest.fail("candidate-sweep must not run full feature sync"),
+    )
     monkeypatch.setattr(
         job_runs,
         "sync_market_family_mappings",
         lambda *_args, **_kwargs: record("market_family_mappings", {}),
     )
+    captured_generate_kwargs: dict[str, object] = {}
+
+    def fake_generate_candidates(*_args, **kwargs):
+        captured_generate_kwargs.update(kwargs)
+        return record("candidate_engine", {"status": "completed", "dry_run_candidates_only": True})
+
     monkeypatch.setattr(
         job_runs,
         "generate_candidates",
-        lambda *_args, **_kwargs: record("candidate_engine", {"status": "completed", "dry_run_candidates_only": True}),
+        fake_generate_candidates,
     )
     monkeypatch.setattr(
         job_runs,
@@ -1799,21 +1830,175 @@ def test_candidate_sweep_dry_run_skips_price_refresh_and_snapshot(monkeypatch) -
             triggered_by="api",
             steps=[],
         )
+        session.add(
+            MlbFeatureSnapshot(
+                mlb_game_id=1,
+                target_date=target,
+                source=features.FEATURE_VERSION,
+                captured_at=datetime(2026, 7, 2, 11, 45, tzinfo=UTC),
+                data_quality=Decimal("0.7500"),
+                source_statuses={},
+                features={},
+            )
+        )
         result = job_runs._execute_job_steps(
             session,
             run,
             "candidate-sweep",
             target,
+            min_time_to_start_minutes=45,
+            max_time_to_start_minutes=180,
+            sweep_label="rolling_pregame_window",
             dry_run_candidates_only=True,
         )
 
-    assert call_order == ["schedule", "features", "market_family_mappings", "candidate_engine"]
+    assert call_order == ["schedule", "market_family_mappings", "candidate_engine"]
+    assert captured_generate_kwargs == {
+        "min_time_to_start_minutes": 45,
+        "max_time_to_start_minutes": 180,
+        "sweep_label": "rolling_pregame_window",
+        "dry_run_candidates_only": True,
+    }
+    assert result["feature_sync_mode"] == "cache_only"
+    assert result["feature_sync_skipped"] is True
     assert result["price_refresh"] == {"skipped": True, "reason": "dry_run_candidates_only"}
     assert result["balance_snapshot"] == {
         "skipped": True,
         "reason": "dry_run_candidates_only",
         "snapshot_id": None,
     }
+
+
+def test_candidate_sweep_completes_cleanly_when_cached_feature_snapshots_missing(monkeypatch) -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    target = date(2026, 7, 2)
+    call_order: list[str] = []
+
+    def record(name: str, result: object) -> object:
+        call_order.append(name)
+        return result
+
+    monkeypatch.setattr(job_runs, "sync_schedule", lambda *_args, **_kwargs: record("schedule", 0))
+    monkeypatch.setattr(
+        job_runs,
+        "sync_mlb_features",
+        lambda *_args, **_kwargs: pytest.fail("candidate-sweep must not run full feature sync"),
+    )
+    monkeypatch.setattr(
+        job_runs,
+        "sync_market_family_mappings",
+        lambda *_args, **_kwargs: pytest.fail("missing cached features should skip mapping sync"),
+    )
+    monkeypatch.setattr(
+        job_runs,
+        "generate_candidates",
+        lambda *_args, **_kwargs: pytest.fail("missing cached features should skip candidate generation"),
+    )
+    monkeypatch.setattr(job_runs, "refresh_open_position_prices", lambda *_args, **_kwargs: record("price_refresh", {}))
+    monkeypatch.setattr(
+        job_runs,
+        "create_balance_snapshot",
+        lambda *_args, **_kwargs: record("balance_snapshot", SimpleNamespace(id=456)),
+    )
+
+    with Session(engine) as session:
+        run = JobRun(
+            job_name="candidate-sweep",
+            job_type="paper_ops",
+            target_date=target,
+            status="running",
+            started_at=datetime(2026, 7, 2, 12, 0, tzinfo=UTC),
+            lock_key="candidate-sweep:2026-07-02",
+            triggered_by="api",
+            steps=[],
+        )
+        result = job_runs._execute_job_steps(
+            session,
+            run,
+            "candidate-sweep",
+            target,
+            min_time_to_start_minutes=45,
+            max_time_to_start_minutes=180,
+            sweep_label="rolling_pregame_window",
+        )
+
+    assert call_order == ["schedule", "price_refresh", "balance_snapshot"]
+    assert result["feature_sync_mode"] == "cache_only"
+    assert result["feature_sync_skipped"] is True
+    assert result["cached_features"]["status"] == "missing_cached_feature_snapshots"
+    assert result["candidate_engine"]["status"] == "skipped_missing_cached_features"
+    assert result["candidate_engine"]["zero_trade_reason"] == "no_candidates_missing_feature_snapshots"
+    assert result["candidate_sweep_window"] == {
+        "sweep_label": "rolling_pregame_window",
+        "sweep_window_enabled": True,
+        "min_time_to_start_minutes": 45,
+        "max_time_to_start_minutes": 180,
+        "dry_run_candidates_only": False,
+        "status": "skipped_missing_cached_features",
+    }
+    assert result["warnings"] == [
+        "no_candidates_missing_feature_snapshots: run daily-setup or feature sync before candidate-sweep."
+    ]
+    assert result["balance_snapshot"] == {"snapshot_id": 456}
+
+
+def test_daily_setup_still_runs_full_feature_sync(monkeypatch) -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    target = date(2026, 7, 2)
+    call_order: list[str] = []
+
+    def record(name: str, result: object) -> object:
+        call_order.append(name)
+        return result
+
+    monkeypatch.setattr(job_runs, "sync_schedule", lambda *_args, **_kwargs: record("schedule", 0))
+    monkeypatch.setattr(job_runs, "sync_results", lambda *_args, **_kwargs: record("results", {}))
+    monkeypatch.setattr(job_runs, "sync_mlb_features", lambda *_args, **_kwargs: record("features", {"status": "ok"}))
+    monkeypatch.setattr(
+        job_runs,
+        "run_market_family_discovery",
+        lambda *_args, **_kwargs: record("market_family_discovery", {}),
+    )
+    monkeypatch.setattr(
+        job_runs,
+        "sync_market_family_mappings",
+        lambda *_args, **_kwargs: record("market_family_mappings", {}),
+    )
+    monkeypatch.setattr(job_runs, "refresh_open_position_prices", lambda *_args, **_kwargs: record("price_refresh", {}))
+    monkeypatch.setattr(
+        job_runs,
+        "create_balance_snapshot",
+        lambda *_args, **_kwargs: record("balance_snapshot", SimpleNamespace(id=789)),
+    )
+    monkeypatch.setattr(job_runs, "feature_coverage", lambda *_args, **_kwargs: record("feature_coverage", {}))
+
+    with Session(engine) as session:
+        run = JobRun(
+            job_name="daily-setup",
+            job_type="paper_ops",
+            target_date=target,
+            status="running",
+            started_at=datetime(2026, 7, 2, 12, 0, tzinfo=UTC),
+            lock_key="daily-setup:2026-07-02",
+            triggered_by="api",
+            steps=[],
+        )
+        result = job_runs._execute_job_steps(session, run, "daily-setup", target)
+
+    assert call_order == [
+        "schedule",
+        "results",
+        "results",
+        "features",
+        "market_family_discovery",
+        "market_family_mappings",
+        "price_refresh",
+        "balance_snapshot",
+        "feature_coverage",
+    ]
+    assert result["features"] == {"status": "ok"}
 
 
 def test_governance_job_scopes_resolved_samples_to_active_epoch() -> None:

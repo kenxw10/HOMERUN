@@ -151,8 +151,8 @@ python -m app.jobs.runner --job full-paper-cycle --target-date today_et
 
 Recommended production cadence:
 
-- Daily setup at 8:30 AM ET.
-- Candidate sweep every 30 minutes from 10:30 AM ET through 10:00 PM ET using the 45-180 minute rolling pregame window.
+- Daily setup at 8:30 AM ET. This is the normal owner of heavy MLB feature sync, including public MLB Stats API hydration, pybaseball/FanGraphs, Statcast/Savant, Open-Meteo, and `mature_mlb_features_v2` snapshot writes.
+- Candidate sweep every 30 minutes from 10:30 AM ET through 10:00 PM ET using the 45-180 minute rolling pregame window. Candidate sweeps are feature-cache-only and should not run full MLB feature sync.
 - Price refresh every 15 minutes from 11:00 AM ET through 1:30 AM ET. Price refresh intentionally has no time-to-start filter because it marks all active open paper positions.
 - Settlement every 30 minutes from 2:30 PM ET through 1:30 AM ET for `today_et`, plus an 8:30 AM ET `yesterday_et` catch-up.
 - Governance at 9:00 AM ET after the settlement catch-up.
@@ -169,20 +169,21 @@ Protected manual endpoints mirror the cron jobs:
 - `POST /v1/jobs/run/governance`
 - `POST /v1/jobs/run/full-paper-cycle?target_date=YYYY-MM-DD`
 
-The dashboard shows the last setup, candidate sweep, price refresh, settlement, governance, WebSocket/REST status, and the last candidate sweep window. A windowed sweep with no games in range should return `status=skipped_no_games_in_window`, count excluded games, and still be a successful no-work run rather than an error.
+The dashboard shows the last setup, candidate sweep, price refresh, settlement, governance, WebSocket/REST status, and the last candidate sweep window. A windowed sweep with no games in range should return `status=skipped_no_games_in_window`, count excluded games, and still be a successful no-work run rather than an error. Candidate-sweep results should report `feature_sync_mode=cache_only`, `feature_sync_skipped=true`, and `cached_features` diagnostics. If target-date mature feature snapshots are missing, the sweep should complete cleanly with `no_candidates_missing_feature_snapshots` instead of starting source ingestion or failing the job.
 
 After deployment, validate:
 
 1. `POST /v1/jobs/run/candidate-sweep?target_date=today_et&min_time_to_start_minutes=45&max_time_to_start_minutes=180&sweep_label=rolling_pregame_window` returns the sweep diagnostics.
-2. Only in-window games create paper trades.
-3. Out-of-window games are counted as too soon, too late, started, or wrong date.
-4. Repeated sweeps do not duplicate paper trades.
-5. Spread trading remains disabled unless explicitly enabled.
-6. YES and NO candidates can still be scored in-window.
-7. Daily/open/family/scope risk caps still apply across the full active epoch, not only the current sweep.
-8. Price refresh updates all open positions.
-9. The dashboard shows the last sweep window and paper trades created in that sweep.
-10. No live execution path or live order placement is enabled.
+2. The result contains `feature_sync_mode=cache_only`, `feature_sync_skipped=true`, and does not include a `sync_mlb_features` step.
+3. Only in-window games create paper trades.
+4. Out-of-window games are counted as too soon, too late, started, or wrong date.
+5. Repeated sweeps do not duplicate paper trades.
+6. Spread trading remains disabled unless explicitly enabled.
+7. YES and NO candidates can still be scored in-window.
+8. Daily/open/family/scope risk caps still apply across the full active epoch, not only the current sweep.
+9. Price refresh updates all open positions.
+10. The dashboard shows the last sweep window and paper trades created in that sweep.
+11. No live execution path or live order placement is enabled.
 
 ## PR3d Hotfix 3 Spread Audit And Correlation Validation
 
