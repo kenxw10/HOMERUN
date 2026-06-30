@@ -30,6 +30,7 @@ from app.services.market_family_discovery import (
     _selection_code,
 )
 from app.services.market_sync import _market_status, _update_market_fields
+from app.services.spread_verification import verify_spread_market
 from app.time_utils import ensure_aware_utc, get_dashboard_zone, today_eastern
 
 PAPER_SUPPORTED = "paper_supported"
@@ -52,6 +53,7 @@ class ParsedFamilyMarket:
     mapping_status: str
     validation_status: str
     reason: str
+    metadata: dict[str, object] | None = None
 
 
 def _empty_family_counts() -> dict[str, int]:
@@ -204,6 +206,7 @@ def _parse_discovered_item(item: MarketFamilyDiscoveryItem, game: MlbGame) -> Pa
     inning_scope = "first_five" if family_key.startswith("first_five") else "full_game"
     reason = "parsed"
     paper_supported = False
+    metadata: dict[str, object] | None = None
 
     if family_key == FULL_GAME_WINNER:
         paper_supported = _is_team_selection(selection, game)
@@ -214,8 +217,18 @@ def _parse_discovered_item(item: MarketFamilyDiscoveryItem, game: MlbGame) -> Pa
     elif family_key in {FULL_GAME_SPREAD, FIRST_FIVE_SPREAD}:
         if not _is_team_selection(selection, game):
             selection = _spread_selection_from_yes_text(raw, game)
-        paper_supported = _is_team_selection(selection, game) and line_value is not None
-        reason = "spread_selection_and_line_parsed" if paper_supported else "missing_spread_selection_or_line"
+        verification = verify_spread_market(
+            game=game,
+            family_key=family_key,
+            raw=raw,
+            line_value=line_value,
+            selection_code=selection,
+        )
+        line_value = verification.line_value
+        selection = verification.selection_code
+        paper_supported = verification.verified
+        reason = "spread_text_and_settlement_verified" if paper_supported else "spread_text_or_settlement_unverified"
+        metadata = {"spread_verification": verification.as_metadata()}
     elif family_key in {FULL_GAME_TOTAL, FIRST_FIVE_TOTAL}:
         line_value = _total_line_value(line_value)
         paper_supported = over_under in {"over", "under"} and line_value is not None
@@ -233,6 +246,7 @@ def _parse_discovered_item(item: MarketFamilyDiscoveryItem, game: MlbGame) -> Pa
         mapping_status="confirmed" if paper_supported else NEEDS_REVIEW,
         validation_status=settlement_rule_status,
         reason=reason,
+        metadata=metadata,
     )
 
 
@@ -265,6 +279,8 @@ def _upsert_market_from_item(
     market.over_under_side = parsed.over_under_side
     market.inning_scope = parsed.inning_scope
     market.settlement_rule_status = parsed.settlement_rule_status
+    if parsed.metadata:
+        market.raw_payload = {**(market.raw_payload or {}), **parsed.metadata}
     session.add(market)
     session.flush()
     return market
@@ -320,6 +336,7 @@ def _upsert_mapping(
         "selection_display": labels.selection_display,
         "matchup_display": labels.matchup_display,
         "contract_display": labels.contract_display,
+        **(parsed.metadata or {}),
     }
     session.add(mapping)
     return mapping

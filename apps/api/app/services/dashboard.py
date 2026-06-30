@@ -136,6 +136,7 @@ def _position_from_trade(
     trade: PaperTrade,
     game: MlbGame | None = None,
     market: KalshiMarket | None = None,
+    candidate: ModelCandidate | None = None,
 ) -> PositionSummary:
     current = _first_decimal(trade.exit_price, trade.current_price, trade.entry_price)
     cost_basis = (trade.entry_price * trade.quantity) + paper_trade_fee(trade)
@@ -166,6 +167,25 @@ def _position_from_trade(
         matchup_display=trade.matchup_display or fallback_labels.matchup_display,
         contract_display=display,
         normalized_equivalent_display=fallback_labels.normalized_equivalent_display,
+        display_title=fallback_labels.display_title,
+        display_subtitle=fallback_labels.display_subtitle,
+        raw_ticker_display=fallback_labels.raw_ticker_display,
+        selected_position_rationale=(
+            {
+                "decision": candidate.decision,
+                "probability_edge": _float(candidate.probability_edge),
+                "net_expected_value": _float(candidate.net_expected_value),
+                "data_quality": _float(candidate.data_quality),
+                "risk_limit_basis": (candidate.scoring_rationale or {}).get("risk_limit_basis")
+                if isinstance(candidate.scoring_rationale, dict)
+                else None,
+                "contracts": trade.quantity,
+                "estimated_total_cost": _float(trade.estimated_total_cost),
+                "total_fee_estimate": _float(trade.total_fee_estimate),
+            }
+            if candidate is not None
+            else {}
+        ),
         side=trade.contract_side,
         entry_price=float(trade.entry_price),
         exit_price=float(trade.exit_price) if trade.exit_price is not None else None,
@@ -206,6 +226,10 @@ def _position_from_position(position: Position) -> PositionSummary:
         matchup_display=fallback_labels.matchup_display,
         contract_display=fallback_labels.contract_display,
         normalized_equivalent_display=fallback_labels.normalized_equivalent_display,
+        display_title=fallback_labels.display_title,
+        display_subtitle=fallback_labels.display_subtitle,
+        raw_ticker_display=fallback_labels.raw_ticker_display,
+        selected_position_rationale={},
         side=position.contract_side,
         entry_price=float(position.entry_price),
         exit_price=None,
@@ -334,7 +358,15 @@ def _decision_breakdown(candidates: list[ModelCandidate]) -> tuple[dict[str, dic
 
 
 def _latest_job_status(session: Session, epoch: PaperTradingEpoch) -> dict[str, JobRunSummary]:
-    job_names = ["daily-setup", "candidate-sweep", "price-refresh", "settlement", "governance", "full-paper-cycle"]
+    job_names = [
+        "daily-setup",
+        "candidate-sweep",
+        "price-refresh",
+        "settlement",
+        "governance",
+        "full-paper-cycle",
+        "spread-audit",
+    ]
     ranked = (
         select(
             JobRun.id.label("job_run_id"),
@@ -464,7 +496,7 @@ def dashboard_summary_from_db(
     open_positions = [] if not include_archived else list(session.scalars(select(Position).where(Position.status == "open").limit(100)))
     open_trade_rows = list(
         session.execute(
-            select(PaperTrade, MlbGame, KalshiMarket)
+            select(PaperTrade, MlbGame, KalshiMarket, ModelCandidate)
             .outerjoin(ModelCandidate, PaperTrade.candidate_id == ModelCandidate.id)
             .outerjoin(MlbGame, ModelCandidate.mlb_game_id == MlbGame.id)
             .outerjoin(KalshiMarket, ModelCandidate.kalshi_market_id == KalshiMarket.id)
@@ -476,14 +508,14 @@ def dashboard_summary_from_db(
     summary.positions = [_position_from_position(position) for position in open_positions]
     position_keys = {(position.market_ticker, position.contract_side) for position in open_positions}
     summary.positions.extend(
-        _position_from_trade(trade, game, market)
-        for trade, game, market in open_trade_rows
+        _position_from_trade(trade, game, market, candidate)
+        for trade, game, market, candidate in open_trade_rows
         if (trade.market_ticker, trade.contract_side) not in position_keys
     )
     closed_start, closed_end = _date_bounds(selected_closed_date)
     closed_trade_rows = list(
         session.execute(
-            select(PaperTrade, MlbGame, KalshiMarket)
+            select(PaperTrade, MlbGame, KalshiMarket, ModelCandidate)
             .outerjoin(ModelCandidate, PaperTrade.candidate_id == ModelCandidate.id)
             .outerjoin(MlbGame, ModelCandidate.mlb_game_id == MlbGame.id)
             .outerjoin(KalshiMarket, ModelCandidate.kalshi_market_id == KalshiMarket.id)
@@ -499,7 +531,9 @@ def dashboard_summary_from_db(
             .limit(200)
         )
     )
-    summary.closed_positions = [_position_from_trade(trade, game, market) for trade, game, market in closed_trade_rows]
+    summary.closed_positions = [
+        _position_from_trade(trade, game, market, candidate) for trade, game, market, candidate in closed_trade_rows
+    ]
     summary.closed_positions_date = selected_closed_date.isoformat()
     summary.closed_positions_count = len(summary.closed_positions)
 

@@ -57,6 +57,10 @@ type PositionSummary = {
   matchup_display: string | null;
   contract_display: string | null;
   normalized_equivalent_display: string | null;
+  display_title: string | null;
+  display_subtitle: string | null;
+  raw_ticker_display: string | null;
+  selected_position_rationale: Record<string, unknown>;
   side: "yes" | "no";
   entry_price: number;
   exit_price: number | null;
@@ -299,6 +303,14 @@ function formatPercent(value: number | null | undefined): string {
   }).format(value);
 }
 
+function formatSignedPercent(value: number | null | undefined): string {
+  if (value === null || value === undefined || Number.isNaN(value)) {
+    return "N/A";
+  }
+  const formatted = formatPercent(Math.abs(value));
+  return value > 0 ? `+${formatted}` : value < 0 ? `-${formatted}` : formatted;
+}
+
 function formatNumber(value: number | null | undefined): string {
   if (value === null || value === undefined || Number.isNaN(value)) {
     return "N/A";
@@ -317,6 +329,19 @@ function formatUnknown(value: unknown): string {
     return value.toUpperCase();
   }
   return "N/A";
+}
+
+function positionRationaleLabel(position: PositionSummary): string | null {
+  const rationale = position.selected_position_rationale ?? {};
+  const edge = typeof rationale.probability_edge === "number" ? rationale.probability_edge : null;
+  const netEv = typeof rationale.net_expected_value === "number" ? rationale.net_expected_value : null;
+  const quality = typeof rationale.data_quality === "number" ? rationale.data_quality : null;
+  const pieces = [
+    edge !== null ? `EDGE ${formatSignedPercent(edge)}` : null,
+    netEv !== null ? `NET EV ${formatSignedCurrency(netEv)}` : null,
+    quality !== null ? `QUALITY ${formatNumber(quality)}` : null,
+  ].filter(Boolean);
+  return pieces.length ? pieces.join(" · ") : null;
 }
 
 function featureCompletenessLabel(value: Record<string, unknown>): string {
@@ -704,12 +729,23 @@ function PositionsTable({ positions }: { positions: PositionSummary[] }) {
                 <tr key={`${position.market}-${position.side}-${position.time_entered}-${position.entry_price}`}>
                   <td>{position.time_entered_display ?? formatEastern(position.time_entered)}</td>
                   <td>
-                    <span className="market-primary">{position.contract_display ?? position.market}</span>
+                    <span className="market-primary">
+                      {position.matchup_display ? `${position.matchup_display} · ` : ""}
+                      {position.contract_display ?? position.market}
+                    </span>
                     {position.normalized_equivalent_display ? (
                       <span className="market-secondary">{position.normalized_equivalent_display}</span>
                     ) : null}
-                    <span className="market-secondary" title={position.market_ticker ?? position.market}>
-                      {position.market_ticker ?? position.market}
+                    {positionRationaleLabel(position) ? (
+                      <span className="market-secondary">{positionRationaleLabel(position)}</span>
+                    ) : null}
+                    {position.display_title ? <span className="market-secondary">{position.display_title}</span> : null}
+                    {position.display_subtitle ? <span className="market-secondary">{position.display_subtitle}</span> : null}
+                    <span
+                      className="market-secondary"
+                      title={position.raw_ticker_display ?? position.market_ticker ?? position.market}
+                    >
+                      {position.raw_ticker_display ?? position.market_ticker ?? position.market}
                     </span>
                   </td>
                   <td>{position.side.toUpperCase()}</td>
@@ -805,12 +841,23 @@ function ClosedPositionsTable({
                   <td>{position.time_entered_display ?? formatEastern(position.time_entered)}</td>
                   <td>{position.time_closed_display ?? formatEastern(position.time_closed)}</td>
                   <td>
-                    <span className="market-primary">{position.contract_display ?? position.market}</span>
+                    <span className="market-primary">
+                      {position.matchup_display ? `${position.matchup_display} · ` : ""}
+                      {position.contract_display ?? position.market}
+                    </span>
                     {position.normalized_equivalent_display ? (
                       <span className="market-secondary">{position.normalized_equivalent_display}</span>
                     ) : null}
-                    <span className="market-secondary" title={position.market_ticker ?? position.market}>
-                      {position.market_ticker ?? position.market}
+                    {positionRationaleLabel(position) ? (
+                      <span className="market-secondary">{positionRationaleLabel(position)}</span>
+                    ) : null}
+                    {position.display_title ? <span className="market-secondary">{position.display_title}</span> : null}
+                    {position.display_subtitle ? <span className="market-secondary">{position.display_subtitle}</span> : null}
+                    <span
+                      className="market-secondary"
+                      title={position.raw_ticker_display ?? position.market_ticker ?? position.market}
+                    >
+                      {position.raw_ticker_display ?? position.market_ticker ?? position.market}
                     </span>
                   </td>
                   <td>{position.side.toUpperCase()}</td>
@@ -933,6 +980,7 @@ function jobStatusRows(summary: DashboardSummary): StatusRow[] {
     ["LAST SETTLEMENT", "settlement"],
     ["LAST GOVERNANCE", "governance"],
     ["FULL PAPER CYCLE", "full-paper-cycle"],
+    ["SPREAD AUDIT", "spread-audit"],
   ];
   const rows = jobLabels.map(([label, key]) => {
     const job = summary.job_status[key];
@@ -1002,6 +1050,10 @@ export default function DashboardPage() {
   const sweepWindowLabel = sweepWindowEnabled
     ? `${formatUnknown(sweepLabel)} ${formatUnknown(sweepMin)}-${formatUnknown(sweepMax)} MIN`
     : "NO WINDOW";
+  const riskBasisType =
+    typeof tradeCapsUsed.risk_limit_basis_type === "string" ? tradeCapsUsed.risk_limit_basis_type : "UNKNOWN";
+  const riskBasisAmount =
+    typeof tradeCapsUsed.risk_limit_basis_amount === "number" ? formatCurrency(tradeCapsUsed.risk_limit_basis_amount) : "N/A";
 
   const modelRows: StatusRow[] = [
     { label: "ACTIVE MODEL VERSION", value: summary.model_status.active_model_version ?? "NONE" },
@@ -1037,6 +1089,12 @@ export default function DashboardPage() {
         summary.model_status.trade_policy.paper_max_trades_per_slate,
       )}`,
     },
+    {
+      label: "GAME SCOPE CAP",
+      value: `${formatUnknown(tradeCapsUsed.game_scope_correlation_candidates_kept)} KEPT / ${formatUnknown(
+        tradeCapsUsed.game_scope_correlation_candidates_rejected,
+      )} BLOCKED`,
+    },
     { label: "LAST CANDIDATE SWEEP WINDOW", value: sweepWindowLabel, tone: sweepWindowEnabled ? "green" : "amber" },
     { label: "GAMES IN WINDOW", value: formatUnknown(tradeCapsUsed.games_in_window) },
     {
@@ -1068,6 +1126,7 @@ export default function DashboardPage() {
       value: summary.model_status.trade_policy.aggregate_risk_caps_enabled === false ? "DISABLED" : "ENABLED",
       tone: summary.model_status.trade_policy.aggregate_risk_caps_enabled === false ? "red" : "green",
     },
+    { label: "RISK LIMIT BASIS", value: `${riskBasisType.toUpperCase()} ${riskBasisAmount}` },
     {
       label: "DAILY RISK USED / MAX",
       value: `${formatUnknown(tradeCapsUsed.daily_risk_used)} / ${formatUnknown(

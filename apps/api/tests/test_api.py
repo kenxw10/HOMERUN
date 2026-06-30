@@ -88,6 +88,7 @@ from app.services.paper_epoch import (
 )
 from app.services.portfolio import calculate_paper_portfolio
 from app.services.settlement import settle_paper_trades
+from app.services.spread_audit import run_spread_audit
 from app.time_utils import classify_time_bucket, eastern_display
 from app.workers import kalshi_ws_paper
 
@@ -9929,6 +9930,7 @@ def test_line_selection_rejects_correlated_total_lines_before_caps(monkeypatch) 
 def test_trade_caps_allow_configured_multiple_total_lines(monkeypatch) -> None:
     monkeypatch.setenv("PAPER_ALLOW_MULTIPLE_LINES_PER_GAME_FAMILY", "true")
     monkeypatch.setenv("PAPER_MAX_TRADES_PER_GAME_FAMILY", "2")
+    monkeypatch.setenv("PAPER_MAX_TRADES_PER_GAME_SCOPE", "2")
     monkeypatch.setenv("PAPER_MAX_TRADES_PER_GAME", "3")
     monkeypatch.setenv("PAPER_MAX_TRADES_PER_MARKET_FAMILY", "8")
     monkeypatch.setenv("PAPER_MIN_NET_EV", "0")
@@ -11332,6 +11334,8 @@ def test_market_family_mapping_sync_promotes_only_parseable_supported_families()
                     returned_ticker="KXMLBSPREAD-26JUL011900SEAPIT-PIT-1.5",
                     returned_event_ticker="KXMLBSPREAD-26JUL011900SEAPIT",
                     title="Pittsburgh Pirates spread -1.5 vs Seattle Mariners",
+                    yes_sub_title="Pittsburgh -1.5",
+                    no_sub_title="Seattle +1.5",
                     raw_status="open",
                     confidence=Decimal("0.9500"),
                     line_value=Decimal("-1.5000"),
@@ -11467,7 +11471,8 @@ def test_market_family_mapping_parses_event_level_spread_selection_from_yes_text
     assert mapping.settlement_rule_status == "paper_supported"
     assert mapping.selection_code == "PIT"
     assert mapping.mapping_metadata["selection_display"] == "PIT -1.5"
-    assert mapping.mapping_metadata["contract_display"] == "FULL GAME SPREAD - SEA @ PIT - PIT -1.5"
+    assert mapping.mapping_metadata["contract_display"] == "SEA @ PIT - FULL GAME SPREAD - PIT -1.5"
+    assert mapping.mapping_metadata["spread_verification"]["verified"] is True
     assert market is not None
     assert market.selection_code == "PIT"
 
@@ -11943,3 +11948,284 @@ def test_resolve_preview_endpoint_returns_ok_with_partial_warnings(monkeypatch) 
 
 def test_eastern_display_includes_daylight_label() -> None:
     assert "EDT" in eastern_display(datetime(2026, 7, 1, 12, 0, tzinfo=UTC))
+
+
+def test_spread_mapping_keeps_ticker_only_parse_needs_review() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        game = MlbGame(
+            external_game_id="spread-unverified-text-1",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+            status="scheduled",
+        )
+        run = MarketFamilyDiscoveryRun(
+            target_date=date(2026, 7, 1),
+            started_at=datetime(2026, 7, 1, 12, 0, tzinfo=UTC),
+            status="completed",
+            games_considered=1,
+            families_considered=1,
+            markets_found=1,
+            errors=[],
+            warnings=[],
+            raw_summary={},
+        )
+        session.add_all([game, run])
+        session.flush()
+        session.add(
+            MarketFamilyDiscoveryItem(
+                run_id=run.id,
+                mlb_game_id=game.id,
+                family_key="full_game_spread",
+                returned_ticker="KXMLBSPREAD-26JUL011900SEAPIT-PIT-1.5",
+                returned_event_ticker="KXMLBSPREAD-26JUL011900SEAPIT",
+                title="Seattle Mariners vs Pittsburgh Pirates",
+                raw_status="open",
+                confidence=Decimal("0.9500"),
+                line_value=Decimal("-1.5000"),
+            )
+        )
+        session.commit()
+
+        result = market_family_mapping.sync_market_family_mappings(session, date(2026, 7, 1))
+        mapping = session.scalar(select(MarketMapping))
+
+    assert result["paper_supported"] == 0
+    assert result["needs_review"] == 1
+    assert mapping is not None
+    assert mapping.mapping_status == "needs_review"
+    assert mapping.settlement_rule_status == "needs_review"
+    assert mapping.mapping_metadata["spread_verification"]["verified"] is False
+
+
+def test_spread_audit_reports_verified_spread_without_trades(monkeypatch) -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+
+    with Session(engine) as session:
+        game = MlbGame(
+            external_game_id="spread-audit-1",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 1, 18, 0, tzinfo=UTC),
+            status="scheduled",
+        )
+        market = KalshiMarket(
+            kalshi_market_id="KX-SPREAD-AUDIT",
+            ticker="KXMLBSPREAD-26JUL011400SEAPIT",
+            title="Seattle Mariners vs Pittsburgh Pirates run line",
+            yes_subtitle="Pittsburgh -1.5",
+            no_subtitle="Seattle +1.5",
+            status="open",
+            market_family="full_game_spread",
+            market_type="full_game_spread",
+            line_value=Decimal("-1.5000"),
+            selection_code="PIT",
+            inning_scope="full_game",
+            settlement_rule_status="paper_supported",
+        )
+        session.add_all([game, market])
+        session.flush()
+        session.add(
+            MarketMapping(
+                mlb_game_id=game.id,
+                kalshi_market_id=market.id,
+                mapping_status="confirmed",
+                confidence=Decimal("0.9500"),
+                market_family="full_game_spread",
+                market_type="full_game_spread",
+                line_value=Decimal("-1.5000"),
+                selection_code="PIT",
+                inning_scope="full_game",
+                settlement_rule_status="paper_supported",
+            )
+        )
+        session.commit()
+        monkeypatch.setattr("app.services.spread_audit.utc_now", lambda: now)
+        result = run_spread_audit(
+            session,
+            date(2026, 7, 1),
+            min_time_to_start_minutes=45,
+            max_time_to_start_minutes=180,
+        )
+        trade = session.scalar(select(PaperTrade))
+
+    assert result["checked"] == 1
+    assert result["verified"] == 1
+    assert result["paper_trades_created"] == 0
+    assert result["items"][0]["actual_contract_display"] == "YES ON PITTSBURGH PIRATES -1.5 FULL GAME"
+    assert trade is None
+
+
+def test_total_no_label_displays_under_equivalent() -> None:
+    game = MlbGame(
+        external_game_id="total-label-1",
+        home_team="Pittsburgh Pirates",
+        away_team="Seattle Mariners",
+        home_abbreviation="PIT",
+        away_abbreviation="SEA",
+        scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+        status="scheduled",
+    )
+    labels = contract_labels(
+        game=game,
+        market=KalshiMarket(
+            kalshi_market_id="KX-TOTAL-LABEL",
+            ticker="KXMLBTOTAL-26JUL011900SEAPIT-OVER-8",
+            title="Total runs over 8",
+            status="open",
+            line_value=Decimal("8.0000"),
+            over_under_side="over",
+        ),
+        market_ticker="KXMLBTOTAL-26JUL011900SEAPIT-OVER-8",
+        market_type="full_game_total",
+        contract_side="no",
+    )
+
+    assert labels.actual_contract_display == "NO ON OVER 8 FULL GAME"
+    assert labels.normalized_equivalent_display == "UNDER 8 FULL GAME EQUIVALENT"
+
+
+def _add_scope_market(
+    session: Session,
+    game: MlbGame,
+    *,
+    ticker: str,
+    family: str,
+    scope: str,
+    ask: str = "0.4000",
+    line_value: Decimal | None = None,
+    selection_code: str | None = None,
+    over_under_side: str | None = None,
+) -> None:
+    market = KalshiMarket(
+        kalshi_market_id=f"KX-{ticker}",
+        ticker=ticker,
+        title=ticker,
+        status="open",
+        occurrence_datetime=game.scheduled_start,
+        implied_yes_ask=Decimal(ask),
+        market_family=family,
+        market_type=family,
+        line_value=line_value,
+        selection_code=selection_code,
+        over_under_side=over_under_side,
+        inning_scope=scope,
+        settlement_rule_status="paper_supported",
+    )
+    session.add(market)
+    _add_candidate_mapping(
+        session,
+        game,
+        market,
+        mapping_status="confirmed",
+        market_family=family,
+        market_type=family,
+        line_value=line_value,
+        selection_code=selection_code,
+        over_under_side=over_under_side,
+        inning_scope=scope,
+        settlement_rule_status="paper_supported",
+    )
+
+
+def test_same_game_same_scope_correlation_blocks_second_trade(monkeypatch) -> None:
+    _relax_data_quality_gate(monkeypatch)
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+    monkeypatch.setattr(candidates, "utc_now", lambda: now)
+    monkeypatch.setattr(candidates, "score_mature_candidate", lambda *_args, **_kwargs: _fixed_model_score("0.800000"))
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        game = MlbGame(
+            external_game_id="same-scope-cap-1",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+            status="scheduled",
+        )
+        session.add(game)
+        session.flush()
+        _add_scope_market(
+            session,
+            game,
+            ticker="KXMLBF5-26JUL011900SEAPIT-TIE",
+            family="first_five_winner",
+            scope="first_five",
+            selection_code="TIE",
+        )
+        _add_scope_market(
+            session,
+            game,
+            ticker="KXMLBF5TOTAL-26JUL011900SEAPIT-OVER-4.5",
+            family="first_five_total",
+            scope="first_five",
+            line_value=Decimal("4.5000"),
+            over_under_side="over",
+        )
+        session.commit()
+
+        result = candidates.generate_candidates(session, target_date=date(2026, 7, 1))
+        decisions = {candidate.decision for candidate in session.scalars(select(ModelCandidate))}
+
+    assert result["paper_trades"] == 1
+    assert result["game_scope_correlation_candidates_rejected"] == 1
+    assert "no_trade_same_game_scope_correlation_not_best" in decisions
+    assert result["risk_caps"]["risk_limit_basis_type"] == "active_epoch_portfolio_value"
+
+
+def test_same_game_different_scopes_can_both_trade(monkeypatch) -> None:
+    _relax_data_quality_gate(monkeypatch)
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+    monkeypatch.setattr(candidates, "utc_now", lambda: now)
+    monkeypatch.setattr(candidates, "score_mature_candidate", lambda *_args, **_kwargs: _fixed_model_score("0.800000"))
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        game = MlbGame(
+            external_game_id="different-scope-cap-1",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+            status="scheduled",
+        )
+        session.add(game)
+        session.flush()
+        _add_scope_market(
+            session,
+            game,
+            ticker="KXMLBGAME-26JUL011900SEAPIT-PIT",
+            family="full_game_winner",
+            scope="full_game",
+            selection_code="PIT",
+        )
+        _add_scope_market(
+            session,
+            game,
+            ticker="KXMLBF5-26JUL011900SEAPIT-TIE",
+            family="first_five_winner",
+            scope="first_five",
+            selection_code="TIE",
+        )
+        session.commit()
+
+        result = candidates.generate_candidates(session, target_date=date(2026, 7, 1))
+
+    assert result["paper_trades"] == 2
+    assert result["game_scope_correlation_candidates_rejected"] == 0

@@ -142,6 +142,7 @@ Use `app.jobs.runner` for Railway cron jobs. Each invocation opens a database se
 ```powershell
 python -m app.jobs.runner --job daily-setup --target-date today_et
 python -m app.jobs.runner --job candidate-sweep --target-date today_et --min-time-to-start-minutes 45 --max-time-to-start-minutes 180 --sweep-label rolling_pregame_window
+python -m app.jobs.runner --job spread-audit --target-date today_et --min-time-to-start-minutes 45 --max-time-to-start-minutes 180
 python -m app.jobs.runner --job price-refresh --target-date today_et
 python -m app.jobs.runner --job settlement --target-date yesterday_et
 python -m app.jobs.runner --job governance
@@ -162,6 +163,7 @@ Protected manual endpoints mirror the cron jobs:
 
 - `POST /v1/jobs/run/daily-setup?target_date=YYYY-MM-DD`
 - `POST /v1/jobs/run/candidate-sweep?target_date=YYYY-MM-DD&min_time_to_start_minutes=45&max_time_to_start_minutes=180&sweep_label=rolling_pregame_window`
+- `POST /v1/jobs/run/spread-audit?target_date=YYYY-MM-DD&min_time_to_start_minutes=45&max_time_to_start_minutes=180`
 - `POST /v1/jobs/run/price-refresh?target_date=YYYY-MM-DD`
 - `POST /v1/jobs/run/settlement?target_date=YYYY-MM-DD`
 - `POST /v1/jobs/run/governance`
@@ -181,6 +183,43 @@ After deployment, validate:
 8. Price refresh updates all open positions.
 9. The dashboard shows the last sweep window and paper trades created in that sweep.
 10. No live execution path or live order placement is enabled.
+
+## PR3d Hotfix 3 Spread Audit And Correlation Validation
+
+Run the spread audit before considering `PAPER_SPREAD_TRADING_ENABLED=true`:
+
+```powershell
+python -m app.jobs.runner --job spread-audit --target-date today_et --min-time-to-start-minutes 45 --max-time-to-start-minutes 180
+Invoke-RestMethod -Method Post -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-RAILWAY-API/v1/jobs/run/spread-audit?target_date=today_et&min_time_to_start_minutes=45&max_time_to_start_minutes=180"
+```
+
+Expected audit behavior:
+
+- The job updates spread mapping metadata only; it does not create paper trades.
+- Verified spread rows include parsed selection, line, inning scope, settlement rule status, actual contract display, normalized equivalent display, and raw Kalshi contract text.
+- Ticker-only spread rows remain `needs_review` / parser-unverified.
+- Spread candidates still return `no_trade_spread_trading_disabled` while `PAPER_SPREAD_TRADING_ENABLED=false`.
+
+Display checks:
+
+- Actual contract display should describe the real Kalshi YES/NO contract, for example `NO ON PITTSBURGH PIRATES -1.5 FULL GAME`.
+- Normalized equivalent display may show the operator-friendly equivalent, for example `SEATTLE MARINERS +1.5 FULL GAME EQUIVALENT`.
+- Totals NO should display under/over equivalents, for example `UNDER 8 FULL GAME EQUIVALENT`, not a fake signed spread such as `+8`.
+
+Correlation checks:
+
+- Default `PAPER_MAX_TRADES_PER_GAME_SCOPE=1` blocks two positions for the same `target_date + mlb_game_id + inning_scope`.
+- A first-five total and a first-five tie on the same game cannot both trade by default.
+- One first-five position and one full-game position for the same game are different scopes and may both pass if every other gate and cap passes.
+- Candidate sweep summaries should include `game_scope_correlation`, `trade_eligible_after_game_scope_correlation`, and `trades_blocked_by_game_scope_correlation`.
+
+Risk-basis checks:
+
+- Candidate sweep summaries should report risk caps using `risk_limit_basis_type=active_epoch_portfolio_value`.
+- The dashboard model panel should show the active risk basis amount and game-scope cap.
+- Selected positions should include a short rationale with edge, net EV, quality, and risk-basis context.
+
+This hotfix does not enable live trading, new production cron services, or spread paper trading. Keep cron and spread trading blocked until the audit output is manually compared with the Kalshi UI for multiple spread markets.
 
 ## PR3d WebSocket Market Data Worker
 
@@ -232,6 +271,7 @@ The backend also exposes these POST endpoints for controlled operational runs:
 - `POST /v1/admin/paper-trading/reset-epoch`
 - `POST /v1/jobs/run/daily-setup?target_date=YYYY-MM-DD`
 - `POST /v1/jobs/run/candidate-sweep?target_date=YYYY-MM-DD`
+- `POST /v1/jobs/run/spread-audit?target_date=YYYY-MM-DD`
 - `POST /v1/jobs/run/price-refresh?target_date=YYYY-MM-DD`
 - `POST /v1/jobs/run/settlement?target_date=YYYY-MM-DD`
 - `POST /v1/jobs/run/governance`
