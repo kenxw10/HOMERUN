@@ -999,9 +999,10 @@ function PortfolioChart({ summary }: { summary: DashboardSummary }) {
       : activeMode === "P/L $"
         ? "PORTFOLIO P/L $ (PAPER TRADING)"
         : "PORTFOLIO P/L % (PAPER TRADING)";
+  const latestGuideLength = 40;
   const latestLabel = chart.latest
     ? {
-        guideX: Math.min(Math.max(chart.latest.x, chart.plotLeft), chart.plotRight - 1),
+        guideX: Math.max(chart.plotLeft, Math.min(chart.latest.x, chart.plotRight - latestGuideLength)),
         textAnchor: chart.latest.x >= chart.plotRight - 120 ? ("end" as const) : ("start" as const),
         x:
           chart.latest.x >= chart.plotRight - 120
