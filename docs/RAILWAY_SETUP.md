@@ -60,6 +60,7 @@ PAPER_MAX_TRADES_PER_SLATE=8
 PAPER_MAX_TRADES_PER_GAME=3
 PAPER_MAX_TRADES_PER_MARKET_FAMILY=4
 PAPER_MAX_TRADES_PER_GAME_FAMILY=1
+PAPER_MAX_TRADES_PER_GAME_SCOPE=1
 PAPER_ALLOW_MULTIPLE_LINES_PER_GAME_FAMILY=false
 PAPER_ALLOW_MULTIPLE_F5_WINNER_OUTCOMES=false
 PAPER_MAX_OPEN_POSITIONS=12
@@ -147,6 +148,7 @@ Run these from the Railway backend service shell after migrations succeed:
 ```powershell
 python -m app.jobs.runner --job daily-setup --target-date today_et
 python -m app.jobs.runner --job candidate-sweep --target-date today_et --min-time-to-start-minutes 45 --max-time-to-start-minutes 180 --sweep-label rolling_pregame_window
+python -m app.jobs.runner --job spread-audit --target-date today_et --min-time-to-start-minutes 45 --max-time-to-start-minutes 180
 python -m app.jobs.runner --job price-refresh --target-date today_et
 python -m app.jobs.runner --job settlement --target-date yesterday_et
 python -m app.jobs.runner --job governance
@@ -154,6 +156,8 @@ python -m app.jobs.runner --job full-paper-cycle --target-date today_et
 ```
 
 These commands create database records for the dashboard and paper engine. They do not place live orders.
+
+The spread-audit command verifies spread parsing and settlement metadata from Kalshi raw text fields. It does not create paper trades. Do not add a Railway cron service for spread audit, enable `PAPER_SPREAD_TRADING_ENABLED`, or add any live execution service until the audit output has been manually validated against the Kalshi UI.
 
 Recommended Railway cron services should be separate short-lived services, not the main web server. Times below show the intended ET cadence and the equivalent UTC cron during EDT:
 
@@ -221,6 +225,9 @@ Expected behavior:
 - PR 3b market-family discovery returns structured `by_family` output from the observed deterministic prefixes `KXMLBGAME`, `KXMLBSPREAD`, `KXMLBTOTAL`, `KXMLBF5`, `KXMLBF5SPREAD`, and `KXMLBF5TOTAL`, while mapping sync promotes only parseable validated rows to `paper_supported`.
 - Candidate generation can paper trade supported spread, total, and first-five mappings only when the market is open, the ask is executable, the edge threshold clears, and the safety posture remains paper-only.
 - Candidate generation applies slate, game, market-family, open-position, and correlated game/family caps before creating paper trades.
+- PR3d hotfix 3 adds a same-game same-scope cap with `PAPER_MAX_TRADES_PER_GAME_SCOPE=1` by default. First-five total plus first-five tie on the same game is blocked by default; one first-five and one full-game position remain separate scopes.
+- PR3d hotfix 3 adds protected `POST /v1/jobs/run/spread-audit?target_date=YYYY-MM-DD&min_time_to_start_minutes=45&max_time_to_start_minutes=180`. Run it manually before enabling spread paper trading. Verified spread rows should include parser status, settlement rule status, actual contract display, normalized equivalent display, and raw Kalshi contract text.
+- Candidate sweep summaries and the dashboard report risk caps using the active epoch portfolio value as the risk-limit basis.
 - First-five settlement requires MLB linescore innings. Missing linescore should produce a skipped result and leave the trade open.
 - Discovery uses direct exact market-ticker queries only for winner families where the selected team is deterministic. Spread and total families use `event_ticker` filtering because the actual market ticker includes Kalshi line/side details that should not be guessed. Normal runs should call `POST /v1/run/market-family-discovery?target_date=YYYY-MM-DD&force_refresh=false`, which reuses recent cached runs and honors active cooldowns. The result should include `request_count`, `requests_saved_by_batching`, `rate_limited_count`, `retries_attempted`, `stopped_due_to_rate_limit`, `served_from_cache`, and `cooldown_until`.
 - Open-position price refresh updates REST last marks for open paper positions only.

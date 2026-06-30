@@ -19,6 +19,7 @@ from app.services.paper_epoch import get_or_create_active_paper_epoch
 from app.services.portfolio import create_balance_snapshot
 from app.services.position_refresh import refresh_open_position_prices
 from app.services.settlement import settle_paper_trades
+from app.services.spread_audit import run_spread_audit
 from app.time_utils import ensure_aware_utc, today_eastern, utc_now
 
 JOB_NAMES = {
@@ -28,9 +29,10 @@ JOB_NAMES = {
     "settlement",
     "governance",
     "full-paper-cycle",
+    "spread-audit",
 }
 DATE_INSENSITIVE_LOCK_JOBS = {"price-refresh"}
-TODAY_DEFAULT_LOCK_JOBS = {"daily-setup", "candidate-sweep", "settlement", "full-paper-cycle"}
+TODAY_DEFAULT_LOCK_JOBS = {"daily-setup", "candidate-sweep", "settlement", "full-paper-cycle", "spread-audit"}
 
 
 def _job_lock_key(job_name: str, target_date: date | None) -> str:
@@ -341,6 +343,22 @@ def _execute_job_steps(
                 "model_governance",
                 lambda: run_model_governance(session, paper_trading_epoch_id=run.paper_trading_epoch_id),
             )
+        }
+    if job_name == "spread-audit":
+        return {
+            "market_family_mappings": _run_step(
+                run, "market_family_mappings", lambda: sync_market_family_mappings(session, target)
+            ),
+            "spread_audit": _run_step(
+                run,
+                "spread_audit",
+                lambda: run_spread_audit(
+                    session,
+                    target,
+                    min_time_to_start_minutes=min_time_to_start_minutes,
+                    max_time_to_start_minutes=max_time_to_start_minutes,
+                ),
+            ),
         }
     if job_name == "full-paper-cycle":
         return {

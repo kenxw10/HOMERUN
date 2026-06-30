@@ -23,8 +23,9 @@ This is not a sportsbook app. It does not use DraftKings, FanDuel, Odds API, or 
 - PR 3c scores validated MLB market-family rows with `mature_mlb_run_distribution_v2` and `mature_mlb_features_v2`.
 - Team totals, multivariate/MVE markets, sportsbook data, and guessed/retired prefixes remain out of scope.
 - Paper candidates are explicitly target-date scoped and side-aware: YES uses executable YES asks/orderbook-implied YES asks, and NO uses executable NO asks/orderbook-implied NO asks. The engine must not price a NO candidate from a YES ask.
-- Spread paper trading is disabled by default with `PAPER_SPREAD_TRADING_ENABLED=false`. Spread rows can still be discovered, mapped, priced, and scored for diagnostics until the side-aware parser is manually verified.
+- Spread paper trading is disabled by default with `PAPER_SPREAD_TRADING_ENABLED=false`. Spread rows can still be discovered, mapped, priced, and scored for diagnostics until the side-aware parser and settlement metadata are verified from Kalshi raw text fields.
 - Paper trade caps default to `PAPER_MAX_TRADES_PER_SLATE=8`, `PAPER_MAX_TRADES_PER_MARKET_FAMILY=4`, and `PAPER_MAX_OPEN_POSITIONS=12`, plus aggregate bankroll caps for daily new risk, open risk, market-family risk, scope risk, and sub-20c low-price risk.
+- Same-game same-scope correlation defaults to `PAPER_MAX_TRADES_PER_GAME_SCOPE=1`, so first-five total and first-five winner exposure cannot both trade for the same MLB game by default. One first-five and one full-game position remain separate scopes.
 - Open-position current price uses REST last marks by default. PR3d adds an optional paper-only WebSocket market-data worker; it is disabled unless `WEBSOCKET_MARKET_DATA_ENABLED=true`.
 - `PAPER_STARTING_BALANCE=1000.00` by default.
 - Active PR3d observation epochs can be reset to a $500 paper bankroll through the protected reset endpoint. Archived validation rows stay in the database but are hidden from the main dashboard. The PR3d contaminated spread-validation epoch should be archived as `pr3d_bad_spread_parser_validation`, followed by a clean `pr3d_paper_observation_v2` epoch.
@@ -77,6 +78,7 @@ From `apps/api` after installing backend dependencies:
 .\.venv\Scripts\python.exe -m app.jobs.open_position_price_refresh
 .\.venv\Scripts\python.exe -m app.jobs.runner --job daily-setup --target-date today_et
 .\.venv\Scripts\python.exe -m app.jobs.runner --job candidate-sweep --target-date today_et --min-time-to-start-minutes 45 --max-time-to-start-minutes 180 --sweep-label rolling_pregame_window
+.\.venv\Scripts\python.exe -m app.jobs.runner --job spread-audit --target-date today_et --min-time-to-start-minutes 45 --max-time-to-start-minutes 180
 .\.venv\Scripts\python.exe -m app.jobs.runner --job price-refresh --target-date today_et
 .\.venv\Scripts\python.exe -m app.jobs.runner --job settlement --target-date yesterday_et
 .\.venv\Scripts\python.exe -m app.jobs.runner --job governance
@@ -126,6 +128,7 @@ PR 3c exposes these internal API run endpoints:
 - `POST /v1/admin/paper-trading/reset-epoch`
 - `POST /v1/jobs/run/daily-setup?target_date=YYYY-MM-DD`
 - `POST /v1/jobs/run/candidate-sweep?target_date=YYYY-MM-DD&min_time_to_start_minutes=45&max_time_to_start_minutes=180&sweep_label=rolling_pregame_window`
+- `POST /v1/jobs/run/spread-audit?target_date=YYYY-MM-DD&min_time_to_start_minutes=45&max_time_to_start_minutes=180`
 - `POST /v1/jobs/run/price-refresh?target_date=YYYY-MM-DD`
 - `POST /v1/jobs/run/settlement?target_date=YYYY-MM-DD`
 - `POST /v1/jobs/run/governance`
@@ -139,6 +142,21 @@ PR 3c exposes these internal API run endpoints:
 - `GET /v1/kalshi/resolve-preview?date=YYYY-MM-DD`
 
 PR3d hotfix 2 adds time-windowed candidate sweeps for production paper observation. When min/max are supplied, the sweep only scores games whose first pitch is inside that minutes-to-start window. Games outside the window are counted in the job result and dashboard, but they do not create candidates or paper trades. A dry-run option (`dry_run_candidates_only=true`) saves labeled candidate diagnostics without opening trades or refreshing open-position marks.
+
+PR3d hotfix 3 adds a protected spread-audit job and stricter display/correlation diagnostics. The audit verifies spread side, line, inning scope, and settlement support from Kalshi raw text fields instead of trusting the ticker alone. It does not create paper trades.
+
+```powershell
+.\.venv\Scripts\python.exe -m app.jobs.runner --job spread-audit --target-date today_et --min-time-to-start-minutes 45 --max-time-to-start-minutes 180
+Invoke-RestMethod -Method Post -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-RAILWAY-API/v1/jobs/run/spread-audit?target_date=today_et&min_time_to_start_minutes=45&max_time_to_start_minutes=180"
+```
+
+Expected display examples:
+
+- Actual spread contract: `NO ON PITTSBURGH PIRATES -1.5 FULL GAME`
+- Normalized spread equivalent: `SEATTLE MARINERS +1.5 FULL GAME EQUIVALENT`
+- Total NO equivalent: `UNDER 8 FULL GAME EQUIVALENT`, not `+8`
+
+Candidate sweep diagnostics now include same-game same-scope correlation counts and risk-limit basis values. Risk caps are computed from the active epoch portfolio value at sweep time, and dashboard summaries label that basis explicitly. This hotfix does not enable live trading, spread paper trading, or new production cron services; keep spread trading disabled until audit output is manually validated against the Kalshi UI.
 
 For local development, these endpoints can run without a key when `APP_ENV=local` and `BACKEND_API_KEY` is empty. For any public or deployed backend, set `BACKEND_API_KEY` and call these endpoints with an `X-API-Key` header.
 

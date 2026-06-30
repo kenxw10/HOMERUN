@@ -63,6 +63,7 @@ class Settings(BaseSettings):
     paper_max_trades_per_game: int = Field(default=3, alias="PAPER_MAX_TRADES_PER_GAME")
     paper_max_trades_per_market_family: int = Field(default=4, alias="PAPER_MAX_TRADES_PER_MARKET_FAMILY")
     paper_max_trades_per_game_family: int = Field(default=1, alias="PAPER_MAX_TRADES_PER_GAME_FAMILY")
+    paper_max_trades_per_game_scope: int = Field(default=1, alias="PAPER_MAX_TRADES_PER_GAME_SCOPE")
     paper_allow_multiple_lines_per_game_family: bool = Field(
         default=False, alias="PAPER_ALLOW_MULTIPLE_LINES_PER_GAME_FAMILY"
     )
@@ -197,6 +198,7 @@ class Settings(BaseSettings):
         "paper_max_trades_per_game",
         "paper_max_trades_per_market_family",
         "paper_max_trades_per_game_family",
+        "paper_max_trades_per_game_scope",
         "paper_max_open_positions",
         "paper_min_contracts",
         "paper_max_contracts_per_trade",

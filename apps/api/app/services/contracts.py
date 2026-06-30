@@ -39,6 +39,9 @@ class ContractLabels:
     contract_display: str
     actual_contract_display: str | None = None
     normalized_equivalent_display: str | None = None
+    display_title: str | None = None
+    display_subtitle: str | None = None
+    raw_ticker_display: str | None = None
 
 
 def selected_team_from_ticker(ticker: str | None) -> str | None:
@@ -127,6 +130,7 @@ def contract_labels(
     ticker = market_ticker.upper()
     matchup = matchup_display(game)
     title = (market.title if market else None) or ticker
+    subtitle = (market.subtitle if market else None) or (market.yes_subtitle if market else None)
     market_type = market_type_from_ticker(ticker, market_type)
     line_value = getattr(market, "line_value", None)
     over_under_side = getattr(market, "over_under_side", None)
@@ -145,6 +149,11 @@ def contract_labels(
             return f"+{value:g}"
         return f"{value:g}"
 
+    def fmt_total_line() -> str:
+        if line_value is None:
+            return ""
+        return f"{abs(float(line_value)):g}"
+
     def selection_with_line() -> str:
         line = fmt_line()
         return f"{selection} {line}".strip()
@@ -155,7 +164,7 @@ def contract_labels(
             side = "OVER"
         elif side in {"U", "UNDER"}:
             side = "UNDER"
-        line = fmt_line()
+        line = fmt_total_line()
         return f"{side} {line}".strip()
 
     family_labels = {
@@ -168,7 +177,7 @@ def contract_labels(
     }
     if market_type in family_labels and matchup:
         family_label, selection_label = family_labels[market_type]
-        market_display = f"{family_label} - {matchup} - {selection_label}"
+        market_display = f"{matchup} - {family_label} - {selection_label}"
         side = contract_side.upper()
         actual_display = market_display
         normalized_display: str | None = None
@@ -210,7 +219,14 @@ def contract_labels(
             total_label = total_selection()
             actual_display = f"{side} on {total_label} {scope}".upper()
             if contract_side.lower() == "no":
-                normalized_display = f"INVERSE OF {total_label} {scope}".upper()
+                line = fmt_total_line()
+                total_side = str(over_under_side or selection).upper()
+                if total_side in {"O", "OVER"}:
+                    normalized_display = f"UNDER {line} {scope} equivalent".upper()
+                elif total_side in {"U", "UNDER"}:
+                    normalized_display = f"OVER {line} {scope} equivalent".upper()
+                else:
+                    normalized_display = f"NOT {total_label} {scope}".upper()
             else:
                 normalized_display = f"{total_label} {scope}".upper()
         return ContractLabels(
@@ -220,6 +236,9 @@ def contract_labels(
             contract_display=market_display,
             actual_contract_display=actual_display,
             normalized_equivalent_display=normalized_display,
+            display_title=title,
+            display_subtitle=subtitle,
+            raw_ticker_display=ticker,
         )
 
     fallback = ticker if title.upper() == ticker else f"{ticker} - {title}".upper()
@@ -228,6 +247,9 @@ def contract_labels(
         selection_display=selection,
         matchup_display=matchup or "UNKNOWN MATCHUP",
         contract_display=fallback,
+        display_title=title,
+        display_subtitle=subtitle,
+        raw_ticker_display=ticker,
     )
 
 

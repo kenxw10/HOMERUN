@@ -612,3 +612,13 @@ Every future PR must update this section with:
 - Dry-run candidate sweeps save labeled diagnostics without opening paper trades, refreshing open-position marks, or writing balance snapshots.
 - Risk caps remain active-epoch/global for the target date and are not reset per sweep. Price refresh remains unwindowed so all open paper positions continue to be marked.
 - Safety posture is unchanged: no live order placement, no live execution path, no sportsbook/Odds API logic, no team totals, no umpire factors, and no production credential changes.
+
+### PR3d Hotfix 3 - Spread Verification, Display Audit, And Game-Scope Correlation
+
+- Added a spread verification service and protected spread-audit job that parse spread side, line, inning scope, settlement rule status, actual contract display, normalized equivalent display, and raw contract text from Kalshi raw fields. Ticker-only spread parsing is not enough to mark a row verified.
+- Added `POST /v1/jobs/run/spread-audit?target_date=YYYY-MM-DD&min_time_to_start_minutes=45&max_time_to_start_minutes=180` and `python -m app.jobs.runner --job spread-audit ...`. The job updates mapping/market audit metadata only and does not create paper trades.
+- Spread candidates can only trade when the parser is verified, settlement metadata is verified, all normal candidate gates pass, and `PAPER_SPREAD_TRADING_ENABLED=true`. Default behavior remains diagnostics-only with `no_trade_spread_trading_disabled`.
+- Improved position/candidate display so the dashboard shows matchup first, actual Kalshi contract display, normalized equivalent display, display title/subtitle, raw ticker, and selected-position rationale. Totals NO displays under/over equivalents such as `UNDER 8 FULL GAME EQUIVALENT` rather than fake spread-style signed lines.
+- Added same-game same-scope correlation selection with `PAPER_MAX_TRADES_PER_GAME_SCOPE=1` by default. First-five total plus first-five winner/tie on the same game is blocked by default; one first-five and one full-game exposure remain separate scopes.
+- Candidate sweep summaries and dashboard risk panels now report the active epoch portfolio value used as the risk-limit basis and the max risk-at-sweep values.
+- No live execution, live order placement, production credential changes, new cron service, schema migration, sportsbook/Odds API logic, team totals, or umpire factors were added. Keep spread paper trading and any new spread cron disabled until audit output is manually validated against the Kalshi UI.

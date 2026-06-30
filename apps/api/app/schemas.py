@@ -68,6 +68,10 @@ class PositionSummary(BaseModel):
     matchup_display: str | None = None
     contract_display: str | None = None
     normalized_equivalent_display: str | None = None
+    display_title: str | None = None
+    display_subtitle: str | None = None
+    raw_ticker_display: str | None = None
+    selected_position_rationale: dict[str, object] = Field(default_factory=dict)
     side: Literal["yes", "no"]
     entry_price: float
     exit_price: float | None = None
@@ -222,6 +226,9 @@ class CandidateSummary(BaseModel):
     contract_side: str | None = None
     contract_display: str | None = None
     normalized_equivalent_display: str | None = None
+    display_title: str | None = None
+    display_subtitle: str | None = None
+    raw_ticker_display: str | None = None
     time_bucket: str | None
     time_to_start_minutes: int | None
     model_probability: float | None

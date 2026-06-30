@@ -41,6 +41,7 @@ from app.services.modeling import (
 )
 from app.services.portfolio import calculate_paper_portfolio, create_balance_snapshot, paper_trade_fee
 from app.services.paper_epoch import get_or_create_active_paper_epoch
+from app.services.spread_verification import SPREAD_FAMILIES, spread_verification_from_mapping
 from app.time_utils import classify_time_bucket, ensure_aware_utc, get_dashboard_zone, utc_now
 
 TRADABLE_MARKET_STATUSES = {"active", "open"}
@@ -523,6 +524,7 @@ def _diagnostics_payload(
     market_open = market.status.strip().lower() in TRADABLE_MARKET_STATUSES
     price_ok = price_context.status == "fresh_executable"
     spread_trading_ok = settings.paper_spread_trading_enabled or market_type not in {FULL_GAME_SPREAD, FIRST_FIVE_SPREAD}
+    spread_parser_ok = _spread_parser_verified(mapping, game, market, market_type)
     data_quality_ok = data_quality is not None and data_quality >= _paper_quality_threshold()
     push_ok = not (push_probability is not None and push_probability > Decimal("0") and market_type.endswith(("spread", "total")))
     probability_present = probability is not None
@@ -547,6 +549,7 @@ def _diagnostics_payload(
         market_open,
         selection_trusted_ok,
         spread_trading_ok,
+        spread_parser_ok,
         price_ok,
         push_ok,
         probability_present,
@@ -566,6 +569,7 @@ def _diagnostics_payload(
         "gate_game_not_started": game_not_started,
         "gate_selection_trusted_ok": selection_trusted_ok,
         "gate_spread_trading_enabled": spread_trading_ok,
+        "gate_spread_parser_verified": spread_parser_ok,
         "gate_price_fresh_executable": price_ok,
         "gate_data_quality_ok": data_quality_ok,
         "gate_push_ok": push_ok,
@@ -576,6 +580,7 @@ def _diagnostics_payload(
         "gate_net_ev_ok": net_ev_ok,
         "gate_calibration_ok": calibration_ok,
         "gate_line_selection_ok": True,
+        "gate_game_scope_correlation_ok": True,
         "gate_caps_ok": True,
         "gate_open_position_ok": open_position_ok,
         "gate_final_trade_eligible": after_quality,
@@ -618,6 +623,7 @@ def _update_gate(candidate: ModelCandidate, key: str, value: bool) -> None:
             "gate_game_not_started",
             "gate_selection_trusted_ok",
             "gate_spread_trading_enabled",
+            "gate_spread_parser_verified",
             "gate_price_fresh_executable",
             "gate_data_quality_ok",
             "gate_push_ok",
@@ -628,6 +634,7 @@ def _update_gate(candidate: ModelCandidate, key: str, value: bool) -> None:
             "gate_net_ev_ok",
             "gate_calibration_ok",
             "gate_line_selection_ok",
+            "gate_game_scope_correlation_ok",
             "gate_caps_ok",
             "gate_open_position_ok",
         )
@@ -649,6 +656,12 @@ def _market_classification_text(market: KalshiMarket) -> str:
             market.event_ticker,
         )
     )
+
+
+def _update_candidate_diagnostics(candidate: ModelCandidate, values: dict[str, object]) -> None:
+    diagnostics = dict(candidate.gate_diagnostics or {})
+    diagnostics.update(values)
+    candidate.gate_diagnostics = diagnostics
 
 
 def _candidate_ids_with_trades(session: Session, candidate_ids: list[int], epoch_id: int | None) -> set[int]:
@@ -703,6 +716,12 @@ def _settlement_status(mapping: MarketMapping, market: KalshiMarket) -> str | No
     return mapping.settlement_rule_status or market.settlement_rule_status
 
 
+def _spread_parser_verified(mapping: MarketMapping, game: MlbGame, market: KalshiMarket, market_type: str) -> bool:
+    if market_type not in SPREAD_FAMILIES:
+        return True
+    return spread_verification_from_mapping(game=game, mapping=mapping, market=market).verified
+
+
 def _base_decision(
     mapping: MarketMapping,
     game: MlbGame,
@@ -732,6 +751,8 @@ def _base_decision(
         return "no_trade_parse_uncertain"
     if market_type in {FULL_GAME_SPREAD, FIRST_FIVE_SPREAD} and not settings.paper_spread_trading_enabled:
         return "no_trade_spread_trading_disabled"
+    if market_type in SPREAD_FAMILIES and not _spread_parser_verified(mapping, game, market, market_type):
+        return "no_trade_spread_parser_unverified"
     if minutes_to_start <= 0:
         return "no_trade_game_started"
     if _eastern_date(game.scheduled_start) != target_date:
@@ -889,6 +910,117 @@ def _apply_line_selection(intents: list[TradeIntent]) -> tuple[list[TradeIntent]
             counts["line_selection_candidates_rejected"] += 1
 
     return selected, counts
+
+
+def _game_scope_key_from_candidate(candidate: ModelCandidate) -> tuple[date | None, int, str] | None:
+    if candidate.mlb_game_id is None:
+        return None
+    family = candidate.market_family or candidate.market_type or "unknown"
+    scope = candidate.inning_scope or _risk_scope(family)
+    return candidate.target_date, candidate.mlb_game_id, scope
+
+
+def _existing_open_game_scope_counts(session: Session, epoch_id: int | None) -> dict[tuple[date | None, int, str], int]:
+    query = (
+        select(PaperTrade, ModelCandidate)
+        .outerjoin(ModelCandidate, PaperTrade.candidate_id == ModelCandidate.id)
+        .where(PaperTrade.status == "open")
+    )
+    if epoch_id is not None:
+        query = query.where(PaperTrade.paper_trading_epoch_id == epoch_id)
+    counts: dict[tuple[date | None, int, str], int] = {}
+    for _trade, candidate in session.execute(query):
+        if candidate is None:
+            continue
+        key = _game_scope_key_from_candidate(candidate)
+        if key is not None:
+            counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def _apply_game_scope_correlation(
+    session: Session,
+    intents: list[TradeIntent],
+    epoch_id: int | None,
+) -> tuple[list[TradeIntent], dict[str, int], dict[str, object]]:
+    settings = get_settings()
+    limit = max(settings.paper_max_trades_per_game_scope, 1)
+    counts = {
+        "game_scope_correlation_groups_considered": 0,
+        "game_scope_correlation_candidates_kept": 0,
+        "game_scope_correlation_candidates_rejected": 0,
+        "no_trade_game_scope_correlation_cap": 0,
+        "no_trade_same_game_scope_correlation_not_best": 0,
+    }
+    if not intents:
+        return [], counts, {"limit": limit, "groups": {}}
+
+    existing_counts = _existing_open_game_scope_counts(session, epoch_id)
+    grouped: dict[tuple[date | None, int, str], list[TradeIntent]] = {}
+    passthrough: list[TradeIntent] = []
+    for intent in intents:
+        key = _game_scope_key_from_candidate(intent.candidate)
+        if key is None:
+            passthrough.append(intent)
+            continue
+        grouped.setdefault(key, []).append(intent)
+
+    selected = list(passthrough)
+    groups_summary: dict[str, dict[str, object]] = {}
+    for key, group in grouped.items():
+        counts["game_scope_correlation_groups_considered"] += 1
+        target_date, game_id, scope = key
+        group_label = f"{target_date.isoformat() if target_date else 'none'}:{game_id}:{scope}"
+        ranked = sorted(group, key=lambda item: item.score, reverse=True)
+        existing = existing_counts.get(key, 0)
+        available = max(limit - existing, 0)
+        kept = ranked[:available]
+        selected.extend(kept)
+        counts["game_scope_correlation_candidates_kept"] += len(kept)
+        groups_summary[group_label] = {
+            "target_date": target_date.isoformat() if target_date else None,
+            "mlb_game_id": game_id,
+            "inning_scope": scope,
+            "limit": limit,
+            "existing_open": existing,
+            "considered": len(ranked),
+            "kept": len(kept),
+        }
+        for index, accepted in enumerate(kept, start=1):
+            _update_candidate_diagnostics(
+                accepted.candidate,
+                {
+                    "gate_game_scope_correlation_ok": True,
+                    "correlation_group_key": group_label,
+                    "correlation_rank": index,
+                    "correlation_rank_score": float(accepted.score),
+                    "correlation_limit": limit,
+                    "correlation_existing_open": existing,
+                },
+            )
+        for index, rejected in enumerate(ranked[available:], start=available + 1):
+            rejected.candidate.decision = (
+                "no_trade_game_scope_correlation_cap"
+                if available <= 0
+                else "no_trade_same_game_scope_correlation_not_best"
+            )
+            _update_gate(rejected.candidate, "gate_game_scope_correlation_ok", False)
+            _update_candidate_diagnostics(
+                rejected.candidate,
+                {
+                    "correlation_group_key": group_label,
+                    "correlation_rank": index,
+                    "correlation_rank_score": float(rejected.score),
+                    "correlation_limit": limit,
+                    "correlation_existing_open": existing,
+                    "correlation_rejection_reason": rejected.candidate.decision,
+                },
+            )
+            counts["game_scope_correlation_candidates_rejected"] += 1
+            counts[rejected.candidate.decision] = counts.get(rejected.candidate.decision, 0) + 1
+            session.add(rejected.candidate)
+
+    return selected, counts, {"limit": limit, "groups": groups_summary}
 
 
 def _apply_side_conflict_guard(intents: list[TradeIntent]) -> tuple[list[TradeIntent], dict[str, int]]:
@@ -1142,6 +1274,9 @@ def _apply_aggregate_risk_caps(
             low_price_used += cost
 
     summary = {
+        "risk_limit_basis_type": "active_epoch_portfolio_value",
+        "risk_limit_basis_amount": float(bankroll),
+        "risk_limit_max_at_sweep": {key: float(value) for key, value in limits.items()},
         "daily_risk_used": float(daily_used),
         "daily_risk_max": float(limits["daily"]),
         "open_risk_used": float(open_used),
@@ -1277,6 +1412,7 @@ def generate_candidates(
             "paper_max_trades_per_game": settings.paper_max_trades_per_game,
             "paper_max_trades_per_market_family": settings.paper_max_trades_per_market_family,
             "paper_max_trades_per_game_family": settings.paper_max_trades_per_game_family,
+            "paper_max_trades_per_game_scope": settings.paper_max_trades_per_game_scope,
             "paper_max_open_positions": settings.paper_max_open_positions,
             "paper_min_net_ev": float(settings.paper_min_net_ev),
             "paper_min_prob_edge": float(settings.paper_min_prob_edge),
@@ -1360,6 +1496,21 @@ def generate_candidates(
             or market.market_type
             or market_type_from_ticker(market.ticker, infer_market_type(_market_classification_text(market)))
         )
+        spread_verification = (
+            spread_verification_from_mapping(game=game, mapping=mapping, market=market)
+            if market_type in SPREAD_FAMILIES
+            else None
+        )
+        parsed_selection_code = (
+            spread_verification.selection_code
+            if spread_verification and spread_verification.selection_code
+            else mapping.selection_code or market.selection_code
+        )
+        parsed_line_value = (
+            spread_verification.line_value
+            if spread_verification and spread_verification.line_value is not None
+            else mapping.line_value if mapping.line_value is not None else market.line_value
+        )
         base_features = build_feature_snapshot(game, market, mapping, session=session, now=now)
         model_score = score_mature_candidate(
             base_features,
@@ -1397,13 +1548,15 @@ def generate_candidates(
             market_context["price_staleness_seconds"] = price_context.staleness_seconds
             market_context["sweep_label"] = normalized_sweep_label
             market_context["sweep_window_enabled"] = sweep_window_enabled
+            if spread_verification is not None:
+                market_context["spread_verification"] = spread_verification.as_metadata()
             features["market_context"] = market_context
             labels = contract_labels(
                 game=game,
                 market=market,
                 market_ticker=market.ticker,
                 market_type=market_type,
-                selection_code=mapping.selection_code or market.selection_code,
+                selection_code=parsed_selection_code,
                 contract_side=contract_side,
             )
             actual_display = labels.actual_contract_display or labels.contract_display
@@ -1476,11 +1629,9 @@ def generate_candidates(
                 open_trade_for_market.line_value = (
                     open_trade_for_market.line_value
                     if open_trade_for_market.line_value is not None
-                    else mapping.line_value if mapping.line_value is not None else market.line_value
+                    else parsed_line_value
                 )
-                open_trade_for_market.selection_code = (
-                    open_trade_for_market.selection_code or mapping.selection_code or market.selection_code
-                )
+                open_trade_for_market.selection_code = open_trade_for_market.selection_code or parsed_selection_code
                 open_trade_for_market.over_under_side = (
                     open_trade_for_market.over_under_side or mapping.over_under_side or market.over_under_side
                 )
@@ -1545,6 +1696,9 @@ def generate_candidates(
             elif decision == "no_trade_spread_trading_disabled":
                 candidate.training_eligible = False
                 candidate.training_exclusion_reason = "spread_trading_disabled"
+            elif decision == "no_trade_spread_parser_unverified":
+                candidate.training_eligible = False
+                candidate.training_exclusion_reason = "spread_parser_unverified"
             elif dry_run_candidates_only:
                 candidate.training_eligible = False
                 candidate.training_exclusion_reason = "dry_run_candidates_only"
@@ -1558,6 +1712,10 @@ def generate_candidates(
                 "actual_no_probability": float(actual_no_probability),
                 "actual_contract_display": labels.actual_contract_display,
                 "normalized_equivalent_display": labels.normalized_equivalent_display,
+                "display_title": labels.display_title,
+                "display_subtitle": labels.display_subtitle,
+                "raw_ticker_display": labels.raw_ticker_display,
+                "spread_verification": spread_verification.as_metadata() if spread_verification else None,
                 "sweep_label": normalized_sweep_label,
                 "sweep_window_enabled": sweep_window_enabled,
                 "dry_run_candidates_only": dry_run_candidates_only,
@@ -1567,8 +1725,8 @@ def generate_candidates(
             candidate.matchup_display = labels.matchup_display
             candidate.contract_display = actual_display
             candidate.market_family = mapping.market_family or market.market_family or market_type
-            candidate.line_value = mapping.line_value if mapping.line_value is not None else market.line_value
-            candidate.selection_code = mapping.selection_code or market.selection_code
+            candidate.line_value = parsed_line_value
+            candidate.selection_code = parsed_selection_code
             candidate.over_under_side = mapping.over_under_side or market.over_under_side
             candidate.inning_scope = mapping.inning_scope or market.inning_scope
             candidate.settlement_rule_status = mapping.settlement_rule_status or market.settlement_rule_status
@@ -1592,6 +1750,11 @@ def generate_candidates(
             )
             diagnostics["actual_contract_display"] = labels.actual_contract_display
             diagnostics["normalized_equivalent_display"] = labels.normalized_equivalent_display
+            diagnostics["display_title"] = labels.display_title
+            diagnostics["display_subtitle"] = labels.display_subtitle
+            diagnostics["raw_ticker_display"] = labels.raw_ticker_display
+            if spread_verification is not None:
+                diagnostics["spread_verification"] = spread_verification.as_metadata()
             diagnostics["sweep_label"] = normalized_sweep_label
             diagnostics["sweep_window_enabled"] = sweep_window_enabled
             diagnostics["dry_run_candidates_only"] = dry_run_candidates_only
@@ -1676,6 +1839,11 @@ def generate_candidates(
 
     side_guarded_trades, side_conflict_counts = _apply_side_conflict_guard(trade_intents)
     line_selected_trades, line_selection_counts = _apply_line_selection(side_guarded_trades)
+    scope_selected_trades, game_scope_counts, game_scope_summary = _apply_game_scope_correlation(
+        session,
+        line_selected_trades,
+        active_epoch.id,
+    )
     for intent in trade_intents:
         output = outputs_by_candidate_id.get(intent.candidate.id)
         if output is not None:
@@ -1686,7 +1854,7 @@ def generate_candidates(
             session.add(output)
         session.add(intent.candidate)
 
-    selected_trades, cap_counts = _apply_trade_caps(session, line_selected_trades, day, day_start, day_end, active_epoch.id)
+    selected_trades, cap_counts = _apply_trade_caps(session, scope_selected_trades, day, day_start, day_end, active_epoch.id)
     session.flush()
     for intent in line_selected_trades:
         output = outputs_by_candidate_id.get(intent.candidate.id)
@@ -1698,6 +1866,10 @@ def generate_candidates(
             session.add(output)
 
     bankroll_for_sizing = Decimal(calculate_paper_portfolio(session, epoch=active_epoch).portfolio_value)
+    risk_basis_context = {
+        "risk_limit_basis_type": "active_epoch_portfolio_value",
+        "risk_limit_basis_amount": float(bankroll_for_sizing),
+    }
 
     sized_selected_trades: list[TradeIntent] = []
     sizing_rejections = 0
@@ -1710,6 +1882,10 @@ def generate_candidates(
         if sizing.contracts < settings.paper_min_contracts:
             intent.candidate.decision = "no_trade_insufficient_bankroll_or_contract_size"
             _update_gate(intent.candidate, "gate_caps_ok", False)
+            intent.candidate.scoring_rationale = {
+                **(intent.candidate.scoring_rationale or {}),
+                "risk_limit_basis": risk_basis_context,
+            }
             intent.candidate.bankroll_at_entry = sizing.bankroll_at_entry
             intent.candidate.risk_pct = sizing.risk_pct
             intent.candidate.risk_dollars = sizing.risk_dollars
@@ -1724,7 +1900,7 @@ def generate_candidates(
             if output is not None:
                 output.decision_reason = intent.candidate.decision
                 raw = dict(output.raw_output or {})
-                raw["sizing"] = sizing.as_dict()
+                raw["sizing"] = {**sizing.as_dict(), **risk_basis_context}
                 raw["gate_diagnostics"] = intent.candidate.gate_diagnostics or {}
                 output.raw_output = raw
                 session.add(output)
@@ -1732,7 +1908,11 @@ def generate_candidates(
             sizing_rejections += 1
             continue
         intent.quantity = sizing.contracts
-        intent.sizing = sizing.as_dict()
+        intent.sizing = {**sizing.as_dict(), **risk_basis_context}
+        intent.candidate.scoring_rationale = {
+            **(intent.candidate.scoring_rationale or {}),
+            "risk_limit_basis": risk_basis_context,
+        }
         intent.candidate.bankroll_at_entry = sizing.bankroll_at_entry
         intent.candidate.risk_pct = sizing.risk_pct
         intent.candidate.risk_dollars = sizing.risk_dollars
@@ -1867,6 +2047,8 @@ def generate_candidates(
     all_cap_counts = {**cap_counts}
     for key, value in side_conflict_counts.items():
         all_cap_counts[key] = all_cap_counts.get(key, 0) + value
+    for key, value in game_scope_counts.items():
+        all_cap_counts[key] = all_cap_counts.get(key, 0) + value
     for key, value in risk_cap_counts.items():
         all_cap_counts[key] = all_cap_counts.get(key, 0) + value
     trades_blocked_by_caps = sum(
@@ -1902,6 +2084,7 @@ def generate_candidates(
         "by_scope": decision_breakdown_by_scope,
         "cap_counts": all_cap_counts,
         "risk_caps": risk_cap_summary,
+        "game_scope_correlation": game_scope_summary,
         "spread_trading_enabled": settings.paper_spread_trading_enabled,
         "side_aware_candidates_enabled": True,
         "risk_caps_enabled": True,
@@ -1924,9 +2107,11 @@ def generate_candidates(
         "eligible_trade_intents": len(trade_intents),
         "trade_eligible_after_side_conflict_guard": len(side_guarded_trades),
         "trade_eligible_after_line_selection": len(line_selected_trades),
-        "trade_eligible_before_caps": len(line_selected_trades),
+        "trade_eligible_after_game_scope_correlation": len(scope_selected_trades),
+        "trade_eligible_before_caps": len(scope_selected_trades),
         "trades_blocked_by_edge_or_fee": trades_blocked_by_edge_or_fee,
         "trades_blocked_by_line_selection": line_selection_counts["line_selection_candidates_rejected"],
+        "trades_blocked_by_game_scope_correlation": game_scope_counts["game_scope_correlation_candidates_rejected"],
         "stale_price_count": stale_price_count,
         "paper_trades": paper_trades,
         "sizing_rejections": sizing_rejections,
@@ -1969,6 +2154,7 @@ def generate_candidates(
         "decision_breakdown_by_scope": decision_breakdown_by_scope,
         "cap_counts": all_cap_counts,
         "risk_caps": risk_cap_summary,
+        "game_scope_correlation": game_scope_summary,
         "spread_trading_enabled": settings.paper_spread_trading_enabled,
         "side_aware_candidates_enabled": True,
         "risk_caps_enabled": True,
@@ -2000,19 +2186,27 @@ def generate_candidates(
         "blocked_by_line_selection": gate_summary["blocked_by_line_selection"],
         "blocked_by_caps": gate_summary["blocked_by_caps"],
         "trade_eligible_after_side_conflict_guard": len(side_guarded_trades),
-        "trade_eligible_before_caps": len(line_selected_trades),
+        "trade_eligible_before_caps": len(scope_selected_trades),
         "trade_eligible_after_ev_filters": len(trade_intents),
         "trade_eligible_after_line_selection": len(line_selected_trades),
+        "trade_eligible_after_game_scope_correlation": len(scope_selected_trades),
         "trades_blocked_by_caps": trades_blocked_by_caps,
         "trades_blocked_by_edge_or_fee": trades_blocked_by_edge_or_fee,
         "trades_blocked_by_line_selection": line_selection_counts["line_selection_candidates_rejected"],
         "trades_blocked_by_line_selection_or_correlation": line_selection_counts["line_selection_candidates_rejected"]
-        + all_cap_counts.get("no_trade_correlated_market_cap", 0),
+        + all_cap_counts.get("no_trade_correlated_market_cap", 0)
+        + game_scope_counts["game_scope_correlation_candidates_rejected"],
+        "trades_blocked_by_game_scope_correlation": game_scope_counts["game_scope_correlation_candidates_rejected"],
         "stale_price_count": stale_price_count,
         "non_executable_price_count": non_executable_price_count,
         "line_selection_groups_considered": line_selection_counts["line_selection_groups_considered"],
         "line_selection_candidates_kept": line_selection_counts["line_selection_candidates_kept"],
         "line_selection_candidates_rejected": line_selection_counts["line_selection_candidates_rejected"],
+        "game_scope_correlation_groups_considered": game_scope_counts["game_scope_correlation_groups_considered"],
+        "game_scope_correlation_candidates_kept": game_scope_counts["game_scope_correlation_candidates_kept"],
+        "game_scope_correlation_candidates_rejected": game_scope_counts[
+            "game_scope_correlation_candidates_rejected"
+        ],
         "avg_probability_edge": _avg_decimal(edge_values),
         "avg_expected_value_net": _avg_decimal(net_ev_values),
         "max_expected_value_net": _max_decimal(net_ev_values),

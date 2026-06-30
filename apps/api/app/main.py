@@ -225,6 +225,7 @@ def _market_summary(market: KalshiMarket, mapping: MarketMapping | None) -> Mark
 
 def _candidate_summary(candidate: ModelCandidate, game: MlbGame | None, market: KalshiMarket | None) -> CandidateSummary:
     game_label = f"{game.away_team} @ {game.home_team}" if game else None
+    rationale = candidate.scoring_rationale if isinstance(candidate.scoring_rationale, dict) else {}
     return CandidateSummary(
         evaluated_at=to_eastern_iso(candidate.evaluated_at),
         evaluated_at_display=eastern_display(candidate.evaluated_at),
@@ -233,11 +234,10 @@ def _candidate_summary(candidate: ModelCandidate, game: MlbGame | None, market: 
         market_type=candidate.market_type,
         contract_side=candidate.contract_side,
         contract_display=candidate.contract_display,
-        normalized_equivalent_display=(
-            (candidate.scoring_rationale or {}).get("normalized_equivalent_display")
-            if isinstance(candidate.scoring_rationale, dict)
-            else None
-        ),
+        normalized_equivalent_display=rationale.get("normalized_equivalent_display"),
+        display_title=rationale.get("display_title"),
+        display_subtitle=rationale.get("display_subtitle"),
+        raw_ticker_display=rationale.get("raw_ticker_display"),
         time_bucket=candidate.time_bucket,
         time_to_start_minutes=candidate.time_to_start_minutes,
         model_probability=_decimal_float(_prefer_not_none(candidate.model_probability, candidate.probability)),
@@ -502,6 +502,21 @@ def run_full_paper_cycle_job(
     _: None = Depends(require_internal_api_key),
 ) -> RunResponse:
     return _run_named_job("full-paper-cycle", target_date)
+
+
+@app.post("/v1/jobs/run/spread-audit", response_model=RunResponse)
+def run_spread_audit_job(
+    target_date: str | None = Query(default=None),
+    min_time_to_start_minutes: int | None = Query(default=45),
+    max_time_to_start_minutes: int | None = Query(default=180),
+    _: None = Depends(require_internal_api_key),
+) -> RunResponse:
+    return _run_named_job(
+        "spread-audit",
+        target_date,
+        min_time_to_start_minutes=min_time_to_start_minutes,
+        max_time_to_start_minutes=max_time_to_start_minutes,
+    )
 
 
 @app.post("/v1/run/model-governance", response_model=RunResponse)
