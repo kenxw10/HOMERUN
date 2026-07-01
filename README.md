@@ -1,6 +1,6 @@
 # HOMERUN
 
-HOMERUN is a Kalshi-native MLB paper-trading system and dashboard. The current version includes the deployable PR 1 foundation, PR 2 data layer, PR 2.5 targeted Kalshi MLB resolver, PR 3 paper results/model infrastructure, PR 3a discovery/operator repairs, PR 3b validated market-family paper wiring, PR 3c full MLB model governance, the PR3c hotfix for date-scoped fee-aware trade selection, PR3c fix2 feature-complete model governance, PR3c fix3-fix6 public feature/discovery hardening, PR3e feature-completeness diagnostics, PR3f cache-only candidate sweeps, PR3g candidate-stage quality/EV diagnostics, and PR3h probable-starter hydration repair: MLB slate/results ingestion, targeted Kalshi `KXMLBGAME` market resolution, auditable game-to-market mapping, mature paper-only model candidates, paper settlement for validated MLB market families, MLB Stats API primary feature cache modules, Statcast/Savant secondary enrichment, trainable parameter governance, market-family discovery audits, portfolio snapshots, and a light trading-terminal dashboard.
+HOMERUN is a Kalshi-native MLB paper-trading system and dashboard. The current version includes the deployable PR 1 foundation, PR 2 data layer, PR 2.5 targeted Kalshi MLB resolver, PR 3 paper results/model infrastructure, PR 3a discovery/operator repairs, PR 3b validated market-family paper wiring, PR 3c full MLB model governance, the PR3c hotfix for date-scoped fee-aware trade selection, PR3c fix2 feature-complete model governance, PR3c fix3-fix6 public feature/discovery hardening, PR3e feature-completeness diagnostics, PR3f cache-only candidate sweeps, PR3g candidate-stage quality/EV diagnostics, PR3h probable-starter hydration repair, and PR3i candidate decision-length hotfix: MLB slate/results ingestion, targeted Kalshi `KXMLBGAME` market resolution, auditable game-to-market mapping, mature paper-only model candidates, paper settlement for validated MLB market families, MLB Stats API primary feature cache modules, Statcast/Savant secondary enrichment, trainable parameter governance, market-family discovery audits, portfolio snapshots, and a light trading-terminal dashboard.
 
 This is not a sportsbook app. It does not use DraftKings, FanDuel, Odds API, or sportsbook odds behavior. Future trading logic should use Kalshi yes/no contract math, account for fees, and assume hold-to-settlement unless a later PR changes that context deliberately.
 
@@ -229,6 +229,8 @@ PR3c hotfix adds migration `0008_pr3c_fee_date_scope.py` for target-date, execut
 PR3c fix2 adds migration `0009_pr3c_fix2_features.py` for additive MLB feature cache tables, model parameter versions, training datasets, and threshold policy versions.
 
 PR3d adds migration `0010_pr3d_paper_ops.py` for paper observation epochs, active-epoch links, job run audits, WebSocket worker status, gate diagnostics, and fixed-risk paper sizing fields.
+
+PR3i adds migration `0011_pr3i_decision_length.py` to widen `model_candidates.decision` so post-eligibility rejection reasons such as `no_trade_same_game_scope_correlation_not_best` persist safely during non-dry candidate sweeps.
 
 ## PR3d Paper Ops Validation
 

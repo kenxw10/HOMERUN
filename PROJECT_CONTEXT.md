@@ -661,3 +661,11 @@ Every future PR must update this section with:
 - Candidate-sweep remains cache-only for heavy features. It runs the lightweight starter refresh only after target-date mature feature snapshots already exist; if snapshots are missing, it still exits cleanly with `no_candidates_missing_feature_snapshots`.
 - Added protected diagnostics: `POST /v1/sync/mlb-starters?target_date=today_et` and `GET /v1/model/starter-status?date=YYYY-MM-DD`. Dashboard model status also includes compact `starter_hydration` counts.
 - No schema migration, threshold change, EV/model/risk-cap change, live execution change, WebSocket change, cron schedule change, full-game spread activation, dependency, secret, or environment-variable change was added.
+
+### PR3i - Candidate Decision Length Hotfix
+
+- Root cause: production non-dry candidate-sweep reached the post-eligibility same-game/scope correlation guard and assigned `no_trade_same_game_scope_correlation_not_best`, but `model_candidates.decision` was still `String(40)`, causing PostgreSQL `StringDataRightTruncation`.
+- Widened `ModelCandidate.decision` to the same 120-character decision/reason capacity already used by prediction outputs and added migration `0011_pr3i_decision_length.py`.
+- Added tests that scan candidate-engine decision strings against the persisted schema length and exercise the same-game/scope correlation rejection path through flush/commit without creating paper trades.
+- Validation commands: `apps/api/.venv/Scripts/python.exe -m ruff check .`, `apps/api/.venv/Scripts/python.exe -m compileall app`, and `apps/api/.venv/Scripts/python.exe -m pytest`.
+- No trading logic, EV/model threshold, paper risk-cap, candidate ranking, starter hydration, market discovery, WebSocket, cron schedule, live execution, credential, full-game spread activation, sportsbook, team-total, or umpire change was added.

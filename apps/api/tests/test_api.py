@@ -2,6 +2,8 @@ import asyncio
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 import json
+from pathlib import Path
+import re
 import sys
 from types import SimpleNamespace
 
@@ -21,7 +23,9 @@ from app.models import (
     BalanceSnapshot,
     BullpenDailyFeature,
     CalibrationRun,
+    DECISION_REASON_MAX_LENGTH,
     FeatureSnapshot,
+    JobRun,
     KalshiMarket,
     LineupSnapshot,
     MarketFamilyDiscoveryItem,
@@ -35,7 +39,6 @@ from app.models import (
     ModelPredictionRun,
     ModelThresholdVersion,
     ModelVersion,
-    JobRun,
     MarketDataWorkerStatus,
     PaperTrade,
     PaperTradingEpoch,
@@ -202,6 +205,36 @@ def _fixed_model_score(
         training_exclusion_reason=None,
         push_probability=Decimal(push_probability),
     )
+
+
+_CANDIDATE_DECISION_PATTERN = re.compile(
+    r'"((?:candidate_only|eligible_for_paper_trade|no_trade|paper_trade)[a-z0-9_]*)"'
+)
+
+
+def test_candidate_decision_strings_fit_persisted_schema_length() -> None:
+    source = Path(candidates.__file__).read_text(encoding="utf-8")
+    decisions = set(_CANDIDATE_DECISION_PATTERN.findall(source))
+    required_decisions = {
+        "no_trade_same_game_scope_correlation_not_best",
+        "no_trade_game_scope_correlation_cap",
+        "no_trade_conflicting_side_signals",
+        "no_trade_fee_adjusted_ev_too_low",
+        "candidate_only_existing_trade",
+        "candidate_only_dry_run",
+        "no_trade_low_price_bucket_risk_cap",
+    }
+
+    assert required_decisions <= decisions
+    assert ModelCandidate.__table__.c.decision.type.length == DECISION_REASON_MAX_LENGTH
+    assert ModelPredictionOutput.__table__.c.decision_reason.type.length == DECISION_REASON_MAX_LENGTH
+
+    too_long_for_candidates = sorted(
+        (decision, len(decision))
+        for decision in decisions
+        if len(decision) > DECISION_REASON_MAX_LENGTH
+    )
+    assert too_long_for_candidates == []
 
 
 def test_default_kalshi_fee_rounding_mode_rounds_up_to_cent(monkeypatch) -> None:
@@ -13786,6 +13819,103 @@ def test_same_game_same_scope_correlation_blocks_second_trade(monkeypatch) -> No
     assert result["game_scope_correlation_candidates_rejected"] == 1
     assert "no_trade_same_game_scope_correlation_not_best" in decisions
     assert result["risk_caps"]["risk_limit_basis_type"] == "active_epoch_portfolio_value"
+
+
+def test_game_scope_correlation_rejection_persists_without_creating_trade(monkeypatch) -> None:
+    monkeypatch.delenv("PAPER_MAX_TRADES_PER_GAME_SCOPE", raising=False)
+    get_settings.cache_clear()
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+
+    try:
+        engine = create_engine("sqlite+pysqlite:///:memory:")
+        Base.metadata.create_all(engine)
+
+        with Session(engine) as session:
+            game = MlbGame(
+                external_game_id="same-scope-direct-1",
+                home_team="Pittsburgh Pirates",
+                away_team="Seattle Mariners",
+                home_abbreviation="PIT",
+                away_abbreviation="SEA",
+                scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+                status="scheduled",
+            )
+            session.add(game)
+            session.flush()
+            first_candidate = ModelCandidate(
+                mlb_game_id=game.id,
+                evaluated_at=now,
+                features={},
+                target_date=date(2026, 7, 1),
+                market_family="first_five_total",
+                market_type="first_five_total",
+                inning_scope="first_five",
+                decision="eligible_for_paper_trade",
+                net_expected_value=Decimal("0.100000"),
+                data_quality=Decimal("1.0000"),
+            )
+            second_candidate = ModelCandidate(
+                mlb_game_id=game.id,
+                evaluated_at=now,
+                features={},
+                target_date=date(2026, 7, 1),
+                market_family="first_five_winner",
+                market_type="first_five_winner",
+                inning_scope="first_five",
+                decision="eligible_for_paper_trade",
+                net_expected_value=Decimal("0.090000"),
+                data_quality=Decimal("1.0000"),
+            )
+            session.add_all([first_candidate, second_candidate])
+            session.flush()
+
+            market_one = KalshiMarket(
+                kalshi_market_id="KX-SCOPE-DIRECT-1",
+                ticker="KXMLBF5TOTAL-26JUL011900SEAPIT-OVER-4.5",
+                title="First five total over 4.5",
+                status="open",
+            )
+            market_two = KalshiMarket(
+                kalshi_market_id="KX-SCOPE-DIRECT-2",
+                ticker="KXMLBF5-26JUL011900SEAPIT-TIE",
+                title="First five tie",
+                status="open",
+            )
+            intent_one = candidates.TradeIntent(
+                candidate=first_candidate,
+                game=game,
+                market=market_one,
+                price=Decimal("0.4000"),
+                labels=SimpleNamespace(),
+                score=Decimal("2.0000"),
+            )
+            intent_two = candidates.TradeIntent(
+                candidate=second_candidate,
+                game=game,
+                market=market_two,
+                price=Decimal("0.4000"),
+                labels=SimpleNamespace(),
+                score=Decimal("1.0000"),
+            )
+
+            selected, counts, _summary = candidates._apply_game_scope_correlation(
+                session,
+                [intent_one, intent_two],
+                epoch_id=None,
+            )
+            session.flush()
+            session.commit()
+
+            saved_rejected = session.get(ModelCandidate, second_candidate.id)
+            trades = list(session.scalars(select(PaperTrade)))
+
+        assert selected == [intent_one]
+        assert counts["game_scope_correlation_candidates_rejected"] == 1
+        assert saved_rejected is not None
+        assert saved_rejected.decision == "no_trade_same_game_scope_correlation_not_best"
+        assert trades == []
+    finally:
+        get_settings.cache_clear()
 
 
 def test_same_game_different_scopes_can_both_trade(monkeypatch) -> None:
