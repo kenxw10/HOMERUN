@@ -651,3 +651,13 @@ Every future PR must update this section with:
 - Candidate and prediction-output JSON now include EV decomposition: probability, executable price, gross EV, fee estimate, net EV, probability edge, and threshold pass/fail flags.
 - Candidate-sweep summaries now include EV/edge pass counts, quality-blocked counts, deduped game/scope/family opportunity counts, top counterfactual candidates blocked by quality, and grouped average/max EV and edge by family, scope, and side. `/v1/dashboard/summary` surfaces the compact latest diagnostic payload.
 - PR3g does not change live execution, cron schedules, WebSocket behavior, settlement, market discovery, probability math, EV/edge thresholds, risk caps, same-game/scope caps, spread activation, or the PR3f cache-only sweep behavior. Full-game spread remains blocked by default unless a later dedicated PR enables it.
+
+### PR3h - Probable Starter Hydration and Cache Freshness
+
+- Root cause: the lightweight MLB schedule sync used by candidate-sweep requested only `team,linescore` and replaced `MlbGame.raw_payload`, which could erase `probablePitcher` data hydrated by daily setup before the pregame window.
+- Schedule/result sync now requests `hydrate=probablePitcher(note),team,venue,linescore` and preserves cached live feed data when updating games.
+- Added a bounded official-MLB starter refresh path. It reads target-date schedule probable pitchers, supplements with per-game MLB live feed `gameData.probablePitchers` and boxscore pitcher data, stores per-side starter metadata in existing `MlbGame.raw_payload`, and never fabricates a starter when official sources are missing. When multiple official identities are present, live feed/boxscore starter data takes priority over a stale schedule probable.
+- Starter refresh writes only MLB Stats API/derived pitcher cache rows and refreshes mature feature snapshots for the target slate. It does not call pybaseball, FanGraphs, Statcast/Savant, Open-Meteo, full `sync_mlb_features`, sportsbook APIs, team totals, or umpire logic.
+- Candidate-sweep remains cache-only for heavy features. It runs the lightweight starter refresh only after target-date mature feature snapshots already exist; if snapshots are missing, it still exits cleanly with `no_candidates_missing_feature_snapshots`.
+- Added protected diagnostics: `POST /v1/sync/mlb-starters?target_date=today_et` and `GET /v1/model/starter-status?date=YYYY-MM-DD`. Dashboard model status also includes compact `starter_hydration` counts.
+- No schema migration, threshold change, EV/model/risk-cap change, live execution change, WebSocket change, cron schedule change, full-game spread activation, dependency, secret, or environment-variable change was added.

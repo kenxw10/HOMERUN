@@ -18,8 +18,14 @@ def fetch_schedule(target_date: date | None = None) -> dict[str, Any]:
     settings = get_settings()
     return get_json(
         f"{settings.mlb_stats_base_url.rstrip('/')}/schedule",
-        params={"sportId": 1, "date": target.isoformat(), "hydrate": "team,linescore"},
+        params={"sportId": 1, "date": target.isoformat(), "hydrate": "probablePitcher(note),team,venue,linescore"},
     )
+
+
+def _merged_game_payload(existing: MlbGame | None, payload: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(existing.raw_payload or {}) if existing is not None and isinstance(existing.raw_payload, dict) else {}
+    merged.update(payload)
+    return merged
 
 
 def sync_schedule(session: Session, target_date: date | None = None) -> int:
@@ -51,7 +57,7 @@ def sync_schedule(session: Session, target_date: date | None = None) -> int:
             row.status = game.get("status", {}).get("detailedState") or game.get("status", {}).get("abstractGameState") or "scheduled"
             row.home_score = home.get("score")
             row.away_score = away.get("score")
-            row.raw_payload = game
+            row.raw_payload = _merged_game_payload(existing, game)
             session.add(row)
             count += 1
 
@@ -84,7 +90,7 @@ def sync_results(session: Session, target_date: date | None = None) -> dict[str,
                 row.status = status.get("detailedState") or status.get("abstractGameState") or row.status
                 row.home_score = home.get("score")
                 row.away_score = away.get("score")
-                row.raw_payload = game
+                row.raw_payload = _merged_game_payload(row, game)
                 session.add(row)
                 updated += 1
                 if str(status.get("abstractGameState") or row.status).lower() == "final":
