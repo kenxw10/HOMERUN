@@ -4,7 +4,7 @@ from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from math import atan2, cos, radians, sin, sqrt
 import re
-from typing import Any
+from typing import Any, Callable
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -669,9 +669,14 @@ def _probable_pitcher_from_schedule(payload: dict[str, object], side: str) -> di
     return _pitcher_identity(pitcher, source_path=f"schedule.teams.{side}.probablePitcher")
 
 
-def _probable_pitcher_from_refresh_cache(payload: dict[str, object], side: str) -> dict[str, object] | None:
+def _starter_hydration_side_payload(payload: dict[str, object], side: str) -> dict[str, object] | None:
     hydration = payload.get("homerun_starter_hydration") if isinstance(payload, dict) else None
     side_payload = hydration.get(side) if isinstance(hydration, dict) else None
+    return side_payload if isinstance(side_payload, dict) else None
+
+
+def _probable_pitcher_from_refresh_cache(payload: dict[str, object], side: str) -> dict[str, object] | None:
+    side_payload = _starter_hydration_side_payload(payload, side)
     if not isinstance(side_payload, dict) or not side_payload.get("pitcher_id"):
         return None
     return {
@@ -712,11 +717,15 @@ def _probable_pitcher_from_boxscore(payload: dict[str, object], side: str) -> di
 def probable_pitcher_from_payload(payload: dict[str, object], side: str) -> dict[str, object] | None:
     if not isinstance(payload, dict):
         return None
+    cached = _probable_pitcher_from_refresh_cache(payload, side)
+    if cached and cached.get("id"):
+        return cached
+    if _starter_hydration_side_payload(payload, side) is not None:
+        return None
     for candidate in (
         _probable_pitcher_from_game_data(payload, side),
         _probable_pitcher_from_boxscore(payload, side),
         _probable_pitcher_from_schedule(payload, side),
-        _probable_pitcher_from_refresh_cache(payload, side),
     ):
         if candidate and candidate.get("id"):
             return candidate
@@ -4409,11 +4418,12 @@ def _starter_hydration_metadata(
     game: MlbGame,
     *,
     previous: dict[str, dict[str, object] | None],
+    refreshed: dict[str, dict[str, object] | None],
     checked_at: datetime,
     errors: list[dict[str, object]],
 ) -> dict[str, object]:
-    home_identity = probable_pitcher_from_payload(game.raw_payload or {}, "home")
-    away_identity = probable_pitcher_from_payload(game.raw_payload or {}, "away")
+    home_identity = refreshed.get("home")
+    away_identity = refreshed.get("away")
     source_timestamp = None
     raw = game.raw_payload or {}
     game_data = raw.get("gameData") if isinstance(raw, dict) else None
@@ -4431,10 +4441,33 @@ def _starter_hydration_metadata(
     }
 
 
-def _starter_identity_missing(game: MlbGame) -> bool:
-    return not probable_pitcher_from_payload(game.raw_payload or {}, "home") or not probable_pitcher_from_payload(
-        game.raw_payload or {}, "away"
-    )
+def _starter_identity_missing(identities: dict[str, dict[str, object] | None]) -> bool:
+    return not identities.get("home") or not identities.get("away")
+
+
+def _fresh_schedule_starter_identities(payload: dict[str, object]) -> dict[str, dict[str, object] | None]:
+    return {
+        "home": _probable_pitcher_from_schedule(payload, "home"),
+        "away": _probable_pitcher_from_schedule(payload, "away"),
+    }
+
+
+def _fresh_feed_starter_identity(payload: dict[str, object], side: str) -> dict[str, object] | None:
+    return _probable_pitcher_from_game_data(payload, side) or _probable_pitcher_from_boxscore(payload, side)
+
+
+def _fresh_boxscore_starter_identity(payload: dict[str, object], side: str) -> dict[str, object] | None:
+    return _probable_pitcher_from_boxscore({"liveData": {"boxscore": payload}}, side)
+
+
+def _fill_missing_starter_identities(
+    identities: dict[str, dict[str, object] | None],
+    resolver: Callable[[str], dict[str, object] | None],
+) -> None:
+    for side in ("home", "away"):
+        if identities.get(side):
+            continue
+        identities[side] = resolver(side)
 
 
 def _refresh_game_starter_sources(
@@ -4447,20 +4480,31 @@ def _refresh_game_starter_sources(
         "home": probable_pitcher_from_payload(game.raw_payload or {}, "home"),
         "away": probable_pitcher_from_payload(game.raw_payload or {}, "away"),
     }
+    refreshed = _fresh_schedule_starter_identities(game.raw_payload or {})
     errors: list[dict[str, object]] = []
-    if _starter_identity_missing(game) and game.external_game_id and str(game.external_game_id).isdigit():
+    if _starter_identity_missing(refreshed) and game.external_game_id and str(game.external_game_id).isdigit():
         try:
-            _merge_game_payload(game, client.get_game_feed(game.external_game_id))
+            feed_payload = client.get_game_feed(game.external_game_id)
+            _fill_missing_starter_identities(refreshed, lambda side: _fresh_feed_starter_identity(feed_payload, side))
+            _merge_game_payload(game, feed_payload)
         except Exception as exc:
             errors.append(_source_error(source=MLB_STATS_SOURCE, table="mlb_games_feed", game_pk=game.external_game_id, exc=exc))
-    if _starter_identity_missing(game) and game.external_game_id and str(game.external_game_id).isdigit():
+    if _starter_identity_missing(refreshed) and game.external_game_id and str(game.external_game_id).isdigit():
         try:
-            _merge_boxscore_payload(game, client.get_game_boxscore(game.external_game_id))
+            boxscore_payload = client.get_game_boxscore(game.external_game_id)
+            _fill_missing_starter_identities(refreshed, lambda side: _fresh_boxscore_starter_identity(boxscore_payload, side))
+            _merge_boxscore_payload(game, boxscore_payload)
         except Exception as exc:
             errors.append(
                 _source_error(source=MLB_STATS_SOURCE, table="mlb_games_boxscore", game_pk=game.external_game_id, exc=exc)
             )
-    metadata = _starter_hydration_metadata(game, previous=previous, checked_at=checked_at, errors=errors)
+    metadata = _starter_hydration_metadata(
+        game,
+        previous=previous,
+        refreshed=refreshed,
+        checked_at=checked_at,
+        errors=errors,
+    )
     merged = dict(game.raw_payload or {})
     merged["homerun_starter_hydration"] = metadata
     game.raw_payload = merged
