@@ -776,7 +776,7 @@ def _clear_stale_probable_pitcher_sources(
                 team.pop("probablePitcher", None)
                 teams[side] = team
         for side in changed_sides:
-            if not should_clear_source(side, "schedule.teams."):
+            if should_clear_source(side, "schedule.teams."):
                 team = teams.get(side)
                 if isinstance(team, dict):
                     team = dict(team)
