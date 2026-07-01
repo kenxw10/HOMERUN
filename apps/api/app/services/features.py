@@ -734,6 +734,27 @@ def _pitcher_identity_id(identity: dict[str, object] | None) -> str | None:
     return str(identity.get("id"))
 
 
+def _pitcher_identity_source_path(identity: dict[str, object] | None) -> str | None:
+    if not identity or not identity.get("source_path"):
+        return None
+    return str(identity.get("source_path"))
+
+
+def _pitcher_identity_requires_source_refresh(
+    previous: dict[str, object] | None,
+    refreshed: dict[str, object] | None,
+) -> bool:
+    previous_id = _pitcher_identity_id(previous)
+    refreshed_id = _pitcher_identity_id(refreshed)
+    if not previous_id or not refreshed_id:
+        return False
+    if previous_id != refreshed_id:
+        return True
+    previous_source = _pitcher_identity_source_path(previous)
+    refreshed_source = _pitcher_identity_source_path(refreshed)
+    return bool(previous_source and refreshed_source and previous_source != refreshed_source)
+
+
 def _clear_stale_probable_pitcher_sources(
     payload: dict[str, object],
     *,
@@ -4623,9 +4644,7 @@ def _refresh_game_starter_sources(
     changed_sides = {
         side
         for side in ("home", "away")
-        if _pitcher_identity_id(previous.get(side))
-        and _pitcher_identity_id(refreshed.get(side))
-        and _pitcher_identity_id(previous.get(side)) != _pitcher_identity_id(refreshed.get(side))
+        if _pitcher_identity_requires_source_refresh(previous.get(side), refreshed.get(side))
     }
     merged = _clear_stale_probable_pitcher_sources(
         game.raw_payload or {},

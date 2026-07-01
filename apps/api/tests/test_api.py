@@ -10250,6 +10250,59 @@ def test_sync_mlb_starters_clears_stale_schedule_after_feed_probable_update(monk
     assert snapshot.source_statuses["starter_identity"] == {"home": "available", "away": "available"}
 
 
+def test_sync_mlb_starters_prefers_feed_metadata_when_starter_ids_match(monkeypatch) -> None:
+    monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "true")
+    get_settings.cache_clear()
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    class FakeMLBStatsClient:
+        def get_schedule(self, *_args, **_kwargs):
+            return {"dates": [{"games": [_starter_schedule_game()]}]}
+
+        def get_game_feed(self, *_args, **_kwargs):
+            return {
+                "gameData": {
+                    "datetime": {"dateTime": "2026-07-01T23:00:00Z"},
+                    "probablePitchers": {
+                        "home": {"id": 1999, "fullName": "Home Feed Starter", "pitchHand": {"code": "R"}},
+                        "away": {"id": 2999, "fullName": "Away Feed Starter", "pitchHand": {"code": "L"}},
+                    },
+                }
+            }
+
+        def get_game_boxscore(self, *_args, **_kwargs):
+            pytest.fail("feed gameData should satisfy starter refresh")
+
+        def get_pitcher_game_log_stats(self, *_args, **_kwargs):
+            return _starter_game_log_payload()
+
+    monkeypatch.setattr(features, "MLBStatsClient", FakeMLBStatsClient)
+
+    try:
+        with Session(engine) as session:
+            _seed_existing_starter_feature_snapshot(session)
+            result = features.sync_mlb_starters(session, date(2026, 7, 1))
+            game = session.scalar(select(MlbGame).where(MlbGame.external_game_id == "123456"))
+    finally:
+        get_settings.cache_clear()
+
+    assert result["starter_identity_available_count"] == 2
+    assert game is not None
+    assert "probablePitcher" not in game.raw_payload["teams"]["home"]
+    assert "probablePitcher" not in game.raw_payload["teams"]["away"]
+    home_pitcher = features.probable_pitcher_from_payload(game.raw_payload or {}, "home")
+    away_pitcher = features.probable_pitcher_from_payload(game.raw_payload or {}, "away")
+    assert home_pitcher is not None
+    assert home_pitcher["id"] == "1999"
+    assert home_pitcher["handedness"] == "R"
+    assert home_pitcher["source_path"] == "game.gameData.probablePitchers.home"
+    assert away_pitcher is not None
+    assert away_pitcher["id"] == "2999"
+    assert away_pitcher["handedness"] == "L"
+    assert away_pitcher["source_path"] == "game.gameData.probablePitchers.away"
+
+
 def test_sync_mlb_starters_does_not_fake_missing_starters(monkeypatch) -> None:
     monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "true")
     get_settings.cache_clear()
