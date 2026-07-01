@@ -76,6 +76,12 @@ class PositionSummary(BaseModel):
     entry_price: float
     exit_price: float | None = None
     current_price: float | None
+    entry_notional: float | None = None
+    entry_total_cost: float | None = None
+    current_value: float | None = None
+    exit_value: float | None = None
+    fee_paid: float | None = None
+    estimated_fee: float | None = None
     current_price_updated_at: str | None = None
     current_price_updated_at_display: str | None = None
     quantity: int
