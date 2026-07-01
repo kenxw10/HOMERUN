@@ -9840,6 +9840,77 @@ def test_sync_mlb_starters_falls_back_to_game_feed_and_marks_missing_stats_parti
     assert snapshot.source_statuses["starter_season"] == {"home": "partial", "away": "partial"}
 
 
+def test_sync_mlb_starters_prefers_feed_boxscore_over_probable_pitchers(monkeypatch) -> None:
+    monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "true")
+    get_settings.cache_clear()
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    game_log_calls: list[str] = []
+
+    class FakeMLBStatsClient:
+        def get_schedule(self, *_args, **_kwargs):
+            return {"dates": [{"games": [_starter_schedule_game(home_probable=False, away_probable=False)]}]}
+
+        def get_game_feed(self, *_args, **_kwargs):
+            return {
+                "gameData": {
+                    "datetime": {"dateTime": "2026-07-01T23:00:00Z"},
+                    "probablePitchers": {
+                        "home": {"id": 1111, "fullName": "Scratched Home Probable", "pitchHand": {"code": "R"}},
+                        "away": {"id": 2222, "fullName": "Scratched Away Probable", "pitchHand": {"code": "L"}},
+                    },
+                },
+                "liveData": {
+                    "boxscore": {
+                        "teams": {
+                            "home": {
+                                "pitchers": [1999],
+                                "players": {
+                                    "ID1999": {
+                                        "person": {"id": 1999, "fullName": "Actual Home Starter"},
+                                        "pitchHand": {"code": "R"},
+                                    }
+                                },
+                            },
+                            "away": {
+                                "pitchers": [2999],
+                                "players": {
+                                    "ID2999": {
+                                        "person": {"id": 2999, "fullName": "Actual Away Starter"},
+                                        "pitchHand": {"code": "L"},
+                                    }
+                                },
+                            },
+                        }
+                    }
+                },
+            }
+
+        def get_pitcher_game_log_stats(self, person_id: str, _season: int):
+            game_log_calls.append(str(person_id))
+            return _starter_game_log_payload()
+
+    monkeypatch.setattr(features, "MLBStatsClient", FakeMLBStatsClient)
+
+    try:
+        with Session(engine) as session:
+            result = features.sync_mlb_starters(session, date(2026, 7, 1))
+            game = session.scalar(select(MlbGame).where(MlbGame.external_game_id == "123456"))
+            snapshot = session.scalar(select(MlbFeatureSnapshot).where(MlbFeatureSnapshot.source == features.FEATURE_VERSION))
+    finally:
+        get_settings.cache_clear()
+
+    assert result["games_with_both_starters"] == 1
+    assert game_log_calls == ["1999", "2999"]
+    assert game is not None
+    assert game.raw_payload["homerun_starter_hydration"]["home"]["pitcher_id"] == "1999"
+    assert game.raw_payload["homerun_starter_hydration"]["away"]["pitcher_id"] == "2999"
+    assert features.probable_pitcher_from_payload(game.raw_payload or {}, "home")["id"] == "1999"
+    assert features.probable_pitcher_from_payload(game.raw_payload or {}, "away")["id"] == "2999"
+    assert snapshot is not None
+    assert snapshot.source_statuses["starter_identity"] == {"home": "available", "away": "available"}
+
+
 def test_sync_mlb_starters_does_not_fake_missing_starters(monkeypatch) -> None:
     monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "true")
     get_settings.cache_clear()

@@ -4505,7 +4505,7 @@ def _fresh_schedule_starter_identities(payload: dict[str, object]) -> dict[str, 
 
 
 def _fresh_feed_starter_identity(payload: dict[str, object], side: str) -> dict[str, object] | None:
-    return _probable_pitcher_from_game_data(payload, side) or _probable_pitcher_from_boxscore(payload, side)
+    return _probable_pitcher_from_boxscore(payload, side) or _probable_pitcher_from_game_data(payload, side)
 
 
 def _fresh_boxscore_starter_identity(payload: dict[str, object], side: str) -> dict[str, object] | None:
