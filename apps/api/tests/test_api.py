@@ -2463,6 +2463,21 @@ def test_job_endpoint_accepts_symbolic_target_date(monkeypatch) -> None:
     assert response.json()["result"]["target_date"] == "2026-07-02"
 
 
+def test_starter_endpoints_return_422_for_invalid_dates() -> None:
+    app.dependency_overrides[require_internal_api_key] = lambda: None
+
+    try:
+        sync_response = client.post("/v1/sync/mlb-starters?target_date=not-a-date")
+        status_response = client.get("/v1/model/starter-status?date=not-a-date")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert sync_response.status_code == 422
+    assert sync_response.json()["detail"] == "Invalid target_date. Use YYYY-MM-DD, today_et, or yesterday_et."
+    assert status_response.status_code == 422
+    assert status_response.json()["detail"] == "Invalid date. Use YYYY-MM-DD, today_et, or yesterday_et."
+
+
 def test_job_lock_is_committed_before_steps_execute(monkeypatch, tmp_path) -> None:
     db_path = tmp_path / "job-lock.sqlite"
     engine = create_engine(f"sqlite+pysqlite:///{db_path}")
@@ -9926,6 +9941,76 @@ def test_sync_mlb_starters_skips_snapshot_without_existing_mature_feature(monkey
     assert result["feature_snapshots_upserted"] == 0
     assert result["feature_snapshots_skipped_missing_existing"] == 1
     assert snapshot is None
+
+
+def test_sync_mlb_starters_preserves_cached_statcast_pitcher_fields(monkeypatch) -> None:
+    monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "true")
+    get_settings.cache_clear()
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    cached_contact = {
+        "source": features.STATCAST_SOURCE,
+        "batted_ball_events_count": 31,
+        "average_release_speed": 94.7,
+        "barrel_pct": 0.08,
+    }
+
+    class FakeMLBStatsClient:
+        def get_schedule(self, *_args, **_kwargs):
+            return {"dates": [{"games": [_starter_schedule_game()]}]}
+
+        def get_game_feed(self, *_args, **_kwargs):
+            return {}
+
+        def get_pitcher_game_log_stats(self, *_args, **_kwargs):
+            return _starter_game_log_payload()
+
+    monkeypatch.setattr(features, "MLBStatsClient", FakeMLBStatsClient)
+
+    try:
+        with Session(engine) as session:
+            _seed_existing_starter_feature_snapshot(session)
+            session.add(
+                PitcherDailyFeature(
+                    target_date=date(2026, 7, 1),
+                    team_code="PIT",
+                    pitcher_id="1999",
+                    pitcher_name="Home Starter",
+                    captured_at=datetime(2026, 7, 1, 12, 0, tzinfo=UTC),
+                    source=features.MLB_STATS_SOURCE,
+                    source_status="available",
+                    sample_size=20,
+                    confidence=Decimal("0.8500"),
+                    completeness=Decimal("0.8000"),
+                    stale=False,
+                    features={
+                        "season_contact_quality": cached_contact,
+                        "recent_contact_quality": cached_contact,
+                        "contact_quality_status": "available",
+                    },
+                    raw_payload={"statcast": cached_contact},
+                )
+            )
+            session.commit()
+
+            result = features.sync_mlb_starters(session, date(2026, 7, 1))
+            pitcher = session.scalar(
+                select(PitcherDailyFeature)
+                .where(PitcherDailyFeature.target_date == date(2026, 7, 1))
+                .where(PitcherDailyFeature.team_code == "PIT")
+                .where(PitcherDailyFeature.pitcher_id == "1999")
+                .where(PitcherDailyFeature.source == features.MLB_STATS_SOURCE)
+            )
+    finally:
+        get_settings.cache_clear()
+
+    assert result["validation_status"] == "ok"
+    assert pitcher is not None
+    assert pitcher.features["season_contact_quality"] == cached_contact
+    assert pitcher.features["recent_contact_quality"] == cached_contact
+    assert pitcher.features["contact_quality_status"] == "available"
+    assert pitcher.features["recent"]["velocity_trend"] == 94.7
+    assert pitcher.raw_payload["statcast"] == cached_contact
 
 
 def test_sync_mlb_starters_falls_back_to_game_feed_and_marks_missing_stats_partial(monkeypatch) -> None:

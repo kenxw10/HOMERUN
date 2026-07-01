@@ -426,13 +426,7 @@ def _run_named_job(
     sweep_label: str | None = None,
     dry_run_candidates_only: bool = False,
 ) -> RunResponse:
-    try:
-        resolved_target_date = resolve_job_target_date(target_date)
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Invalid target_date. Use YYYY-MM-DD, today_et, or yesterday_et.",
-        ) from exc
+    resolved_target_date = _resolve_api_target_date(target_date)
     with _db_session_or_503() as session:
         try:
             result = run_job(
@@ -448,6 +442,16 @@ def _run_named_job(
         except ValueError as exc:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
     return RunResponse(ok=result.get("status") not in {"failed", "failed_stale"}, action=f"job_{job_name}", result=result)
+
+
+def _resolve_api_target_date(target_date: str | date | None, *, parameter_name: str = "target_date") -> date | None:
+    try:
+        return resolve_job_target_date(target_date)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid {parameter_name}. Use YYYY-MM-DD, today_et, or yesterday_et.",
+        ) from exc
 
 
 @app.post("/v1/jobs/run/daily-setup", response_model=RunResponse)
@@ -651,8 +655,9 @@ def run_mlb_starter_sync(
     target_date: str | None = Query(default=None),
     _: None = Depends(require_internal_api_key),
 ) -> RunResponse:
+    resolved_target_date = _resolve_api_target_date(target_date)
     with _db_session_or_503() as session:
-        result = sync_mlb_starters(session, resolve_job_target_date(target_date))
+        result = sync_mlb_starters(session, resolved_target_date)
     return RunResponse(ok=result.get("validation_status") != "failed", action="mlb_starter_sync", result=result)
 
 
@@ -661,8 +666,9 @@ def model_starter_status(
     target_date: str | None = Query(default=None, alias="date"),
     _: None = Depends(require_internal_api_key),
 ) -> RunResponse:
+    resolved_target_date = _resolve_api_target_date(target_date, parameter_name="date")
     with _db_session_or_503() as session:
-        result = starter_status_report(session, resolve_job_target_date(target_date))
+        result = starter_status_report(session, resolved_target_date)
     return RunResponse(ok=True, action="starter_status", result=result)
 
 

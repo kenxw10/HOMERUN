@@ -1397,6 +1397,19 @@ def _statcast_status(contact: dict[str, object] | None) -> str:
     return "missing"
 
 
+def _cached_pitcher_statcast_contact(row: PitcherDailyFeature | None) -> dict[str, object] | None:
+    if row is None:
+        return None
+    features = row.features if isinstance(row.features, dict) else {}
+    for key in ("season_contact_quality", "recent_contact_quality"):
+        value = features.get(key)
+        if isinstance(value, dict):
+            return value
+    raw_payload = row.raw_payload if isinstance(row.raw_payload, dict) else {}
+    statcast = raw_payload.get("statcast")
+    return statcast if isinstance(statcast, dict) else None
+
+
 def _statcast_batting_team_code(row: dict[str, object]) -> str | None:
     direct = _canonical_public_team_code(_row_value(row, "bat_team"))
     if direct:
@@ -3065,6 +3078,8 @@ def _upsert_mlb_primary_pitcher(
     mlb_context: dict[str, object],
     statcast_context: dict[str, object],
     stats: dict[str, object],
+    *,
+    preserve_missing_statcast: bool = False,
 ) -> PitcherDailyFeature | None:
     team_code = (game.home_abbreviation if side == "home" else game.away_abbreviation) or "UNK"
     identity = probable_pitcher_from_payload(game.raw_payload or {}, side)
@@ -3098,6 +3113,15 @@ def _upsert_mlb_primary_pitcher(
         except ValueError:
             rest_days = None
     contact = statcast_context.get("pitcher_contact_by_id", {}).get(pitcher_id) if isinstance(statcast_context.get("pitcher_contact_by_id"), dict) else None
+    row = session.scalar(
+        select(PitcherDailyFeature)
+        .where(PitcherDailyFeature.target_date == day)
+        .where(PitcherDailyFeature.team_code == team_code)
+        .where(PitcherDailyFeature.pitcher_id == pitcher_id)
+        .where(PitcherDailyFeature.source == MLB_STATS_SOURCE)
+    )
+    if preserve_missing_statcast and contact is None:
+        contact = _cached_pitcher_statcast_contact(row)
     season = {
         "pitcher_id": pitcher_id,
         "pitcher_name": identity.get("name") or identity.get("pitcher_name"),
@@ -3154,13 +3178,6 @@ def _upsert_mlb_primary_pitcher(
         "expected_bullpen_innings": _float(max(Decimal("1.5000"), min(Decimal("8.0000"), Decimal("9") - expected_ip))) if expected_ip is not None else None,
     }
     status = "available" if season["era"] is not None and season["whip"] is not None and season["innings_pitched"] is not None else "partial"
-    row = session.scalar(
-        select(PitcherDailyFeature)
-        .where(PitcherDailyFeature.target_date == day)
-        .where(PitcherDailyFeature.team_code == team_code)
-        .where(PitcherDailyFeature.pitcher_id == pitcher_id)
-        .where(PitcherDailyFeature.source == MLB_STATS_SOURCE)
-    )
     row = row or PitcherDailyFeature(target_date=day, team_code=team_code, pitcher_id=pitcher_id, source=MLB_STATS_SOURCE)
     row.pitcher_name = str(identity.get("name") or identity.get("pitcher_name") or "")
     row.captured_at = captured_at
@@ -4735,7 +4752,17 @@ def sync_mlb_starters(
             _record_feature_row(
                 stats,
                 "pitcher_daily_features",
-                _upsert_mlb_primary_pitcher(session, game, side, day, captured_at, mlb_context, statcast_context, stats),
+                _upsert_mlb_primary_pitcher(
+                    session,
+                    game,
+                    side,
+                    day,
+                    captured_at,
+                    mlb_context,
+                    statcast_context,
+                    stats,
+                    preserve_missing_statcast=True,
+                ),
             )
             _record_feature_row(
                 stats,
