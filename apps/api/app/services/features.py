@@ -739,11 +739,21 @@ def _clear_stale_probable_pitcher_sources(
     *,
     missing_sides: set[str],
     changed_sides: set[str] | None = None,
+    refreshed: dict[str, dict[str, object] | None] | None = None,
 ) -> dict[str, object]:
     changed_sides = changed_sides or set()
     stale_source_sides = missing_sides | changed_sides
     if not stale_source_sides:
         return dict(payload)
+    refreshed = refreshed or {}
+
+    def should_clear_source(side: str, source_prefix: str) -> bool:
+        if side in missing_sides:
+            return True
+        identity = refreshed.get(side)
+        source_path = str(identity.get("source_path") or "") if isinstance(identity, dict) else ""
+        return not source_path.startswith(source_prefix)
+
     cleared = dict(payload)
     game_data = cleared.get("gameData")
     if isinstance(game_data, dict):
@@ -752,7 +762,8 @@ def _clear_stale_probable_pitcher_sources(
         if isinstance(probable, dict):
             probable = dict(probable)
             for side in stale_source_sides:
-                probable.pop(side, None)
+                if should_clear_source(side, "game.gameData.probablePitchers."):
+                    probable.pop(side, None)
             game_data["probablePitchers"] = probable
         cleared["gameData"] = game_data
     teams = cleared.get("teams")
@@ -764,6 +775,13 @@ def _clear_stale_probable_pitcher_sources(
                 team = dict(team)
                 team.pop("probablePitcher", None)
                 teams[side] = team
+        for side in changed_sides:
+            if not should_clear_source(side, "schedule.teams."):
+                team = teams.get(side)
+                if isinstance(team, dict):
+                    team = dict(team)
+                    team.pop("probablePitcher", None)
+                    teams[side] = team
         cleared["teams"] = teams
     live_data = cleared.get("liveData")
     boxscore = live_data.get("boxscore") if isinstance(live_data, dict) else None
@@ -776,7 +794,8 @@ def _clear_stale_probable_pitcher_sources(
             box_team = box_teams.get(side)
             if isinstance(box_team, dict):
                 box_team = dict(box_team)
-                box_team.pop("pitchers", None)
+                if should_clear_source(side, "game.liveData.boxscore.teams."):
+                    box_team.pop("pitchers", None)
                 box_teams[side] = box_team
         boxscore["teams"] = box_teams
         live_data["boxscore"] = boxscore
@@ -4522,6 +4541,16 @@ def _fill_missing_starter_identities(
         identities[side] = resolver(side)
 
 
+def _replace_starter_identities(
+    identities: dict[str, dict[str, object] | None],
+    resolver: Callable[[str], dict[str, object] | None],
+) -> None:
+    for side in ("home", "away"):
+        identity = resolver(side)
+        if identity:
+            identities[side] = identity
+
+
 def _preserve_previous_starters_after_refresh_errors(
     refreshed: dict[str, dict[str, object] | None],
     previous: dict[str, dict[str, object] | None],
@@ -4549,10 +4578,10 @@ def _refresh_game_starter_sources(
     }
     refreshed = _fresh_schedule_starter_identities(game.raw_payload or {})
     errors: list[dict[str, object]] = []
-    if _starter_identity_missing(refreshed) and game.external_game_id and str(game.external_game_id).isdigit():
+    if game.external_game_id and str(game.external_game_id).isdigit():
         try:
             feed_payload = client.get_game_feed(game.external_game_id)
-            _fill_missing_starter_identities(refreshed, lambda side: _fresh_feed_starter_identity(feed_payload, side))
+            _replace_starter_identities(refreshed, lambda side: _fresh_feed_starter_identity(feed_payload, side))
             _merge_game_payload(game, feed_payload)
         except Exception as exc:
             errors.append(_source_error(source=MLB_STATS_SOURCE, table="mlb_games_feed", game_pk=game.external_game_id, exc=exc))
@@ -4585,6 +4614,7 @@ def _refresh_game_starter_sources(
         game.raw_payload or {},
         missing_sides=missing_sides,
         changed_sides=changed_sides,
+        refreshed=refreshed,
     )
     merged["homerun_starter_hydration"] = metadata
     game.raw_payload = merged
