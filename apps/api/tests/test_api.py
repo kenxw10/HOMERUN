@@ -10206,6 +10206,35 @@ def test_probable_pitcher_adapter_uses_fresh_probable_after_missing_refresh_cach
     assert away_pitcher["source_path"] == "game.gameData.probablePitchers.away"
 
 
+def test_probable_pitcher_adapter_prefers_schedule_over_stale_game_data() -> None:
+    payload = {
+        "gameData": {
+            "probablePitchers": {
+                "home": {
+                    "id": 1999,
+                    "fullName": "Old Feed Starter",
+                    "pitchHand": {"code": "L"},
+                }
+            }
+        },
+        "teams": {
+            "home": {
+                "probablePitcher": {
+                    "id": 2999,
+                    "fullName": "Fresh Schedule Starter",
+                    "pitchHand": {"code": "R"},
+                }
+            }
+        },
+    }
+
+    pitcher = features.probable_pitcher_from_payload(payload, "home")
+
+    assert pitcher is not None
+    assert pitcher["id"] == "2999"
+    assert pitcher["source_path"] == "schedule.teams.home.probablePitcher"
+
+
 def test_data_quality_caps_missing_critical_modules() -> None:
     now = datetime(2026, 7, 1, 21, 45, tzinfo=UTC)
     game = MlbGame(

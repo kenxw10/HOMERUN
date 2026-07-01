@@ -718,10 +718,10 @@ def probable_pitcher_from_payload(payload: dict[str, object], side: str) -> dict
     if not isinstance(payload, dict):
         return None
     for candidate in (
-        _probable_pitcher_from_game_data(payload, side),
         _probable_pitcher_from_boxscore(payload, side),
         _probable_pitcher_from_schedule(payload, side),
         _probable_pitcher_from_refresh_cache(payload, side),
+        _probable_pitcher_from_game_data(payload, side),
     ):
         if candidate and candidate.get("id"):
             return candidate
