@@ -159,8 +159,11 @@ def _cached_feature_status(session: Session, target_date: date) -> dict[str, obj
 
 def _safe_starter_refresh(session: Session, target_date: date) -> dict[str, object]:
     try:
-        result = sync_mlb_starters(session, target_date, update_snapshots=True, commit=False)
+        with session.begin_nested():
+            result = sync_mlb_starters(session, target_date, update_snapshots=True, commit=False)
     except Exception as exc:
+        if not session.is_active:
+            session.rollback()
         return {
             "status": "degraded_starter_refresh_failed",
             "feature_sync_mode": "starter_refresh_lightweight",

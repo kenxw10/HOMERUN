@@ -717,19 +717,58 @@ def _probable_pitcher_from_boxscore(payload: dict[str, object], side: str) -> di
 def probable_pitcher_from_payload(payload: dict[str, object], side: str) -> dict[str, object] | None:
     if not isinstance(payload, dict):
         return None
-    cached = _probable_pitcher_from_refresh_cache(payload, side)
-    if cached and cached.get("id"):
-        return cached
-    if _starter_hydration_side_payload(payload, side) is not None:
-        return None
     for candidate in (
         _probable_pitcher_from_game_data(payload, side),
         _probable_pitcher_from_boxscore(payload, side),
         _probable_pitcher_from_schedule(payload, side),
+        _probable_pitcher_from_refresh_cache(payload, side),
     ):
         if candidate and candidate.get("id"):
             return candidate
     return None
+
+
+def _clear_stale_probable_pitcher_sources(payload: dict[str, object], missing_sides: set[str]) -> dict[str, object]:
+    if not missing_sides:
+        return dict(payload)
+    cleared = dict(payload)
+    game_data = cleared.get("gameData")
+    if isinstance(game_data, dict):
+        game_data = dict(game_data)
+        probable = game_data.get("probablePitchers")
+        if isinstance(probable, dict):
+            probable = dict(probable)
+            for side in missing_sides:
+                probable.pop(side, None)
+            game_data["probablePitchers"] = probable
+        cleared["gameData"] = game_data
+    teams = cleared.get("teams")
+    if isinstance(teams, dict):
+        teams = dict(teams)
+        for side in missing_sides:
+            team = teams.get(side)
+            if isinstance(team, dict):
+                team = dict(team)
+                team.pop("probablePitcher", None)
+                teams[side] = team
+        cleared["teams"] = teams
+    live_data = cleared.get("liveData")
+    boxscore = live_data.get("boxscore") if isinstance(live_data, dict) else None
+    box_teams = boxscore.get("teams") if isinstance(boxscore, dict) else None
+    if isinstance(live_data, dict) and isinstance(boxscore, dict) and isinstance(box_teams, dict):
+        live_data = dict(live_data)
+        boxscore = dict(boxscore)
+        box_teams = dict(box_teams)
+        for side in missing_sides:
+            box_team = box_teams.get(side)
+            if isinstance(box_team, dict):
+                box_team = dict(box_team)
+                box_team.pop("pitchers", None)
+                box_teams[side] = box_team
+        boxscore["teams"] = box_teams
+        live_data["boxscore"] = boxscore
+        cleared["liveData"] = live_data
+    return cleared
 
 
 def _game_endpoint_url(game_pk: str) -> str:
@@ -4505,7 +4544,8 @@ def _refresh_game_starter_sources(
         checked_at=checked_at,
         errors=errors,
     )
-    merged = dict(game.raw_payload or {})
+    missing_sides = {side for side in ("home", "away") if not refreshed.get(side)}
+    merged = _clear_stale_probable_pitcher_sources(game.raw_payload or {}, missing_sides)
     merged["homerun_starter_hydration"] = metadata
     game.raw_payload = merged
     return metadata, errors

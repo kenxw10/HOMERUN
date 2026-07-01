@@ -2248,6 +2248,49 @@ def test_candidate_sweep_continues_when_lightweight_starter_refresh_fails(monkey
     assert result["starter_refresh"]["error"]["type"] == "TimeoutError"
 
 
+def test_safe_starter_refresh_rolls_back_partial_refresh_writes(monkeypatch) -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    target = date(2026, 7, 2)
+
+    def fail_after_partial_write(session, *_args, **_kwargs):
+        session.add(
+            MlbFeatureSnapshot(
+                mlb_game_id=42,
+                target_date=target,
+                source="partial-starter-refresh",
+                captured_at=datetime(2026, 7, 2, 11, 45, tzinfo=UTC),
+                data_quality=Decimal("0.1000"),
+                source_statuses={},
+                features={},
+            )
+        )
+        session.flush()
+        raise RuntimeError("starter refresh write failed")
+
+    monkeypatch.setattr(job_runs, "sync_mlb_starters", fail_after_partial_write)
+
+    with Session(engine) as session:
+        result = job_runs._safe_starter_refresh(session, target)
+        snapshots = session.scalars(select(MlbFeatureSnapshot)).all()
+        session.add(
+            MlbFeatureSnapshot(
+                mlb_game_id=43,
+                target_date=target,
+                source="post-failure-session-still-usable",
+                captured_at=datetime(2026, 7, 2, 12, 0, tzinfo=UTC),
+                data_quality=Decimal("0.1000"),
+                source_statuses={},
+                features={},
+            )
+        )
+        session.flush()
+
+    assert result["status"] == "degraded_starter_refresh_failed"
+    assert result["error"]["type"] == "RuntimeError"
+    assert snapshots == []
+
+
 def test_daily_setup_still_runs_full_feature_sync(monkeypatch) -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
@@ -10124,6 +10167,43 @@ def test_probable_pitcher_adapter_uses_boxscore_fallback() -> None:
         "note": None,
         "source_path": "game.liveData.boxscore.teams.away.pitchers[0]",
     }
+
+
+def test_probable_pitcher_adapter_uses_fresh_probable_after_missing_refresh_cache() -> None:
+    payload = {
+        "homerun_starter_hydration": {
+            "home": {"status": "missing", "missing_reason": "starter_not_available_from_mlb_stats_api"},
+            "away": {"status": "missing", "missing_reason": "starter_not_available_from_mlb_stats_api"},
+        },
+        "teams": {
+            "home": {
+                "probablePitcher": {
+                    "id": 1999,
+                    "fullName": "Fresh Home Starter",
+                    "pitchHand": {"code": "R"},
+                }
+            }
+        },
+        "gameData": {
+            "probablePitchers": {
+                "away": {
+                    "id": 2999,
+                    "fullName": "Fresh Away Starter",
+                    "pitchHand": {"code": "L"},
+                }
+            }
+        },
+    }
+
+    home_pitcher = features.probable_pitcher_from_payload(payload, "home")
+    away_pitcher = features.probable_pitcher_from_payload(payload, "away")
+
+    assert home_pitcher is not None
+    assert home_pitcher["id"] == "1999"
+    assert home_pitcher["source_path"] == "schedule.teams.home.probablePitcher"
+    assert away_pitcher is not None
+    assert away_pitcher["id"] == "2999"
+    assert away_pitcher["source_path"] == "game.gameData.probablePitchers.away"
 
 
 def test_data_quality_caps_missing_critical_modules() -> None:
