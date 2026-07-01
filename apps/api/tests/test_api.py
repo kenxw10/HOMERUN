@@ -1482,6 +1482,154 @@ def test_generate_candidates_records_quality_gate_counterfactual(monkeypatch) ->
     assert candidate.counterfactual_trade_eligible_before_quality is True
 
 
+def test_generate_candidates_uses_candidate_stage_quality_without_lowering_threshold(monkeypatch) -> None:
+    monkeypatch.setenv("PAPER_OBSERVATION_MIN_DATA_QUALITY", "0.55")
+    get_settings.cache_clear()
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+    monkeypatch.setattr(candidates, "utc_now", lambda: now)
+    monkeypatch.setattr(
+        candidates,
+        "score_mature_candidate",
+        lambda *_args, **_kwargs: _fixed_model_score("0.800000", data_quality="0.4500"),
+    )
+
+    core_modules = set(candidates.PAPER_OBSERVATION_QUALITY_WEIGHTS)
+
+    def cached_feature_snapshot(*_args, **_kwargs):
+        module_scores = {
+            module: (0.9 if module in core_modules and module != "market_context" else 0.0)
+            for module in features.CORE_MODULES
+        }
+        source_statuses = {
+            module: ("available" if module in core_modules and module != "market_context" else "missing")
+            for module in features.CORE_MODULES
+        }
+        return {
+            "feature_version": features.FEATURE_VERSION,
+            "data_quality": 0.45,
+            "data_quality_summary": {
+                "score": 0.45,
+                "module_scores": module_scores,
+                "data_quality_reason": [],
+                "source_statuses": source_statuses,
+                "context": "pregame",
+            },
+            "source_statuses": source_statuses,
+            "market_context": {"source_status": "missing", "completeness": 0.0},
+        }
+
+    monkeypatch.setattr(candidates, "build_feature_snapshot", cached_feature_snapshot)
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        get_or_create_active_paper_epoch(session, starting_balance=Decimal("500.00"))
+        game = MlbGame(
+            external_game_id="candidate-stage-quality-1",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 2, 23, 0, tzinfo=UTC),
+            status="scheduled",
+        )
+        market = KalshiMarket(
+            kalshi_market_id="KX-CANDIDATE-STAGE-QUALITY",
+            ticker="KXMLBGAME-CANDIDATE-STAGE-QUALITY-PIT",
+            title="Will the Pittsburgh Pirates win?",
+            status="open",
+            implied_yes_ask=Decimal("0.4000"),
+            market_price_updated_at=now,
+            market_family="full_game_winner",
+            market_type="full_game_winner",
+            selection_code="PIT",
+            settlement_rule_status="paper_supported",
+        )
+        session.add_all([game, market])
+        _add_candidate_mapping(
+            session,
+            game,
+            market,
+            mapping_status="confirmed",
+            market_family="full_game_winner",
+            market_type="full_game_winner",
+            selection_code="PIT",
+            settlement_rule_status="paper_supported",
+        )
+        session.commit()
+
+        result = candidates.generate_candidates(session, target_date=date(2026, 7, 2))
+        candidate = session.scalar(select(ModelCandidate).order_by(ModelCandidate.id.desc()).limit(1))
+        trade = session.scalar(select(PaperTrade))
+
+    settings = get_settings()
+    assert settings.paper_observation_min_data_quality == Decimal("0.55")
+    assert result["paper_trades"] == 1
+    assert result["raw_feature_snapshot_data_quality_avg"] == 0.45
+    assert result["paper_observation_data_quality_avg"] is not None
+    assert result["paper_observation_data_quality_avg"] >= 0.55
+    assert result["candidate_stage_market_context_status_counts"] == {"available": 1}
+    assert candidate is not None
+    assert trade is not None
+    assert candidate.data_quality is not None
+    assert candidate.data_quality >= Decimal("0.55")
+    assert candidate.features["raw_feature_snapshot_data_quality"] == 0.45
+    assert candidate.features["paper_observation_data_quality"] >= 0.55
+    quality = candidate.gate_diagnostics["quality_decomposition"]
+    assert quality["candidate_stage_market_context"]["source_status"] == "available"
+    assert quality["paper_observation"]["module_status"]["injuries"] == "missing"
+    assert quality["paper_observation"]["module_role"]["injuries"] == "optional_structural"
+    assert quality["paper_observation"]["quality_weight_by_module"]["injuries"] == 0.0
+
+
+def test_ev_edge_diagnostics_dedupe_overlapping_candidate_surfaces() -> None:
+    shared_gate_diagnostics = {
+        "gate_gross_ev_positive": True,
+        "gate_net_ev_ok": True,
+        "gate_probability_edge_ok": True,
+        "counterfactual_trade_eligible_before_quality": True,
+        "blocked_by_quality_only": True,
+    }
+    candidates_under_test = [
+        ModelCandidate(
+            id=1,
+            mlb_game_id=10,
+            evaluated_at=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
+            features={},
+            decision="no_trade_low_data_quality",
+            market_family="full_game_winner",
+            inning_scope="full_game",
+            contract_side="yes",
+            net_expected_value=Decimal("0.120000"),
+            probability_edge=Decimal("0.150000"),
+            data_quality=Decimal("0.4500"),
+            gate_diagnostics=shared_gate_diagnostics,
+        ),
+        ModelCandidate(
+            id=2,
+            mlb_game_id=10,
+            evaluated_at=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
+            features={},
+            decision="no_trade_low_data_quality",
+            market_family="full_game_winner",
+            inning_scope="full_game",
+            contract_side="no",
+            net_expected_value=Decimal("0.100000"),
+            probability_edge=Decimal("0.140000"),
+            data_quality=Decimal("0.4400"),
+            gate_diagnostics=shared_gate_diagnostics,
+        ),
+    ]
+
+    diagnostics = candidates._opportunity_diagnostics(candidates_under_test)
+
+    assert diagnostics["ev_and_edge_pass_count"] == 2
+    assert diagnostics["pre_quality_trade_eligible_count"] == 2
+    assert diagnostics["unique_game_scope_family_side_count"] == 2
+    assert diagnostics["deduped_ev_edge_pass_count_by_game_scope_family"] == 1
+    assert diagnostics["deduped_pre_quality_trade_eligible_count_by_game_scope_family"] == 1
+
+
 def test_fixed_risk_sizing_uses_active_epoch_bankroll(monkeypatch) -> None:
     _relax_data_quality_gate(monkeypatch)
     now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
