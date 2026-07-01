@@ -1425,6 +1425,8 @@ def _apply_trade_caps(
     day_start: datetime,
     day_end: datetime,
     epoch_id: int | None,
+    *,
+    enforce_sweep_cap: bool = True,
 ) -> tuple[list[TradeIntent], dict[str, int], dict[str, object]]:
     settings = get_settings()
     (
@@ -1482,7 +1484,7 @@ def _apply_trade_caps(
         elif existing_slate + len(selected) >= settings.paper_max_trades_per_slate:
             candidate.decision = "no_trade_slate_cap"
             _update_gate(candidate, "gate_caps_ok", False)
-        elif len(selected) >= settings.paper_max_new_trades_per_sweep:
+        elif enforce_sweep_cap and len(selected) >= settings.paper_max_new_trades_per_sweep:
             candidate.decision = "no_trade_sweep_cap_reached"
             _update_gate(candidate, "gate_caps_ok", False)
         elif early_window and existing_slate + len(selected) >= early_allowed:
@@ -1681,6 +1683,7 @@ def _apply_aggregate_risk_caps(
     day_end: datetime,
     epoch_id: int | None,
     bankroll: Decimal,
+    max_new_trades: int | None = None,
 ) -> tuple[list[TradeIntent], dict[str, int], dict[str, object]]:
     settings = get_settings()
     usage = _daily_and_open_risk_usage(session, target_date, day_start, day_end, epoch_id)
@@ -1703,6 +1706,7 @@ def _apply_aggregate_risk_caps(
         "no_trade_scope_risk_cap": 0,
         "no_trade_low_price_bucket_risk_cap": 0,
         "no_trade_post_cap_size_too_small": 0,
+        "no_trade_sweep_cap_reached": 0,
         "aggregate_risk_quantity_reduced": 0,
     }
     selected: list[TradeIntent] = []
@@ -1741,6 +1745,13 @@ def _apply_aggregate_risk_caps(
             cap_counts["no_trade_post_cap_size_too_small"] += 1
             continue
 
+        if max_new_trades is not None and len(selected) >= max_new_trades:
+            candidate.decision = "no_trade_sweep_cap_reached"
+            _update_gate(candidate, "gate_caps_ok", False)
+            cap_counts["no_trade_sweep_cap_reached"] += 1
+            session.add(candidate)
+            continue
+
         candidate.decision = "paper_trade"
         _update_gate(candidate, "gate_caps_ok", True)
         selected.append(intent)
@@ -1765,6 +1776,8 @@ def _apply_aggregate_risk_caps(
         "scope_risk_max": float(limits["scope"]),
         "low_price_bucket_risk_used": float(low_price_used),
         "low_price_bucket_risk_max": float(limits["low_price"]),
+        "max_new_trades_per_sweep": max_new_trades,
+        "new_trades_after_sizing_and_risk": len(selected),
     }
     return selected, cap_counts, summary
 
@@ -2724,6 +2737,7 @@ def generate_candidates(
         day_start,
         day_end,
         active_epoch.id,
+        enforce_sweep_cap=False,
     )
     session.flush()
     for intent in line_selected_trades:
@@ -2803,8 +2817,14 @@ def generate_candidates(
         day_end=day_end,
         epoch_id=active_epoch.id,
         bankroll=bankroll_for_sizing,
+        max_new_trades=settings.paper_max_new_trades_per_sweep,
     )
     risk_selected_trades, post_cap_size_counts = _apply_post_cap_size_guard(session, risk_selected_trades)
+    trade_allocation_summary = {
+        **trade_allocation_summary,
+        "pre_sizing_candidates_after_preliminary_caps": trade_allocation_summary["new_trades_this_sweep"],
+        "new_trades_this_sweep": len(risk_selected_trades),
+    }
     for intent in sized_selected_trades:
         output = outputs_by_candidate_id.get(intent.candidate.id)
         if output is not None:
