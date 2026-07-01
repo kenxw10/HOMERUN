@@ -4522,6 +4522,21 @@ def _fill_missing_starter_identities(
         identities[side] = resolver(side)
 
 
+def _preserve_previous_starters_after_refresh_errors(
+    refreshed: dict[str, dict[str, object] | None],
+    previous: dict[str, dict[str, object] | None],
+    errors: list[dict[str, object]],
+) -> dict[str, dict[str, object] | None]:
+    if not errors:
+        return refreshed
+    preserved = dict(refreshed)
+    for side in ("home", "away"):
+        if preserved.get(side) or not previous.get(side):
+            continue
+        preserved[side] = previous.get(side)
+    return preserved
+
+
 def _refresh_game_starter_sources(
     game: MlbGame,
     *,
@@ -4550,6 +4565,7 @@ def _refresh_game_starter_sources(
             errors.append(
                 _source_error(source=MLB_STATS_SOURCE, table="mlb_games_boxscore", game_pk=game.external_game_id, exc=exc)
             )
+    refreshed = _preserve_previous_starters_after_refresh_errors(refreshed, previous, errors)
     metadata = _starter_hydration_metadata(
         game,
         previous=previous,
