@@ -1582,6 +1582,90 @@ def test_generate_candidates_uses_candidate_stage_quality_without_lowering_thres
     assert quality["paper_observation"]["quality_weight_by_module"]["injuries"] == 0.0
 
 
+def test_raw_model_quality_does_not_bypass_paper_observation_profile(monkeypatch) -> None:
+    monkeypatch.setenv("PAPER_OBSERVATION_MIN_DATA_QUALITY", "0.55")
+    get_settings.cache_clear()
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+    monkeypatch.setattr(candidates, "utc_now", lambda: now)
+    monkeypatch.setattr(
+        candidates,
+        "score_mature_candidate",
+        lambda *_args, **_kwargs: _fixed_model_score("0.900000", data_quality="1.0000"),
+    )
+
+    def low_quality_cached_feature_snapshot(*_args, **_kwargs):
+        module_scores = {module: 0.0 for module in features.CORE_MODULES}
+        source_statuses = {module: "missing" for module in features.CORE_MODULES}
+        return {
+            "feature_version": features.FEATURE_VERSION,
+            "data_quality": 1.0,
+            "data_quality_summary": {
+                "score": 1.0,
+                "module_scores": module_scores,
+                "data_quality_reason": [],
+                "source_statuses": source_statuses,
+                "context": "pregame",
+            },
+            "source_statuses": source_statuses,
+            "market_context": {"source_status": "missing", "completeness": 0.0},
+        }
+
+    monkeypatch.setattr(candidates, "build_feature_snapshot", low_quality_cached_feature_snapshot)
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        get_or_create_active_paper_epoch(session, starting_balance=Decimal("500.00"))
+        game = MlbGame(
+            external_game_id="raw-quality-bypass-1",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 2, 23, 0, tzinfo=UTC),
+            status="scheduled",
+        )
+        market = KalshiMarket(
+            kalshi_market_id="KX-RAW-QUALITY-BYPASS",
+            ticker="KXMLBGAME-RAW-QUALITY-BYPASS-PIT",
+            title="Will the Pittsburgh Pirates win?",
+            status="open",
+            implied_yes_ask=Decimal("0.1000"),
+            market_price_updated_at=now,
+            market_family="full_game_winner",
+            market_type="full_game_winner",
+            selection_code="PIT",
+            settlement_rule_status="paper_supported",
+        )
+        session.add_all([game, market])
+        _add_candidate_mapping(
+            session,
+            game,
+            market,
+            mapping_status="confirmed",
+            market_family="full_game_winner",
+            market_type="full_game_winner",
+            selection_code="PIT",
+            settlement_rule_status="paper_supported",
+        )
+        session.commit()
+
+        result = candidates.generate_candidates(session, target_date=date(2026, 7, 2))
+        candidate = session.scalar(select(ModelCandidate).order_by(ModelCandidate.id.desc()).limit(1))
+        trade = session.scalar(select(PaperTrade))
+
+    assert result["paper_trades"] == 0
+    assert result["blocked_by_quality_only"] == 1
+    assert candidate is not None
+    assert candidate.decision == "no_trade_low_data_quality"
+    assert candidate.gate_data_quality_ok is False
+    assert candidate.data_quality is not None
+    assert candidate.data_quality < Decimal("0.55")
+    assert candidate.gate_diagnostics["quality_decomposition"]["model_score_data_quality"] == 1.0
+    assert candidate.gate_diagnostics["paper_observation_data_quality"] < 0.55
+    assert trade is None
+
+
 def test_ev_edge_diagnostics_dedupe_overlapping_candidate_surfaces() -> None:
     shared_gate_diagnostics = {
         "gate_gross_ev_positive": True,
@@ -4330,6 +4414,7 @@ def test_generate_candidates_blocks_stale_prices(monkeypatch) -> None:
 
 def test_generate_candidates_uses_market_price_observation_timestamp(monkeypatch) -> None:
     monkeypatch.setenv("PAPER_MAX_PRICE_STALENESS_SECONDS", "900")
+    monkeypatch.setenv("PAPER_OBSERVATION_MIN_DATA_QUALITY", "0")
     get_settings.cache_clear()
     now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
     monkeypatch.setattr(candidates, "utc_now", lambda: now)
@@ -4380,6 +4465,7 @@ def test_generate_candidates_uses_market_price_observation_timestamp(monkeypatch
 def test_generate_candidates_uses_fee_adjusted_ev_before_caps(monkeypatch) -> None:
     monkeypatch.setenv("PAPER_MIN_NET_EV", "0.0500")
     monkeypatch.setenv("PAPER_MIN_PROB_EDGE", "0.0300")
+    monkeypatch.setenv("PAPER_OBSERVATION_MIN_DATA_QUALITY", "0")
     get_settings.cache_clear()
     now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
     monkeypatch.setattr(candidates, "utc_now", lambda: now)
@@ -10260,6 +10346,7 @@ def test_candidate_less_trade_entry_time_counts_against_slate_cap(monkeypatch) -
     monkeypatch.setenv("PAPER_MAX_TRADES_PER_SLATE", "1")
     monkeypatch.setenv("PAPER_MIN_NET_EV", "0")
     monkeypatch.setenv("PAPER_MIN_PROB_EDGE", "0")
+    monkeypatch.setenv("PAPER_OBSERVATION_MIN_DATA_QUALITY", "0")
     get_settings.cache_clear()
     now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
     monkeypatch.setattr(candidates, "utc_now", lambda: now)
@@ -10326,6 +10413,7 @@ def test_line_selection_rejects_correlated_total_lines_before_caps(monkeypatch) 
     monkeypatch.setenv("PAPER_MAX_TRADES_PER_GAME_FAMILY", "1")
     monkeypatch.setenv("PAPER_MIN_NET_EV", "0")
     monkeypatch.setenv("PAPER_MIN_PROB_EDGE", "0")
+    monkeypatch.setenv("PAPER_OBSERVATION_MIN_DATA_QUALITY", "0")
     get_settings.cache_clear()
     now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
     monkeypatch.setattr(candidates, "utc_now", lambda: now)
@@ -10398,6 +10486,7 @@ def test_trade_caps_allow_configured_multiple_total_lines(monkeypatch) -> None:
     monkeypatch.setenv("PAPER_MAX_TRADES_PER_MARKET_FAMILY", "8")
     monkeypatch.setenv("PAPER_MIN_NET_EV", "0")
     monkeypatch.setenv("PAPER_MIN_PROB_EDGE", "0")
+    monkeypatch.setenv("PAPER_OBSERVATION_MIN_DATA_QUALITY", "0")
     get_settings.cache_clear()
     now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
     monkeypatch.setattr(candidates, "utc_now", lambda: now)

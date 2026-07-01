@@ -649,9 +649,6 @@ def _paper_observation_quality_context(
         paper_quality = min(paper_quality, Decimal("0.6500"))
         quality_block_reason.append("PAPER_OBSERVATION_CAP_OFFENSE_MISSING")
 
-    if model_score_data_quality is not None:
-        paper_quality = max(paper_quality, model_score_data_quality.quantize(Decimal("0.0001")))
-
     threshold = _paper_quality_threshold()
     raw_weights = QUALITY_WEIGHTS.get(market_type or FULL_GAME_WINNER, QUALITY_WEIGHTS[FULL_GAME_WINNER])
     raw_breakdown = _quality_contribution_breakdown(scores=raw_scores, weights=raw_weights, features=features)
