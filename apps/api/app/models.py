@@ -10,6 +10,9 @@ from sqlalchemy.sql import func, text
 from app.database import Base
 
 
+DECISION_REASON_MAX_LENGTH = 120
+
+
 class TimestampMixin:
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
@@ -183,7 +186,7 @@ class ModelCandidate(TimestampMixin, Base):
     time_bucket: Mapped[str | None] = mapped_column(String(40))
     time_to_start_minutes: Mapped[int | None] = mapped_column(Integer)
     contract_side: Mapped[str | None] = mapped_column(String(10))
-    decision: Mapped[str] = mapped_column(String(40), default="no_trade", nullable=False)
+    decision: Mapped[str] = mapped_column(String(DECISION_REASON_MAX_LENGTH), default="no_trade", nullable=False)
     outcome: Mapped[str | None] = mapped_column(String(40))
     outcome_source: Mapped[str | None] = mapped_column(String(80))
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -633,7 +636,7 @@ class ModelPredictionOutput(TimestampMixin, Base):
     data_quality: Mapped[Decimal | None] = mapped_column(Numeric(6, 4))
     calibration_status: Mapped[str | None] = mapped_column(String(80))
     trade_rank: Mapped[int | None] = mapped_column(Integer)
-    decision_reason: Mapped[str | None] = mapped_column(String(120))
+    decision_reason: Mapped[str | None] = mapped_column(String(DECISION_REASON_MAX_LENGTH))
     raw_output: Mapped[dict[str, object] | None] = mapped_column(JSON)
 
 

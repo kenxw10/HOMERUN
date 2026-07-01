@@ -191,6 +191,8 @@ After deployment, validate:
 12. The dashboard shows the last sweep window, starter hydration aggregate, and paper trades created in that sweep.
 13. No live execution path or live order placement is enabled.
 
+PR3i widens the persisted candidate decision field so post-eligibility rejection reasons from line selection, same-game/scope correlation, and caps can be saved safely. After deploying and running `alembic upgrade head`, include one normal non-dry candidate-sweep validation during the 45-180 minute window and confirm it completes without `StringDataRightTruncation`; paper trades should open only if the existing gates and caps allow them.
+
 ## PR3g Candidate-Stage Quality And EV Diagnostics
 
 PR3g does not change thresholds, cron schedules, trading gates, settlement, WebSocket behavior, or spread activation. It makes candidate-sweep results explain whether no-trade behavior is caused by data quality, price/mapping gates, EV/edge filters, duplicate market surfaces, or caps.
