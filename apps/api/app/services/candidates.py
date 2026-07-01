@@ -1702,6 +1702,7 @@ def _apply_aggregate_risk_caps(
         "no_trade_family_risk_cap": 0,
         "no_trade_scope_risk_cap": 0,
         "no_trade_low_price_bucket_risk_cap": 0,
+        "no_trade_post_cap_size_too_small": 0,
         "aggregate_risk_quantity_reduced": 0,
     }
     selected: list[TradeIntent] = []
@@ -1736,6 +1737,10 @@ def _apply_aggregate_risk_caps(
                 session.add(candidate)
                 continue
 
+        if _reject_post_cap_size_if_needed(session, intent):
+            cap_counts["no_trade_post_cap_size_too_small"] += 1
+            continue
+
         candidate.decision = "paper_trade"
         _update_gate(candidate, "gate_caps_ok", True)
         selected.append(intent)
@@ -1764,40 +1769,47 @@ def _apply_aggregate_risk_caps(
     return selected, cap_counts, summary
 
 
+def _reject_post_cap_size_if_needed(session: Session, intent: TradeIntent) -> bool:
+    settings = get_settings()
+    estimated_total_cost = _intent_cost(intent)
+    if (
+        intent.quantity >= settings.paper_min_post_cap_contracts
+        and estimated_total_cost >= settings.paper_min_post_cap_notional
+    ):
+        return False
+
+    candidate = intent.candidate
+    candidate.decision = "no_trade_post_cap_size_too_small"
+    _update_gate(candidate, "gate_caps_ok", False)
+    original_contracts = int((intent.sizing or {}).get("original_contracts") or intent.quantity)
+    post_cap_size = {
+        "original_intended_contracts": original_contracts,
+        "final_contracts": intent.quantity,
+        "estimated_total_cost": float(estimated_total_cost),
+        "min_post_cap_contracts": settings.paper_min_post_cap_contracts,
+        "min_post_cap_notional": float(settings.paper_min_post_cap_notional),
+        "rejection_reason": candidate.decision,
+    }
+    sizing = dict(intent.sizing or {})
+    sizing["post_cap_size"] = post_cap_size
+    intent.sizing = sizing
+    candidate.scoring_rationale = {
+        **(candidate.scoring_rationale or {}),
+        "post_cap_size": post_cap_size,
+    }
+    _update_candidate_diagnostics(candidate, {"post_cap_size": post_cap_size})
+    session.add(candidate)
+    return True
+
+
 def _apply_post_cap_size_guard(
     session: Session,
     intents: list[TradeIntent],
 ) -> tuple[list[TradeIntent], dict[str, int]]:
-    settings = get_settings()
     selected: list[TradeIntent] = []
     counts = {"no_trade_post_cap_size_too_small": 0}
     for intent in intents:
-        estimated_total_cost = _intent_cost(intent)
-        if (
-            intent.quantity < settings.paper_min_post_cap_contracts
-            or estimated_total_cost < settings.paper_min_post_cap_notional
-        ):
-            candidate = intent.candidate
-            candidate.decision = "no_trade_post_cap_size_too_small"
-            _update_gate(candidate, "gate_caps_ok", False)
-            original_contracts = int((intent.sizing or {}).get("original_contracts") or intent.quantity)
-            post_cap_size = {
-                "original_intended_contracts": original_contracts,
-                "final_contracts": intent.quantity,
-                "estimated_total_cost": float(estimated_total_cost),
-                "min_post_cap_contracts": settings.paper_min_post_cap_contracts,
-                "min_post_cap_notional": float(settings.paper_min_post_cap_notional),
-                "rejection_reason": candidate.decision,
-            }
-            sizing = dict(intent.sizing or {})
-            sizing["post_cap_size"] = post_cap_size
-            intent.sizing = sizing
-            candidate.scoring_rationale = {
-                **(candidate.scoring_rationale or {}),
-                "post_cap_size": post_cap_size,
-            }
-            _update_candidate_diagnostics(candidate, {"post_cap_size": post_cap_size})
-            session.add(candidate)
+        if _reject_post_cap_size_if_needed(session, intent):
             counts["no_trade_post_cap_size_too_small"] += 1
             continue
         selected.append(intent)

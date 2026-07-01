@@ -11653,6 +11653,70 @@ def test_post_cap_tiny_quantity_is_rejected(monkeypatch) -> None:
     assert intent.candidate.gate_diagnostics["post_cap_size"]["original_intended_contracts"] == 12
 
 
+def test_post_cap_reject_does_not_consume_aggregate_risk(monkeypatch) -> None:
+    monkeypatch.setenv("PAPER_MIN_POST_CAP_CONTRACTS", "5")
+    monkeypatch.setenv("PAPER_MIN_POST_CAP_NOTIONAL", "2.00")
+    monkeypatch.setenv("PAPER_MAX_DAILY_NEW_RISK_PCT", "0.008")
+    monkeypatch.setenv("PAPER_MAX_OPEN_RISK_PCT", "0.008")
+    monkeypatch.setenv("PAPER_MAX_MARKET_FAMILY_RISK_PCT", "0.008")
+    monkeypatch.setenv("PAPER_MAX_SCOPE_RISK_PCT", "0.008")
+    get_settings.cache_clear()
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    day_start, day_end = candidates._candidate_day_bounds(now, date(2026, 7, 1))[1:]
+
+    try:
+        with Session(engine) as session:
+            epoch_id = _active_epoch_id(session)
+            reduced_below_minimum = _cap_intent(
+                session,
+                epoch_id=epoch_id,
+                target_date=date(2026, 7, 1),
+                market_ticker="KXMLBGAME-POST-CAP-REFUND-HIGH-PIT",
+                price="0.9000",
+                score="1.0000",
+            )
+            reduced_below_minimum.quantity = 10
+            reduced_below_minimum.candidate.estimated_cost_per_contract = Decimal("0.920000")
+            reduced_below_minimum.candidate.estimated_total_cost = Decimal("9.20")
+            reduced_below_minimum.sizing = {"original_contracts": 10}
+
+            valid_after_reject = _cap_intent(
+                session,
+                epoch_id=epoch_id,
+                target_date=date(2026, 7, 1),
+                market_ticker="KXMLBGAME-POST-CAP-REFUND-VALID-PIT",
+                price="0.2000",
+                score="0.9000",
+            )
+            valid_after_reject.quantity = 10
+            valid_after_reject.candidate.estimated_cost_per_contract = Decimal("0.200000")
+            valid_after_reject.candidate.estimated_total_cost = Decimal("2.00")
+            valid_after_reject.sizing = {"original_contracts": 10}
+
+            selected, cap_counts, summary = candidates._apply_aggregate_risk_caps(
+                session,
+                [reduced_below_minimum, valid_after_reject],
+                target_date=date(2026, 7, 1),
+                day_start=day_start,
+                day_end=day_end,
+                epoch_id=epoch_id,
+                bankroll=Decimal("500.00"),
+            )
+    finally:
+        get_settings.cache_clear()
+
+    assert selected == [valid_after_reject]
+    assert cap_counts["aggregate_risk_quantity_reduced"] == 1
+    assert cap_counts["no_trade_post_cap_size_too_small"] == 1
+    assert reduced_below_minimum.candidate.decision == "no_trade_post_cap_size_too_small"
+    assert reduced_below_minimum.candidate.gate_diagnostics["post_cap_size"]["final_contracts"] == 4
+    assert valid_after_reject.candidate.decision == "paper_trade"
+    assert summary["daily_risk_used"] == 2.0
+
+
 def test_per_sweep_cap_limits_new_trades(monkeypatch) -> None:
     monkeypatch.setenv("PAPER_MAX_NEW_TRADES_PER_SWEEP", "3")
     get_settings.cache_clear()
