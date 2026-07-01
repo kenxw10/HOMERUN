@@ -152,7 +152,7 @@ python -m app.jobs.runner --job full-paper-cycle --target-date today_et
 Recommended production cadence:
 
 - Daily setup at 8:30 AM ET. This is the normal owner of heavy MLB feature sync, including public MLB Stats API hydration, pybaseball/FanGraphs, Statcast/Savant, Open-Meteo, and `mature_mlb_features_v2` snapshot writes.
-- Candidate sweep every 30 minutes from 10:30 AM ET through 10:00 PM ET using the 45-180 minute rolling pregame window. Candidate sweeps are feature-cache-only and should not run full MLB feature sync.
+- Candidate sweep every 30 minutes from 10:30 AM ET through 10:00 PM ET using the 45-180 minute rolling pregame window. Candidate sweeps are feature-cache-only for heavy features and should not run full MLB feature sync; they may run the bounded MLB Stats API starter refresh after cached mature feature snapshots already exist.
 - Price refresh every 15 minutes from 11:00 AM ET through 1:30 AM ET. Price refresh intentionally has no time-to-start filter because it marks all active open paper positions.
 - Settlement every 30 minutes from 2:30 PM ET through 1:30 AM ET for `today_et`, plus an 8:30 AM ET `yesterday_et` catch-up.
 - Governance at 9:00 AM ET after the settlement catch-up.
@@ -168,22 +168,28 @@ Protected manual endpoints mirror the cron jobs:
 - `POST /v1/jobs/run/settlement?target_date=YYYY-MM-DD`
 - `POST /v1/jobs/run/governance`
 - `POST /v1/jobs/run/full-paper-cycle?target_date=YYYY-MM-DD`
+- `POST /v1/sync/mlb-starters?target_date=today_et`
+- `GET /v1/model/starter-status?date=YYYY-MM-DD`
 
 The dashboard shows the last setup, candidate sweep, price refresh, settlement, governance, WebSocket/REST status, and the last candidate sweep window. A windowed sweep with no games in range should return `status=skipped_no_games_in_window`, count excluded games, and still be a successful no-work run rather than an error. Candidate-sweep results should report `feature_sync_mode=cache_only`, `feature_sync_skipped=true`, and `cached_features` diagnostics. If target-date mature feature snapshots are missing, the sweep should complete cleanly with `no_candidates_missing_feature_snapshots` instead of starting source ingestion or failing the job.
 
+PR3h starter refresh uses only official MLB Stats API calls: target-date schedule with `probablePitcher(note)`, per-game live feed probable pitchers, boxscore starter data, and pitcher game-log stats for known starter IDs. Live feed/boxscore identities are preferred over stale schedule probables when both exist. It does not call pybaseball, FanGraphs, Statcast/Savant, Open-Meteo, full `sync_mlb_features`, sportsbook APIs, team totals, or umpire logic. If official MLB sources do not identify a starter, the status remains missing with a reason; no neutral or fake starter is inserted.
+
 After deployment, validate:
 
-1. `POST /v1/jobs/run/candidate-sweep?target_date=today_et&min_time_to_start_minutes=45&max_time_to_start_minutes=180&sweep_label=rolling_pregame_window` returns the sweep diagnostics.
-2. The result contains `feature_sync_mode=cache_only`, `feature_sync_skipped=true`, and does not include a `sync_mlb_features` step.
-3. Only in-window games create paper trades.
-4. Out-of-window games are counted as too soon, too late, started, or wrong date.
-5. Repeated sweeps do not duplicate paper trades.
-6. Spread trading remains disabled unless explicitly enabled.
-7. YES and NO candidates can still be scored in-window.
-8. Daily/open/family/scope risk caps still apply across the full active epoch, not only the current sweep.
-9. Price refresh updates all open positions.
-10. The dashboard shows the last sweep window and paper trades created in that sweep.
-11. No live execution path or live order placement is enabled.
+1. `POST /v1/sync/mlb-starters?target_date=today_et` returns `feature_sync_mode=starter_refresh_lightweight`, target-date games checked, starter IDs/names where MLB has announced them, and explicit missing reasons otherwise.
+2. `GET /v1/model/starter-status?date=YYYY-MM-DD` reports per-game gamePk, teams, scheduled start ET, starter IDs/names/status/source, last checked time, pitcher stat statuses, and starter feature module statuses.
+3. `POST /v1/jobs/run/candidate-sweep?target_date=today_et&min_time_to_start_minutes=45&max_time_to_start_minutes=180&sweep_label=rolling_pregame_window` returns the sweep diagnostics.
+4. The result contains `feature_sync_mode=cache_only`, `feature_sync_skipped=true`, `starter_refresh`, and does not include a `sync_mlb_features` step.
+5. Only in-window games create paper trades.
+6. Out-of-window games are counted as too soon, too late, started, or wrong date.
+7. Repeated sweeps do not duplicate paper trades.
+8. Spread trading remains disabled unless explicitly enabled.
+9. YES and NO candidates can still be scored in-window.
+10. Daily/open/family/scope risk caps still apply across the full active epoch, not only the current sweep.
+11. Price refresh updates all open positions.
+12. The dashboard shows the last sweep window, starter hydration aggregate, and paper trades created in that sweep.
+13. No live execution path or live order placement is enabled.
 
 ## PR3g Candidate-Stage Quality And EV Diagnostics
 
@@ -276,6 +282,7 @@ The backend also exposes these POST endpoints for controlled operational runs:
 - `GET /v1/model/governance/status`
 - `GET /v1/model/features/coverage?date=YYYY-MM-DD`
 - `GET /v1/model/features/detail?date=YYYY-MM-DD`
+- `GET /v1/model/starter-status?date=YYYY-MM-DD`
 - `GET /v1/model/parameters/active`
 - `GET /v1/model/sources/status`
 - `GET /v1/model/training/latest`
@@ -283,6 +290,7 @@ The backend also exposes these POST endpoints for controlled operational runs:
 - `GET /v1/model/predictions/today`
 - `POST /v1/sync/mlb-features?target_date=YYYY-MM-DD`
 - `POST /v1/sync/mlb-features?target_date=YYYY-MM-DD&include_modules=all`
+- `POST /v1/sync/mlb-starters?target_date=today_et`
 - `POST /v1/sync/mlb-team-features?target_date=YYYY-MM-DD`
 - `POST /v1/sync/mlb-pitcher-features?target_date=YYYY-MM-DD`
 - `POST /v1/sync/mlb-lineups?target_date=YYYY-MM-DD`

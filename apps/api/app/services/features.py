@@ -635,40 +635,91 @@ def parse_starting_lineup_from_game_payload(payload: dict[str, object], side: st
     return sorted(starters, key=lambda item: int(item["batting_order"]))
 
 
-def probable_pitcher_from_payload(payload: dict[str, object], side: str) -> dict[str, object] | None:
+def _pitcher_identity(
+    pitcher: object,
+    *,
+    source_path: str,
+    handedness: object | None = None,
+    note: object | None = None,
+) -> dict[str, object] | None:
+    if not isinstance(pitcher, dict) or not pitcher.get("id"):
+        return None
+    pitch_hand = pitcher.get("pitchHand") if isinstance(pitcher.get("pitchHand"), dict) else {}
+    return {
+        "id": str(pitcher.get("id")),
+        "name": pitcher.get("fullName") or pitcher.get("name"),
+        "pitcher_name": pitcher.get("fullName") or pitcher.get("name"),
+        "handedness": handedness or pitch_hand.get("code") or pitch_hand.get("description"),
+        "note": note if note is not None else pitcher.get("note"),
+        "source_path": source_path,
+    }
+
+
+def _probable_pitcher_from_game_data(payload: dict[str, object], side: str) -> dict[str, object] | None:
+    game_data = payload.get("gameData") if isinstance(payload, dict) else None
+    probable = game_data.get("probablePitchers") if isinstance(game_data, dict) else None
+    pitcher = probable.get(side) if isinstance(probable, dict) else None
+    return _pitcher_identity(pitcher, source_path=f"game.gameData.probablePitchers.{side}")
+
+
+def _probable_pitcher_from_schedule(payload: dict[str, object], side: str) -> dict[str, object] | None:
+    teams = payload.get("teams") if isinstance(payload, dict) else None
+    team = teams.get(side) if isinstance(teams, dict) else None
+    pitcher = team.get("probablePitcher") if isinstance(team, dict) else None
+    return _pitcher_identity(pitcher, source_path=f"schedule.teams.{side}.probablePitcher")
+
+
+def _probable_pitcher_from_refresh_cache(payload: dict[str, object], side: str) -> dict[str, object] | None:
+    hydration = payload.get("homerun_starter_hydration") if isinstance(payload, dict) else None
+    side_payload = hydration.get(side) if isinstance(hydration, dict) else None
+    if not isinstance(side_payload, dict) or not side_payload.get("pitcher_id"):
+        return None
+    return {
+        "id": str(side_payload.get("pitcher_id")),
+        "name": side_payload.get("pitcher_name"),
+        "pitcher_name": side_payload.get("pitcher_name"),
+        "handedness": side_payload.get("handedness"),
+        "note": side_payload.get("note"),
+        "source_path": str(side_payload.get("source_path") or f"homerun_starter_hydration.{side}"),
+    }
+
+
+def _probable_pitcher_from_boxscore(payload: dict[str, object], side: str) -> dict[str, object] | None:
     live_data = payload.get("liveData") if isinstance(payload, dict) else None
     boxscore = live_data.get("boxscore") if isinstance(live_data, dict) else None
     box_teams = boxscore.get("teams") if isinstance(boxscore, dict) else None
     box_team = box_teams.get(side) if isinstance(box_teams, dict) else None
     pitchers = box_team.get("pitchers") if isinstance(box_team, dict) else None
     players = box_team.get("players") if isinstance(box_team, dict) else None
-    if isinstance(pitchers, list) and pitchers and isinstance(players, dict):
-        pitcher_id = pitchers[0]
-        player = players.get(f"ID{pitcher_id}") or players.get(str(pitcher_id))
-        if isinstance(player, dict):
-            person = player.get("person") if isinstance(player.get("person"), dict) else {}
-            pitch_hand = player.get("pitchHand") if isinstance(player.get("pitchHand"), dict) else {}
-            return {
-                "id": str(person.get("id") or pitcher_id),
-                "name": person.get("fullName") or player.get("fullName"),
-                "pitcher_name": person.get("fullName") or player.get("fullName"),
-                "handedness": pitch_hand.get("code") or pitch_hand.get("description"),
-                "note": player.get("note"),
-                "source_path": f"game.liveData.boxscore.teams.{side}.pitchers[0]",
-            }
+    if not isinstance(pitchers, list) or not pitchers or not isinstance(players, dict):
+        return None
+    pitcher_id = pitchers[0]
+    player = players.get(f"ID{pitcher_id}") or players.get(str(pitcher_id))
+    if not isinstance(player, dict):
+        return None
+    person = player.get("person") if isinstance(player.get("person"), dict) else {}
+    pitch_hand = player.get("pitchHand") if isinstance(player.get("pitchHand"), dict) else {}
+    return {
+        "id": str(person.get("id") or pitcher_id),
+        "name": person.get("fullName") or player.get("fullName"),
+        "pitcher_name": person.get("fullName") or player.get("fullName"),
+        "handedness": pitch_hand.get("code") or pitch_hand.get("description"),
+        "note": player.get("note"),
+        "source_path": f"game.liveData.boxscore.teams.{side}.pitchers[0]",
+    }
 
-    teams = payload.get("teams") if isinstance(payload, dict) else None
-    team = teams.get(side) if isinstance(teams, dict) else None
-    pitcher = team.get("probablePitcher") if isinstance(team, dict) else None
-    if isinstance(pitcher, dict) and pitcher.get("id"):
-        return {
-            "id": str(pitcher.get("id")),
-            "name": pitcher.get("fullName"),
-            "pitcher_name": pitcher.get("fullName"),
-            "handedness": None,
-            "note": pitcher.get("note"),
-            "source_path": f"schedule.teams.{side}.probablePitcher",
-        }
+
+def probable_pitcher_from_payload(payload: dict[str, object], side: str) -> dict[str, object] | None:
+    if not isinstance(payload, dict):
+        return None
+    for candidate in (
+        _probable_pitcher_from_game_data(payload, side),
+        _probable_pitcher_from_boxscore(payload, side),
+        _probable_pitcher_from_schedule(payload, side),
+        _probable_pitcher_from_refresh_cache(payload, side),
+    ):
+        if candidate and candidate.get("id"):
+            return candidate
     return None
 
 
@@ -4315,6 +4366,384 @@ def _hydrate_game_endpoint_if_available(game: MlbGame) -> dict[str, object] | No
     if payload:
         _merge_game_payload(game, payload)
     return None
+
+
+def _merge_boxscore_payload(game: MlbGame, payload: dict[str, object]) -> None:
+    if not payload:
+        return
+    merged = dict(game.raw_payload or {})
+    live_data = dict(merged.get("liveData") or {}) if isinstance(merged.get("liveData"), dict) else {}
+    live_data["boxscore"] = payload
+    merged["liveData"] = live_data
+    game.raw_payload = merged
+
+
+def _starter_side_payload(
+    identity: dict[str, object] | None,
+    *,
+    previous_identity: dict[str, object] | None,
+    checked_at: datetime,
+) -> dict[str, object]:
+    if identity and identity.get("id"):
+        status = "available" if identity.get("name") or identity.get("pitcher_name") else "partial"
+        missing_reason = None
+    else:
+        status = "missing"
+        missing_reason = "starter_not_available_from_mlb_stats_api"
+    previous_id = str(previous_identity.get("id")) if previous_identity and previous_identity.get("id") else None
+    pitcher_id = str(identity.get("id")) if identity and identity.get("id") else None
+    return {
+        "status": status,
+        "pitcher_id": pitcher_id,
+        "pitcher_name": (identity or {}).get("name") or (identity or {}).get("pitcher_name"),
+        "handedness": (identity or {}).get("handedness"),
+        "note": (identity or {}).get("note"),
+        "source_path": (identity or {}).get("source_path"),
+        "missing_reason": missing_reason,
+        "last_checked_at": checked_at.isoformat(),
+        "identity_changed": previous_id is not None and pitcher_id is not None and previous_id != pitcher_id,
+    }
+
+
+def _starter_hydration_metadata(
+    game: MlbGame,
+    *,
+    previous: dict[str, dict[str, object] | None],
+    checked_at: datetime,
+    errors: list[dict[str, object]],
+) -> dict[str, object]:
+    home_identity = probable_pitcher_from_payload(game.raw_payload or {}, "home")
+    away_identity = probable_pitcher_from_payload(game.raw_payload or {}, "away")
+    source_timestamp = None
+    raw = game.raw_payload or {}
+    game_data = raw.get("gameData") if isinstance(raw, dict) else None
+    datetime_payload = game_data.get("datetime") if isinstance(game_data, dict) else None
+    if isinstance(datetime_payload, dict):
+        source_timestamp = datetime_payload.get("dateTime")
+    source_timestamp = source_timestamp or raw.get("gameDate") if isinstance(raw, dict) else source_timestamp
+    return {
+        "checked_at": checked_at.isoformat(),
+        "source": MLB_STATS_SOURCE,
+        "source_payload_timestamp": source_timestamp,
+        "home": _starter_side_payload(home_identity, previous_identity=previous.get("home"), checked_at=checked_at),
+        "away": _starter_side_payload(away_identity, previous_identity=previous.get("away"), checked_at=checked_at),
+        "errors": errors,
+    }
+
+
+def _starter_identity_missing(game: MlbGame) -> bool:
+    return not probable_pitcher_from_payload(game.raw_payload or {}, "home") or not probable_pitcher_from_payload(
+        game.raw_payload or {}, "away"
+    )
+
+
+def _refresh_game_starter_sources(
+    game: MlbGame,
+    *,
+    client: MLBStatsClient,
+    checked_at: datetime,
+) -> tuple[dict[str, object], list[dict[str, object]]]:
+    previous = {
+        "home": probable_pitcher_from_payload(game.raw_payload or {}, "home"),
+        "away": probable_pitcher_from_payload(game.raw_payload or {}, "away"),
+    }
+    errors: list[dict[str, object]] = []
+    if _starter_identity_missing(game) and game.external_game_id and str(game.external_game_id).isdigit():
+        try:
+            _merge_game_payload(game, client.get_game_feed(game.external_game_id))
+        except Exception as exc:
+            errors.append(_source_error(source=MLB_STATS_SOURCE, table="mlb_games_feed", game_pk=game.external_game_id, exc=exc))
+    if _starter_identity_missing(game) and game.external_game_id and str(game.external_game_id).isdigit():
+        try:
+            _merge_boxscore_payload(game, client.get_game_boxscore(game.external_game_id))
+        except Exception as exc:
+            errors.append(
+                _source_error(source=MLB_STATS_SOURCE, table="mlb_games_boxscore", game_pk=game.external_game_id, exc=exc)
+            )
+    metadata = _starter_hydration_metadata(game, previous=previous, checked_at=checked_at, errors=errors)
+    merged = dict(game.raw_payload or {})
+    merged["homerun_starter_hydration"] = metadata
+    game.raw_payload = merged
+    return metadata, errors
+
+
+def _upsert_feature_snapshot_for_game(
+    session: Session,
+    game: MlbGame,
+    day: date,
+    captured_at: datetime,
+) -> MlbFeatureSnapshot:
+    mapping = MarketMapping(
+        mlb_game_id=game.id or 0,
+        kalshi_market_id=0,
+        mapping_status="feature_sync",
+        confidence=Decimal("0.0000"),
+    )
+    market = KalshiMarket(
+        kalshi_market_id=f"feature-sync-{game.external_game_id}",
+        ticker=f"FEATURE-SYNC-{game.external_game_id}",
+        title=f"{game.away_team} @ {game.home_team}",
+        status="feature_sync",
+    )
+    feature_payload = build_feature_snapshot(game, market, mapping, session=session, now=captured_at)
+    row = session.scalar(
+        select(MlbFeatureSnapshot)
+        .where(MlbFeatureSnapshot.mlb_game_id == game.id)
+        .where(MlbFeatureSnapshot.target_date == day)
+        .where(MlbFeatureSnapshot.source == FEATURE_VERSION)
+    )
+    row = row or MlbFeatureSnapshot(mlb_game_id=game.id, target_date=day, source=FEATURE_VERSION)
+    row.captured_at = captured_at
+    row.data_quality = Decimal(str(feature_payload["data_quality"])).quantize(Decimal("0.0001"))
+    row.source_statuses = feature_payload.get("source_statuses")
+    row.features = feature_payload
+    session.add(row)
+    return row
+
+
+def sync_mlb_starters(
+    session: Session,
+    target_date: date | None = None,
+    *,
+    update_snapshots: bool = True,
+    commit: bool = True,
+) -> dict[str, object]:
+    day = target_date or today_eastern()
+    captured_at = utc_now()
+    stats = _new_sync_stats(day, {"pitcher"})
+    stats.update(
+        {
+            "action": "mlb_starter_refresh",
+            "feature_sync_mode": "starter_refresh_lightweight",
+            "heavy_feature_sync_skipped": True,
+            "network_sources_enabled": bool(get_settings().feature_sync_enable_network_sources),
+            "starter_games_checked": 0,
+            "games_with_both_starters": 0,
+            "games_missing_both_starters": 0,
+            "games_missing_home_starter": 0,
+            "games_missing_away_starter": 0,
+            "starter_identity_available_count": 0,
+            "feature_snapshots_upserted": 0,
+        }
+    )
+    if not get_settings().feature_sync_enable_network_sources:
+        stats["validation_status"] = "skipped_network_disabled"
+        _append_warning(stats, "FEATURE_SYNC_ENABLE_NETWORK_SOURCES=false; starter refresh skipped official MLB reads.")
+        return stats
+
+    client = MLBStatsClient()
+    try:
+        payload = client.get_schedule(day)
+        for game_payload in _schedule_games_from_payload(payload):
+            with session.begin_nested():
+                if _upsert_game_from_schedule_payload(session, game_payload) is not None:
+                    stats["hydration_rows_upserted"] = int(stats.get("hydration_rows_upserted", 0)) + 1
+                stats["hydration_rows_seen"] = int(stats.get("hydration_rows_seen", 0)) + 1
+        stats["hydration_validation_status"] = "ok"
+    except Exception as exc:
+        error = _source_error(source=MLB_STATS_SOURCE, table="mlb_games", exc=exc)
+        _append_error(stats, error)
+        stats["hydration_error_count"] = int(stats.get("hydration_error_count", 0)) + 1
+        stats["hydration_validation_status"] = "degraded_with_errors"
+
+    session.flush()
+    games = _target_games(session, day)
+    stats["games_seen"] = len(games)
+    for game in games:
+        metadata, errors = _refresh_game_starter_sources(game, client=client, checked_at=captured_at)
+        for error in errors:
+            _append_error(stats, error)
+        home_status = str((metadata.get("home") or {}).get("status") or "missing")
+        away_status = str((metadata.get("away") or {}).get("status") or "missing")
+        stats["starter_games_checked"] = int(stats.get("starter_games_checked", 0)) + 1
+        stats["starter_identity_available_count"] = int(stats.get("starter_identity_available_count", 0)) + sum(
+            1 for status in (home_status, away_status) if status in {"available", "partial"}
+        )
+        if home_status in {"available", "partial"} and away_status in {"available", "partial"}:
+            stats["games_with_both_starters"] = int(stats.get("games_with_both_starters", 0)) + 1
+        elif home_status == "missing" and away_status == "missing":
+            stats["games_missing_both_starters"] = int(stats.get("games_missing_both_starters", 0)) + 1
+        else:
+            if home_status == "missing":
+                stats["games_missing_home_starter"] = int(stats.get("games_missing_home_starter", 0)) + 1
+            if away_status == "missing":
+                stats["games_missing_away_starter"] = int(stats.get("games_missing_away_starter", 0)) + 1
+        session.add(game)
+
+    session.flush()
+    mlb_context = _mlb_primary_fetch_context(games, day, {"pitcher"}, stats)
+    statcast_context = {"pitcher_contact_by_id": {}}
+    for game in games:
+        for side in ("home", "away"):
+            _record_feature_row(
+                stats,
+                "pitcher_daily_features",
+                _upsert_mlb_primary_pitcher(session, game, side, day, captured_at, mlb_context, statcast_context, stats),
+            )
+            _record_feature_row(
+                stats,
+                "pitcher_daily_features",
+                _upsert_pitcher(session, game, side, day, captured_at),
+            )
+    session.flush()
+    if update_snapshots:
+        for game in games:
+            _upsert_feature_snapshot_for_game(session, game, day, captured_at)
+            stats["feature_snapshots_upserted"] = int(stats.get("feature_snapshots_upserted", 0)) + 1
+
+    if int(stats.get("error_count", 0)) > 0:
+        stats["validation_status"] = "degraded_with_errors"
+    elif int(stats.get("games_seen", 0)) == 0:
+        stats["validation_status"] = "degraded_no_games"
+    else:
+        stats["validation_status"] = "ok"
+    if commit:
+        session.commit()
+    return stats
+
+
+def _side_status_from_snapshot(row: MlbFeatureSnapshot | None, module_name: str, side: str) -> str:
+    statuses = row.source_statuses if row is not None and isinstance(row.source_statuses, dict) else {}
+    value = statuses.get(module_name) if isinstance(statuses, dict) else None
+    if isinstance(value, dict):
+        return str(value.get(side) or "missing")
+    return str(value or "missing")
+
+
+def starter_status_report(session: Session, target_date: date | None = None) -> dict[str, object]:
+    day = target_date or today_eastern()
+    games = _target_games(session, day)
+    items: list[dict[str, object]] = []
+    summary = {
+        "games_total": len(games),
+        "games_with_both_starters": 0,
+        "games_missing_away_starter": 0,
+        "games_missing_home_starter": 0,
+        "games_missing_both_starters": 0,
+        "starter_identity_available_count": 0,
+        "starter_season_available_or_partial_count": 0,
+        "starter_recent_available_or_partial_count": 0,
+        "starter_workload_available_or_partial_count": 0,
+        "last_starter_refresh_at": None,
+        "starter_refresh_status": "missing",
+        "latest_starter_refresh_errors": [],
+    }
+    latest_checked: datetime | None = None
+    latest_errors: list[dict[str, object]] = []
+    for game in games:
+        snapshot = session.scalar(
+            select(MlbFeatureSnapshot)
+            .where(MlbFeatureSnapshot.mlb_game_id == game.id)
+            .where(MlbFeatureSnapshot.target_date == day)
+            .where(MlbFeatureSnapshot.source == FEATURE_VERSION)
+            .order_by(MlbFeatureSnapshot.captured_at.desc(), MlbFeatureSnapshot.id.desc())
+            .limit(1)
+        )
+        hydration = (game.raw_payload or {}).get("homerun_starter_hydration") if isinstance(game.raw_payload, dict) else {}
+        hydration = hydration if isinstance(hydration, dict) else {}
+        checked_value = hydration.get("checked_at")
+        if checked_value:
+            parsed_checked = parse_datetime(checked_value)
+            if parsed_checked and (latest_checked is None or parsed_checked > latest_checked):
+                latest_checked = parsed_checked
+        errors = hydration.get("errors")
+        if isinstance(errors, list) and errors:
+            latest_errors.extend(error for error in errors if isinstance(error, dict))
+
+        identities = {
+            "home": probable_pitcher_from_payload(game.raw_payload or {}, "home"),
+            "away": probable_pitcher_from_payload(game.raw_payload or {}, "away"),
+        }
+        side_payload: dict[str, dict[str, object]] = {}
+        for side in ("away", "home"):
+            team_code = game.away_abbreviation if side == "away" else game.home_abbreviation
+            identity = identities[side]
+            pitcher_row = _cached_pitcher(session, day, team_code or "", identity)
+            identity_status = "available" if identity and identity.get("id") else "missing"
+            season_status = _side_status_from_snapshot(snapshot, "starter_season", side)
+            recent_status = _side_status_from_snapshot(snapshot, "starter_recent", side)
+            workload_status = _side_status_from_snapshot(snapshot, "starter_workload", side)
+            side_payload[side] = {
+                "probable_pitcher_id": str(identity.get("id")) if identity and identity.get("id") else None,
+                "probable_pitcher_name": (identity or {}).get("name") or (identity or {}).get("pitcher_name"),
+                "starter_status": identity_status,
+                "starter_source": (identity or {}).get("source_path"),
+                "starter_missing_reason": None if identity_status == "available" else "starter_not_available_from_mlb_stats_api",
+                "pitcher_feature_source": pitcher_row.source if pitcher_row is not None else None,
+                "pitcher_feature_status": pitcher_row.source_status if pitcher_row is not None else "missing",
+                "season_stats_status": season_status,
+                "recent_stats_status": recent_status,
+                "workload_status": workload_status,
+            }
+            if identity_status == "available":
+                summary["starter_identity_available_count"] = int(summary["starter_identity_available_count"]) + 1
+            if season_status in {"available", "partial"}:
+                summary["starter_season_available_or_partial_count"] = int(
+                    summary["starter_season_available_or_partial_count"]
+                ) + 1
+            if recent_status in {"available", "partial"}:
+                summary["starter_recent_available_or_partial_count"] = int(
+                    summary["starter_recent_available_or_partial_count"]
+                ) + 1
+            if workload_status in {"available", "partial"}:
+                summary["starter_workload_available_or_partial_count"] = int(
+                    summary["starter_workload_available_or_partial_count"]
+                ) + 1
+
+        home_known = side_payload["home"]["starter_status"] == "available"
+        away_known = side_payload["away"]["starter_status"] == "available"
+        if home_known and away_known:
+            summary["games_with_both_starters"] = int(summary["games_with_both_starters"]) + 1
+        elif not home_known and not away_known:
+            summary["games_missing_both_starters"] = int(summary["games_missing_both_starters"]) + 1
+        else:
+            if not home_known:
+                summary["games_missing_home_starter"] = int(summary["games_missing_home_starter"]) + 1
+            if not away_known:
+                summary["games_missing_away_starter"] = int(summary["games_missing_away_starter"]) + 1
+
+        items.append(
+            {
+                "game_pk": game.external_game_id,
+                "mlb_game_id": game.id,
+                "away_team": game.away_abbreviation or game.away_team,
+                "home_team": game.home_abbreviation or game.home_team,
+                "scheduled_start_et": ensure_aware_utc(game.scheduled_start).astimezone(get_dashboard_zone()).isoformat(),
+                "starter_last_checked_at": hydration.get("checked_at"),
+                "starter_source_payload_timestamp": hydration.get("source_payload_timestamp"),
+                "feature_snapshot_id": snapshot.id if snapshot is not None else None,
+                "feature_snapshot_captured_at": snapshot.captured_at.isoformat() if snapshot is not None else None,
+                "starter_identity_module_status": {
+                    "home": _side_status_from_snapshot(snapshot, "starter_identity", "home"),
+                    "away": _side_status_from_snapshot(snapshot, "starter_identity", "away"),
+                },
+                "starter_season_module_status": {
+                    "home": _side_status_from_snapshot(snapshot, "starter_season", "home"),
+                    "away": _side_status_from_snapshot(snapshot, "starter_season", "away"),
+                },
+                "starter_recent_module_status": {
+                    "home": _side_status_from_snapshot(snapshot, "starter_recent", "home"),
+                    "away": _side_status_from_snapshot(snapshot, "starter_recent", "away"),
+                },
+                "starter_workload_module_status": {
+                    "home": _side_status_from_snapshot(snapshot, "starter_workload", "home"),
+                    "away": _side_status_from_snapshot(snapshot, "starter_workload", "away"),
+                },
+                **{f"away_{key}": value for key, value in side_payload["away"].items()},
+                **{f"home_{key}": value for key, value in side_payload["home"].items()},
+            }
+        )
+
+    if latest_checked is not None:
+        summary["last_starter_refresh_at"] = latest_checked.isoformat()
+    if int(summary["games_total"]) == 0:
+        summary["starter_refresh_status"] = "no_games"
+    elif int(summary["games_with_both_starters"]) == int(summary["games_total"]):
+        summary["starter_refresh_status"] = "available"
+    elif int(summary["starter_identity_available_count"]) > 0:
+        summary["starter_refresh_status"] = "partial"
+    summary["latest_starter_refresh_errors"] = latest_errors[-10:]
+    return {"date": day.isoformat(), "feature_version": FEATURE_VERSION, "summary": summary, "games": items}
 
 
 def sync_mlb_team_features(

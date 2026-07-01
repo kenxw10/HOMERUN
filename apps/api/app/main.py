@@ -41,6 +41,8 @@ from app.services.features import (
     feature_coverage,
     feature_detail,
     source_status_report,
+    starter_status_report,
+    sync_mlb_starters,
     sync_mlb_bullpen_features,
     sync_mlb_features,
     sync_mlb_lineups,
@@ -642,6 +644,26 @@ def run_mlb_feature_sync(
         modules = None if not include_modules or include_modules == "all" else set(include_modules.split(","))
         result = sync_mlb_features(session, target_date, modules, refresh_schedule)
     return RunResponse(ok=True, action="mlb_feature_sync", result=result)
+
+
+@app.post("/v1/sync/mlb-starters", response_model=RunResponse)
+def run_mlb_starter_sync(
+    target_date: str | None = Query(default=None),
+    _: None = Depends(require_internal_api_key),
+) -> RunResponse:
+    with _db_session_or_503() as session:
+        result = sync_mlb_starters(session, resolve_job_target_date(target_date))
+    return RunResponse(ok=result.get("validation_status") != "failed", action="mlb_starter_sync", result=result)
+
+
+@app.get("/v1/model/starter-status", response_model=RunResponse)
+def model_starter_status(
+    target_date: str | None = Query(default=None, alias="date"),
+    _: None = Depends(require_internal_api_key),
+) -> RunResponse:
+    with _db_session_or_503() as session:
+        result = starter_status_report(session, resolve_job_target_date(target_date))
+    return RunResponse(ok=True, action="starter_status", result=result)
 
 
 @app.post("/v1/sync/mlb-team-features", response_model=RunResponse)

@@ -35,7 +35,7 @@ from app.schemas import (
     WebSocketStatusSummary,
 )
 from app.services.contracts import contract_labels, market_type_from_ticker
-from app.services.features import FEATURE_VERSION, source_status_report
+from app.services.features import FEATURE_VERSION, source_status_report, starter_status_report
 from app.services.modeling import latest_governance_artifacts
 from app.services.portfolio import calculate_paper_portfolio, paper_trade_fee
 from app.services.paper_epoch import resolve_epoch_filter
@@ -617,6 +617,7 @@ def dashboard_summary_from_db(
     )
     avg_data_quality = candidate_avg_data_quality if candidate_avg_data_quality is not None else feature_avg_data_quality
     source_status = source_status_report(session)
+    starter_report = starter_status_report(session, today_eastern())
     summary.model_status = ModelStatus(
         active_model_version=active_version.version_tag if active_version else None,
         active_parameter_version=active_parameter_version.version_tag if active_parameter_version else None,
@@ -648,6 +649,7 @@ def dashboard_summary_from_db(
         data_quality_summary={
             "avg": float(avg_data_quality) if avg_data_quality is not None else None,
             "feature_version": active_version.feature_version if active_version else None,
+            "starter_hydration": starter_report["summary"],
             **(
                 {
                     key: (last_prediction.summary or {}).get("candidate_diagnostics", {}).get(key)

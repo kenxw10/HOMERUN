@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 
 from app.models import JobRun
 from app.services.candidates import generate_candidates
-from app.services.features import feature_coverage, sync_mlb_features
+from app.services.features import feature_coverage, sync_mlb_features, sync_mlb_starters
 from app.services.market_family_discovery import run_market_family_discovery
 from app.services.market_family_mapping import sync_market_family_mappings
 from app.services.mlb import sync_results, sync_schedule
@@ -154,6 +154,34 @@ def _cached_feature_status(session: Session, target_date: date) -> dict[str, obj
         "unavailable_module_observations": summary.get("unavailable_module_observations"),
         "zero_trade_reason": zero_trade_reason,
         "warnings": warnings,
+    }
+
+
+def _safe_starter_refresh(session: Session, target_date: date) -> dict[str, object]:
+    try:
+        result = sync_mlb_starters(session, target_date, update_snapshots=True, commit=False)
+    except Exception as exc:
+        return {
+            "status": "degraded_starter_refresh_failed",
+            "feature_sync_mode": "starter_refresh_lightweight",
+            "heavy_feature_sync_skipped": True,
+            "error": {"message": str(exc), "type": exc.__class__.__name__},
+            "warnings": ["starter_refresh_failed: candidate-sweep continued with cached feature data."],
+        }
+    return {
+        "status": result.get("validation_status"),
+        "feature_sync_mode": result.get("feature_sync_mode", "starter_refresh_lightweight"),
+        "heavy_feature_sync_skipped": True,
+        "starter_games_checked": result.get("starter_games_checked"),
+        "games_with_both_starters": result.get("games_with_both_starters"),
+        "games_missing_both_starters": result.get("games_missing_both_starters"),
+        "starter_identity_available_count": result.get("starter_identity_available_count"),
+        "pitcher_game_log_available_count": result.get("pitcher_game_log_available_count"),
+        "starter_recent_available_count": result.get("starter_recent_available_count"),
+        "starter_workload_available_count": result.get("starter_workload_available_count"),
+        "feature_snapshots_upserted": result.get("feature_snapshots_upserted"),
+        "errors": result.get("errors", []),
+        "warnings": result.get("warnings", []),
     }
 
 
@@ -401,6 +429,11 @@ def _execute_job_steps(
                     run, "balance_snapshot", lambda: {"snapshot_id": create_balance_snapshot(session, source="candidate_sweep").id}
                 )
             return result
+        result["starter_refresh"] = _run_step(
+            run,
+            "starter_refresh",
+            lambda: _safe_starter_refresh(session, target),
+        )
         result.update({
             "market_family_mappings": _run_step(
                 run, "market_family_mappings", lambda: sync_market_family_mappings(session, target)

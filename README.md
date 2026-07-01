@@ -1,6 +1,6 @@
 # HOMERUN
 
-HOMERUN is a Kalshi-native MLB paper-trading system and dashboard. The current version includes the deployable PR 1 foundation, PR 2 data layer, PR 2.5 targeted Kalshi MLB resolver, PR 3 paper results/model infrastructure, PR 3a discovery/operator repairs, PR 3b validated market-family paper wiring, PR 3c full MLB model governance, the PR3c hotfix for date-scoped fee-aware trade selection, PR3c fix2 feature-complete model governance, PR3c fix3-fix6 public feature/discovery hardening, PR3e feature-completeness diagnostics, PR3f cache-only candidate sweeps, and PR3g candidate-stage quality/EV diagnostics: MLB slate/results ingestion, targeted Kalshi `KXMLBGAME` market resolution, auditable game-to-market mapping, mature paper-only model candidates, paper settlement for validated MLB market families, MLB Stats API primary feature cache modules, Statcast/Savant secondary enrichment, trainable parameter governance, market-family discovery audits, portfolio snapshots, and a light trading-terminal dashboard.
+HOMERUN is a Kalshi-native MLB paper-trading system and dashboard. The current version includes the deployable PR 1 foundation, PR 2 data layer, PR 2.5 targeted Kalshi MLB resolver, PR 3 paper results/model infrastructure, PR 3a discovery/operator repairs, PR 3b validated market-family paper wiring, PR 3c full MLB model governance, the PR3c hotfix for date-scoped fee-aware trade selection, PR3c fix2 feature-complete model governance, PR3c fix3-fix6 public feature/discovery hardening, PR3e feature-completeness diagnostics, PR3f cache-only candidate sweeps, PR3g candidate-stage quality/EV diagnostics, and PR3h probable-starter hydration repair: MLB slate/results ingestion, targeted Kalshi `KXMLBGAME` market resolution, auditable game-to-market mapping, mature paper-only model candidates, paper settlement for validated MLB market families, MLB Stats API primary feature cache modules, Statcast/Savant secondary enrichment, trainable parameter governance, market-family discovery audits, portfolio snapshots, and a light trading-terminal dashboard.
 
 This is not a sportsbook app. It does not use DraftKings, FanDuel, Odds API, or sportsbook odds behavior. Future trading logic should use Kalshi yes/no contract math, account for fees, and assume hold-to-settlement unless a later PR changes that context deliberately.
 
@@ -109,6 +109,7 @@ PR 3c exposes these internal API run endpoints:
 - `GET /v1/model/governance/status`
 - `GET /v1/model/features/coverage?date=YYYY-MM-DD`
 - `GET /v1/model/features/detail?date=YYYY-MM-DD`
+- `GET /v1/model/starter-status?date=YYYY-MM-DD`
 - `GET /v1/model/parameters/active`
 - `GET /v1/model/sources/status`
 - `GET /v1/model/training/latest`
@@ -116,6 +117,7 @@ PR 3c exposes these internal API run endpoints:
 - `GET /v1/model/predictions/today`
 - `POST /v1/sync/mlb-features?target_date=YYYY-MM-DD`
 - `POST /v1/sync/mlb-features?target_date=YYYY-MM-DD&include_modules=all`
+- `POST /v1/sync/mlb-starters?target_date=today_et`
 - `POST /v1/sync/mlb-team-features?target_date=YYYY-MM-DD`
 - `POST /v1/sync/mlb-pitcher-features?target_date=YYYY-MM-DD`
 - `POST /v1/sync/mlb-lineups?target_date=YYYY-MM-DD`
@@ -146,6 +148,8 @@ PR3d hotfix 2 adds time-windowed candidate sweeps for production paper observati
 PR3f makes the repeating candidate-sweep job feature-cache-only. Heavy MLB feature ingestion, pybaseball, FanGraphs, Statcast/Savant, Open-Meteo, and full `mature_mlb_features_v2` snapshot sync belong to daily setup or explicit feature-sync endpoints, not the 30-minute sweep. Candidate-sweep returns `feature_sync_mode=cache_only`, `feature_sync_skipped=true`, and `cached_features` diagnostics; if target-date mature feature snapshots are missing, it exits cleanly with `no_candidates_missing_feature_snapshots` instead of starting source ingestion.
 
 PR3g adds candidate-stage quality and EV diagnostics for paper observation. Candidate and sweep results now preserve `raw_feature_snapshot_data_quality`, compute separate `paper_observation_data_quality` from explicit candidate-stage market context, and report module status/role/contribution/penalty, quality block reasons, EV/fee/edge decomposition, deduped game/scope/family opportunity counts, and top counterfactual candidates blocked by quality. The observation threshold is not lowered, candidate-sweep remains cache-only, and full-game spread remains disabled by default.
+
+PR3h repairs probable-starter freshness. Lightweight MLB schedule sync now requests `probablePitcher(note)` and preserves cached live feed payloads instead of replacing them with thinner schedule rows. A protected `POST /v1/sync/mlb-starters?target_date=today_et` refreshes only official MLB starter identity, pitcher game-log cache rows, and target-date mature feature snapshots. It reads schedule probable pitchers, supplements with per-game live feed `gameData.probablePitchers` and boxscore starter data, prefers live feed/boxscore identities over stale schedule probables when both exist, never fabricates missing starters, and exposes `GET /v1/model/starter-status?date=YYYY-MM-DD` plus dashboard `starter_hydration` counts. Candidate-sweep still does not run full feature sync; it only runs this bounded starter refresh after cached mature feature snapshots exist.
 
 PR3d hotfix 3 adds a protected spread-audit job and stricter display/correlation diagnostics. The audit verifies spread side, line, inning scope, and settlement support from Kalshi raw text fields instead of trusting the ticker alone. It does not create paper trades.
 
