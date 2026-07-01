@@ -4626,7 +4626,16 @@ def _upsert_feature_snapshot_for_game(
     game: MlbGame,
     day: date,
     captured_at: datetime,
-) -> MlbFeatureSnapshot:
+) -> MlbFeatureSnapshot | None:
+    row = session.scalar(
+        select(MlbFeatureSnapshot)
+        .where(MlbFeatureSnapshot.mlb_game_id == game.id)
+        .where(MlbFeatureSnapshot.target_date == day)
+        .where(MlbFeatureSnapshot.source == FEATURE_VERSION)
+    )
+    if row is None:
+        return None
+
     mapping = MarketMapping(
         mlb_game_id=game.id or 0,
         kalshi_market_id=0,
@@ -4640,13 +4649,6 @@ def _upsert_feature_snapshot_for_game(
         status="feature_sync",
     )
     feature_payload = build_feature_snapshot(game, market, mapping, session=session, now=captured_at)
-    row = session.scalar(
-        select(MlbFeatureSnapshot)
-        .where(MlbFeatureSnapshot.mlb_game_id == game.id)
-        .where(MlbFeatureSnapshot.target_date == day)
-        .where(MlbFeatureSnapshot.source == FEATURE_VERSION)
-    )
-    row = row or MlbFeatureSnapshot(mlb_game_id=game.id, target_date=day, source=FEATURE_VERSION)
     row.captured_at = captured_at
     row.data_quality = Decimal(str(feature_payload["data_quality"])).quantize(Decimal("0.0001"))
     row.source_statuses = feature_payload.get("source_statuses")
@@ -4678,6 +4680,7 @@ def sync_mlb_starters(
             "games_missing_away_starter": 0,
             "starter_identity_available_count": 0,
             "feature_snapshots_upserted": 0,
+            "feature_snapshots_skipped_missing_existing": 0,
         }
     )
     if not get_settings().feature_sync_enable_network_sources:
@@ -4742,7 +4745,12 @@ def sync_mlb_starters(
     session.flush()
     if update_snapshots:
         for game in games:
-            _upsert_feature_snapshot_for_game(session, game, day, captured_at)
+            row = _upsert_feature_snapshot_for_game(session, game, day, captured_at)
+            if row is None:
+                stats["feature_snapshots_skipped_missing_existing"] = int(
+                    stats.get("feature_snapshots_skipped_missing_existing", 0)
+                ) + 1
+                continue
             stats["feature_snapshots_upserted"] = int(stats.get("feature_snapshots_upserted", 0)) + 1
 
     if int(stats.get("error_count", 0)) > 0:
