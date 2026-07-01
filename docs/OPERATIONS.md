@@ -185,6 +185,29 @@ After deployment, validate:
 10. The dashboard shows the last sweep window and paper trades created in that sweep.
 11. No live execution path or live order placement is enabled.
 
+## PR3g Candidate-Stage Quality And EV Diagnostics
+
+PR3g does not change thresholds, cron schedules, trading gates, settlement, WebSocket behavior, or spread activation. It makes candidate-sweep results explain whether no-trade behavior is caused by data quality, price/mapping gates, EV/edge filters, duplicate market surfaces, or caps.
+
+After deployment, inspect the next candidate-sweep job result or `GET /v1/dashboard/summary` and confirm these fields are present:
+
+- `raw_feature_snapshot_data_quality_avg` and `paper_observation_data_quality_avg`
+- `quality_threshold`
+- `candidate_stage_market_context_status_counts`
+- `quality_block_reason_counts`
+- `top_quality_blockers`
+- `quality_ev_diagnostics.ev_and_edge_pass_count`
+- `quality_ev_diagnostics.deduped_ev_edge_pass_count_by_game_scope_family`
+- `quality_ev_diagnostics.top_counterfactual_candidates_blocked_by_quality`
+
+Expected behavior:
+
+- `feature_sync_mode=cache_only` is still present for candidate-sweep.
+- Missing optional/structural modules remain visible as missing/partial and are not marked available.
+- Candidate-stage market context can be `available` only when mapping, settlement support, trusted selection, market status, side, and fresh executable price checks pass.
+- Full-game spread still returns blocked diagnostics while `PAPER_SPREAD_TRADING_ENABLED=false`.
+- If no trades are created, the dominant reason should be explicit in `decision_counts`, `candidate_diagnostics`, and `quality_ev_diagnostics`.
+
 ## PR3d Hotfix 3 Spread Audit And Correlation Validation
 
 Run the spread audit before considering `PAPER_SPREAD_TRADING_ENABLED=true`:

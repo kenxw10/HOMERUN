@@ -31,7 +31,7 @@ from app.services.contracts import (
     has_trusted_selection,
     market_type_from_ticker,
 )
-from app.services.features import FEATURE_VERSION, build_feature_snapshot
+from app.services.features import CORE_MODULES, FEATURE_VERSION, QUALITY_WEIGHTS, build_feature_snapshot
 from app.services.mapping import infer_market_type
 from app.services.modeling import (
     MATURE_MODEL_TAG,
@@ -108,6 +108,16 @@ class SizingContext:
         }
 
 
+@dataclass(frozen=True)
+class QualityContext:
+    raw_feature_snapshot_data_quality: Decimal | None
+    paper_observation_data_quality: Decimal
+    threshold: Decimal
+    candidate_stage_market_context: dict[str, object]
+    decomposition: dict[str, object]
+    quality_block_reason: list[str]
+
+
 SWEEP_CLASSIFICATIONS = (
     "in_window",
     "excluded_too_soon",
@@ -115,6 +125,47 @@ SWEEP_CLASSIFICATIONS = (
     "excluded_started",
     "excluded_wrong_date",
 )
+
+PAPER_OBSERVATION_QUALITY_WEIGHTS: dict[str, Decimal] = {
+    "game_context": Decimal("0.08"),
+    "market_context": Decimal("0.12"),
+    "team_strength_prior": Decimal("0.12"),
+    "offense_season": Decimal("0.12"),
+    "offense_recent": Decimal("0.10"),
+    "handedness_platoon": Decimal("0.07"),
+    "starter_identity": Decimal("0.12"),
+    "starter_season": Decimal("0.10"),
+    "starter_recent": Decimal("0.08"),
+    "starter_workload": Decimal("0.05"),
+    "park_weather": Decimal("0.04"),
+}
+
+QUALITY_MODULE_ROLES: dict[str, str] = {
+    "game_context": "core",
+    "market_context": "candidate_stage",
+    "team_strength_prior": "core",
+    "offense_season": "core",
+    "offense_recent": "core",
+    "handedness_platoon": "core",
+    "starter_identity": "core",
+    "starter_season": "core",
+    "starter_recent": "core",
+    "starter_workload": "core",
+    "park_weather": "core",
+    "bullpen_season": "supporting",
+    "bullpen_recent_workload": "optional_structural",
+    "lineup": "supporting",
+    "injuries": "optional_structural",
+    "defense_catcher": "optional_structural",
+    "travel_schedule": "optional_structural",
+}
+
+QUALITY_STATUS_ORDER = {
+    "available": 3,
+    "partial": 2,
+    "missing": 1,
+    "unavailable": 0,
+}
 
 
 def _candidate_day_bounds(now: datetime, target_date: date | None = None) -> tuple[date, datetime, datetime]:
@@ -408,6 +459,275 @@ def _expected_values(
 
 def _decimal_json(value: Decimal | None) -> float | None:
     return float(value) if value is not None else None
+
+
+def _quality_decimal(value: object, default: Decimal = Decimal("0")) -> Decimal:
+    if value is None:
+        return default
+    try:
+        return Decimal(str(value))
+    except Exception:
+        return default
+
+
+def _module_status_from_features(features: dict[str, object], module_name: str) -> str:
+    source_statuses = features.get("source_statuses")
+    value: object = None
+    if isinstance(source_statuses, dict):
+        value = source_statuses.get(module_name)
+    if value is None:
+        module = features.get(module_name)
+        if isinstance(module, dict):
+            value = module.get("source_status")
+
+    if isinstance(value, dict):
+        statuses = [str(item or "missing").lower() for item in value.values()]
+        if statuses and all(status == "available" for status in statuses):
+            return "available"
+        if any(status in {"available", "partial"} for status in statuses):
+            return "partial"
+        if any(status == "unavailable" for status in statuses):
+            return "unavailable"
+        return "missing"
+
+    status = str(value or "missing").lower()
+    return status if status in QUALITY_STATUS_ORDER else "missing"
+
+
+def _status_score(status: str, completeness: Decimal | None = None) -> Decimal:
+    completeness = completeness if completeness is not None else Decimal("0")
+    if status == "available":
+        return min(max(completeness, Decimal("0")), Decimal("1"))
+    if status == "partial":
+        return min(max(completeness, Decimal("0")), Decimal("0.5"))
+    return Decimal("0")
+
+
+def _candidate_stage_market_context(
+    *,
+    mapping: MarketMapping,
+    game: MlbGame,
+    market: KalshiMarket,
+    market_type: str,
+    price_context: PriceContext,
+    contract_side: str,
+) -> dict[str, object]:
+    settings = get_settings()
+    settlement_status = _settlement_status(mapping, market)
+    selection_code = (mapping.selection_code or market.selection_code or "").upper()
+    trusted_tie_selection = market_type == FIRST_FIVE_WINNER and selection_code == "TIE"
+    checks = {
+        "mapping_trusted": mapping.mapping_status != "needs_review"
+        and (mapping.confidence or Decimal("0")) >= Decimal("0.55"),
+        "market_family_supported": market_type in PAPER_SUPPORTED_MARKET_FAMILIES,
+        "settlement_supported": market_type == FULL_GAME_WINNER or settlement_status == "paper_supported",
+        "selection_trusted": (
+            not settings.safe_execution_posture
+            or market_type not in SELECTION_REQUIRED_FAMILIES
+            or trusted_tie_selection
+            or _has_trusted_candidate_selection(mapping, game, market)
+        ),
+        "market_open": market.status.strip().lower() in TRADABLE_MARKET_STATUSES,
+        "price_fresh_executable": price_context.status == "fresh_executable",
+        "side_known": contract_side.lower() in {"yes", "no"},
+    }
+    passed = sum(1 for value in checks.values() if value)
+    failed = [key for key, value in checks.items() if not value]
+    if passed == len(checks):
+        status = "available"
+        completeness = Decimal("1.0000")
+        confidence = Decimal("0.9500")
+    elif passed:
+        status = "partial"
+        completeness = min(Decimal("0.5000"), (Decimal(passed) / Decimal(len(checks))).quantize(Decimal("0.0001")))
+        confidence = completeness
+    else:
+        status = "missing"
+        completeness = Decimal("0.0000")
+        confidence = Decimal("0.0000")
+    return {
+        "source_status": status,
+        "role": "candidate_stage",
+        "source": "candidate_engine_market_context",
+        "confidence": float(confidence),
+        "completeness": float(completeness),
+        "checks": checks,
+        "failed_checks": failed,
+        "contract_side": contract_side,
+        "market_family": market_type,
+        "settlement_status": settlement_status,
+        "mapping_status": mapping.mapping_status,
+        "mapping_confidence": _decimal_json(mapping.confidence),
+        "price_status": price_context.status,
+        "executable_price_source": price_context.source,
+        "price_staleness_seconds": price_context.staleness_seconds,
+    }
+
+
+def _module_scores_from_summary(features: dict[str, object]) -> dict[str, Decimal]:
+    summary = features.get("data_quality_summary")
+    module_scores = summary.get("module_scores") if isinstance(summary, dict) else {}
+    scores: dict[str, Decimal] = {}
+    if isinstance(module_scores, dict):
+        for module_name, value in module_scores.items():
+            scores[str(module_name)] = _quality_decimal(value)
+    return scores
+
+
+def _quality_contribution_breakdown(
+    *,
+    scores: dict[str, Decimal],
+    weights: dict[str, Decimal],
+    features: dict[str, object],
+) -> dict[str, object]:
+    total_weight = sum(weights.values())
+    all_modules = tuple(dict.fromkeys((*CORE_MODULES, *weights.keys())))
+    contribution_by_module: dict[str, float] = {}
+    penalty_by_module: dict[str, float] = {}
+    score_by_module: dict[str, float] = {}
+    status_by_module: dict[str, str] = {}
+    role_by_module: dict[str, str] = {}
+    weight_by_module: dict[str, float] = {}
+
+    for module_name in all_modules:
+        score = min(max(scores.get(module_name, Decimal("0")), Decimal("0")), Decimal("1"))
+        weight = weights.get(module_name, Decimal("0"))
+        normalized_weight = (weight / total_weight) if total_weight else Decimal("0")
+        contribution = (score * normalized_weight).quantize(Decimal("0.0001"))
+        penalty = max(normalized_weight - contribution, Decimal("0")).quantize(Decimal("0.0001"))
+        contribution_by_module[module_name] = float(contribution)
+        penalty_by_module[module_name] = float(penalty)
+        score_by_module[module_name] = float(score.quantize(Decimal("0.0001")))
+        status_by_module[module_name] = _module_status_from_features(features, module_name)
+        role_by_module[module_name] = QUALITY_MODULE_ROLES.get(module_name, "supporting")
+        weight_by_module[module_name] = float(normalized_weight.quantize(Decimal("0.0001")))
+
+    return {
+        "module_scores": score_by_module,
+        "module_status": status_by_module,
+        "module_role": role_by_module,
+        "quality_contribution_by_module": contribution_by_module,
+        "quality_penalty_by_module": penalty_by_module,
+        "quality_weight_by_module": weight_by_module,
+    }
+
+
+def _paper_observation_quality_context(
+    *,
+    features: dict[str, object],
+    market_type: str,
+    candidate_stage_market_context: dict[str, object],
+    model_score_data_quality: Decimal | None,
+) -> QualityContext:
+    raw_quality = _quality_decimal(features.get("data_quality"), default=Decimal("0")).quantize(Decimal("0.0001"))
+    raw_scores = _module_scores_from_summary(features)
+    paper_scores = dict(raw_scores)
+    paper_scores["market_context"] = _status_score(
+        str(candidate_stage_market_context.get("source_status") or "missing"),
+        _quality_decimal(candidate_stage_market_context.get("completeness"), Decimal("0")),
+    )
+    total_weight = sum(PAPER_OBSERVATION_QUALITY_WEIGHTS.values())
+    weighted = sum(
+        paper_scores.get(module_name, Decimal("0")) * weight
+        for module_name, weight in PAPER_OBSERVATION_QUALITY_WEIGHTS.items()
+    )
+    profile_quality = (weighted / total_weight if total_weight else Decimal("0")).quantize(Decimal("0.0001"))
+    paper_quality = profile_quality
+    quality_block_reason = list(
+        str(reason)
+        for reason in ((features.get("data_quality_summary") or {}).get("data_quality_reason") or [])
+        if reason
+    )
+
+    if paper_scores.get("starter_identity", Decimal("0")) == Decimal("0"):
+        paper_quality = min(paper_quality, Decimal("0.6000"))
+        quality_block_reason.append("PAPER_OBSERVATION_CAP_STARTER_IDENTITY_MISSING")
+    if (
+        paper_scores.get("offense_season", Decimal("0")) == Decimal("0")
+        and paper_scores.get("offense_recent", Decimal("0")) == Decimal("0")
+    ):
+        paper_quality = min(paper_quality, Decimal("0.6500"))
+        quality_block_reason.append("PAPER_OBSERVATION_CAP_OFFENSE_MISSING")
+
+    threshold = _paper_quality_threshold()
+    raw_weights = QUALITY_WEIGHTS.get(market_type or FULL_GAME_WINNER, QUALITY_WEIGHTS[FULL_GAME_WINNER])
+    raw_breakdown = _quality_contribution_breakdown(scores=raw_scores, weights=raw_weights, features=features)
+    paper_breakdown = _quality_contribution_breakdown(
+        scores=paper_scores,
+        weights=PAPER_OBSERVATION_QUALITY_WEIGHTS,
+        features=features,
+    )
+    paper_breakdown["module_status"]["market_context"] = str(
+        candidate_stage_market_context.get("source_status") or "missing"
+    )
+    paper_breakdown["module_role"]["market_context"] = "candidate_stage"
+
+    top_penalties = sorted(
+        (
+            {
+                "module": module_name,
+                "penalty": penalty,
+                "status": paper_breakdown["module_status"].get(module_name),
+                "role": paper_breakdown["module_role"].get(module_name),
+            }
+            for module_name, penalty in paper_breakdown["quality_penalty_by_module"].items()
+            if penalty
+        ),
+        key=lambda item: float(item["penalty"]),
+        reverse=True,
+    )[:8]
+    if paper_quality < threshold:
+        quality_block_reason.append("PAPER_OBSERVATION_QUALITY_BELOW_THRESHOLD")
+        quality_block_reason.extend(
+            f"{item['module'].upper()}_{str(item['status']).upper()}" for item in top_penalties[:3]
+        )
+
+    decomposition = {
+        "raw_feature_snapshot_data_quality": float(raw_quality),
+        "model_score_data_quality": _decimal_json(model_score_data_quality),
+        "paper_observation_profile_data_quality": float(profile_quality),
+        "paper_observation_data_quality": float(paper_quality),
+        "quality_threshold": float(threshold),
+        "candidate_stage_market_context": candidate_stage_market_context,
+        "raw_feature_snapshot": raw_breakdown,
+        "paper_observation": paper_breakdown,
+        "quality_block_reason": list(dict.fromkeys(quality_block_reason)),
+        "top_quality_penalties": top_penalties,
+    }
+    return QualityContext(
+        raw_feature_snapshot_data_quality=raw_quality,
+        paper_observation_data_quality=paper_quality,
+        threshold=threshold,
+        candidate_stage_market_context=candidate_stage_market_context,
+        decomposition=decomposition,
+        quality_block_reason=list(dict.fromkeys(quality_block_reason)),
+    )
+
+
+def _ev_decomposition(
+    *,
+    probability: Decimal | None,
+    price: Decimal | None,
+    gross_ev: Decimal | None,
+    fee_estimate: Decimal | None,
+    net_ev: Decimal | None,
+    probability_edge: Decimal | None,
+) -> dict[str, object]:
+    settings = get_settings()
+    return {
+        "probability": _decimal_json(probability),
+        "executable_price": _decimal_json(price),
+        "gross_expected_value": _decimal_json(gross_ev),
+        "fee_estimate": _decimal_json(fee_estimate),
+        "net_expected_value": _decimal_json(net_ev),
+        "probability_edge": _decimal_json(probability_edge),
+        "paper_min_net_ev": float(settings.paper_min_net_ev),
+        "paper_min_prob_edge": float(settings.paper_min_prob_edge),
+        "gross_ev_pass": gross_ev is not None and gross_ev > Decimal("0"),
+        "net_ev_pass": net_ev is not None and net_ev >= settings.paper_min_net_ev,
+        "probability_edge_pass": probability_edge is not None and probability_edge >= settings.paper_min_prob_edge,
+        "fee_present": fee_estimate is not None,
+    }
 
 
 def _scope_for_family(family: str | None) -> str:
@@ -1328,6 +1648,11 @@ def _gate_summary(candidates: list[ModelCandidate]) -> dict[str, object]:
         return sum(1 for candidate in candidates if bool((candidate.gate_diagnostics or {}).get(key)) is expected)
 
     data_quality_values = [candidate.data_quality for candidate in candidates if candidate.data_quality is not None]
+    raw_data_quality_values = [
+        _quality_decimal((candidate.gate_diagnostics or {}).get("raw_feature_snapshot_data_quality"))
+        for candidate in candidates
+        if (candidate.gate_diagnostics or {}).get("raw_feature_snapshot_data_quality") is not None
+    ]
     ev_passing_values = [
         candidate.net_expected_value
         for candidate in candidates
@@ -1338,6 +1663,41 @@ def _gate_summary(candidates: list[ModelCandidate]) -> dict[str, object]:
         for candidate in candidates
         if candidate.probability_edge is not None and bool((candidate.gate_diagnostics or {}).get("gate_probability_edge_ok"))
     ]
+    market_context_status_counts: dict[str, int] = {}
+    quality_block_reason_counts: dict[str, int] = {}
+    quality_penalty_totals: dict[str, Decimal] = {}
+    quality_bucket_counts: dict[str, int] = {"below_threshold": 0, "meets_threshold": 0}
+    threshold = _paper_quality_threshold()
+    for candidate in candidates:
+        diagnostics = candidate.gate_diagnostics or {}
+        status = str(diagnostics.get("candidate_stage_market_context_status") or "unknown")
+        market_context_status_counts[status] = market_context_status_counts.get(status, 0) + 1
+        if candidate.data_quality is not None and candidate.data_quality >= threshold:
+            quality_bucket_counts["meets_threshold"] += 1
+        else:
+            quality_bucket_counts["below_threshold"] += 1
+        for reason in diagnostics.get("quality_block_reason") or []:
+            reason_key = str(reason)
+            quality_block_reason_counts[reason_key] = quality_block_reason_counts.get(reason_key, 0) + 1
+        quality = diagnostics.get("quality_decomposition")
+        if isinstance(quality, dict):
+            paper = quality.get("paper_observation")
+            penalties = paper.get("quality_penalty_by_module") if isinstance(paper, dict) else {}
+            if isinstance(penalties, dict):
+                for module_name, value in penalties.items():
+                    quality_penalty_totals[str(module_name)] = quality_penalty_totals.get(
+                        str(module_name), Decimal("0")
+                    ) + _quality_decimal(value)
+
+    top_quality_blockers = sorted(
+        (
+            {"module": module_name, "total_penalty": float(value.quantize(Decimal("0.0001")))}
+            for module_name, value in quality_penalty_totals.items()
+            if value > Decimal("0")
+        ),
+        key=lambda item: item["total_penalty"],
+        reverse=True,
+    )[:8]
     return {
         "trade_eligible_before_quality": count("counterfactual_trade_eligible_before_quality"),
         "trade_eligible_after_quality": count("counterfactual_trade_eligible_after_quality"),
@@ -1355,8 +1715,196 @@ def _gate_summary(candidates: list[ModelCandidate]) -> dict[str, object]:
         "average_data_quality": _avg_decimal(data_quality_values),
         "min_data_quality": _min_decimal(data_quality_values),
         "max_data_quality": _max_decimal(data_quality_values),
+        "raw_feature_snapshot_data_quality_avg": _avg_decimal(raw_data_quality_values),
+        "raw_feature_snapshot_data_quality_min": _min_decimal(raw_data_quality_values),
+        "raw_feature_snapshot_data_quality_max": _max_decimal(raw_data_quality_values),
+        "paper_observation_data_quality_avg": _avg_decimal(data_quality_values),
+        "paper_observation_data_quality_min": _min_decimal(data_quality_values),
+        "paper_observation_data_quality_max": _max_decimal(data_quality_values),
+        "quality_threshold": float(threshold),
+        "candidate_stage_market_context_status_counts": market_context_status_counts,
+        "quality_block_reason_counts": quality_block_reason_counts,
+        "quality_bucket_counts": quality_bucket_counts,
+        "top_quality_blockers": top_quality_blockers,
         "average_net_ev_among_ev_passing": _avg_decimal(ev_passing_values),
         "average_probability_edge_among_edge_passing": _avg_decimal(edge_passing_values),
+    }
+
+
+def _quality_bucket(candidate: ModelCandidate) -> str:
+    if candidate.data_quality is None:
+        return "missing"
+    threshold = _paper_quality_threshold()
+    if candidate.data_quality >= threshold:
+        return "meets_threshold"
+    if candidate.data_quality >= threshold - Decimal("0.0500"):
+        return "near_threshold"
+    return "below_threshold"
+
+
+def _candidate_opportunity_key(candidate: ModelCandidate) -> tuple[int | None, str, str]:
+    family = candidate.market_family or candidate.market_type or "unknown"
+    scope = candidate.inning_scope or _scope_for_family(family)
+    return candidate.mlb_game_id, scope, family
+
+
+def _candidate_opportunity_side_key(candidate: ModelCandidate) -> tuple[int | None, str, str, str]:
+    game_id, scope, family = _candidate_opportunity_key(candidate)
+    return game_id, scope, family, (candidate.contract_side or "unknown").lower()
+
+
+def _candidate_counterfactual_payload(candidate: ModelCandidate) -> dict[str, object]:
+    diagnostics = candidate.gate_diagnostics or {}
+    return {
+        "candidate_id": candidate.id,
+        "mlb_game_id": candidate.mlb_game_id,
+        "market_ticker": (candidate.features or {}).get("market_context", {}).get("ticker")
+        if isinstance(candidate.features, dict)
+        else None,
+        "market_family": candidate.market_family or candidate.market_type,
+        "scope": candidate.inning_scope or _scope_for_family(candidate.market_family or candidate.market_type),
+        "contract_side": candidate.contract_side,
+        "decision": candidate.decision,
+        "net_expected_value": _decimal_json(candidate.net_expected_value),
+        "probability_edge": _decimal_json(candidate.probability_edge),
+        "paper_observation_data_quality": _decimal_json(candidate.data_quality),
+        "raw_feature_snapshot_data_quality": diagnostics.get("raw_feature_snapshot_data_quality"),
+        "quality_block_reason": diagnostics.get("quality_block_reason") or [],
+    }
+
+
+def _average_max_by_group(
+    candidates: list[ModelCandidate],
+    group_fn,
+    value_attr: str,
+) -> dict[str, dict[str, float | int | None]]:
+    grouped: dict[str, list[Decimal]] = {}
+    for candidate in candidates:
+        value = getattr(candidate, value_attr)
+        if value is None:
+            continue
+        key = str(group_fn(candidate) or "unknown")
+        grouped.setdefault(key, []).append(value)
+    return {
+        key: {
+            "count": len(values),
+            "avg": _avg_decimal(values),
+            "max": _max_decimal(values),
+        }
+        for key, values in sorted(grouped.items())
+    }
+
+
+def _opportunity_diagnostics(candidates: list[ModelCandidate]) -> dict[str, object]:
+    ev_pass = [
+        candidate
+        for candidate in candidates
+        if bool((candidate.gate_diagnostics or {}).get("gate_gross_ev_positive"))
+        and bool((candidate.gate_diagnostics or {}).get("gate_net_ev_ok"))
+    ]
+    edge_pass = [
+        candidate for candidate in candidates if bool((candidate.gate_diagnostics or {}).get("gate_probability_edge_ok"))
+    ]
+    ev_and_edge_pass = [
+        candidate
+        for candidate in candidates
+        if candidate in ev_pass and bool((candidate.gate_diagnostics or {}).get("gate_probability_edge_ok"))
+    ]
+    pre_quality = [
+        candidate
+        for candidate in candidates
+        if bool((candidate.gate_diagnostics or {}).get("counterfactual_trade_eligible_before_quality"))
+    ]
+    post_quality = [
+        candidate
+        for candidate in candidates
+        if bool((candidate.gate_diagnostics or {}).get("counterfactual_trade_eligible_after_quality"))
+    ]
+    quality_blocked = [
+        candidate for candidate in candidates if bool((candidate.gate_diagnostics or {}).get("blocked_by_quality_only"))
+    ]
+    top_quality_blocked = sorted(
+        quality_blocked,
+        key=lambda candidate: (
+            candidate.net_expected_value or Decimal("-999"),
+            candidate.probability_edge or Decimal("-999"),
+        ),
+        reverse=True,
+    )[:10]
+
+    deduped_top: dict[tuple[int | None, str, str], ModelCandidate] = {}
+    for candidate in sorted(
+        quality_blocked,
+        key=lambda item: (item.net_expected_value or Decimal("-999"), item.probability_edge or Decimal("-999")),
+        reverse=True,
+    ):
+        deduped_top.setdefault(_candidate_opportunity_key(candidate), candidate)
+
+    family_counts: dict[str, dict[str, int]] = {}
+    scope_counts: dict[str, dict[str, int]] = {}
+    side_counts: dict[str, dict[str, int]] = {}
+    quality_bucket_counts: dict[str, int] = {}
+    for candidate in candidates:
+        decision = candidate.decision or "unknown"
+        family = candidate.market_family or candidate.market_type or "unknown"
+        scope = candidate.inning_scope or _scope_for_family(family)
+        side = (candidate.contract_side or "unknown").lower()
+        family_bucket = family_counts.setdefault(family, {})
+        family_bucket[decision] = family_bucket.get(decision, 0) + 1
+        scope_bucket = scope_counts.setdefault(scope, {})
+        scope_bucket[decision] = scope_bucket.get(decision, 0) + 1
+        side_bucket = side_counts.setdefault(side, {})
+        side_bucket[decision] = side_bucket.get(decision, 0) + 1
+        bucket = _quality_bucket(candidate)
+        quality_bucket_counts[bucket] = quality_bucket_counts.get(bucket, 0) + 1
+
+    return {
+        "candidates_total": len(candidates),
+        "ev_pass_count": len(ev_pass),
+        "edge_pass_count": len(edge_pass),
+        "ev_and_edge_pass_count": len(ev_and_edge_pass),
+        "pre_quality_trade_eligible_count": len(pre_quality),
+        "post_quality_trade_eligible_count": len(post_quality),
+        "quality_blocked_count": len(quality_blocked),
+        "mapping_uncertain_count": sum(1 for candidate in candidates if candidate.decision == "no_trade_mapping_uncertain"),
+        "unique_game_count": len({candidate.mlb_game_id for candidate in candidates}),
+        "unique_game_scope_count": len({(candidate.mlb_game_id, candidate.inning_scope or _scope_for_family(candidate.market_family or candidate.market_type)) for candidate in candidates}),
+        "unique_game_scope_family_count": len({_candidate_opportunity_key(candidate) for candidate in candidates}),
+        "unique_game_scope_family_side_count": len({_candidate_opportunity_side_key(candidate) for candidate in candidates}),
+        "deduped_ev_edge_pass_count_by_game_scope_family": len(
+            {_candidate_opportunity_key(candidate) for candidate in ev_and_edge_pass}
+        ),
+        "deduped_pre_quality_trade_eligible_count_by_game_scope_family": len(
+            {_candidate_opportunity_key(candidate) for candidate in pre_quality}
+        ),
+        "top_counterfactual_candidates_blocked_by_quality": [
+            _candidate_counterfactual_payload(candidate) for candidate in top_quality_blocked
+        ],
+        "top_deduped_counterfactual_opinions_by_game_scope_family": [
+            _candidate_counterfactual_payload(candidate) for candidate in list(deduped_top.values())[:10]
+        ],
+        "avg_max_net_ev_by_family": _average_max_by_group(
+            candidates, lambda candidate: candidate.market_family or candidate.market_type, "net_expected_value"
+        ),
+        "avg_max_net_ev_by_scope": _average_max_by_group(
+            candidates, lambda candidate: candidate.inning_scope or _scope_for_family(candidate.market_family or candidate.market_type), "net_expected_value"
+        ),
+        "avg_max_net_ev_by_side": _average_max_by_group(
+            candidates, lambda candidate: (candidate.contract_side or "unknown").lower(), "net_expected_value"
+        ),
+        "avg_max_probability_edge_by_family": _average_max_by_group(
+            candidates, lambda candidate: candidate.market_family or candidate.market_type, "probability_edge"
+        ),
+        "avg_max_probability_edge_by_scope": _average_max_by_group(
+            candidates, lambda candidate: candidate.inning_scope or _scope_for_family(candidate.market_family or candidate.market_type), "probability_edge"
+        ),
+        "avg_max_probability_edge_by_side": _average_max_by_group(
+            candidates, lambda candidate: (candidate.contract_side or "unknown").lower(), "probability_edge"
+        ),
+        "counts_by_decision_family": family_counts,
+        "counts_by_decision_scope": scope_counts,
+        "counts_by_decision_side": side_counts,
+        "counts_by_quality_bucket": quality_bucket_counts,
     }
 
 
@@ -1551,6 +2099,43 @@ def generate_candidates(
             if spread_verification is not None:
                 market_context["spread_verification"] = spread_verification.as_metadata()
             features["market_context"] = market_context
+            candidate_stage_market_context = _candidate_stage_market_context(
+                mapping=mapping,
+                game=game,
+                market=market,
+                market_type=market_type,
+                price_context=price_context,
+                contract_side=contract_side,
+            )
+            quality_context = _paper_observation_quality_context(
+                features=features,
+                market_type=market_type,
+                candidate_stage_market_context=candidate_stage_market_context,
+                model_score_data_quality=model_score.data_quality,
+            )
+            features["raw_feature_snapshot_data_quality"] = (
+                float(quality_context.raw_feature_snapshot_data_quality)
+                if quality_context.raw_feature_snapshot_data_quality is not None
+                else None
+            )
+            features["paper_observation_data_quality"] = float(quality_context.paper_observation_data_quality)
+            features["candidate_stage_market_context"] = quality_context.candidate_stage_market_context
+            features["quality_decomposition"] = quality_context.decomposition
+            features["quality_block_reason"] = quality_context.quality_block_reason
+            features["data_quality"] = float(quality_context.paper_observation_data_quality)
+            features["data_quality_summary"] = {
+                **(features.get("data_quality_summary") if isinstance(features.get("data_quality_summary"), dict) else {}),
+                "raw_feature_snapshot_data_quality": (
+                    float(quality_context.raw_feature_snapshot_data_quality)
+                    if quality_context.raw_feature_snapshot_data_quality is not None
+                    else None
+                ),
+                "paper_observation_data_quality": float(quality_context.paper_observation_data_quality),
+                "quality_threshold": float(quality_context.threshold),
+                "quality_block_reason": quality_context.quality_block_reason,
+                "candidate_stage_market_context_status": candidate_stage_market_context["source_status"],
+                "paper_observation": quality_context.decomposition["paper_observation"],
+            }
             labels = contract_labels(
                 game=game,
                 market=market,
@@ -1579,7 +2164,7 @@ def generate_candidates(
                 fee,
                 net_ev,
                 probability_edge,
-                model_score.data_quality,
+                quality_context.paper_observation_data_quality,
                 model_score.calibration_status,
                 model_score.push_probability,
             )
@@ -1702,10 +2287,27 @@ def generate_candidates(
             elif dry_run_candidates_only:
                 candidate.training_eligible = False
                 candidate.training_exclusion_reason = "dry_run_candidates_only"
-            candidate.data_quality = model_score.data_quality
+            candidate.data_quality = quality_context.paper_observation_data_quality
             candidate.calibration_status = model_score.calibration_status
             candidate.scoring_rationale = {
                 **model_score.rationale,
+                "raw_feature_snapshot_data_quality": (
+                    float(quality_context.raw_feature_snapshot_data_quality)
+                    if quality_context.raw_feature_snapshot_data_quality is not None
+                    else None
+                ),
+                "paper_observation_data_quality": float(quality_context.paper_observation_data_quality),
+                "quality_threshold": float(quality_context.threshold),
+                "quality_decomposition": quality_context.decomposition,
+                "quality_block_reason": quality_context.quality_block_reason,
+                "ev_decomposition": _ev_decomposition(
+                    probability=probability,
+                    price=price,
+                    gross_ev=gross_ev,
+                    fee_estimate=fee,
+                    net_ev=net_ev,
+                    probability_edge=probability_edge,
+                ),
                 "contract_side": contract_side,
                 "side_probability": float(probability),
                 "actual_yes_probability": float(actual_yes_probability),
@@ -1743,10 +2345,28 @@ def generate_candidates(
                 fee_estimate=fee,
                 net_ev=net_ev,
                 probability_edge=probability_edge,
-                data_quality=model_score.data_quality,
+                data_quality=quality_context.paper_observation_data_quality,
                 calibration_status=model_score.calibration_status,
                 push_probability=model_score.push_probability,
                 open_trade_exists=open_trade_for_market is not None or opposite_open_trade is not None,
+            )
+            diagnostics["raw_feature_snapshot_data_quality"] = (
+                float(quality_context.raw_feature_snapshot_data_quality)
+                if quality_context.raw_feature_snapshot_data_quality is not None
+                else None
+            )
+            diagnostics["paper_observation_data_quality"] = float(quality_context.paper_observation_data_quality)
+            diagnostics["quality_threshold"] = float(quality_context.threshold)
+            diagnostics["quality_decomposition"] = quality_context.decomposition
+            diagnostics["quality_block_reason"] = quality_context.quality_block_reason
+            diagnostics["candidate_stage_market_context_status"] = candidate_stage_market_context["source_status"]
+            diagnostics["ev_decomposition"] = _ev_decomposition(
+                probability=probability,
+                price=price,
+                gross_ev=gross_ev,
+                fee_estimate=fee,
+                net_ev=net_ev,
+                probability_edge=probability_edge,
             )
             diagnostics["actual_contract_display"] = labels.actual_contract_display
             diagnostics["normalized_equivalent_display"] = labels.normalized_equivalent_display
@@ -2032,6 +2652,7 @@ def generate_candidates(
             net_ev_values_by_side[side].append(candidate.net_expected_value)
     decision_breakdown_by_family, decision_breakdown_by_scope = _decision_breakdowns(evaluated_candidates)
     gate_summary = _gate_summary(evaluated_candidates)
+    opportunity_diagnostics = _opportunity_diagnostics(evaluated_candidates)
     edge_values = [candidate.probability_edge for candidate in evaluated_candidates if candidate.probability_edge is not None]
     net_ev_values = [
         candidate.net_expected_value for candidate in evaluated_candidates if candidate.net_expected_value is not None
@@ -2080,6 +2701,7 @@ def generate_candidates(
         "decision_counts": decision_counts,
         "decision_counts_by_side": decision_counts_by_side,
         "candidate_diagnostics": gate_summary,
+        "quality_ev_diagnostics": opportunity_diagnostics,
         "by_family": decision_breakdown_by_family,
         "by_scope": decision_breakdown_by_scope,
         "cap_counts": all_cap_counts,
@@ -2150,6 +2772,7 @@ def generate_candidates(
         "decision_counts": decision_counts,
         "decision_counts_by_side": decision_counts_by_side,
         "candidate_diagnostics": gate_summary,
+        "quality_ev_diagnostics": opportunity_diagnostics,
         "decision_breakdown_by_family": decision_breakdown_by_family,
         "decision_breakdown_by_scope": decision_breakdown_by_scope,
         "cap_counts": all_cap_counts,
@@ -2213,6 +2836,28 @@ def generate_candidates(
         "average_data_quality": gate_summary["average_data_quality"],
         "min_data_quality": gate_summary["min_data_quality"],
         "max_data_quality": gate_summary["max_data_quality"],
+        "raw_feature_snapshot_data_quality_avg": gate_summary["raw_feature_snapshot_data_quality_avg"],
+        "raw_feature_snapshot_data_quality_max": gate_summary["raw_feature_snapshot_data_quality_max"],
+        "paper_observation_data_quality_avg": gate_summary["paper_observation_data_quality_avg"],
+        "paper_observation_data_quality_max": gate_summary["paper_observation_data_quality_max"],
+        "quality_threshold": gate_summary["quality_threshold"],
+        "candidate_stage_market_context_status_counts": gate_summary[
+            "candidate_stage_market_context_status_counts"
+        ],
+        "quality_block_reason_counts": gate_summary["quality_block_reason_counts"],
+        "top_quality_blockers": gate_summary["top_quality_blockers"],
+        "ev_pass_count": opportunity_diagnostics["ev_pass_count"],
+        "edge_pass_count": opportunity_diagnostics["edge_pass_count"],
+        "ev_and_edge_pass_count": opportunity_diagnostics["ev_and_edge_pass_count"],
+        "deduped_ev_edge_pass_count_by_game_scope_family": opportunity_diagnostics[
+            "deduped_ev_edge_pass_count_by_game_scope_family"
+        ],
+        "deduped_pre_quality_trade_eligible_count_by_game_scope_family": opportunity_diagnostics[
+            "deduped_pre_quality_trade_eligible_count_by_game_scope_family"
+        ],
+        "top_counterfactual_candidates_blocked_by_quality": opportunity_diagnostics[
+            "top_counterfactual_candidates_blocked_by_quality"
+        ],
         "average_net_ev_among_ev_passing": gate_summary["average_net_ev_among_ev_passing"],
         "average_probability_edge_among_edge_passing": gate_summary["average_probability_edge_among_edge_passing"],
         "fee_estimate_avg": _avg_decimal(fee_values),

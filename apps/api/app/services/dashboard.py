@@ -604,7 +604,10 @@ def dashboard_summary_from_db(
         lambda trade: _family_scope(trade.market_family, trade.inning_scope),
     )
     if last_prediction and last_prediction.summary:
-        summary.latest_candidate_diagnostics = dict(last_prediction.summary.get("candidate_diagnostics") or {})
+        summary.latest_candidate_diagnostics = {
+            **dict(last_prediction.summary.get("candidate_diagnostics") or {}),
+            "quality_ev_diagnostics": dict(last_prediction.summary.get("quality_ev_diagnostics") or {}),
+        }
     summary.job_status = _latest_job_status(session, active_epoch)
     summary.websocket_status = _websocket_status(session)
     feature_avg_data_quality = (
@@ -645,6 +648,22 @@ def dashboard_summary_from_db(
         data_quality_summary={
             "avg": float(avg_data_quality) if avg_data_quality is not None else None,
             "feature_version": active_version.feature_version if active_version else None,
+            **(
+                {
+                    key: (last_prediction.summary or {}).get("candidate_diagnostics", {}).get(key)
+                    for key in (
+                        "raw_feature_snapshot_data_quality_avg",
+                        "raw_feature_snapshot_data_quality_max",
+                        "paper_observation_data_quality_avg",
+                        "paper_observation_data_quality_max",
+                        "quality_threshold",
+                        "candidate_stage_market_context_status_counts",
+                        "top_quality_blockers",
+                    )
+                }
+                if last_prediction and last_prediction.summary
+                else {}
+            ),
         },
         feature_completeness=feature_completeness,
         source_statuses=source_statuses,
