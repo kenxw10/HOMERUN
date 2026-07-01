@@ -9786,7 +9786,7 @@ def test_mlb_schedule_sync_requests_probable_pitchers_and_preserves_live_payload
     assert game.raw_payload["teams"]["home"]["probablePitcher"]["id"] == 1999
 
 
-def test_mlb_schedule_sync_clears_stale_cached_starter_when_probable_disappears(monkeypatch) -> None:
+def test_mlb_schedule_sync_preserves_cached_starter_until_refresh_rechecks(monkeypatch) -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
 
@@ -9840,13 +9840,13 @@ def test_mlb_schedule_sync_clears_stale_cached_starter_when_probable_disappears(
     assert game is not None
     assert "probablePitcher" not in game.raw_payload["teams"]["home"]
     assert game.raw_payload["teams"]["away"]["probablePitcher"]["id"] == 2999
-    assert "home" not in game.raw_payload["homerun_starter_hydration"]
+    assert game.raw_payload["homerun_starter_hydration"]["home"]["pitcher_id"] == "1999"
     assert game.raw_payload["homerun_starter_hydration"]["away"]["pitcher_id"] == "2999"
-    assert "home" not in game.raw_payload["gameData"]["probablePitchers"]
+    assert game.raw_payload["gameData"]["probablePitchers"]["home"]["id"] == 1999
     assert game.raw_payload["gameData"]["probablePitchers"]["away"]["id"] == 2999
-    assert "pitchers" not in game.raw_payload["liveData"]["boxscore"]["teams"]["home"]
+    assert game.raw_payload["liveData"]["boxscore"]["teams"]["home"]["pitchers"] == [1999]
     assert game.raw_payload["liveData"]["boxscore"]["teams"]["away"]["pitchers"] == [2999]
-    assert features.probable_pitcher_from_payload(game.raw_payload or {}, "home") is None
+    assert features.probable_pitcher_from_payload(game.raw_payload or {}, "home")["id"] == "1999"
 
 
 def test_sync_mlb_starters_hydrates_schedule_probables_and_pitcher_features(monkeypatch) -> None:
