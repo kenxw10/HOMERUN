@@ -9960,6 +9960,85 @@ def test_sync_mlb_starters_rechecks_when_schedule_drops_cached_probables(monkeyp
     assert snapshot.source_statuses["starter_identity"] == {"home": "missing", "away": "missing"}
 
 
+def test_sync_mlb_starters_clears_changed_stale_boxscore_starters(monkeypatch) -> None:
+    monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "true")
+    get_settings.cache_clear()
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    game_log_calls: list[str] = []
+
+    class FakeMLBStatsClient:
+        def get_schedule(self, *_args, **_kwargs):
+            return {"dates": [{"games": [_starter_schedule_game()]}]}
+
+        def get_game_feed(self, *_args, **_kwargs):
+            pytest.fail("complete schedule probables should not require feed fallback")
+
+        def get_game_boxscore(self, *_args, **_kwargs):
+            pytest.fail("complete schedule probables should not require boxscore fallback")
+
+        def get_pitcher_game_log_stats(self, person_id: str, _season: int):
+            game_log_calls.append(str(person_id))
+            return _starter_game_log_payload()
+
+    monkeypatch.setattr(features, "MLBStatsClient", FakeMLBStatsClient)
+
+    stale_raw_payload = {
+        "liveData": {
+            "boxscore": {
+                "teams": {
+                    "home": {
+                        "pitchers": [1111],
+                        "players": {"ID1111": {"person": {"id": 1111, "fullName": "Old Home Starter"}}},
+                    },
+                    "away": {
+                        "pitchers": [2222],
+                        "players": {"ID2222": {"person": {"id": 2222, "fullName": "Old Away Starter"}}},
+                    },
+                }
+            }
+        },
+        "gameData": {
+            "probablePitchers": {
+                "home": {"id": 1111, "fullName": "Old Home Starter"},
+                "away": {"id": 2222, "fullName": "Old Away Starter"},
+            }
+        },
+    }
+
+    try:
+        with Session(engine) as session:
+            session.add(
+                MlbGame(
+                    external_game_id="123456",
+                    home_team="Pittsburgh Pirates",
+                    away_team="Seattle Mariners",
+                    home_abbreviation="PIT",
+                    away_abbreviation="SEA",
+                    scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+                    status="scheduled",
+                    raw_payload=stale_raw_payload,
+                )
+            )
+            session.commit()
+
+            result = features.sync_mlb_starters(session, date(2026, 7, 1))
+            game = session.scalar(select(MlbGame).where(MlbGame.external_game_id == "123456"))
+            snapshot = session.scalar(select(MlbFeatureSnapshot).where(MlbFeatureSnapshot.source == features.FEATURE_VERSION))
+    finally:
+        get_settings.cache_clear()
+
+    assert result["starter_identity_available_count"] == 2
+    assert game_log_calls == ["1999", "2999"]
+    assert game is not None
+    assert features.probable_pitcher_from_payload(game.raw_payload or {}, "home")["id"] == "1999"
+    assert features.probable_pitcher_from_payload(game.raw_payload or {}, "away")["id"] == "2999"
+    assert game.raw_payload["homerun_starter_hydration"]["home"]["identity_changed"] is True
+    assert game.raw_payload["homerun_starter_hydration"]["away"]["identity_changed"] is True
+    assert snapshot is not None
+    assert snapshot.source_statuses["starter_identity"] == {"home": "available", "away": "available"}
+
+
 def test_open_meteo_parse_uses_nearest_forecast_hour() -> None:
     parsed = features._parse_open_meteo(
         {

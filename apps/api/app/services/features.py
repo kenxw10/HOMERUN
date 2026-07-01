@@ -728,8 +728,21 @@ def probable_pitcher_from_payload(payload: dict[str, object], side: str) -> dict
     return None
 
 
-def _clear_stale_probable_pitcher_sources(payload: dict[str, object], missing_sides: set[str]) -> dict[str, object]:
-    if not missing_sides:
+def _pitcher_identity_id(identity: dict[str, object] | None) -> str | None:
+    if not identity or not identity.get("id"):
+        return None
+    return str(identity.get("id"))
+
+
+def _clear_stale_probable_pitcher_sources(
+    payload: dict[str, object],
+    *,
+    missing_sides: set[str],
+    changed_sides: set[str] | None = None,
+) -> dict[str, object]:
+    changed_sides = changed_sides or set()
+    stale_source_sides = missing_sides | changed_sides
+    if not stale_source_sides:
         return dict(payload)
     cleared = dict(payload)
     game_data = cleared.get("gameData")
@@ -738,7 +751,7 @@ def _clear_stale_probable_pitcher_sources(payload: dict[str, object], missing_si
         probable = game_data.get("probablePitchers")
         if isinstance(probable, dict):
             probable = dict(probable)
-            for side in missing_sides:
+            for side in stale_source_sides:
                 probable.pop(side, None)
             game_data["probablePitchers"] = probable
         cleared["gameData"] = game_data
@@ -759,7 +772,7 @@ def _clear_stale_probable_pitcher_sources(payload: dict[str, object], missing_si
         live_data = dict(live_data)
         boxscore = dict(boxscore)
         box_teams = dict(box_teams)
-        for side in missing_sides:
+        for side in stale_source_sides:
             box_team = box_teams.get(side)
             if isinstance(box_team, dict):
                 box_team = dict(box_team)
@@ -4545,7 +4558,18 @@ def _refresh_game_starter_sources(
         errors=errors,
     )
     missing_sides = {side for side in ("home", "away") if not refreshed.get(side)}
-    merged = _clear_stale_probable_pitcher_sources(game.raw_payload or {}, missing_sides)
+    changed_sides = {
+        side
+        for side in ("home", "away")
+        if _pitcher_identity_id(previous.get(side))
+        and _pitcher_identity_id(refreshed.get(side))
+        and _pitcher_identity_id(previous.get(side)) != _pitcher_identity_id(refreshed.get(side))
+    }
+    merged = _clear_stale_probable_pitcher_sources(
+        game.raw_payload or {},
+        missing_sides=missing_sides,
+        changed_sides=changed_sides,
+    )
     merged["homerun_starter_hydration"] = metadata
     game.raw_payload = merged
     return metadata, errors
