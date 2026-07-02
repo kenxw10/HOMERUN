@@ -8040,6 +8040,91 @@ def test_empty_fielding_logs_remain_partial_without_fabricated_zero_metrics() ->
     assert section["reason"] == "MLB Stats API fielding logs returned games but limited fielding metrics."
 
 
+def test_fielding_only_logs_do_not_create_mlb_team_offense_cache() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    day = date(2026, 7, 1)
+    captured_at = datetime(2026, 7, 1, 15, 0, tzinfo=UTC)
+    fielding_payload = {
+        "stats": [
+            {
+                "splits": [
+                    {
+                        "date": "2026-06-30",
+                        "stat": {
+                            "errors": 1,
+                            "assists": 12,
+                            "putOuts": 27,
+                            "doublePlays": 1,
+                        },
+                    }
+                ]
+            }
+        ]
+    }
+
+    with Session(engine) as session:
+        game = _fielding_test_game()
+        session.add(game)
+        session.flush()
+        mlb_context = {"team_fielding_logs_by_id": {"134": fielding_payload}}
+
+        daily = features._upsert_mlb_primary_team_daily(
+            session,
+            game,
+            "home",
+            day,
+            captured_at,
+            mlb_context,
+            {"team_contact_by_code": {}},
+        )
+        recent = features._upsert_mlb_primary_team_recent(
+            session,
+            game,
+            "home",
+            day,
+            captured_at,
+            14,
+            mlb_context,
+            {"team_contact_by_code": {}},
+        )
+
+        persisted_daily = session.scalar(
+            select(TeamDailyFeature).where(TeamDailyFeature.source == features.MLB_STATS_SOURCE)
+        )
+        persisted_recent = session.scalar(
+            select(TeamRecentFeature).where(TeamRecentFeature.source == features.MLB_STATS_SOURCE)
+        )
+
+    assert daily is None
+    assert recent is None
+    assert persisted_daily is None
+    assert persisted_recent is None
+
+
+def test_caught_stealing_rate_requires_both_running_game_fields() -> None:
+    stolen_only = features._aggregate_team_fielding_logs(
+        [{"date": "2026-06-30", "stat": {"stolenBases": 2}}],
+        1,
+    )
+    caught_only = features._aggregate_team_fielding_logs(
+        [{"date": "2026-06-30", "stat": {"caughtStealing": 1}}],
+        1,
+    )
+    complete = features._aggregate_team_fielding_logs(
+        [{"date": "2026-06-30", "stat": {"stolenBases": 2, "caughtStealing": 1}}],
+        1,
+    )
+
+    assert stolen_only["stolen_bases_allowed"] == 2.0
+    assert stolen_only["caught_stealing"] is None
+    assert stolen_only["caught_stealing_rate"] is None
+    assert caught_only["stolen_bases_allowed"] is None
+    assert caught_only["caught_stealing"] == 1.0
+    assert caught_only["caught_stealing_rate"] is None
+    assert complete["caught_stealing_rate"] == 0.3333
+
+
 def test_fielding_source_failure_degrades_defense_without_blocking_offense(monkeypatch) -> None:
     monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "true")
     get_settings.cache_clear()

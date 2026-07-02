@@ -3093,7 +3093,7 @@ def _aggregate_team_fielding_logs(splits: list[dict[str, object]], limit: int) -
         "stolen_bases_allowed": _float(totals["stolenBases"]) if "stolenBases" in present_fields else None,
         "caught_stealing": _float(totals["caughtStealing"]) if "caughtStealing" in present_fields else None,
         "caught_stealing_rate": _float(_ratio(totals["caughtStealing"], stolen_attempts))
-        if present_fields & {"stolenBases", "caughtStealing"}
+        if {"stolenBases", "caughtStealing"}.issubset(present_fields)
         else None,
     }
 
@@ -3186,7 +3186,7 @@ def _upsert_mlb_primary_team_daily(
     hitting_splits = _game_log_splits_before(hitting_payload if isinstance(hitting_payload, dict) else None, day)
     pitching_splits = _game_log_splits_before(pitching_payload if isinstance(pitching_payload, dict) else None, day)
     fielding_splits = _game_log_splits_before(fielding_payload if isinstance(fielding_payload, dict) else None, day)
-    if not hitting_splits and not pitching_splits and not fielding_splits:
+    if not hitting_splits and not pitching_splits:
         return None
     hitting = _aggregate_team_hitting_logs(hitting_splits, len(hitting_splits))
     pitching = _aggregate_team_pitching_logs(pitching_splits, len(pitching_splits))
@@ -3308,7 +3308,7 @@ def _upsert_mlb_primary_team_recent(
     hitting_splits = _game_log_splits_before(hitting_payload if isinstance(hitting_payload, dict) else None, day, window_start)
     pitching_splits = _game_log_splits_before(pitching_payload if isinstance(pitching_payload, dict) else None, day, window_start)
     fielding_splits = _game_log_splits_before(fielding_payload if isinstance(fielding_payload, dict) else None, day, window_start)
-    if not hitting_splits and not pitching_splits and not fielding_splits:
+    if not hitting_splits and not pitching_splits:
         return None
     hitting = _aggregate_team_hitting_logs(hitting_splits, len(hitting_splits))
     pitching = _aggregate_team_pitching_logs(pitching_splits, len(pitching_splits))
