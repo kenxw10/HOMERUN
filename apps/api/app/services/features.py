@@ -1555,6 +1555,12 @@ def _statcast_fetch_context(
             }
             if by_team:
                 stats["statcast_source_status"] = "available"
+            elif rows:
+                stats["statcast_source_status"] = "statcast_unmatched_team_rows"
+                _append_warning(
+                    stats,
+                    "Statcast/Savant team contact returned rows but none mapped to known team codes.",
+                )
             stats["statcast_rows_matched"] = int(stats.get("statcast_rows_matched", 0)) + sum(len(rows) for rows in by_team.values())
         except Exception as exc:
             stats["statcast_error_count"] = int(stats.get("statcast_error_count", 0)) + 1
@@ -5313,6 +5319,12 @@ def _statcast_audit_issue(feature_audit: dict[str, object]) -> dict[str, object]
             "table": "statcast_fetch_context",
             "error_code": "unavailable_pybaseball_not_installed",
             "message": "Statcast/Savant unavailable because pybaseball is not installed.",
+        },
+        "statcast_unmatched_team_rows": {
+            "source": STATCAST_SOURCE,
+            "table": "statcast_team_contact",
+            "error_code": "statcast_unmatched_team_rows",
+            "message": "Statcast/Savant team contact returned rows but none mapped to known team codes.",
         },
     }
     issue = issues.get(str(status))

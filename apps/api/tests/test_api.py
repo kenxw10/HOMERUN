@@ -9386,6 +9386,32 @@ def test_statcast_team_rows_derive_batting_team_from_inning_half(monkeypatch) ->
     assert stats["statcast_rows_matched"] == 60
 
 
+def test_statcast_unmatched_team_rows_mark_source_attempted(monkeypatch) -> None:
+    monkeypatch.setattr(
+        features.pybaseball_client,
+        "import_status",
+        lambda: {"available": True, "version": "2.2.7", "module_path": "mocked", "import_error": None},
+    )
+    monkeypatch.setattr(
+        features.pybaseball_client,
+        "get_statcast_range",
+        lambda *_args, **_kwargs: {
+            "rows": [{"launch_speed": 96, "launch_angle": 18, "estimated_woba_using_speedangle": 0.360}]
+        },
+    )
+
+    stats = features._new_sync_stats(date(2026, 6, 24), {"team"})
+    context = features._statcast_fetch_context([], date(2026, 6, 24), {"team"}, stats)
+
+    assert context["team_contact_by_code"] == {}
+    assert stats["statcast_rows_seen"] == 1
+    assert stats["statcast_rows_matched"] == 0
+    assert stats["statcast_source_status"] == "statcast_unmatched_team_rows"
+    assert stats["warnings"] == [
+        "Statcast/Savant team contact returned rows but none mapped to known team codes."
+    ]
+
+
 def test_statcast_empty_team_result_survives_pitcher_rows(monkeypatch) -> None:
     monkeypatch.setattr(
         features.pybaseball_client,
@@ -9854,6 +9880,71 @@ def test_source_status_report_marks_empty_statcast_attempt_as_cached_fallback(mo
     assert inventory["statcast_savant"]["status"] == "cached"
     assert inventory["statcast_savant"]["fallback_used"] is True
     assert inventory["statcast_savant"]["fallback_reason"] == "statcast_empty_result"
+
+
+def test_source_status_report_marks_unmatched_statcast_rows_as_cached_fallback(monkeypatch) -> None:
+    monkeypatch.setenv("STATCAST_CACHE_MAX_STALE_HOURS", "48")
+    get_settings.cache_clear()
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    cached_at = datetime(2026, 7, 1, 20, 0, tzinfo=UTC)
+
+    try:
+        with Session(engine) as session:
+            session.add_all(
+                [
+                    TeamDailyFeature(
+                        target_date=date(2026, 7, 1),
+                        team_code="PIT",
+                        captured_at=cached_at,
+                        source=features.MLB_STATS_SOURCE,
+                        source_status="available",
+                        confidence=Decimal("0.8500"),
+                        completeness=Decimal("0.8000"),
+                        stale=False,
+                        features={
+                            "contact_quality": {
+                                "source": features.STATCAST_SOURCE,
+                                "captured_at": cached_at.isoformat(),
+                                "batted_ball_events_count": 30,
+                                "hard_hit_pct": 0.42,
+                            },
+                            "contact_quality_status": "available",
+                        },
+                        raw_payload={"bounded_before": "2026-07-01"},
+                    ),
+                    MlbFeatureSnapshot(
+                        mlb_game_id=None,
+                        target_date=date(2026, 7, 1),
+                        source=features.FEATURE_SYNC_AUDIT_SOURCE,
+                        captured_at=datetime(2026, 7, 1, 21, 0, tzinfo=UTC),
+                        data_quality=None,
+                        source_statuses={"sync": "completed"},
+                        features={
+                            "sync_status": {
+                                "attempted_at": datetime(2026, 7, 1, 21, 0, tzinfo=UTC).isoformat(),
+                                "validation_status": "completed",
+                                "statcast_source_status": "statcast_unmatched_team_rows",
+                                "errors": [],
+                                "warnings": [
+                                    "Statcast/Savant team contact returned rows but none mapped to known team codes."
+                                ],
+                            }
+                        },
+                    ),
+                ]
+            )
+            session.commit()
+            report = features.source_status_report(session)
+    finally:
+        get_settings.cache_clear()
+
+    inventory = {item["source_name"]: item for item in report["source_inventory"]}
+    assert report["statcast_savant_status"] == "cached"
+    assert report["statcast_savant_last_error"]["error_code"] == "statcast_unmatched_team_rows"
+    assert inventory["statcast_savant"]["status"] == "cached"
+    assert inventory["statcast_savant"]["fallback_used"] is True
+    assert inventory["statcast_savant"]["fallback_reason"] == "statcast_unmatched_team_rows"
 
 
 def test_source_status_report_uses_statcast_contact_timestamp_for_cache_age(monkeypatch) -> None:
