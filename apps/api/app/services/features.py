@@ -1444,6 +1444,20 @@ def _aggregate_statcast_contact(rows: list[dict[str, object]]) -> dict[str, obje
     }
 
 
+def _statcast_contact_payload(
+    rows: list[dict[str, object]],
+    *,
+    start: date,
+    end: date,
+    captured_at: datetime,
+) -> dict[str, object]:
+    return {
+        **_aggregate_statcast_contact(rows),
+        "date_range": {"start": start.isoformat(), "end": end.isoformat()},
+        "captured_at": ensure_aware_utc(captured_at).isoformat(),
+    }
+
+
 def _statcast_status(contact: dict[str, object] | None) -> str:
     if not contact:
         return "missing"
@@ -1506,6 +1520,7 @@ def _statcast_fetch_context(
     if not pybaseball_available():
         stats["statcast_source_status"] = "unavailable_pybaseball_not_installed"
         return context
+    statcast_captured_at = utc_now()
 
     if requested_modules & {"team"}:
         try:
@@ -1521,7 +1536,12 @@ def _statcast_fetch_context(
                 if normalized:
                     by_team.setdefault(normalized, []).append(row)
             context["team_contact_by_code"] = {
-                team_code: {**_aggregate_statcast_contact(team_rows), "date_range": {"start": start.isoformat(), "end": end.isoformat()}}
+                team_code: _statcast_contact_payload(
+                    team_rows,
+                    start=start,
+                    end=end,
+                    captured_at=statcast_captured_at,
+                )
                 for team_code, team_rows in by_team.items()
             }
             if by_team:
@@ -1547,10 +1567,12 @@ def _statcast_fetch_context(
                 rows = _statcast_rows(result)
                 stats["statcast_pitcher_rows_seen"] = int(stats.get("statcast_pitcher_rows_seen", 0)) + len(rows)
                 if rows:
-                    context["pitcher_contact_by_id"][pitcher_id] = {
-                        **_aggregate_statcast_contact(rows),
-                        "date_range": {"start": start.isoformat(), "end": end.isoformat()},
-                    }
+                    context["pitcher_contact_by_id"][pitcher_id] = _statcast_contact_payload(
+                        rows,
+                        start=start,
+                        end=end,
+                        captured_at=statcast_captured_at,
+                    )
                     if stats.get("statcast_source_status") != "statcast_empty_result":
                         stats["statcast_source_status"] = "available"
                     stats["statcast_pitcher_rows_matched"] = int(stats.get("statcast_pitcher_rows_matched", 0)) + len(rows)
@@ -5301,6 +5323,22 @@ def _statcast_contact_from_row(row: object) -> dict[str, object] | None:
     return None
 
 
+def _statcast_contact_timestamp(row: object) -> datetime | None:
+    contact = _statcast_contact_from_row(row)
+    if isinstance(contact, dict):
+        for key in ("captured_at", "statcast_captured_at", "fetched_at", "synced_at"):
+            parsed = _parsed_status_timestamp(contact.get(key))
+            if parsed is not None:
+                return parsed
+    raw_payload = getattr(row, "raw_payload", None)
+    if isinstance(raw_payload, dict):
+        for key in ("statcast_captured_at", "statcast_fetched_at"):
+            parsed = _parsed_status_timestamp(raw_payload.get(key))
+            if parsed is not None:
+                return parsed
+    return None
+
+
 def _statcast_db_status(session: Session, feature_audit: dict[str, object]) -> dict[str, object]:
     rows: list[object] = []
     for model in (TeamDailyFeature, TeamRecentFeature, PitcherDailyFeature):
@@ -5315,12 +5353,18 @@ def _statcast_db_status(session: Session, feature_audit: dict[str, object]) -> d
     rows = sorted(rows, key=lambda row: row.captured_at, reverse=True)[:200]
     contact_rows = [row for row in rows if _statcast_contact_from_row(row)]
     status_counts: dict[str, int] = {}
-    last_success = None
+    last_success_timestamp = None
     for row in contact_rows:
-        status = _statcast_status(_statcast_contact_from_row(row))
+        contact = _statcast_contact_from_row(row)
+        status = _statcast_status(contact)
         status_counts[status] = status_counts.get(status, 0) + 1
-        if last_success is None and status in {"available", "partial"}:
-            last_success = ensure_aware_utc(row.captured_at).isoformat()
+        if status in {"available", "partial"}:
+            contact_timestamp = _statcast_contact_timestamp(row)
+            if contact_timestamp is not None and (
+                last_success_timestamp is None or contact_timestamp > last_success_timestamp
+            ):
+                last_success_timestamp = contact_timestamp
+    last_success = last_success_timestamp.isoformat() if last_success_timestamp is not None else None
     last_error = _latest_audit_error(feature_audit, STATCAST_SOURCE) or _statcast_audit_issue(feature_audit)
     settings = get_settings()
     if last_error and last_success:

@@ -9700,6 +9700,7 @@ def test_source_status_report_exposes_source_inventory_and_cached_fallbacks(monk
     attempted_at = datetime(2026, 7, 1, 21, 0, tzinfo=UTC).isoformat()
     cached_contact = {
         "source": features.STATCAST_SOURCE,
+        "captured_at": captured_at.isoformat(),
         "batted_ball_events_count": 30,
         "hard_hit_pct": 0.42,
     }
@@ -9813,6 +9814,7 @@ def test_source_status_report_marks_empty_statcast_attempt_as_cached_fallback(mo
                         features={
                             "contact_quality": {
                                 "source": features.STATCAST_SOURCE,
+                                "captured_at": cached_at.isoformat(),
                                 "batted_ball_events_count": 30,
                                 "hard_hit_pct": 0.42,
                             },
@@ -9852,6 +9854,72 @@ def test_source_status_report_marks_empty_statcast_attempt_as_cached_fallback(mo
     assert inventory["statcast_savant"]["status"] == "cached"
     assert inventory["statcast_savant"]["fallback_used"] is True
     assert inventory["statcast_savant"]["fallback_reason"] == "statcast_empty_result"
+
+
+def test_source_status_report_uses_statcast_contact_timestamp_for_cache_age(monkeypatch) -> None:
+    fixed_now = datetime(2026, 7, 2, 21, 0, tzinfo=UTC)
+    cached_at = fixed_now - timedelta(hours=3)
+    monkeypatch.setenv("STATCAST_CACHE_MAX_STALE_HOURS", "1")
+    monkeypatch.setattr(features, "utc_now", lambda: fixed_now)
+    get_settings.cache_clear()
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    try:
+        with Session(engine) as session:
+            session.add_all(
+                [
+                    TeamDailyFeature(
+                        target_date=date(2026, 7, 2),
+                        team_code="PIT",
+                        captured_at=fixed_now,
+                        source=features.MLB_STATS_SOURCE,
+                        source_status="available",
+                        confidence=Decimal("0.8500"),
+                        completeness=Decimal("0.8000"),
+                        stale=False,
+                        features={
+                            "contact_quality": {
+                                "source": features.STATCAST_SOURCE,
+                                "captured_at": cached_at.isoformat(),
+                                "batted_ball_events_count": 30,
+                                "hard_hit_pct": 0.42,
+                            },
+                            "contact_quality_status": "available",
+                        },
+                        raw_payload={"bounded_before": "2026-07-02"},
+                    ),
+                    MlbFeatureSnapshot(
+                        mlb_game_id=None,
+                        target_date=date(2026, 7, 2),
+                        source=features.FEATURE_SYNC_AUDIT_SOURCE,
+                        captured_at=fixed_now,
+                        data_quality=None,
+                        source_statuses={"sync": "completed"},
+                        features={
+                            "sync_status": {
+                                "attempted_at": fixed_now.isoformat(),
+                                "validation_status": "completed",
+                                "statcast_source_status": "statcast_empty_result",
+                                "errors": [],
+                                "warnings": [
+                                    "Statcast/Savant team contact returned no rows for the completed date range."
+                                ],
+                            }
+                        },
+                    ),
+                ]
+            )
+            session.commit()
+            report = features.source_status_report(session)
+    finally:
+        get_settings.cache_clear()
+
+    inventory = {item["source_name"]: item for item in report["source_inventory"]}
+    assert report["statcast_savant_last_successful_sync"] == cached_at.isoformat()
+    assert report["statcast_savant_status"] == "stale"
+    assert inventory["statcast_savant"]["status"] == "stale"
+    assert inventory["statcast_savant"]["fallback_used"] is True
 
 
 def test_source_status_report_ignores_pybaseball_player_mapping_misses(monkeypatch) -> None:
