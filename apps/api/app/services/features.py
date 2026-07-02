@@ -1469,6 +1469,15 @@ def _statcast_status(contact: dict[str, object] | None) -> str:
     return "missing"
 
 
+def _statcast_contact_with_cache_timestamp(contact: dict[str, object], row: object) -> dict[str, object]:
+    payload = dict(contact)
+    if not any(payload.get(key) for key in ("captured_at", "statcast_captured_at", "fetched_at", "synced_at")):
+        captured_at = getattr(row, "captured_at", None)
+        if captured_at is not None:
+            payload["captured_at"] = ensure_aware_utc(captured_at).isoformat()
+    return payload
+
+
 def _cached_pitcher_statcast_contact(row: PitcherDailyFeature | None) -> dict[str, object] | None:
     if row is None:
         return None
@@ -1476,17 +1485,17 @@ def _cached_pitcher_statcast_contact(row: PitcherDailyFeature | None) -> dict[st
     for key in ("season_contact_quality", "recent_contact_quality"):
         value = features.get(key)
         if isinstance(value, dict):
-            return value
+            return _statcast_contact_with_cache_timestamp(value, row)
     raw_payload = row.raw_payload if isinstance(row.raw_payload, dict) else {}
     statcast = raw_payload.get("statcast")
-    return statcast if isinstance(statcast, dict) else None
+    return _statcast_contact_with_cache_timestamp(statcast, row) if isinstance(statcast, dict) else None
 
 
 def _cached_team_statcast_contact(row: TeamDailyFeature | TeamRecentFeature | None) -> dict[str, object] | None:
     if row is None or not isinstance(row.features, dict):
         return None
     contact = row.features.get("contact_quality")
-    return contact if isinstance(contact, dict) else None
+    return _statcast_contact_with_cache_timestamp(contact, row) if isinstance(contact, dict) else None
 
 
 def _statcast_batting_team_code(row: dict[str, object]) -> str | None:

@@ -10275,6 +10275,7 @@ def test_mlb_primary_team_daily_preserves_cached_statcast_when_current_fetch_emp
     }
 
     with Session(engine) as session:
+        legacy_cache_at = datetime(2026, 7, 1, 19, 0, tzinfo=UTC)
         game = MlbGame(
             external_game_id="statcast-cache-preserve",
             home_team="Pittsburgh Pirates",
@@ -10294,7 +10295,7 @@ def test_mlb_primary_team_daily_preserves_cached_statcast_when_current_fetch_emp
             TeamDailyFeature(
                 target_date=day,
                 team_code="PIT",
-                captured_at=datetime(2026, 7, 1, 19, 0, tzinfo=UTC),
+                captured_at=legacy_cache_at,
                 source=features.MLB_STATS_SOURCE,
                 source_status="available",
                 confidence=Decimal("0.8500"),
@@ -10322,7 +10323,7 @@ def test_mlb_primary_team_daily_preserves_cached_statcast_when_current_fetch_emp
         )
 
     assert row is not None
-    assert row.features["contact_quality"] == cached_contact
+    assert row.features["contact_quality"] == {**cached_contact, "captured_at": legacy_cache_at.isoformat()}
     assert row.features["contact_quality_status"] == "available"
 
 
@@ -10837,13 +10838,14 @@ def test_sync_mlb_starters_preserves_cached_statcast_pitcher_fields(monkeypatch)
     try:
         with Session(engine) as session:
             _seed_existing_starter_feature_snapshot(session)
+            legacy_cache_at = datetime(2026, 7, 1, 12, 0, tzinfo=UTC)
             session.add(
                 PitcherDailyFeature(
                     target_date=date(2026, 7, 1),
                     team_code="PIT",
                     pitcher_id="1999",
                     pitcher_name="Home Starter",
-                    captured_at=datetime(2026, 7, 1, 12, 0, tzinfo=UTC),
+                    captured_at=legacy_cache_at,
                     source=features.MLB_STATS_SOURCE,
                     source_status="available",
                     sample_size=20,
@@ -10873,11 +10875,12 @@ def test_sync_mlb_starters_preserves_cached_statcast_pitcher_fields(monkeypatch)
 
     assert result["validation_status"] == "ok"
     assert pitcher is not None
-    assert pitcher.features["season_contact_quality"] == cached_contact
-    assert pitcher.features["recent_contact_quality"] == cached_contact
+    expected_contact = {**cached_contact, "captured_at": legacy_cache_at.isoformat()}
+    assert pitcher.features["season_contact_quality"] == expected_contact
+    assert pitcher.features["recent_contact_quality"] == expected_contact
     assert pitcher.features["contact_quality_status"] == "available"
     assert pitcher.features["recent"]["velocity_trend"] == 94.7
-    assert pitcher.raw_payload["statcast"] == cached_contact
+    assert pitcher.raw_payload["statcast"] == expected_contact
 
 
 def test_sync_mlb_starters_falls_back_to_game_feed_and_marks_missing_stats_partial(monkeypatch) -> None:
