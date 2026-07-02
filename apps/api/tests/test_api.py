@@ -7284,6 +7284,103 @@ def test_generate_candidates_uses_heuristic_probability_and_feature_snapshot(mon
     assert feature_snapshot.features["data_quality"] > 0
 
 
+def test_candidate_diagnostics_include_defense_module_status(monkeypatch) -> None:
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+    monkeypatch.setattr(candidates, "utc_now", lambda: now)
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    def team_daily(team_code: str) -> TeamDailyFeature:
+        return TeamDailyFeature(
+            target_date=date(2026, 7, 1),
+            team_code=team_code,
+            captured_at=now,
+            source=features.MLB_STATS_SOURCE,
+            source_status="available",
+            confidence=Decimal("0.8500"),
+            completeness=Decimal("0.8000"),
+            features={
+                "defense_season": {
+                    "source": features.MLB_STATS_SOURCE,
+                    "source_status": "available",
+                    "reason": "team defense season from MLB Stats API fielding game logs",
+                    "fielding_percentage": 0.985,
+                    "errors_per_game": 0.4,
+                    "double_plays_per_game": 0.9,
+                    "completeness": 0.65,
+                }
+            },
+        )
+
+    def team_recent(team_code: str) -> TeamRecentFeature:
+        return TeamRecentFeature(
+            target_date=date(2026, 7, 1),
+            team_code=team_code,
+            window_days=14,
+            captured_at=now,
+            source=features.MLB_STATS_SOURCE,
+            source_status="available",
+            sample_size=10,
+            confidence=Decimal("0.8000"),
+            completeness=Decimal("0.7500"),
+            features={
+                "defense_recent": {
+                    "source": features.MLB_STATS_SOURCE,
+                    "source_status": "available",
+                    "reason": "team defense recent from MLB Stats API fielding game logs over 14 days",
+                    "fielding_percentage": 0.982,
+                    "errors_per_game": 0.5,
+                    "completeness": 0.60,
+                }
+            },
+        )
+
+    with Session(engine) as session:
+        game = MlbGame(
+            external_game_id="candidate-defense-1",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+            status="scheduled",
+        )
+        market = KalshiMarket(
+            kalshi_market_id="KX-CANDIDATE-DEFENSE",
+            ticker="KXMLBGAME-26JUL011900SEAPIT-PIT",
+            title="Will the Pittsburgh Pirates win the game against the Seattle Mariners?",
+            status="open",
+            occurrence_datetime=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+            implied_yes_ask=Decimal("0.4000"),
+            market_price_updated_at=now,
+        )
+        session.add_all(
+            [
+                game,
+                market,
+                team_daily("PIT"),
+                team_daily("SEA"),
+                team_recent("PIT"),
+                team_recent("SEA"),
+            ]
+        )
+        _add_candidate_mapping(session, game, market)
+        session.commit()
+
+        candidates.generate_candidates(session)
+        candidate = session.scalar(select(ModelCandidate))
+
+    assert candidate is not None
+    defense = candidate.features["defense_catcher"]
+    assert defense["source_status"] == "partial"
+    assert defense["home"]["team_defense_season"]["source_status"] == "available"
+    quality = candidate.gate_diagnostics["quality_decomposition"]["paper_observation"]
+    assert quality["module_status"]["defense_catcher"] == "partial"
+    assert "defense_catcher" in quality["quality_contribution_by_module"]
+    assert "defense_catcher" in quality["quality_penalty_by_module"]
+
+
 def test_model_governance_skips_training_and_records_runs_when_samples_are_too_small() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
@@ -7770,6 +7867,504 @@ def test_feature_coverage_detail_and_source_status_include_17_module_summary(mon
     assert detail["items"][0]["module_completeness"]["injuries"]["status"] == "missing"
     assert report["latest_feature_completeness"]["summary"]["core_module_count"] == 17
     assert report["latest_feature_completeness"]["modules"]["lineup"]["available"] == 1
+
+
+def _fielding_test_game() -> MlbGame:
+    return MlbGame(
+        external_game_id="defense-fielding-1",
+        home_team="Pittsburgh Pirates",
+        away_team="Seattle Mariners",
+        home_abbreviation="PIT",
+        away_abbreviation="SEA",
+        scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+        status="scheduled",
+        raw_payload={
+            "venue": {"id": 31, "name": "PNC Park"},
+            "teams": {
+                "home": {"team": {"id": 134, "name": "Pittsburgh Pirates"}},
+                "away": {"team": {"id": 136, "name": "Seattle Mariners"}},
+            },
+        },
+    )
+
+
+def _team_log_rows(group: str, count: int = 15) -> dict[str, object]:
+    rows = []
+    for index in range(count):
+        if group == "hitting":
+            stat = {
+                "runs": 4,
+                "hits": 8,
+                "homeRuns": 1,
+                "baseOnBalls": 3,
+                "strikeOuts": 7,
+                "atBats": 34,
+                "plateAppearances": 38,
+                "totalBases": 13,
+            }
+        elif group == "pitching":
+            stat = {
+                "inningsPitched": "9.0",
+                "runs": 3,
+                "earnedRuns": 3,
+                "hits": 7,
+                "homeRuns": 1,
+                "baseOnBalls": 2,
+                "strikeOuts": 8,
+                "battersFaced": 36,
+                "numberOfPitches": 142,
+                "saves": 1,
+                "holds": 1,
+                "blownSaves": 0,
+                "saveOpportunities": 1,
+                "gamesFinished": 1,
+            }
+        else:
+            stat = {
+                "innings": "9.0",
+                "errors": 1 if index % 5 == 0 else 0,
+                "assists": 12,
+                "putOuts": 27,
+                "chances": 40,
+                "doublePlays": 1,
+                "passedBalls": 0,
+                "wildPitches": 1 if index % 7 == 0 else 0,
+                "stolenBases": 1,
+                "caughtStealing": 1 if index % 3 == 0 else 0,
+            }
+        rows.append({"date": f"2026-06-{30 - index:02d}", "stat": stat})
+    return {"stats": [{"splits": rows}]}
+
+
+def test_mlb_stats_fielding_populates_baseline_defense_and_source_health(monkeypatch) -> None:
+    monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "true")
+    get_settings.cache_clear()
+    _stub_pybaseball_unavailable(monkeypatch)
+    monkeypatch.setattr(features, "_fetch_open_meteo", lambda *_args, **_kwargs: {"hourly": {"time": []}})
+
+    class FakeMLBStatsClient:
+        def get_team_game_log_stats(self, team_id: str, group: str, season: int):
+            return _team_log_rows(group)
+
+        def get_team_stat_splits(self, *_args, **_kwargs):
+            return {"stats": [{"splits": []}]}
+
+        def get_pitcher_game_log_stats(self, *_args, **_kwargs):
+            return {"stats": [{"splits": []}]}
+
+        def get_game_feed(self, *_args, **_kwargs):
+            return {}
+
+    monkeypatch.setattr(features, "MLBStatsClient", FakeMLBStatsClient)
+
+    def hydrate_schedule(session: Session, *_args, **_kwargs) -> int:
+        session.add(_fielding_test_game())
+        session.flush()
+        return 1
+
+    monkeypatch.setattr(features, "_hydrate_schedule_window", hydrate_schedule)
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    try:
+        with Session(engine) as session:
+            result = features.sync_mlb_features(session, date(2026, 7, 1))
+            team = session.scalar(
+                select(TeamDailyFeature)
+                .where(TeamDailyFeature.team_code == "PIT")
+                .where(TeamDailyFeature.source == features.MLB_STATS_SOURCE)
+            )
+            recent = session.scalar(
+                select(TeamRecentFeature)
+                .where(TeamRecentFeature.team_code == "PIT")
+                .where(TeamRecentFeature.window_days == 14)
+                .where(TeamRecentFeature.source == features.MLB_STATS_SOURCE)
+            )
+            snapshot = session.scalar(
+                select(MlbFeatureSnapshot)
+                .where(MlbFeatureSnapshot.source == features.FEATURE_VERSION)
+                .where(MlbFeatureSnapshot.mlb_game_id.is_not(None))
+            )
+            coverage = features.feature_coverage(session, date(2026, 7, 1))
+            detail = features.feature_detail(session, date(2026, 7, 1))
+            source_report = features.source_status_report(session)
+    finally:
+        get_settings.cache_clear()
+
+    assert result["validation_status"] == "ok"
+    assert team is not None
+    assert team.features["defense_season"]["source_status"] == "available"
+    assert team.features["defense_season"]["fielding_percentage"] is not None
+    assert team.features["defense_season"]["errors_per_game"] is not None
+    assert recent is not None
+    assert recent.features["defense_recent"]["source_status"] == "available"
+    assert recent.features["defense_recent"]["double_plays_per_game"] is not None
+    assert snapshot is not None
+    defense = snapshot.features["defense_catcher"]
+    assert defense["source_status"] == "partial"
+    assert defense["home"]["team_defense_season"]["source_status"] == "available"
+    assert defense["home"]["team_defense_recent"]["source_status"] == "available"
+    assert defense["home"]["catcher_starting_lineup"]["reason"] == "catcher unavailable because official lineup not posted yet"
+    assert defense["advanced_catcher_metrics"]["source_status"] == "unavailable"
+    assert defense["advanced_catcher_metrics"]["source"] == "not_configured"
+    assert defense["umpire"]["source_status"] == "excluded"
+    assert coverage["module_completeness"]["defense_catcher"]["partial"] == 1
+    assert detail["items"][0]["module_completeness"]["defense_catcher"]["status"] == "partial"
+    source_names = {item["source_name"]: item for item in source_report["source_health"]}
+    assert source_names["mlb_stats_api_fielding"]["status"] == "available"
+    assert source_names["catcher_from_official_lineup"]["status"] in {"missing", "not_attempted"}
+    assert source_names["advanced_catcher_metrics"]["status"] == "not_configured"
+    assert source_names["umpire"]["status"] == "excluded"
+
+
+def test_empty_fielding_logs_remain_partial_without_fabricated_zero_metrics() -> None:
+    fielding = features._aggregate_team_fielding_logs(
+        [{"date": "2026-06-30", "stat": {"gamesPlayed": 1}}],
+        1,
+    )
+    section = features._defense_feature_section(
+        fielding,
+        component="defense_season",
+        reason_available="team defense season from MLB Stats API fielding game logs",
+        reason_missing="team defense season missing because MLB Stats API fielding game logs were unavailable or empty",
+    )
+
+    assert fielding["game_count"] == 1
+    assert fielding["source_fields_present"] == []
+    assert fielding["errors"] is None
+    assert fielding["assists"] is None
+    assert fielding["putouts"] is None
+    assert fielding["double_plays"] is None
+    assert fielding["fielding_percentage"] is None
+    assert section["source_status"] == "partial"
+    assert section["reason"] == "MLB Stats API fielding logs returned games but limited fielding metrics."
+
+
+def test_incomplete_fielding_components_do_not_inflate_fielding_percentage() -> None:
+    fielding = features._aggregate_team_fielding_logs(
+        [{"date": "2026-06-30", "stat": {"putOuts": 27, "assists": 12}}],
+        1,
+    )
+    section = features._defense_feature_section(
+        fielding,
+        component="defense_season",
+        reason_available="team defense season from MLB Stats API fielding game logs",
+        reason_missing="team defense season missing because MLB Stats API fielding game logs were unavailable or empty",
+    )
+
+    assert fielding["source_fields_present"] == ["assists", "putOuts"]
+    assert fielding["chances"] is None
+    assert fielding["fielding_percentage"] is None
+    assert section["source_status"] == "partial"
+
+
+def test_fielding_only_logs_do_not_create_mlb_team_offense_cache() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    day = date(2026, 7, 1)
+    captured_at = datetime(2026, 7, 1, 15, 0, tzinfo=UTC)
+    fielding_payload = {
+        "stats": [
+            {
+                "splits": [
+                    {
+                        "date": "2026-06-30",
+                        "stat": {
+                            "errors": 1,
+                            "assists": 12,
+                            "putOuts": 27,
+                            "doublePlays": 1,
+                        },
+                    }
+                ]
+            }
+        ]
+    }
+
+    with Session(engine) as session:
+        game = _fielding_test_game()
+        session.add(game)
+        session.flush()
+        mlb_context = {"team_fielding_logs_by_id": {"134": fielding_payload}}
+
+        daily = features._upsert_mlb_primary_team_daily(
+            session,
+            game,
+            "home",
+            day,
+            captured_at,
+            mlb_context,
+            {"team_contact_by_code": {}},
+        )
+        recent = features._upsert_mlb_primary_team_recent(
+            session,
+            game,
+            "home",
+            day,
+            captured_at,
+            14,
+            mlb_context,
+            {"team_contact_by_code": {}},
+        )
+
+        persisted_daily = session.scalar(
+            select(TeamDailyFeature).where(TeamDailyFeature.source == features.MLB_STATS_SOURCE)
+        )
+        persisted_recent = session.scalar(
+            select(TeamRecentFeature).where(TeamRecentFeature.source == features.MLB_STATS_SOURCE)
+        )
+
+    assert daily is None
+    assert recent is None
+    assert persisted_daily is None
+    assert persisted_recent is None
+
+
+def test_caught_stealing_rate_requires_both_running_game_fields() -> None:
+    stolen_only = features._aggregate_team_fielding_logs(
+        [{"date": "2026-06-30", "stat": {"stolenBases": 2}}],
+        1,
+    )
+    caught_only = features._aggregate_team_fielding_logs(
+        [{"date": "2026-06-30", "stat": {"caughtStealing": 1}}],
+        1,
+    )
+    complete = features._aggregate_team_fielding_logs(
+        [{"date": "2026-06-30", "stat": {"stolenBases": 2, "caughtStealing": 1}}],
+        1,
+    )
+
+    assert stolen_only["stolen_bases_allowed"] == 2.0
+    assert stolen_only["caught_stealing"] is None
+    assert stolen_only["caught_stealing_rate"] is None
+    assert caught_only["stolen_bases_allowed"] is None
+    assert caught_only["caught_stealing"] == 1.0
+    assert caught_only["caught_stealing_rate"] is None
+    assert complete["caught_stealing_rate"] == 0.3333
+
+
+def test_fielding_fetch_failure_preserves_cached_defense_sections() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    day = date(2026, 7, 1)
+    cached_at = datetime(2026, 7, 1, 12, 0, tzinfo=UTC)
+    captured_at = datetime(2026, 7, 1, 15, 0, tzinfo=UTC)
+    cached_season = {
+        "component": "defense_season",
+        "source_status": "available",
+        "source": features.MLB_STATS_SOURCE,
+        "reason": "team defense season from MLB Stats API fielding game logs",
+        "fielding_percentage": 0.985,
+        "source_fields_present": ["errors", "putOuts", "assists"],
+    }
+    cached_recent = {
+        "component": "defense_recent",
+        "source_status": "available",
+        "source": features.MLB_STATS_SOURCE,
+        "reason": "team defense recent from MLB Stats API fielding game logs over 14 days",
+        "double_plays_per_game": 0.8,
+        "source_fields_present": ["doublePlays"],
+    }
+
+    with Session(engine) as session:
+        game = _fielding_test_game()
+        session.add(game)
+        session.flush()
+        session.add(
+            TeamDailyFeature(
+                target_date=day,
+                team_code="PIT",
+                captured_at=cached_at,
+                source=features.MLB_STATS_SOURCE,
+                source_status="available",
+                confidence=Decimal("0.8500"),
+                completeness=Decimal("0.8000"),
+                stale=False,
+                features={"defense_season": cached_season},
+            )
+        )
+        session.add(
+            TeamRecentFeature(
+                target_date=day,
+                team_code="PIT",
+                window_days=14,
+                captured_at=cached_at,
+                source=features.MLB_STATS_SOURCE,
+                source_status="available",
+                confidence=Decimal("0.8000"),
+                completeness=Decimal("0.7500"),
+                stale=False,
+                features={"defense_recent": cached_recent},
+            )
+        )
+        session.flush()
+        mlb_context = {
+            "team_hitting_logs_by_id": {"134": _team_log_rows("hitting")},
+            "team_pitching_logs_by_id": {"134": _team_log_rows("pitching")},
+        }
+
+        daily = features._upsert_mlb_primary_team_daily(
+            session,
+            game,
+            "home",
+            day,
+            captured_at,
+            mlb_context,
+            {"team_contact_by_code": {}},
+        )
+        recent = features._upsert_mlb_primary_team_recent(
+            session,
+            game,
+            "home",
+            day,
+            captured_at,
+            14,
+            mlb_context,
+            {"team_contact_by_code": {}},
+        )
+        defense_status = features._defense_db_status(session)
+        source_report = features.source_status_report(session)
+
+    assert daily is not None
+    assert recent is not None
+    assert daily.raw_payload["fielding_rows"] == 0
+    assert recent.raw_payload["fielding_rows"] == 0
+    assert daily.features["defense_season"]["fielding_percentage"] == cached_season["fielding_percentage"]
+    assert daily.features["defense_season"]["captured_at"] == cached_at.isoformat()
+    assert daily.features["defense_season"]["cache_reused_at"] == captured_at.isoformat()
+    assert daily.features["defense_season"]["stale"] is True
+    assert daily.features["defense_season"]["cache_reused"] is True
+    assert recent.features["defense_recent"]["double_plays_per_game"] == cached_recent["double_plays_per_game"]
+    assert recent.features["defense_recent"]["captured_at"] == cached_at.isoformat()
+    assert recent.features["defense_recent"]["cache_reused_at"] == captured_at.isoformat()
+    assert recent.features["defense_recent"]["stale"] is True
+    assert recent.features["defense_recent"]["cache_reused"] is True
+    assert defense_status["status"] == "cached"
+    assert defense_status["last_successful_sync"] == cached_at.isoformat()
+    assert defense_status["cache_reused_count"] == 2
+    source_health = {item["source_name"]: item for item in source_report["source_health"]}
+    assert source_health["mlb_stats_api_fielding"]["status"] == "cached"
+    assert source_health["mlb_stats_api_fielding"]["last_successful_sync"] == cached_at.isoformat()
+    assert source_health["mlb_stats_api_fielding"]["fallback_used"] is True
+    assert source_health["mlb_stats_api_fielding"]["fallback_source"] == "last_good_mlb_fielding_cache"
+
+
+def test_fielding_source_failure_degrades_defense_without_blocking_offense(monkeypatch) -> None:
+    monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "true")
+    get_settings.cache_clear()
+    _stub_pybaseball_unavailable(monkeypatch)
+    monkeypatch.setattr(features, "_fetch_open_meteo", lambda *_args, **_kwargs: {"hourly": {"time": []}})
+
+    class FakeMLBStatsClient:
+        def get_team_game_log_stats(self, team_id: str, group: str, season: int):
+            if group == "fielding":
+                raise RuntimeError("fielding source unavailable")
+            return _team_log_rows(group)
+
+        def get_team_stat_splits(self, *_args, **_kwargs):
+            return {"stats": [{"splits": []}]}
+
+        def get_pitcher_game_log_stats(self, *_args, **_kwargs):
+            return {"stats": [{"splits": []}]}
+
+        def get_game_feed(self, *_args, **_kwargs):
+            return {}
+
+    monkeypatch.setattr(features, "MLBStatsClient", FakeMLBStatsClient)
+
+    def hydrate_schedule(session: Session, *_args, **_kwargs) -> int:
+        session.add(_fielding_test_game())
+        session.flush()
+        return 1
+
+    monkeypatch.setattr(features, "_hydrate_schedule_window", hydrate_schedule)
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    try:
+        with Session(engine) as session:
+            result = features.sync_mlb_features(session, date(2026, 7, 1))
+            snapshot = session.scalar(
+                select(MlbFeatureSnapshot)
+                .where(MlbFeatureSnapshot.source == features.FEATURE_VERSION)
+                .where(MlbFeatureSnapshot.mlb_game_id.is_not(None))
+            )
+    finally:
+        get_settings.cache_clear()
+
+    assert result["validation_status"] == "degraded_with_errors"
+    assert any(error["table"] == "team_fielding_game_log" for error in result["errors"])
+    assert snapshot is not None
+    assert snapshot.features["offense_season"]["home"]["source_status"] == "available"
+    assert snapshot.features["defense_catcher"]["source_status"] == "missing"
+    assert snapshot.features["defense_catcher"]["home"]["team_defense_season"]["source_status"] == "missing"
+    assert "fielding game logs" in snapshot.features["defense_catcher"]["home"]["team_defense_season"]["reason"]
+
+
+def test_defense_catcher_infers_official_catcher_and_keeps_missing_reason() -> None:
+    captured_at = datetime(2026, 7, 1, 19, 0, tzinfo=UTC)
+    home_lineup = LineupSnapshot(
+        mlb_game_id=1,
+        target_date=date(2026, 7, 1),
+        team_code="PIT",
+        captured_at=captured_at,
+        source=features.MLB_STATS_SOURCE,
+        source_status="available",
+        confirmed=True,
+        features={"starters": [{"id": "44", "name": "Home Catcher", "position": "C"}]},
+    )
+    away_lineup = LineupSnapshot(
+        mlb_game_id=1,
+        target_date=date(2026, 7, 1),
+        team_code="SEA",
+        captured_at=captured_at,
+        source=features.MLB_STATS_SOURCE,
+        source_status="missing",
+        confirmed=False,
+        features={"starters": [], "missing_reason": features.LINEUP_NOT_POSTED_YET},
+    )
+
+    module = features._defense_catcher_module(None, None, None, None, home_lineup, away_lineup, captured_at)
+
+    assert module["source_status"] == "partial"
+    assert module["home"]["catcher_starting_lineup"]["source_status"] == "available"
+    assert module["home"]["catcher_starting_lineup"]["catcher"]["name"] == "Home Catcher"
+    assert module["away"]["catcher_starting_lineup"]["source_status"] == "missing"
+    assert module["away"]["catcher_starting_lineup"]["reason"] == "catcher unavailable because official lineup not posted yet"
+    assert module["advanced_catcher_metrics"]["reason"] == "advanced catcher metrics not configured/unavailable"
+    assert module["umpire"]["reason"] == "umpire factors excluded by design"
+
+
+def test_source_status_report_marks_catcher_partial_when_lineup_lacks_catcher() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    captured_at = datetime(2026, 7, 1, 19, 0, tzinfo=UTC)
+
+    with Session(engine) as session:
+        session.add(
+            LineupSnapshot(
+                mlb_game_id=1,
+                target_date=date(2026, 7, 1),
+                team_code="PIT",
+                captured_at=captured_at,
+                source=features.MLB_STATS_SOURCE,
+                source_status="partial",
+                confirmed=False,
+                features={
+                    "starters": [{"id": "11", "name": "Partial Starter", "position": "CF"}],
+                    "missing_reason": features.PARTIAL_LINEUP_POSTED,
+                },
+            )
+        )
+        session.commit()
+        report = features.source_status_report(session)
+
+    source_health = {item["source_name"]: item for item in report["source_health"]}
+    catcher_source = source_health["catcher_from_official_lineup"]
+    assert catcher_source["status"] == "partial"
+    assert catcher_source["last_successful_sync"] is None
+    assert catcher_source["last_attempted_sync"] == captured_at.isoformat()
+    assert catcher_source["sample_count"] == 1
 
 
 def test_feature_sync_hydrates_final_games_for_backfill(monkeypatch) -> None:
@@ -8525,6 +9120,116 @@ def test_pybaseball_ingestion_writes_available_advanced_rows_and_snapshots(monke
     assert report["pybaseball_available"] is True
     assert report["pybaseball_version"] == "2.2.7"
     assert report["advanced_stats_status"] == "available"
+
+
+def test_defense_catcher_reads_mlb_stats_row_when_offense_prefers_pybaseball() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    target_date = date(2026, 7, 1)
+    captured_at = datetime(2026, 7, 1, 20, 0, tzinfo=UTC)
+    defense_season = {
+        "component": "defense_season",
+        "source_status": "available",
+        "source": features.MLB_STATS_SOURCE,
+        "reason": "team defense season from MLB Stats API fielding game logs",
+        "fielding_percentage": 0.985,
+        "source_fields_present": ["errors", "putOuts", "assists"],
+    }
+    defense_recent = {
+        "component": "defense_recent",
+        "source_status": "available",
+        "source": features.MLB_STATS_SOURCE,
+        "reason": "team defense recent from MLB Stats API fielding game logs over 14 days",
+        "double_plays_per_game": 0.8,
+        "source_fields_present": ["doublePlays"],
+    }
+
+    with Session(engine) as session:
+        game = MlbGame(
+            external_game_id="defense-source-specific-1",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+            status="scheduled",
+        )
+        session.add(game)
+        session.flush()
+        session.add_all(
+            [
+                TeamDailyFeature(
+                    target_date=target_date,
+                    team_code="PIT",
+                    captured_at=captured_at,
+                    source=features.PYBASEBALL_SOURCE,
+                    source_status="available",
+                    confidence=Decimal("0.9000"),
+                    completeness=Decimal("0.9000"),
+                    stale=False,
+                    features={"runs_per_game": 5.0, "source_status": "available"},
+                ),
+                TeamDailyFeature(
+                    target_date=target_date,
+                    team_code="PIT",
+                    captured_at=captured_at - timedelta(hours=1),
+                    source=features.MLB_STATS_SOURCE,
+                    source_status="partial",
+                    confidence=Decimal("0.4500"),
+                    completeness=Decimal("0.4500"),
+                    stale=False,
+                    features={"defense_season": defense_season},
+                ),
+                TeamRecentFeature(
+                    target_date=target_date,
+                    team_code="PIT",
+                    window_days=14,
+                    captured_at=captured_at,
+                    source=features.DERIVED_SOURCE,
+                    source_status="available",
+                    confidence=Decimal("0.9000"),
+                    completeness=Decimal("0.9000"),
+                    stale=False,
+                    features={"runs_per_game": 4.8},
+                ),
+                TeamRecentFeature(
+                    target_date=target_date,
+                    team_code="PIT",
+                    window_days=14,
+                    captured_at=captured_at - timedelta(hours=1),
+                    source=features.MLB_STATS_SOURCE,
+                    source_status="partial",
+                    confidence=Decimal("0.4000"),
+                    completeness=Decimal("0.4000"),
+                    stale=False,
+                    features={"defense_recent": defense_recent},
+                ),
+            ]
+        )
+        market = KalshiMarket(
+            kalshi_market_id="KX-DEFENSE-SOURCE",
+            ticker="KXMLBGAME-DEFENSE-SOURCE-PIT",
+            title="Will Pittsburgh win?",
+            status="open",
+            market_family="full_game_winner",
+        )
+        mapping = MarketMapping(
+            mlb_game_id=game.id,
+            kalshi_market_id=1,
+            mapping_status="confirmed",
+            confidence=Decimal("0.9500"),
+            market_family="full_game_winner",
+            selection_code="PIT",
+        )
+        snapshot = features.build_feature_snapshot(game, market, mapping, session=session, now=captured_at)
+
+    assert snapshot["offense_season"]["home"]["source"] == features.PYBASEBALL_SOURCE
+    assert snapshot["offense_recent"]["home"]["source"] == features.DERIVED_SOURCE
+    defense = snapshot["defense_catcher"]["home"]
+    assert defense["team_defense_season"]["source"] == features.MLB_STATS_SOURCE
+    assert defense["team_defense_season"]["fielding_percentage"] == 0.985
+    assert defense["team_defense_recent"]["source"] == features.MLB_STATS_SOURCE
+    assert defense["team_defense_recent"]["double_plays_per_game"] == 0.8
 
 
 def test_handedness_platoon_requires_actual_split_values() -> None:
@@ -12654,6 +13359,38 @@ def test_data_quality_caps_missing_critical_modules() -> None:
     assert snapshot["data_quality"] <= 0.60
     assert "CAP_BOTH_STARTERS_MISSING" in snapshot["data_quality_reason"]
     assert "CAP_OFFENSE_SEASON_AND_RECENT_MISSING" in snapshot["data_quality_reason"]
+
+
+def test_defense_catcher_diagnostics_do_not_change_model_quality() -> None:
+    base_features = {
+        module_name: {"source_status": "available", "completeness": 1.0}
+        for module_name in features.QUALITY_WEIGHTS[features.FULL_GAME_WINNER]
+    }
+    missing_defense_features = {
+        **base_features,
+        "defense_catcher": {"source_status": "missing", "completeness": 0.0},
+    }
+    available_defense_features = {
+        **base_features,
+        "defense_catcher": {"source_status": "available", "completeness": 1.0},
+    }
+
+    missing_quality, missing_summary = features._quality_score(
+        missing_defense_features,
+        features.FULL_GAME_WINNER,
+        180,
+    )
+    available_quality, available_summary = features._quality_score(
+        available_defense_features,
+        features.FULL_GAME_WINNER,
+        180,
+    )
+
+    assert "defense_catcher" not in features.QUALITY_WEIGHTS[features.FULL_GAME_WINNER]
+    assert missing_quality == available_quality
+    assert missing_summary["module_scores"] == available_summary["module_scores"]
+    assert missing_summary["source_statuses"]["defense_catcher"] == "missing"
+    assert available_summary["source_statuses"]["defense_catcher"] == "available"
 
 
 def test_first_five_expected_runs_use_starter_context_not_static_share() -> None:
