@@ -1429,6 +1429,7 @@ def _apply_trade_caps(
     enforce_slate_cap: bool = True,
     enforce_sweep_cap: bool = True,
     enforce_time_reserve: bool = True,
+    enforce_open_position_cap: bool = True,
     enforce_low_price_new_caps: bool = True,
     enforce_side_new_caps: bool = True,
 ) -> tuple[list[TradeIntent], dict[str, int], dict[str, object]]:
@@ -1494,7 +1495,7 @@ def _apply_trade_caps(
         elif enforce_time_reserve and early_window and existing_slate + len(selected) >= early_allowed:
             candidate.decision = "no_trade_time_bucket_reserve"
             _update_gate(candidate, "gate_caps_ok", False)
-        elif open_positions + len(selected) >= settings.paper_max_open_positions:
+        elif enforce_open_position_cap and open_positions + len(selected) >= settings.paper_max_open_positions:
             candidate.decision = "no_trade_open_position_cap"
             _update_gate(candidate, "gate_open_position_ok", False)
         elif game_id is not None and game_counts.get(game_id, 0) >= settings.paper_max_trades_per_game:
@@ -1698,6 +1699,8 @@ def _apply_aggregate_risk_caps(
     bankroll: Decimal,
     existing_slate_trades: int = 0,
     max_slate_trades: int | None = None,
+    existing_open_positions: int = 0,
+    max_open_positions: int | None = None,
     max_new_trades: int | None = None,
     max_early_new_trades: int | None = None,
     existing_low_price_trades: int = 0,
@@ -1728,6 +1731,7 @@ def _apply_aggregate_risk_caps(
         "no_trade_low_price_bucket_risk_cap": 0,
         "no_trade_post_cap_size_too_small": 0,
         "no_trade_slate_cap": 0,
+        "no_trade_open_position_cap": 0,
         "no_trade_sweep_cap_reached": 0,
         "no_trade_time_bucket_reserve": 0,
         "no_trade_low_price_slate_cap": 0,
@@ -1780,6 +1784,13 @@ def _apply_aggregate_risk_caps(
             candidate.decision = "no_trade_slate_cap"
             _update_gate(candidate, "gate_caps_ok", False)
             cap_counts["no_trade_slate_cap"] += 1
+            session.add(candidate)
+            continue
+
+        if max_open_positions is not None and existing_open_positions + len(selected) >= max_open_positions:
+            candidate.decision = "no_trade_open_position_cap"
+            _update_gate(candidate, "gate_open_position_ok", False)
+            cap_counts["no_trade_open_position_cap"] += 1
             session.add(candidate)
             continue
 
@@ -1859,6 +1870,8 @@ def _apply_aggregate_risk_caps(
         "low_price_bucket_risk_max": float(limits["low_price"]),
         "existing_slate_trades": existing_slate_trades,
         "max_slate_trades": max_slate_trades,
+        "existing_open_positions": existing_open_positions,
+        "max_open_positions": max_open_positions,
         "max_new_trades_per_sweep": max_new_trades,
         "max_early_new_trades": max_early_new_trades,
         "existing_low_price_trades": existing_low_price_trades,
@@ -2831,6 +2844,7 @@ def generate_candidates(
         enforce_slate_cap=False,
         enforce_sweep_cap=False,
         enforce_time_reserve=False,
+        enforce_open_position_cap=False,
         enforce_low_price_new_caps=False,
         enforce_side_new_caps=False,
     )
@@ -2921,6 +2935,8 @@ def generate_candidates(
         bankroll=bankroll_for_sizing,
         existing_slate_trades=int(trade_allocation_summary["existing_slate_trades"]),
         max_slate_trades=settings.paper_max_trades_per_slate,
+        existing_open_positions=int(trade_allocation_summary["existing_open_trades"]),
+        max_open_positions=settings.paper_max_open_positions,
         max_new_trades=settings.paper_max_new_trades_per_sweep,
         max_early_new_trades=max_early_new_trades,
         existing_low_price_trades=int(trade_allocation_summary["low_price_existing_slate"]),
@@ -2936,6 +2952,8 @@ def generate_candidates(
         "pre_sizing_low_price_candidates_after_preliminary_caps": trade_allocation_summary["low_price_new_this_sweep"],
         "new_trades_this_sweep": len(risk_selected_trades),
         "slate_trades_after_sizing_and_risk": int(trade_allocation_summary["existing_slate_trades"])
+        + len(risk_selected_trades),
+        "open_positions_after_sizing_and_risk": int(trade_allocation_summary["existing_open_trades"])
         + len(risk_selected_trades),
         "early_window_used": int(trade_allocation_summary["existing_slate_trades"]) + len(risk_selected_trades)
         if trade_allocation_summary["early_window"]
