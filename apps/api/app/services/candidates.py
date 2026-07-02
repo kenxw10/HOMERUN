@@ -1426,6 +1426,7 @@ def _apply_trade_caps(
     day_end: datetime,
     epoch_id: int | None,
     *,
+    enforce_slate_cap: bool = True,
     enforce_sweep_cap: bool = True,
     enforce_time_reserve: bool = True,
     enforce_low_price_new_caps: bool = True,
@@ -1484,7 +1485,7 @@ def _apply_trade_caps(
         if intent.market.ticker in market_tickers:
             candidate.decision = "no_trade_correlated_market_cap"
             _update_gate(candidate, "gate_caps_ok", False)
-        elif existing_slate + len(selected) >= settings.paper_max_trades_per_slate:
+        elif enforce_slate_cap and existing_slate + len(selected) >= settings.paper_max_trades_per_slate:
             candidate.decision = "no_trade_slate_cap"
             _update_gate(candidate, "gate_caps_ok", False)
         elif enforce_sweep_cap and len(selected) >= settings.paper_max_new_trades_per_sweep:
@@ -1695,6 +1696,8 @@ def _apply_aggregate_risk_caps(
     day_end: datetime,
     epoch_id: int | None,
     bankroll: Decimal,
+    existing_slate_trades: int = 0,
+    max_slate_trades: int | None = None,
     max_new_trades: int | None = None,
     max_early_new_trades: int | None = None,
     existing_low_price_trades: int = 0,
@@ -1724,6 +1727,7 @@ def _apply_aggregate_risk_caps(
         "no_trade_scope_risk_cap": 0,
         "no_trade_low_price_bucket_risk_cap": 0,
         "no_trade_post_cap_size_too_small": 0,
+        "no_trade_slate_cap": 0,
         "no_trade_sweep_cap_reached": 0,
         "no_trade_time_bucket_reserve": 0,
         "no_trade_low_price_slate_cap": 0,
@@ -1770,6 +1774,13 @@ def _apply_aggregate_risk_caps(
 
         if _reject_post_cap_size_if_needed(session, intent):
             cap_counts["no_trade_post_cap_size_too_small"] += 1
+            continue
+
+        if max_slate_trades is not None and existing_slate_trades + len(selected) >= max_slate_trades:
+            candidate.decision = "no_trade_slate_cap"
+            _update_gate(candidate, "gate_caps_ok", False)
+            cap_counts["no_trade_slate_cap"] += 1
+            session.add(candidate)
             continue
 
         if max_new_trades is not None and len(selected) >= max_new_trades:
@@ -1846,6 +1857,8 @@ def _apply_aggregate_risk_caps(
         "scope_risk_max": float(limits["scope"]),
         "low_price_bucket_risk_used": float(low_price_used),
         "low_price_bucket_risk_max": float(limits["low_price"]),
+        "existing_slate_trades": existing_slate_trades,
+        "max_slate_trades": max_slate_trades,
         "max_new_trades_per_sweep": max_new_trades,
         "max_early_new_trades": max_early_new_trades,
         "existing_low_price_trades": existing_low_price_trades,
@@ -2815,6 +2828,7 @@ def generate_candidates(
         day_start,
         day_end,
         active_epoch.id,
+        enforce_slate_cap=False,
         enforce_sweep_cap=False,
         enforce_time_reserve=False,
         enforce_low_price_new_caps=False,
@@ -2905,6 +2919,8 @@ def generate_candidates(
         day_end=day_end,
         epoch_id=active_epoch.id,
         bankroll=bankroll_for_sizing,
+        existing_slate_trades=int(trade_allocation_summary["existing_slate_trades"]),
+        max_slate_trades=settings.paper_max_trades_per_slate,
         max_new_trades=settings.paper_max_new_trades_per_sweep,
         max_early_new_trades=max_early_new_trades,
         existing_low_price_trades=int(trade_allocation_summary["low_price_existing_slate"]),
@@ -2919,6 +2935,8 @@ def generate_candidates(
         "pre_sizing_candidates_after_preliminary_caps": trade_allocation_summary["new_trades_this_sweep"],
         "pre_sizing_low_price_candidates_after_preliminary_caps": trade_allocation_summary["low_price_new_this_sweep"],
         "new_trades_this_sweep": len(risk_selected_trades),
+        "slate_trades_after_sizing_and_risk": int(trade_allocation_summary["existing_slate_trades"])
+        + len(risk_selected_trades),
         "early_window_used": int(trade_allocation_summary["existing_slate_trades"]) + len(risk_selected_trades)
         if trade_allocation_summary["early_window"]
         else None,
