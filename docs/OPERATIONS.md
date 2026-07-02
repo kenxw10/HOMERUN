@@ -87,6 +87,7 @@ The jobs currently cover:
 - Market-family mapping sync that promotes only cleanly parsed supported families to `paper_supported`.
 - REST last-mark refresh for open paper positions.
 - Strict paper trade caps by slate, game, market family, open-position count, correlated game/family exposure, and aggregate bankroll risk. Defaults are 8 trades per slate, 4 per family, 12 open positions, 20% daily new risk, 25% open risk, 10% family risk, 15% scope risk, and 8% sub-20c low-price bucket risk.
+- PR3k adds stricter paper selection controls: first-five `TIE` is diagnostics-only, sub-10c prices are blocked, 10c-under-20c prices need stronger EV/edge and have low-price slate/sweep caps, each sweep opens at most 3 new trades by default, early sweeps reserve later slots, same-side exposure is capped by default, and risk-cap-reduced positions must still meet minimum size.
 - Spread markets are diagnostics-only unless `PAPER_SPREAD_TRADING_ENABLED=true`. Do not enable spread paper trading until side-aware spread parsing and settlement have been manually verified against the Kalshi UI.
 
 They do not cover scheduled automation or live execution.
@@ -192,6 +193,34 @@ After deployment, validate:
 13. No live execution path or live order placement is enabled.
 
 PR3i widens the persisted candidate decision field so post-eligibility rejection reasons from line selection, same-game/scope correlation, and caps can be saved safely. After deploying and running `alembic upgrade head`, include one normal non-dry candidate-sweep validation during the 45-180 minute window and confirm it completes without `StringDataRightTruncation`; paper trades should open only if the existing gates and caps allow them.
+
+## PR3k Selection And Sizing Controls
+
+Candidate-sweep remains feature-cache-only. Daily setup still owns heavy feature sync; the repeating sweep must not run full MLB feature sync, pybaseball, FanGraphs, Statcast/Savant, Open-Meteo, sportsbook APIs, team totals, or umpire logic.
+
+Default paper controls:
+
+- `PAPER_MIN_TRADE_PRICE=0.10`
+- `PAPER_LOW_PRICE_THRESHOLD=0.20`
+- `PAPER_LOW_PRICE_MIN_NET_EV=0.08`
+- `PAPER_LOW_PRICE_MIN_PROB_EDGE=0.05`
+- `PAPER_LOW_PRICE_MAX_TRADES_PER_SLATE=2`
+- `PAPER_LOW_PRICE_MAX_TRADES_PER_SWEEP=1`
+- `PAPER_MAX_NEW_TRADES_PER_SWEEP=3`
+- `PAPER_MAX_NEW_TRADES_BEFORE_3PM_ET=4`
+- `PAPER_RESERVE_TRADES_AFTER_3PM_ET=2`
+- `PAPER_MIN_POST_CAP_CONTRACTS=5`
+- `PAPER_MIN_POST_CAP_NOTIONAL=2.00`
+- `PAPER_MAX_SAME_SIDE_TRADES_PER_SLATE=6`
+
+After deployment, validate:
+
+1. The next windowed `candidate-sweep` result includes `trade_allocation` and `low_price_controls`.
+2. First-five `TIE` candidates use `no_trade_f5_tie_disabled` and do not create paper trades.
+3. Sub-10c candidates use `no_trade_price_below_floor`.
+4. Early sweeps report reserved later slots and do not consume all daily slots.
+5. Dashboard open/closed position tables show side, entry cost, current/exit value, fee, mark time, and P/L.
+6. No live execution, WebSocket, spread activation, cron schedule, feature threshold, EV/model, settlement, market discovery, sportsbook, team-total, umpire, or defense behavior changed.
 
 ## PR3g Candidate-Stage Quality And EV Diagnostics
 

@@ -65,6 +65,12 @@ type PositionSummary = {
   entry_price: number;
   exit_price: number | null;
   current_price: number | null;
+  entry_notional: number | null;
+  entry_total_cost: number | null;
+  current_value: number | null;
+  exit_value: number | null;
+  fee_paid: number | null;
+  estimated_fee: number | null;
   current_price_updated_at: string | null;
   current_price_updated_at_display: string | null;
   quantity: number;
@@ -1132,6 +1138,9 @@ function PositionsTable({ positions }: { positions: PositionSummary[] }) {
               <th>SIDE</th>
               <th>ENTRY PRICE</th>
               <th>CURRENT PRICE</th>
+              <th>ENTRY COST</th>
+              <th>CURRENT VALUE</th>
+              <th>FEE</th>
               <th>LAST MARK TIME</th>
               <th>QTY</th>
               <th>P/L ($)</th>
@@ -1144,7 +1153,7 @@ function PositionsTable({ positions }: { positions: PositionSummary[] }) {
           <tbody>
             {positions.length === 0 ? (
               <tr>
-                <td colSpan={12} className="table-empty">
+                <td colSpan={15} className="table-empty">
                   <b>NO OPEN POSITIONS</b>
                   <span>PAPER TRADING HAS NOT TAKEN ANY POSITIONS YET.</span>
                 </td>
@@ -1164,8 +1173,6 @@ function PositionsTable({ positions }: { positions: PositionSummary[] }) {
                     {positionRationaleLabel(position) ? (
                       <span className="market-secondary">{positionRationaleLabel(position)}</span>
                     ) : null}
-                    {position.display_title ? <span className="market-secondary">{position.display_title}</span> : null}
-                    {position.display_subtitle ? <span className="market-secondary">{position.display_subtitle}</span> : null}
                     <span
                       className="market-secondary"
                       title={position.raw_ticker_display ?? position.market_ticker ?? position.market}
@@ -1176,6 +1183,9 @@ function PositionsTable({ positions }: { positions: PositionSummary[] }) {
                   <td>{position.side.toUpperCase()}</td>
                   <td>{formatPrice(position.entry_price)}</td>
                   <td>{formatPrice(position.current_price)}</td>
+                  <td>{formatCurrency(position.entry_total_cost ?? position.entry_notional)}</td>
+                  <td>{formatCurrency(position.current_value)}</td>
+                  <td>{formatCurrency(position.fee_paid ?? position.estimated_fee)}</td>
                   <td>{position.current_price_updated_at_display ?? formatEastern(position.current_price_updated_at)}</td>
                   <td>{position.quantity}</td>
                   <td className={pctClass(position.profit_loss)}>{formatSignedCurrency(position.profit_loss)}</td>
@@ -1244,6 +1254,9 @@ function ClosedPositionsTable({
               <th>SIDE</th>
               <th>ENTRY PRICE</th>
               <th>EXIT PRICE</th>
+              <th>ENTRY COST</th>
+              <th>EXIT VALUE</th>
+              <th>FEE</th>
               <th>QTY</th>
               <th>P/L ($)</th>
               <th>P/L (%)</th>
@@ -1255,7 +1268,7 @@ function ClosedPositionsTable({
           <tbody>
             {positions.length === 0 ? (
               <tr>
-                <td colSpan={12} className="table-empty">
+                <td colSpan={15} className="table-empty">
                   <b>NO CLOSED POSITIONS FOR SELECTED DATE</b>
                   <span>{formatDateButton(selectedDate)}</span>
                 </td>
@@ -1276,8 +1289,6 @@ function ClosedPositionsTable({
                     {positionRationaleLabel(position) ? (
                       <span className="market-secondary">{positionRationaleLabel(position)}</span>
                     ) : null}
-                    {position.display_title ? <span className="market-secondary">{position.display_title}</span> : null}
-                    {position.display_subtitle ? <span className="market-secondary">{position.display_subtitle}</span> : null}
                     <span
                       className="market-secondary"
                       title={position.raw_ticker_display ?? position.market_ticker ?? position.market}
@@ -1288,6 +1299,9 @@ function ClosedPositionsTable({
                   <td>{position.side.toUpperCase()}</td>
                   <td>{formatPrice(position.entry_price)}</td>
                   <td>{formatPrice(position.exit_price)}</td>
+                  <td>{formatCurrency(position.entry_total_cost ?? position.entry_notional)}</td>
+                  <td>{formatCurrency(position.exit_value ?? position.current_value)}</td>
+                  <td>{formatCurrency(position.fee_paid ?? position.estimated_fee)}</td>
                   <td>{position.quantity}</td>
                   <td className={pctClass(position.profit_loss)}>{formatSignedCurrency(position.profit_loss)}</td>
                   <td className={pctClass(position.profit_loss_percent)}>{formatPercent(position.profit_loss_percent)}</td>

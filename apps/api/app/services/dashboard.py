@@ -139,11 +139,16 @@ def _position_from_trade(
     candidate: ModelCandidate | None = None,
 ) -> PositionSummary:
     current = _first_decimal(trade.exit_price, trade.current_price, trade.entry_price)
-    cost_basis = (trade.entry_price * trade.quantity) + paper_trade_fee(trade)
+    quantity = Decimal(trade.quantity)
+    fee = paper_trade_fee(trade)
+    entry_notional = (trade.entry_price * quantity).quantize(Decimal("0.01"))
+    cost_basis = (entry_notional + fee).quantize(Decimal("0.01"))
+    current_value = (current * quantity).quantize(Decimal("0.01"))
+    exit_value = (trade.exit_price * quantity).quantize(Decimal("0.01")) if trade.exit_price is not None else None
     pnl = (
         trade.realized_pnl
         if trade.realized_pnl is not None
-        else ((current * trade.quantity) - cost_basis).quantize(Decimal("0.01"))
+        else (current_value - cost_basis).quantize(Decimal("0.01"))
     )
     pnl_percent = (pnl / cost_basis).quantize(Decimal("0.0001")) if cost_basis else None
     fallback_labels = contract_labels(
@@ -190,6 +195,12 @@ def _position_from_trade(
         entry_price=float(trade.entry_price),
         exit_price=float(trade.exit_price) if trade.exit_price is not None else None,
         current_price=float(current),
+        entry_notional=float(entry_notional),
+        entry_total_cost=float(cost_basis),
+        current_value=float(current_value),
+        exit_value=float(exit_value) if exit_value is not None else None,
+        fee_paid=_float(trade.fee_paid),
+        estimated_fee=_float(trade.total_fee_estimate if trade.total_fee_estimate is not None else fee),
         current_price_updated_at=to_eastern_iso(trade.current_price_updated_at),
         current_price_updated_at_display=eastern_display(trade.current_price_updated_at),
         quantity=trade.quantity,
@@ -205,7 +216,10 @@ def _position_from_trade(
 
 def _position_from_position(position: Position) -> PositionSummary:
     current = position.current_price if position.current_price is not None else position.entry_price
-    pnl = ((current - position.entry_price) * position.quantity).quantize(Decimal("0.01"))
+    quantity = Decimal(position.quantity)
+    entry_notional = (position.entry_price * quantity).quantize(Decimal("0.01"))
+    current_value = (current * quantity).quantize(Decimal("0.01"))
+    pnl = (current_value - entry_notional).quantize(Decimal("0.01"))
     pnl_percent = ((current - position.entry_price) / position.entry_price).quantize(Decimal("0.0001")) if position.entry_price else None
     fallback_labels = contract_labels(
         game=None,
@@ -234,6 +248,12 @@ def _position_from_position(position: Position) -> PositionSummary:
         entry_price=float(position.entry_price),
         exit_price=None,
         current_price=float(current),
+        entry_notional=float(entry_notional),
+        entry_total_cost=float(entry_notional),
+        current_value=float(current_value),
+        exit_value=None,
+        fee_paid=None,
+        estimated_fee=0.0,
         current_price_updated_at=None,
         current_price_updated_at_display=None,
         quantity=position.quantity,

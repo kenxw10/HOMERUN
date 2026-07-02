@@ -669,3 +669,12 @@ Every future PR must update this section with:
 - Added tests that scan candidate-engine decision strings against the persisted schema length and exercise the same-game/scope correlation rejection path through flush/commit without creating paper trades.
 - Validation commands: `apps/api/.venv/Scripts/python.exe -m ruff check .`, `apps/api/.venv/Scripts/python.exe -m compileall app`, and `apps/api/.venv/Scripts/python.exe -m pytest`.
 - No trading logic, EV/model threshold, paper risk-cap, candidate ranking, starter hydration, market discovery, WebSocket, cron schedule, live execution, credential, full-game spread activation, sportsbook, team-total, or umpire change was added.
+
+### PR3k - Paper Selection, Sizing, and Dashboard Controls
+
+- First-five winner `TIE` markets remain discoverable and scorable for diagnostics, but paper trading is disabled with `no_trade_f5_tie_disabled`.
+- Tail-price controls now block sub-10c paper entries with `no_trade_price_below_floor` and apply stricter thresholds for 10c-under-20c contracts: `PAPER_LOW_PRICE_MIN_NET_EV=0.08`, `PAPER_LOW_PRICE_MIN_PROB_EDGE=0.05`, `PAPER_LOW_PRICE_MAX_TRADES_PER_SLATE=2`, and `PAPER_LOW_PRICE_MAX_TRADES_PER_SWEEP=1`.
+- Candidate sweeps keep the daily cap, but now also enforce `PAPER_MAX_NEW_TRADES_PER_SWEEP=3`, early-day reservation with `PAPER_MAX_NEW_TRADES_BEFORE_3PM_ET=4` and `PAPER_RESERVE_TRADES_AFTER_3PM_ET=2`, optional same-side concentration via `PAPER_MAX_SAME_SIDE_TRADES_PER_SLATE=6`, and post-cap minimum size with `PAPER_MIN_POST_CAP_CONTRACTS=5` / `PAPER_MIN_POST_CAP_NOTIONAL=2.00`.
+- Daily, low-price, and side cap accounting counts same-day paper trades in the active epoch even after settlement, so early resolved trades do not reopen same-day slots.
+- Dashboard position summaries now expose side, entry notional, fee-aware entry total cost, current/exit value, fee paid/estimated fee, mark timestamp, and realized P/L. The frontend keeps compact tables and removes duplicate middle market description text.
+- PR3k does not change candidate-sweep timing, cache-only feature behavior, EV/probability math, settlement, market discovery, WebSocket, live execution, credentials, sportsbook/Odds API logic, team totals, umpire factors, defense modules, full-game spread activation, or production cron schedules.

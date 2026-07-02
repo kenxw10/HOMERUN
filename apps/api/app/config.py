@@ -72,6 +72,18 @@ class Settings(BaseSettings):
     )
     paper_max_open_positions: int = Field(default=12, alias="PAPER_MAX_OPEN_POSITIONS")
     paper_spread_trading_enabled: bool = Field(default=False, alias="PAPER_SPREAD_TRADING_ENABLED")
+    paper_min_trade_price: Decimal = Field(default=Decimal("0.10"), alias="PAPER_MIN_TRADE_PRICE")
+    paper_low_price_threshold: Decimal = Field(default=Decimal("0.20"), alias="PAPER_LOW_PRICE_THRESHOLD")
+    paper_low_price_max_trades_per_slate: int = Field(default=2, alias="PAPER_LOW_PRICE_MAX_TRADES_PER_SLATE")
+    paper_low_price_max_trades_per_sweep: int = Field(default=1, alias="PAPER_LOW_PRICE_MAX_TRADES_PER_SWEEP")
+    paper_low_price_min_net_ev: Decimal = Field(default=Decimal("0.08"), alias="PAPER_LOW_PRICE_MIN_NET_EV")
+    paper_low_price_min_prob_edge: Decimal = Field(default=Decimal("0.05"), alias="PAPER_LOW_PRICE_MIN_PROB_EDGE")
+    paper_min_post_cap_contracts: int = Field(default=5, alias="PAPER_MIN_POST_CAP_CONTRACTS")
+    paper_min_post_cap_notional: Decimal = Field(default=Decimal("2.00"), alias="PAPER_MIN_POST_CAP_NOTIONAL")
+    paper_max_new_trades_per_sweep: int = Field(default=3, alias="PAPER_MAX_NEW_TRADES_PER_SWEEP")
+    paper_max_new_trades_before_3pm_et: int = Field(default=4, alias="PAPER_MAX_NEW_TRADES_BEFORE_3PM_ET")
+    paper_reserve_trades_after_3pm_et: int = Field(default=2, alias="PAPER_RESERVE_TRADES_AFTER_3PM_ET")
+    paper_max_same_side_trades_per_slate: int = Field(default=6, alias="PAPER_MAX_SAME_SIDE_TRADES_PER_SLATE")
     paper_max_daily_new_risk_pct: Decimal = Field(default=Decimal("0.20"), alias="PAPER_MAX_DAILY_NEW_RISK_PCT")
     paper_max_open_risk_pct: Decimal = Field(default=Decimal("0.25"), alias="PAPER_MAX_OPEN_RISK_PCT")
     paper_max_market_family_risk_pct: Decimal = Field(default=Decimal("0.10"), alias="PAPER_MAX_MARKET_FAMILY_RISK_PCT")
@@ -200,6 +212,13 @@ class Settings(BaseSettings):
         "paper_max_trades_per_game_family",
         "paper_max_trades_per_game_scope",
         "paper_max_open_positions",
+        "paper_low_price_max_trades_per_slate",
+        "paper_low_price_max_trades_per_sweep",
+        "paper_min_post_cap_contracts",
+        "paper_max_new_trades_per_sweep",
+        "paper_max_new_trades_before_3pm_et",
+        "paper_reserve_trades_after_3pm_et",
+        "paper_max_same_side_trades_per_slate",
         "paper_min_contracts",
         "paper_max_contracts_per_trade",
         "paper_max_price_staleness_seconds",
@@ -220,6 +239,11 @@ class Settings(BaseSettings):
     @field_validator(
         "paper_min_net_ev",
         "paper_min_prob_edge",
+        "paper_min_trade_price",
+        "paper_low_price_threshold",
+        "paper_low_price_min_net_ev",
+        "paper_low_price_min_prob_edge",
+        "paper_min_post_cap_notional",
         "paper_min_data_quality",
         "paper_observation_min_data_quality",
         "live_min_data_quality",
