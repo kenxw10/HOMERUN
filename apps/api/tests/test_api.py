@@ -13361,6 +13361,38 @@ def test_data_quality_caps_missing_critical_modules() -> None:
     assert "CAP_OFFENSE_SEASON_AND_RECENT_MISSING" in snapshot["data_quality_reason"]
 
 
+def test_defense_catcher_diagnostics_do_not_change_model_quality() -> None:
+    base_features = {
+        module_name: {"source_status": "available", "completeness": 1.0}
+        for module_name in features.QUALITY_WEIGHTS[features.FULL_GAME_WINNER]
+    }
+    missing_defense_features = {
+        **base_features,
+        "defense_catcher": {"source_status": "missing", "completeness": 0.0},
+    }
+    available_defense_features = {
+        **base_features,
+        "defense_catcher": {"source_status": "available", "completeness": 1.0},
+    }
+
+    missing_quality, missing_summary = features._quality_score(
+        missing_defense_features,
+        features.FULL_GAME_WINNER,
+        180,
+    )
+    available_quality, available_summary = features._quality_score(
+        available_defense_features,
+        features.FULL_GAME_WINNER,
+        180,
+    )
+
+    assert "defense_catcher" not in features.QUALITY_WEIGHTS[features.FULL_GAME_WINNER]
+    assert missing_quality == available_quality
+    assert missing_summary["module_scores"] == available_summary["module_scores"]
+    assert missing_summary["source_statuses"]["defense_catcher"] == "missing"
+    assert available_summary["source_statuses"]["defense_catcher"] == "available"
+
+
 def test_first_five_expected_runs_use_starter_context_not_static_share() -> None:
     game = MlbGame(
         external_game_id="f5-share-1",
