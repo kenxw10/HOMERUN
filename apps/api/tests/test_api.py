@@ -16948,12 +16948,13 @@ def test_market_family_mapping_sync_promotes_only_parseable_supported_families()
                     family_key="full_game_spread",
                     returned_ticker="KXMLBSPREAD-26JUL011900SEAPIT-PIT-1.5",
                     returned_event_ticker="KXMLBSPREAD-26JUL011900SEAPIT",
-                    title="Pittsburgh Pirates spread -1.5 vs Seattle Mariners",
-                    yes_sub_title="Pittsburgh -1.5",
-                    no_sub_title="Seattle +1.5",
-                    raw_status="open",
-                    confidence=Decimal("0.9500"),
-                    line_value=Decimal("-1.5000"),
+                title="Pittsburgh Pirates spread -1.5 vs Seattle Mariners",
+                yes_sub_title="Pittsburgh -1.5",
+                no_sub_title="Seattle +1.5",
+                rules_primary="If Pittsburgh wins by exactly 1 run, the market pushes and contracts are void.",
+                raw_status="open",
+                confidence=Decimal("0.9500"),
+                line_value=Decimal("-1.5000"),
                     selection_code="PIT",
                 ),
                 MarketFamilyDiscoveryItem(
@@ -17069,6 +17070,7 @@ def test_market_family_mapping_parses_event_level_spread_selection_from_yes_text
                 title="Seattle Mariners vs Pittsburgh Pirates run line",
                 yes_sub_title="Pittsburgh -1.5",
                 no_sub_title="Seattle +1.5",
+                rules_primary="If Pittsburgh wins by exactly 1 run, the market pushes and contracts are void.",
                 raw_status="open",
                 confidence=Decimal("0.9500"),
                 line_value=Decimal("-1.5000"),
@@ -17090,6 +17092,124 @@ def test_market_family_mapping_parses_event_level_spread_selection_from_yes_text
     assert mapping.mapping_metadata["spread_verification"]["verified"] is True
     assert market is not None
     assert market.selection_code == "PIT"
+
+
+def test_market_family_mapping_preserves_first_five_spread_verification() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        game = MlbGame(
+            external_game_id="first-five-spread-verified",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+            status="scheduled",
+        )
+        run = MarketFamilyDiscoveryRun(
+            target_date=date(2026, 7, 1),
+            started_at=datetime(2026, 7, 1, 12, 0, tzinfo=UTC),
+            completed_at=datetime(2026, 7, 1, 12, 1, tzinfo=UTC),
+            status="completed",
+            games_considered=1,
+            families_considered=6,
+            markets_found=1,
+            errors=[],
+            warnings=[],
+            raw_summary={},
+        )
+        session.add_all([game, run])
+        session.flush()
+        session.add(
+            MarketFamilyDiscoveryItem(
+                run_id=run.id,
+                mlb_game_id=game.id,
+                family_key="first_five_spread",
+                returned_ticker="KXMLBF5SPREAD-26JUL011900SEAPIT",
+                returned_event_ticker="KXMLBF5SPREAD-26JUL011900SEAPIT",
+                title="Seattle Mariners vs Pittsburgh Pirates first five run line",
+                yes_sub_title="Pittsburgh -0.5 first 5 innings",
+                no_sub_title="Seattle +0.5 first 5 innings",
+                rules_primary="The market is based on the score after the first 5 innings.",
+                raw_status="open",
+                confidence=Decimal("0.9500"),
+                line_value=Decimal("-0.5000"),
+            )
+        )
+        session.commit()
+
+        result = market_family_mapping.sync_market_family_mappings(session, date(2026, 7, 1))
+        mapping = session.scalar(select(MarketMapping))
+
+    assert result["paper_supported"] == 1
+    assert mapping is not None
+    assert mapping.mapping_status == "confirmed"
+    assert mapping.settlement_rule_status == "paper_supported"
+    assert mapping.market_family == "first_five_spread"
+    assert mapping.selection_code == "PIT"
+    assert mapping.line_value == Decimal("-0.5000")
+    assert mapping.mapping_metadata["spread_verification"]["verified"] is True
+    assert mapping.mapping_metadata["spread_verification"]["audit_status"] == "trusted_audit_only"
+    assert mapping.mapping_metadata["spread_verification"]["inning_scope"] == "first_five"
+
+
+def test_market_family_mapping_keeps_spread_without_rules_needs_review() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        game = MlbGame(
+            external_game_id="event-level-spread-no-rules",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+            status="scheduled",
+        )
+        run = MarketFamilyDiscoveryRun(
+            target_date=date(2026, 7, 1),
+            started_at=datetime(2026, 7, 1, 12, 0, tzinfo=UTC),
+            completed_at=datetime(2026, 7, 1, 12, 1, tzinfo=UTC),
+            status="completed",
+            games_considered=1,
+            families_considered=6,
+            markets_found=1,
+            errors=[],
+            warnings=[],
+            raw_summary={},
+        )
+        session.add_all([game, run])
+        session.flush()
+        session.add(
+            MarketFamilyDiscoveryItem(
+                run_id=run.id,
+                mlb_game_id=game.id,
+                family_key="full_game_spread",
+                returned_ticker="KXMLBSPREAD-26JUL011900SEAPIT",
+                returned_event_ticker="KXMLBSPREAD-26JUL011900SEAPIT",
+                title="Seattle Mariners vs Pittsburgh Pirates run line",
+                yes_sub_title="Pittsburgh -1.5",
+                no_sub_title="Seattle +1.5",
+                raw_status="open",
+                confidence=Decimal("0.9500"),
+                line_value=Decimal("-1.5000"),
+            )
+        )
+        session.commit()
+
+        result = market_family_mapping.sync_market_family_mappings(session, date(2026, 7, 1))
+        mapping = session.scalar(select(MarketMapping))
+
+    assert result["paper_supported"] == 0
+    assert result["needs_review"] == 1
+    assert mapping is not None
+    assert mapping.mapping_status == "needs_review"
+    assert mapping.settlement_rule_status == "needs_review"
+    assert mapping.mapping_metadata["spread_verification"]["audit_status"] == "settlement_text_unverified"
+    assert "settlement_text_missing" in mapping.mapping_metadata["spread_verification"]["reason_codes"]
 
 
 def test_new_market_families_require_paper_supported_metadata_for_trades(monkeypatch) -> None:
@@ -17777,6 +17897,7 @@ def test_spread_audit_reports_verified_spread_without_trades(monkeypatch) -> Non
             title="Seattle Mariners vs Pittsburgh Pirates run line",
             yes_subtitle="Pittsburgh -1.5",
             no_subtitle="Seattle +1.5",
+            rules="If Pittsburgh wins by exactly 1 run, the market pushes and contracts are void.",
             status="open",
             market_family="full_game_spread",
             market_type="full_game_spread",
@@ -17799,6 +17920,7 @@ def test_spread_audit_reports_verified_spread_without_trades(monkeypatch) -> Non
                 selection_code="PIT",
                 inning_scope="full_game",
                 settlement_rule_status="paper_supported",
+                mapping_metadata={"existing_note": "preserve"},
             )
         )
         session.commit()
@@ -17810,12 +17932,308 @@ def test_spread_audit_reports_verified_spread_without_trades(monkeypatch) -> Non
             max_time_to_start_minutes=180,
         )
         trade = session.scalar(select(PaperTrade))
+        settlement = session.scalar(select(Settlement))
+        mapping = session.scalar(select(MarketMapping))
 
     assert result["checked"] == 1
     assert result["verified"] == 1
+    assert result["trusted_audit_only_count"] == 1
+    assert result["read_only"] is True
+    assert result["mapping_mutations"] == 0
+    assert result["settlement_rows_created"] == 0
     assert result["paper_trades_created"] == 0
-    assert result["items"][0]["actual_contract_display"] == "YES ON PITTSBURGH PIRATES -1.5 FULL GAME"
+    item = result["items"][0]
+    assert item["audit_status"] == "trusted_audit_only"
+    assert item["reason_codes"] == []
+    assert item["market_family"] == "full_game_spread"
+    assert item["inning_scope"] == "full_game"
+    assert item["selected_team"] == "PIT"
+    assert item["line_sign"] == "negative"
+    assert item["line_direction"] == "selected_team_lays_runs"
+    assert item["actual_contract_display"] == "YES ON PITTSBURGH PIRATES -1.5 FULL GAME"
+    assert item["no_contract_display"] == "NO ON PITTSBURGH PIRATES -1.5 FULL GAME"
+    assert item["normalized_no_equivalent_display"] == "SEATTLE MARINERS +1.5 FULL GAME EQUIVALENT"
+    assert item["yes_outcome_interpretation"] == "PITTSBURGH PIRATES -1.5 COVERS FULL GAME"
+    assert item["no_outcome_interpretation"] == "PITTSBURGH PIRATES -1.5 DOES NOT COVER FULL GAME"
+    assert item["no_is_true_complement"] is True
+    assert item["complement_safe_for_paper_settlement"] is True
+    assert item["push_possible"] is False
+    assert item["settlement_preview"]["preview_status"] == "pending_final"
     assert trade is None
+    assert settlement is None
+    assert mapping is not None
+    assert mapping.mapping_metadata == {"existing_note": "preserve"}
+
+
+def test_spread_audit_reaudits_legacy_verified_metadata(monkeypatch) -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+
+    with Session(engine) as session:
+        _game, market, mapping = _add_spread_audit_case(
+            session,
+            external_game_id="spread-audit-legacy-metadata",
+            ticker="KXMLBSPREAD-LEGACY-METADATA",
+            scheduled_start=datetime(2026, 7, 1, 18, 0, tzinfo=UTC),
+            yes_subtitle="Pittsburgh -1.5",
+            no_subtitle=None,
+            rules=None,
+        )
+        legacy_metadata = {
+            "spread_verification": {
+                "verified": True,
+                "parser_status": "verified",
+                "settlement_rule_status": "verified",
+                "selection_code": "PIT",
+                "line_value": "-1.5000",
+            }
+        }
+        mapping.mapping_metadata = legacy_metadata
+        session.commit()
+        monkeypatch.setattr("app.services.spread_audit.utc_now", lambda: now)
+        result = run_spread_audit(
+            session,
+            date(2026, 7, 1),
+            min_time_to_start_minutes=45,
+            max_time_to_start_minutes=180,
+        )
+        persisted_mapping = session.scalar(select(MarketMapping))
+
+    assert result["checked"] == 1
+    assert result["verified"] == 0
+    item = result["items"][0]
+    assert item["audit_status"] == "ambiguous_yes_no_semantics"
+    assert "no_contract_text_missing" in item["reason_codes"]
+    assert "settlement_text_missing" in item["reason_codes"]
+    assert item["trusted_audit_only"] is False
+    assert item["no_is_true_complement"] is False
+    assert persisted_mapping is not None
+    assert persisted_mapping.mapping_metadata == legacy_metadata
+
+
+def _add_spread_audit_case(
+    session: Session,
+    *,
+    external_game_id: str,
+    ticker: str,
+    scheduled_start: datetime,
+    status: str = "scheduled",
+    home_score: int | None = None,
+    away_score: int | None = None,
+    yes_subtitle: str | None = "Pittsburgh -1.5",
+    no_subtitle: str | None = "Seattle +1.5",
+    rules: str | None = "If the adjusted score is tied, the market pushes and contracts are void.",
+    line_value: Decimal | None = Decimal("-1.5000"),
+    selection_code: str | None = "PIT",
+) -> tuple[MlbGame, KalshiMarket, MarketMapping]:
+    game = MlbGame(
+        external_game_id=external_game_id,
+        home_team="Pittsburgh Pirates",
+        away_team="Seattle Mariners",
+        home_abbreviation="PIT",
+        away_abbreviation="SEA",
+        scheduled_start=scheduled_start,
+        status=status,
+        home_score=home_score,
+        away_score=away_score,
+    )
+    market = KalshiMarket(
+        kalshi_market_id=f"KX-{ticker}",
+        ticker=ticker,
+        title="Seattle Mariners vs Pittsburgh Pirates run line",
+        yes_subtitle=yes_subtitle,
+        no_subtitle=no_subtitle,
+        rules=rules,
+        status="open",
+        market_family="full_game_spread",
+        market_type="full_game_spread",
+        line_value=line_value,
+        selection_code=selection_code,
+        inning_scope="full_game",
+        settlement_rule_status="paper_supported",
+    )
+    session.add_all([game, market])
+    session.flush()
+    mapping = MarketMapping(
+        mlb_game_id=game.id,
+        kalshi_market_id=market.id,
+        mapping_status="confirmed",
+        confidence=Decimal("0.9500"),
+        market_family="full_game_spread",
+        market_type="full_game_spread",
+        line_value=line_value,
+        selection_code=selection_code,
+        inning_scope="full_game",
+        settlement_rule_status="paper_supported",
+    )
+    session.add(mapping)
+    return game, market, mapping
+
+
+def test_spread_audit_classifies_ambiguous_full_game_spreads(monkeypatch) -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+
+    with Session(engine) as session:
+        _add_spread_audit_case(
+            session,
+            external_game_id="spread-audit-missing-line",
+            ticker="KXMLBSPREAD-MISSING-LINE",
+            scheduled_start=datetime(2026, 7, 1, 18, 0, tzinfo=UTC),
+            yes_subtitle="Pittsburgh run line",
+            no_subtitle="Seattle run line",
+            line_value=None,
+        )
+        _add_spread_audit_case(
+            session,
+            external_game_id="spread-audit-ambiguous-team",
+            ticker="KXMLBSPREAD-AMBIGUOUS-TEAM",
+            scheduled_start=datetime(2026, 7, 1, 18, 30, tzinfo=UTC),
+            yes_subtitle="Seattle and Pittsburgh -1.5",
+            no_subtitle="Seattle +1.5",
+        )
+        _add_spread_audit_case(
+            session,
+            external_game_id="spread-audit-ambiguous-line",
+            ticker="KXMLBSPREAD-AMBIGUOUS-LINE",
+            scheduled_start=datetime(2026, 7, 1, 19, 0, tzinfo=UTC),
+            yes_subtitle="Pittsburgh run line",
+            no_subtitle="Seattle +1.5",
+        )
+        _add_spread_audit_case(
+            session,
+            external_game_id="spread-audit-push-uncertain",
+            ticker="KXMLBSPREAD-PUSH-UNCERTAIN",
+            scheduled_start=datetime(2026, 7, 1, 19, 30, tzinfo=UTC),
+            yes_subtitle="Pittsburgh -1",
+            no_subtitle="Seattle +1",
+            rules=None,
+            line_value=Decimal("-1.0000"),
+        )
+        _add_spread_audit_case(
+            session,
+            external_game_id="spread-audit-no-wrong-sign",
+            ticker="KXMLBSPREAD-NO-WRONG-SIGN",
+            scheduled_start=datetime(2026, 7, 1, 19, 45, tzinfo=UTC),
+            yes_subtitle="Pittsburgh -1.5",
+            no_subtitle="Seattle -1.5",
+        )
+        session.commit()
+        monkeypatch.setattr("app.services.spread_audit.utc_now", lambda: now)
+        result = run_spread_audit(
+            session,
+            date(2026, 7, 1),
+            min_time_to_start_minutes=45,
+            max_time_to_start_minutes=240,
+        )
+
+    statuses = {item["market_ticker"]: item["audit_status"] for item in result["items"]}
+    reasons = {item["market_ticker"]: item["reason_codes"] for item in result["items"]}
+    assert statuses["KXMLBSPREAD-MISSING-LINE"] == "missing_line"
+    assert statuses["KXMLBSPREAD-AMBIGUOUS-TEAM"] == "ambiguous_team_selection"
+    assert statuses["KXMLBSPREAD-AMBIGUOUS-LINE"] == "ambiguous_line_direction"
+    assert statuses["KXMLBSPREAD-PUSH-UNCERTAIN"] == "push_behavior_uncertain"
+    assert statuses["KXMLBSPREAD-NO-WRONG-SIGN"] == "ambiguous_yes_no_semantics"
+    assert "missing_line" in reasons["KXMLBSPREAD-MISSING-LINE"]
+    assert "team_selection_not_verified" in reasons["KXMLBSPREAD-AMBIGUOUS-TEAM"]
+    assert "line_direction_not_verified_from_text" in reasons["KXMLBSPREAD-AMBIGUOUS-LINE"]
+    assert "push_behavior_unverified" in reasons["KXMLBSPREAD-PUSH-UNCERTAIN"]
+    assert "no_contract_text_conflicts_with_expected_complement" in reasons["KXMLBSPREAD-NO-WRONG-SIGN"]
+    assert result["missing_line_count"] == 1
+    assert result["ambiguous_team_selection_count"] == 1
+    assert result["ambiguous_yes_no_semantics_count"] == 1
+    assert result["ambiguous_line_direction_count"] == 1
+    assert result["push_behavior_uncertain_count"] == 1
+    assert result["examples_by_reason"]["missing_line"][0]["market_ticker"] == "KXMLBSPREAD-MISSING-LINE"
+
+
+def test_spread_audit_settlement_preview_handles_win_loss_push_and_pending(monkeypatch) -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+
+    with Session(engine) as session:
+        _add_spread_audit_case(
+            session,
+            external_game_id="spread-preview-win",
+            ticker="KXMLBSPREAD-PREVIEW-WIN",
+            scheduled_start=datetime(2026, 7, 1, 18, 0, tzinfo=UTC),
+            status="Final",
+            home_score=5,
+            away_score=3,
+        )
+        _add_spread_audit_case(
+            session,
+            external_game_id="spread-preview-loss",
+            ticker="KXMLBSPREAD-PREVIEW-LOSS",
+            scheduled_start=datetime(2026, 7, 1, 18, 30, tzinfo=UTC),
+            status="Final",
+            home_score=4,
+            away_score=3,
+        )
+        _add_spread_audit_case(
+            session,
+            external_game_id="spread-preview-push",
+            ticker="KXMLBSPREAD-PREVIEW-PUSH",
+            scheduled_start=datetime(2026, 7, 1, 19, 0, tzinfo=UTC),
+            status="Final",
+            home_score=4,
+            away_score=3,
+            yes_subtitle="Pittsburgh -1",
+            no_subtitle="Seattle +1",
+            line_value=Decimal("-1.0000"),
+        )
+        _add_spread_audit_case(
+            session,
+            external_game_id="spread-preview-pending",
+            ticker="KXMLBSPREAD-PREVIEW-PENDING",
+            scheduled_start=datetime(2026, 7, 1, 19, 30, tzinfo=UTC),
+            status="In Progress",
+        )
+        session.commit()
+        monkeypatch.setattr("app.services.spread_audit.utc_now", lambda: now)
+        result = run_spread_audit(
+            session,
+            date(2026, 7, 1),
+            min_time_to_start_minutes=None,
+            max_time_to_start_minutes=None,
+        )
+        settlements = list(session.scalars(select(Settlement)))
+        trades = list(session.scalars(select(PaperTrade)))
+
+    previews = {item["market_ticker"]: item["settlement_preview"] for item in result["items"]}
+    assert previews["KXMLBSPREAD-PREVIEW-WIN"]["preview_status"] == "computed"
+    assert previews["KXMLBSPREAD-PREVIEW-WIN"]["yes_outcome"] == "win"
+    assert previews["KXMLBSPREAD-PREVIEW-WIN"]["no_outcome"] == "loss"
+    assert previews["KXMLBSPREAD-PREVIEW-LOSS"]["yes_outcome"] == "loss"
+    assert previews["KXMLBSPREAD-PREVIEW-LOSS"]["no_outcome"] == "win"
+    assert previews["KXMLBSPREAD-PREVIEW-PUSH"]["yes_outcome"] == "push"
+    assert previews["KXMLBSPREAD-PREVIEW-PUSH"]["no_outcome"] == "push"
+    assert previews["KXMLBSPREAD-PREVIEW-PENDING"]["preview_status"] == "pending_final"
+    assert result["settlement_rows_created"] == 0
+    assert result["paper_trades_created"] == 0
+    assert settlements == []
+    assert trades == []
+
+
+def test_spread_audit_job_does_not_run_mapping_sync(monkeypatch) -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    def fail_mapping_sync(*_args, **_kwargs):
+        raise AssertionError("spread-audit job must be read-only and not run mapping sync")
+
+    monkeypatch.setattr(job_runs, "sync_market_family_mappings", fail_mapping_sync)
+    monkeypatch.setattr(job_runs, "run_spread_audit", lambda *_args, **_kwargs: {"status": "completed"})
+
+    with Session(engine) as session:
+        result = job_runs.run_job(session, job_name="spread-audit", target_date=date(2026, 7, 1))
+
+    assert result["status"] == "succeeded"
+    assert result["result"]["spread_audit"]["status"] == "completed"
+    assert "market_family_mappings" not in result["result"]
 
 
 def test_total_no_label_displays_under_equivalent() -> None:

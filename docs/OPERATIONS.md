@@ -236,6 +236,49 @@ After deployment, validate:
 6. Confirm the dashboard open/closed position tables reflect settlement state after settlement runs.
 7. Confirm no live execution, WebSocket, cron schedule, candidate-generation, EV/model, risk-cap, market-discovery, sportsbook, team-total, umpire, defense, or full-game spread activation behavior changed.
 
+## PR3o Full-Game Spread Audit Only
+
+PR3o is audit-only. Full-game spread paper trading remains disabled with `PAPER_SPREAD_TRADING_ENABLED=false`, and the protected `spread-audit` job does not run market-family mapping sync, create paper trades, write settlements, mutate candidates, or enable mappings for trading.
+
+Run the audit manually:
+
+```powershell
+python -m app.jobs.runner --job spread-audit --target-date today_et --min-time-to-start-minutes 45 --max-time-to-start-minutes 180
+Invoke-RestMethod -Method Post -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-RAILWAY-API/v1/jobs/run/spread-audit?target_date=today_et&min_time_to_start_minutes=45&max_time_to_start_minutes=180"
+```
+
+Audit taxonomy:
+
+- `trusted_audit_only`: team, line, YES/NO complement, and push/settlement evidence are coherent enough for manual review. This is not trade enablement.
+- `needs_review`: generic review bucket when evidence exists but is incomplete.
+- `missing_line`: line value cannot be verified.
+- `ambiguous_team_selection`: selected team cannot be uniquely verified against the mapped MLB game.
+- `ambiguous_yes_no_semantics`: YES/NO text or complement relation is missing or contradictory.
+- `ambiguous_line_direction`: line sign/direction was not verified from Kalshi text.
+- `settlement_text_unverified`: rules/settlement text is missing.
+- `push_behavior_uncertain`: integer spread can push but rules do not verify push/void/refund behavior.
+- `unsupported`, `parse_error`, `missing_market_data`, and `missing_game_mapping`: audit cannot safely evaluate the row.
+
+Per-market rows should include ticker, event ticker, title/subtitle/rules/YES/NO text, mapped MLB game, selected team, line value/sign/direction, `YES selected team covers`, `NO selected team does not cover`, normalized NO equivalent, whether NO is a true complement, push condition, push-rule verification, and read-only settlement preview. Final-game previews compute selected score, opponent score, adjusted margin, YES outcome, NO outcome, and push state without writing settlement rows. Non-final games report `preview_status=pending_final`.
+
+Interpretation:
+
+- `trusted_audit_only_count` is evidence for manual PR3p review only.
+- Any `needs_review`, ambiguous, missing, or push-uncertain status must remain blocked.
+- Candidate sweeps should still show full-game spread candidates as no-trade, usually `no_trade_spread_trading_disabled` while spread trading is disabled.
+- PR3p is the only future PR allowed to enable full-game spread paper trading, and only for rows that PR3o evidence proves safe.
+
+After deployment, validate:
+
+1. Confirm `/v1/system/status` still reports paper mode, demo Kalshi environment, live trading disabled, and execution kill switch enabled.
+2. Confirm default `/v1/dashboard/summary` still has the PR3m.1 observation cutoff active.
+3. Run `POST /v1/jobs/run/spread-audit?target_date=today_et&min_time_to_start_minutes=45&max_time_to_start_minutes=180`.
+4. Confirm the result includes `audit_scope=full_game_spread`, `read_only=true`, `mapping_mutations=0`, `settlement_rows_created=0`, `paper_trades_created=0`, `status_counts`, and `examples_by_reason`.
+5. Inspect trusted and review examples manually against Kalshi UI text before considering PR3p.
+6. Run a dry candidate sweep and confirm `feature_sync_mode=cache_only`, pregame context is present, full-game spread trades are not created, and PR3k controls remain active.
+7. Run settlement and confirm PR3n.1 first-five lifecycle behavior and full-game final-only behavior remain unchanged.
+8. Confirm no live execution, WebSocket, cron schedule, model/EV/risk-cap, source-sync, defense, sportsbook/team-total/umpire, or full-game spread activation behavior changed.
+
 After deployment, validate:
 
 1. `POST /v1/sync/mlb-pregame-context?target_date=today_et` returns `feature_sync_mode=pregame_context_refresh_lightweight`, target-date games checked, starter IDs/names where MLB has announced them, lineup counts, and explicit lineup missing reasons such as `LINEUP_NOT_POSTED_YET`, `PARTIAL_LINEUP_POSTED`, or `LIVE_FEED_UNAVAILABLE`.
@@ -369,7 +412,7 @@ Invoke-RestMethod -Method Post -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-
 
 Expected audit behavior:
 
-- The job updates spread mapping metadata only; it does not create paper trades.
+- The job is read-only; it does not create paper trades, settlement rows, candidates, or mapping/market metadata mutations.
 - Verified spread rows include parsed selection, line, inning scope, settlement rule status, actual contract display, normalized equivalent display, and raw Kalshi contract text.
 - Ticker-only spread rows remain `needs_review` / parser-unverified.
 - Spread candidates still return `no_trade_spread_trading_disabled` while `PAPER_SPREAD_TRADING_ENABLED=false`.
