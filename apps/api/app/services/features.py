@@ -5900,7 +5900,7 @@ def _pybaseball_db_status(session: Session) -> dict[str, object]:
                 .limit(100)
             )
         )
-    rows = sorted(rows, key=lambda row: row.captured_at, reverse=True)[:200]
+    rows = sorted(rows, key=lambda row: ensure_aware_utc(row.captured_at), reverse=True)[:200]
     counts: dict[str, int] = {}
     functions_attempted: list[str] = []
     last_success = None
@@ -6018,12 +6018,16 @@ def _defense_db_status(session: Session) -> dict[str, object]:
                 .limit(100)
             )
         )
-    rows = sorted(rows, key=lambda row: row.captured_at, reverse=True)[:200]
+    rows = sorted(rows, key=lambda row: ensure_aware_utc(row.captured_at), reverse=True)[:200]
     counts: dict[str, int] = {}
     last_success_timestamp = None
     component_rows = 0
     cache_reused_count = 0
     fresh_success_count = 0
+    latest_row_timestamp: datetime | None = None
+    latest_counts: dict[str, int] = {}
+    latest_cache_reused_count = 0
+    latest_fresh_success_count = 0
     for row in rows:
         component = _defense_component_from_row(row)
         if not component:
@@ -6031,20 +6035,33 @@ def _defense_db_status(session: Session) -> dict[str, object]:
         component_rows += 1
         status = str(component.get("source_status") or "missing")
         counts[status] = counts.get(status, 0) + 1
+        row_timestamp = ensure_aware_utc(row.captured_at)
+        is_latest_row = latest_row_timestamp is None or row_timestamp > latest_row_timestamp
+        if is_latest_row:
+            latest_row_timestamp = row_timestamp
+            latest_counts = {}
+            latest_cache_reused_count = 0
+            latest_fresh_success_count = 0
+        if latest_row_timestamp is not None and row_timestamp == latest_row_timestamp:
+            latest_counts[status] = latest_counts.get(status, 0) + 1
         if status in {"available", "partial"}:
             if component.get("cache_reused") or component.get("stale"):
                 cache_reused_count += 1
+                if latest_row_timestamp is not None and row_timestamp == latest_row_timestamp:
+                    latest_cache_reused_count += 1
             else:
                 fresh_success_count += 1
+                if latest_row_timestamp is not None and row_timestamp == latest_row_timestamp:
+                    latest_fresh_success_count += 1
             component_timestamp = _defense_component_timestamp(row, component)
             if component_timestamp is not None and (
                 last_success_timestamp is None or component_timestamp > last_success_timestamp
             ):
                 last_success_timestamp = component_timestamp
-    if counts.get("available", 0) > 0:
-        status = "cached" if cache_reused_count and not fresh_success_count else "available"
-    elif counts.get("partial", 0) > 0:
-        status = "cached" if cache_reused_count and not fresh_success_count else "partial"
+    if latest_counts.get("available", 0) > 0:
+        status = "cached" if latest_cache_reused_count else "available"
+    elif latest_counts.get("partial", 0) > 0:
+        status = "cached" if latest_cache_reused_count else "partial"
     elif component_rows:
         status = "missing"
     else:
@@ -6057,6 +6074,9 @@ def _defense_db_status(session: Session) -> dict[str, object]:
         "row_sample_count": component_rows,
         "status_counts": counts,
         "cache_reused_count": cache_reused_count,
+        "fresh_success_count": fresh_success_count,
+        "latest_cache_reused_count": latest_cache_reused_count,
+        "latest_fresh_success_count": latest_fresh_success_count,
     }
 
 
@@ -6169,7 +6189,7 @@ def _statcast_db_status(session: Session, feature_audit: dict[str, object]) -> d
                 .limit(100)
             )
         )
-    rows = sorted(rows, key=lambda row: row.captured_at, reverse=True)[:200]
+    rows = sorted(rows, key=lambda row: ensure_aware_utc(row.captured_at), reverse=True)[:200]
     contact_rows = [row for row in rows if _statcast_contact_from_row(row)]
     status_counts: dict[str, int] = {}
     last_success_timestamp = None
@@ -6336,7 +6356,9 @@ def _source_inventory(
         defense_health = "cached"
     elif fielding_error:
         defense_health = "failed"
-    defense_cache_reused = bool(defense_status.get("cache_reused_count") and defense_status.get("last_successful_sync"))
+    defense_cache_reused = bool(
+        defense_status.get("latest_cache_reused_count") and defense_status.get("last_successful_sync")
+    )
     defense_fallback_used = bool((fielding_error or defense_cache_reused) and defense_status.get("last_successful_sync"))
     defense_fallback_reason = _source_issue_reason(fielding_error)
     if defense_cache_reused and not defense_fallback_reason:

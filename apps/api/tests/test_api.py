@@ -8202,6 +8202,24 @@ def test_fielding_fetch_failure_preserves_cached_defense_sections() -> None:
                 features={"defense_recent": cached_recent},
             )
         )
+        session.add(
+            TeamDailyFeature(
+                target_date=date(2026, 6, 30),
+                team_code="SEA",
+                captured_at=datetime(2026, 6, 30, 12, 0, tzinfo=UTC),
+                source=features.MLB_STATS_SOURCE,
+                source_status="available",
+                confidence=Decimal("0.8500"),
+                completeness=Decimal("0.8000"),
+                stale=False,
+                features={
+                    "defense_season": {
+                        **cached_season,
+                        "captured_at": datetime(2026, 6, 30, 12, 0, tzinfo=UTC).isoformat(),
+                    }
+                },
+            )
+        )
         session.flush()
         mlb_context = {
             "team_hitting_logs_by_id": {"134": _team_log_rows("hitting")},
@@ -8247,6 +8265,9 @@ def test_fielding_fetch_failure_preserves_cached_defense_sections() -> None:
     assert defense_status["status"] == "cached"
     assert defense_status["last_successful_sync"] == cached_at.isoformat()
     assert defense_status["cache_reused_count"] == 2
+    assert defense_status["fresh_success_count"] == 1
+    assert defense_status["latest_cache_reused_count"] == 2
+    assert defense_status["latest_fresh_success_count"] == 0
     source_health = {item["source_name"]: item for item in source_report["source_health"]}
     assert source_health["mlb_stats_api_fielding"]["status"] == "cached"
     assert source_health["mlb_stats_api_fielding"]["last_successful_sync"] == cached_at.isoformat()
