@@ -3057,12 +3057,12 @@ def _aggregate_team_fielding_logs(splits: list[dict[str, object]], limit: int) -
         add_total("stolenBases", stat, "stolenBases", "stolenBasesAllowed")
         add_total("caughtStealing", stat, "caughtStealing", "caughtStealingByCatcher")
     games = len(sample)
-    has_chances_components = bool(present_fields & {"putOuts", "assists", "errors"})
+    has_complete_chances_components = {"putOuts", "assists", "errors"}.issubset(present_fields)
     chances = (
         totals["chances"]
         if "chances" in present_fields
         else totals["putOuts"] + totals["assists"] + totals["errors"]
-        if has_chances_components
+        if has_complete_chances_components
         else None
     )
     fielding_percentage = (
@@ -3108,7 +3108,7 @@ def _defense_feature_section(
     game_count = int(fielding.get("game_count") or 0)
     has_metric = any(
         fielding.get(key) is not None
-        for key in ("fielding_percentage", "errors", "assists", "putouts", "double_plays")
+        for key in ("fielding_percentage", "errors", "double_plays", "passed_balls", "caught_stealing_rate")
     ) and bool(fielding.get("source_fields_present"))
     if game_count and has_metric:
         status = "available"
@@ -6162,6 +6162,46 @@ def _kalshi_market_data_status(session: Session) -> dict[str, object]:
     }
 
 
+def _catcher_lineup_source_status(session: Session) -> dict[str, object]:
+    rows = list(
+        session.scalars(
+            select(LineupSnapshot)
+            .where(LineupSnapshot.source == MLB_STATS_SOURCE)
+            .order_by(LineupSnapshot.captured_at.desc())
+            .limit(200)
+        )
+    )
+    counts: dict[str, int] = {}
+    catcher_success = None
+    partial_without_catcher = 0
+
+    for row in rows:
+        status = str(row.source_status or "missing")
+        counts[status] = counts.get(status, 0) + 1
+        catcher = _catcher_from_lineup(row)
+        if catcher is not None and catcher_success is None:
+            catcher_success = ensure_aware_utc(row.captured_at).isoformat()
+        elif status in {"available", "partial"}:
+            partial_without_catcher += 1
+
+    if catcher_success:
+        status = "available"
+    elif partial_without_catcher:
+        status = "partial"
+    elif rows:
+        status = "missing"
+    else:
+        status = "not_attempted"
+
+    return {
+        "status": status,
+        "last_successful_sync": catcher_success,
+        "last_attempted_sync": ensure_aware_utc(rows[0].captured_at).isoformat() if rows else None,
+        "row_sample_count": len(rows),
+        "status_counts": counts,
+    }
+
+
 def _source_health_entry(
     *,
     source_name: str,
@@ -6263,6 +6303,7 @@ def _source_inventory(
     kalshi_status = _kalshi_market_data_status(session)
     statcast_error = statcast_status.get("statcast_savant_last_error")
     statcast_last_success = statcast_status.get("statcast_savant_last_successful_sync")
+    catcher_status = _catcher_lineup_source_status(session)
     return [
         _source_health_entry(
             source_name="mlb_stats_api",
@@ -6374,16 +6415,12 @@ def _source_inventory(
             source_name="catcher_from_official_lineup",
             source_kind="official",
             criticality="enrichment",
-            status="available"
-            if lineup_status["last_successful_sync"]
-            else "missing"
-            if last_attempted
-            else "not_attempted",
+            status=str(catcher_status["status"]),
             modules_affected=["defense_catcher", "lineup"],
-            last_successful_sync=lineup_status["last_successful_sync"],
-            last_attempted_sync=last_attempted,
+            last_successful_sync=catcher_status["last_successful_sync"],
+            last_attempted_sync=catcher_status["last_attempted_sync"] or last_attempted,
             last_error=lineup_status["last_error"],
-            sample_count=int(lineup_status["row_sample_count"] or 0),
+            sample_count=int(catcher_status["row_sample_count"] or 0),
         ),
         _source_health_entry(
             source_name="advanced_catcher_metrics",

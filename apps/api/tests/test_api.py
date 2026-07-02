@@ -8040,6 +8040,24 @@ def test_empty_fielding_logs_remain_partial_without_fabricated_zero_metrics() ->
     assert section["reason"] == "MLB Stats API fielding logs returned games but limited fielding metrics."
 
 
+def test_incomplete_fielding_components_do_not_inflate_fielding_percentage() -> None:
+    fielding = features._aggregate_team_fielding_logs(
+        [{"date": "2026-06-30", "stat": {"putOuts": 27, "assists": 12}}],
+        1,
+    )
+    section = features._defense_feature_section(
+        fielding,
+        component="defense_season",
+        reason_available="team defense season from MLB Stats API fielding game logs",
+        reason_missing="team defense season missing because MLB Stats API fielding game logs were unavailable or empty",
+    )
+
+    assert fielding["source_fields_present"] == ["assists", "putOuts"]
+    assert fielding["chances"] is None
+    assert fielding["fielding_percentage"] is None
+    assert section["source_status"] == "partial"
+
+
 def test_fielding_only_logs_do_not_create_mlb_team_offense_cache() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
@@ -8315,6 +8333,38 @@ def test_defense_catcher_infers_official_catcher_and_keeps_missing_reason() -> N
     assert module["away"]["catcher_starting_lineup"]["reason"] == "catcher unavailable because official lineup not posted yet"
     assert module["advanced_catcher_metrics"]["reason"] == "advanced catcher metrics not configured/unavailable"
     assert module["umpire"]["reason"] == "umpire factors excluded by design"
+
+
+def test_source_status_report_marks_catcher_partial_when_lineup_lacks_catcher() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    captured_at = datetime(2026, 7, 1, 19, 0, tzinfo=UTC)
+
+    with Session(engine) as session:
+        session.add(
+            LineupSnapshot(
+                mlb_game_id=1,
+                target_date=date(2026, 7, 1),
+                team_code="PIT",
+                captured_at=captured_at,
+                source=features.MLB_STATS_SOURCE,
+                source_status="partial",
+                confirmed=False,
+                features={
+                    "starters": [{"id": "11", "name": "Partial Starter", "position": "CF"}],
+                    "missing_reason": features.PARTIAL_LINEUP_POSTED,
+                },
+            )
+        )
+        session.commit()
+        report = features.source_status_report(session)
+
+    source_health = {item["source_name"]: item for item in report["source_health"]}
+    catcher_source = source_health["catcher_from_official_lineup"]
+    assert catcher_source["status"] == "partial"
+    assert catcher_source["last_successful_sync"] is None
+    assert catcher_source["last_attempted_sync"] == captured_at.isoformat()
+    assert catcher_source["sample_count"] == 1
 
 
 def test_feature_sync_hydrates_final_games_for_backfill(monkeypatch) -> None:
