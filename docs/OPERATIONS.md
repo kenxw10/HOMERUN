@@ -202,6 +202,40 @@ After deployment, validate:
 7. Confirm PR3k selection controls, PR3m pregame context refresh, and PR3m.1 observation cutoff behavior still hold.
 8. Keep PR3o spread audit and PR3p spread enablement separate.
 
+## PR3n.1 First-Five Lifecycle Settlement
+
+First-five paper markets use their own lifecycle. Once official MLB linescore data contains complete home and away runs for innings 1-5, first-five winner, spread, and total paper trades can settle even while the full game is still in progress. Full-game winner, spread, and total trades still wait for the full game to be final or void.
+
+Completeness criteria:
+
+- The game must have a usable `linescore.innings` payload.
+- The first five inning rows must exist.
+- Each of those five innings must include both `away.runs` and `home.runs`.
+- If any of those values are missing while the game is still open, settlement records `first_five_not_complete` and leaves the trade open.
+- If the game is final/closed but the first-five linescore is still unusable, settlement records `missing_f5_linescore` and leaves the trade open for manual/source follow-up.
+
+Price refresh guard:
+
+- If a first-five trade is already settlement-ready, open-position price refresh skips it and leaves final pricing to settlement.
+- If the first-five linescore is not complete and Kalshi reports that first-five market as closed, price refresh preserves the existing paper mark instead of stamping a misleading 0c/99c closed-market price.
+- Price refresh still marks ordinary open full-game positions and unresolved open first-five positions when the market remains open.
+
+Dashboard behavior:
+
+- No dashboard schema or frontend behavior changed.
+- First-five trades should leave the open table earlier once settlement runs after the fifth inning is official.
+- Closed-position P/L should come from settlement, not from a temporary closed-market quote.
+
+After deployment, validate:
+
+1. Run settlement during an in-progress game after the fifth inning is official and confirm supported first-five paper trades settle.
+2. Confirm supported full-game paper trades for the same in-progress game remain open with `not_final_full_game`.
+3. Confirm an incomplete first-five linescore leaves first-five trades open with `first_five_not_complete`.
+4. Confirm open-position price refresh reports `skipped_first_five_settlement_ready` for first-five trades whose first five innings are complete.
+5. Confirm open-position price refresh reports `skipped_closed_f5_market` and preserves the prior mark when Kalshi closes a first-five market before the linescore is complete.
+6. Confirm the dashboard open/closed position tables reflect settlement state after settlement runs.
+7. Confirm no live execution, WebSocket, cron schedule, candidate-generation, EV/model, risk-cap, market-discovery, sportsbook, team-total, umpire, defense, or full-game spread activation behavior changed.
+
 After deployment, validate:
 
 1. `POST /v1/sync/mlb-pregame-context?target_date=today_et` returns `feature_sync_mode=pregame_context_refresh_lightweight`, target-date games checked, starter IDs/names where MLB has announced them, lineup counts, and explicit lineup missing reasons such as `LINEUP_NOT_POSTED_YET`, `PARTIAL_LINEUP_POSTED`, or `LIVE_FEED_UNAVAILABLE`.

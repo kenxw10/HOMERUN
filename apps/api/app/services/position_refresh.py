@@ -6,11 +6,13 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
-from app.models import KalshiMarket, ModelCandidate, PaperTrade, Position
+from app.models import KalshiMarket, MlbGame, ModelCandidate, PaperTrade, Position
+from app.services.contracts import market_type_from_ticker
 from app.services.kalshi import KalshiAPIError, KalshiClient, derive_orderbook_prices
 from app.services.market_sync import _market_status, _update_market_fields
-from app.services.portfolio import create_balance_snapshot
 from app.services.paper_epoch import get_or_create_active_paper_epoch
+from app.services.portfolio import create_balance_snapshot
+from app.services.settlement import first_five_complete, is_first_five_market
 from app.time_utils import utc_now
 
 
@@ -98,6 +100,8 @@ def refresh_open_position_prices(
     skipped_due_to_limit = max(len(all_trades) - len(trades), 0)
     updated = 0
     skipped = skipped_due_to_limit
+    skipped_first_five_settlement_ready = 0
+    skipped_closed_f5_market = 0
     errors: list[dict[str, object]] = []
     request_counters = {"market_batch_requests": 0, "orderbook_requests": 0}
     batch_markets: dict[str, dict[str, object]] = {}
@@ -109,6 +113,18 @@ def refresh_open_position_prices(
 
     for trade in trades:
         market = None
+        candidate = session.get(ModelCandidate, trade.candidate_id) if trade.candidate_id is not None else None
+        game = session.get(MlbGame, candidate.mlb_game_id) if candidate is not None and candidate.mlb_game_id else None
+        market_type = market_type_from_ticker(
+            trade.market_ticker,
+            trade.market_family or (candidate.market_type if candidate is not None else None),
+        )
+        first_five_trade = is_first_five_market(market_type, trade.inning_scope)
+        if first_five_trade and first_five_complete(game):
+            skipped += 1
+            skipped_first_five_settlement_ready += 1
+            continue
+
         if trade.candidate_id is not None:
             market = session.scalar(
                 select(KalshiMarket)
@@ -150,6 +166,12 @@ def refresh_open_position_prices(
         if mark is None:
             skipped += 1
             continue
+        if first_five_trade and not first_five_complete(game):
+            market_status = str((market.status if market is not None else "") or "").strip().lower()
+            if market_status and market_status != "open":
+                skipped += 1
+                skipped_closed_f5_market += 1
+                continue
 
         if market is not None:
             market.market_price_updated_at = now
@@ -180,6 +202,8 @@ def refresh_open_position_prices(
         "updated": updated,
         "skipped": skipped,
         "skipped_due_to_limit": skipped_due_to_limit,
+        "skipped_first_five_settlement_ready": skipped_first_five_settlement_ready,
+        "skipped_closed_f5_market": skipped_closed_f5_market,
         "errors": errors,
         "snapshot_id": snapshot.id,
         "last_marked_at": now.isoformat(),

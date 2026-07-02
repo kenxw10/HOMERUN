@@ -712,3 +712,12 @@ Every future PR must update this section with:
 - Umpire factors remain explicitly excluded and are not treated as a missing required model input.
 - `/v1/model/features/coverage`, `/v1/model/features/detail`, and `/v1/model/sources/status` now distinguish baseline fielding, recent defense, catcher-from-lineup, advanced catcher metric gaps, and umpire exclusion. Candidate diagnostics surface the `defense_catcher` module contribution/penalty through the existing quality decomposition.
 - PR3n does not change model probability formulas, EV math, trade caps, risk thresholds, settlement, market discovery, WebSocket behavior, live execution, spread activation, sportsbook/team-total logic, cron schedules, secrets, or schemas. Candidate-sweep remains heavy-source cache-only; daily setup or explicit feature sync owns MLB fielding ingestion.
+
+### PR3n.1 - First-Five Lifecycle Settlement
+
+- First-five winner, spread, and total paper trades now settle as soon as the official MLB linescore contains complete home and away runs for innings 1-5. They no longer wait for the full game to reach final status when the first-five outcome is already official.
+- Full-game winner, spread, and total paper settlement timing is unchanged and still waits for the full game to be final or void.
+- Incomplete first-five linescores leave trades open with explicit skip diagnostics: `first_five_not_complete` while the game is still open, or `missing_f5_linescore` when a final/closed game lacks usable first-five inning data.
+- Open-position price refresh now avoids overwriting first-five marks with misleading closed/illiquid Kalshi prices. If the first-five outcome is already complete, settlement owns the final mark; if the first-five linescore is incomplete and the market is closed, the existing paper mark is preserved.
+- Dashboard behavior is unchanged except that first-five trades should move from open to closed earlier once settlement runs. No schema migration, frontend change, candidate-generation change, cron change, model/EV/risk-cap change, market-discovery change, live execution, credential, sportsbook/team-total/umpire, WebSocket, or spread-activation change was added.
+- Follow-up PR3o remains separate for any full-game spread audit or activation work.
