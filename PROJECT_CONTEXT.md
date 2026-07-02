@@ -721,3 +721,13 @@ Every future PR must update this section with:
 - Open-position price refresh now avoids overwriting first-five marks with misleading closed/illiquid Kalshi prices. If the first-five outcome is already complete, settlement owns the final mark; if the first-five linescore is incomplete and the market is closed, the existing paper mark is preserved.
 - Dashboard behavior is unchanged except that first-five trades should move from open to closed earlier once settlement runs. No schema migration, frontend change, candidate-generation change, cron change, model/EV/risk-cap change, market-discovery change, live execution, credential, sportsbook/team-total/umpire, WebSocket, or spread-activation change was added.
 - Follow-up PR3o remains separate for any full-game spread audit or activation work.
+
+### PR3o - Full-Game Spread Audit Only
+
+- The protected `spread-audit` job is now a full-game spread audit-only diagnostic. It no longer runs market-family mapping sync as part of the job and the audit service itself does not write paper trades, settlements, candidates, market rows, or mapping metadata.
+- Audit output classifies full-game spread rows with stable statuses and reason codes, including `trusted_audit_only`, `needs_review`, `missing_line`, `ambiguous_team_selection`, `ambiguous_yes_no_semantics`, `ambiguous_line_direction`, `settlement_text_unverified`, and `push_behavior_uncertain`.
+- Per-market audit rows expose raw Kalshi title/subtitle/rules/YES/NO text, mapped MLB game, selected team, line sign/direction, YES interpretation, NO complement/equivalent interpretation, push possibility, push condition, and read-only settlement preview for final games.
+- `trusted_audit_only` means the parsed team, line, YES/NO complement, and push/settlement evidence are coherent enough for manual review. It does not enable paper trading. Rows with missing or ambiguous evidence remain `needs_review`/unsafe-style statuses and must not be trusted for PR3p.
+- Full-game spread candidate generation remains blocked by `PAPER_SPREAD_TRADING_ENABLED=false` and spread parser verification. PR3o does not enable full-game spread paper trades.
+- No live execution, credential, WebSocket, cron cadence, model probability, EV, risk-cap, source-sync, dashboard observation cutoff, defense, first-five lifecycle settlement, sportsbook/team-total/umpire, schema, or frontend change was added.
+- PR3p remains the separate future PR for any full-game spread paper enablement, and only if PR3o audit evidence passes manual validation.

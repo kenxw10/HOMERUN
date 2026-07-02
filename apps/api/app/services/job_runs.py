@@ -564,9 +564,6 @@ def _execute_job_steps(
         }
     if job_name == "spread-audit":
         return {
-            "market_family_mappings": _run_step(
-                run, "market_family_mappings", lambda: sync_market_family_mappings(session, target)
-            ),
             "spread_audit": _run_step(
                 run,
                 "spread_audit",

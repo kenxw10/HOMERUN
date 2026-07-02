@@ -9,6 +9,21 @@ from app.models import KalshiMarket, MarketMapping, MlbGame
 from app.services.contracts import FIRST_FIVE_SPREAD, FULL_GAME_SPREAD
 
 SPREAD_FAMILIES = {FULL_GAME_SPREAD, FIRST_FIVE_SPREAD}
+FULL_GAME_SPREAD_AUDIT_STATUSES = {
+    "trusted_audit_only",
+    "needs_review",
+    "unsafe",
+    "unsupported",
+    "parse_error",
+    "missing_market_data",
+    "missing_game_mapping",
+    "missing_line",
+    "ambiguous_team_selection",
+    "ambiguous_yes_no_semantics",
+    "ambiguous_line_direction",
+    "settlement_text_unverified",
+    "push_behavior_uncertain",
+}
 SPREAD_TEXT_FIELDS = (
     "yes_sub_title",
     "yes_subtitle",
@@ -40,6 +55,17 @@ class SpreadVerification:
     parse_source: str | None
     raw_contract_text: dict[str, str | None]
     warnings: list[str]
+    audit_status: str = "needs_review"
+    reason_codes: list[str] | None = None
+    yes_interpretation: str | None = None
+    no_interpretation: str | None = None
+    no_is_true_complement: bool = False
+    complement_safe_for_paper_settlement: bool = False
+    line_sign: str | None = None
+    line_direction: str | None = None
+    push_possible: bool = False
+    push_condition: str | None = None
+    push_rule_verified: bool = False
 
     def as_metadata(self) -> dict[str, object]:
         return {
@@ -57,6 +83,17 @@ class SpreadVerification:
             "parse_source": self.parse_source,
             "raw_contract_text": self.raw_contract_text,
             "warnings": list(self.warnings),
+            "audit_status": self.audit_status,
+            "reason_codes": list(self.reason_codes or []),
+            "yes_interpretation": self.yes_interpretation,
+            "no_interpretation": self.no_interpretation,
+            "no_is_true_complement": self.no_is_true_complement,
+            "complement_safe_for_paper_settlement": self.complement_safe_for_paper_settlement,
+            "line_sign": self.line_sign,
+            "line_direction": self.line_direction,
+            "push_possible": self.push_possible,
+            "push_condition": self.push_condition,
+            "push_rule_verified": self.push_rule_verified,
         }
 
 
@@ -111,6 +148,29 @@ def _line_from_text(value: object) -> Decimal | None:
     return None
 
 
+def _line_text(value: Decimal | None) -> str:
+    if value is None:
+        return ""
+    normalized = value.normalize()
+    return f"{normalized:f}".rstrip("0").rstrip(".")
+
+
+def _line_text_variants(value: Decimal | None) -> set[str]:
+    if value is None:
+        return set()
+    base = _line_text(value)
+    variants = {base}
+    if value > 0:
+        variants.add(f"+{base}")
+    variants.add(_format_line(value))
+    return {variant for variant in variants if variant}
+
+
+def _text_mentions_line(value: object, line_value: Decimal | None) -> bool:
+    text = str(value or "").replace("−", "-")
+    return any(variant in text for variant in _line_text_variants(line_value))
+
+
 def _format_line(value: Decimal | None) -> str:
     if value is None:
         return ""
@@ -118,6 +178,39 @@ def _format_line(value: Decimal | None) -> str:
     if numeric > 0:
         return f"+{numeric:g}"
     return f"{numeric:g}"
+
+
+def _line_sign(value: Decimal | None) -> str | None:
+    if value is None:
+        return None
+    if value > 0:
+        return "positive"
+    if value < 0:
+        return "negative"
+    return "zero"
+
+
+def _line_direction(value: Decimal | None) -> str | None:
+    if value is None:
+        return None
+    if value > 0:
+        return "selected_team_gets_runs"
+    if value < 0:
+        return "selected_team_lays_runs"
+    return "pickem"
+
+
+def _push_possible(value: Decimal | None) -> bool:
+    if value is None:
+        return False
+    return value == value.to_integral_value()
+
+
+def _rules_verify_push(value: Decimal | None, rules_text: str | None) -> bool:
+    if not _push_possible(value):
+        return True
+    tokens = set(_text_tokens(rules_text or ""))
+    return bool(tokens & {"push", "void", "tie", "ties", "refund", "refunded", "cancel", "canceled"})
 
 
 def _team_display(game: MlbGame, code: str | None) -> str | None:
@@ -153,6 +246,26 @@ def _extract_raw(raw: dict[str, Any] | None, market: KalshiMarket | None = None)
             for key, value in market.raw_payload.items():
                 payload.setdefault(key, value)
     return payload
+
+
+def _reason_status(reason_codes: list[str]) -> str:
+    priority = (
+        ("unsupported", "unsupported_family"),
+        ("missing_market_data", "missing_market_data"),
+        ("missing_game_mapping", "missing_game_mapping"),
+        ("missing_line", "missing_line"),
+        ("ambiguous_team_selection", "team_selection_not_verified"),
+        ("ambiguous_yes_no_semantics", "yes_contract_text_missing"),
+        ("ambiguous_yes_no_semantics", "no_contract_text_missing"),
+        ("ambiguous_yes_no_semantics", "no_contract_text_conflicts_with_expected_complement"),
+        ("ambiguous_line_direction", "line_direction_not_verified_from_text"),
+        ("push_behavior_uncertain", "push_behavior_unverified"),
+        ("settlement_text_unverified", "settlement_text_missing"),
+    )
+    for status, reason in priority:
+        if reason in reason_codes:
+            return status
+    return "trusted_audit_only" if not reason_codes else "needs_review"
 
 
 def _first_text(payload: dict[str, Any], fields: tuple[str, ...]) -> tuple[str | None, str | None]:
@@ -213,29 +326,59 @@ def verify_spread_market(
 
     team = _team_display(game, parsed_selection)
     opponent = _team_display(game, _opponent_code(game, parsed_selection))
-    verified = (
-        family_key in SPREAD_FAMILIES
-        and parsed_selection in {(game.home_abbreviation or "").upper(), (game.away_abbreviation or "").upper()}
-        and parsed_line is not None
-        and selection_source is not None
-        and line_source is not None
-        and bool(yes_text)
+    home_code = (game.home_abbreviation or "").upper()
+    away_code = (game.away_abbreviation or "").upper()
+    team_codes = {code for code in (home_code, away_code) if code}
+    rules_text = str(payload.get("rules") or payload.get("rules_primary") or payload.get("rules_secondary") or "") or None
+    expected_no_equivalent_line = -parsed_line if parsed_line is not None else None
+    no_text_mentions_expected = bool(
+        no_text
+        and opponent
+        and _team_selection_from_text(no_text, game) == _opponent_code(game, parsed_selection)
+        and _text_mentions_line(no_text, expected_no_equivalent_line)
     )
-    if not verified:
-        if parsed_selection is None:
-            warnings.append("SPREAD_SELECTION_NOT_VERIFIED_FROM_KALSHI_TEXT")
-        if parsed_line is None:
-            warnings.append("SPREAD_LINE_NOT_VERIFIED_FROM_KALSHI_TEXT")
-        if not yes_text:
-            warnings.append("SPREAD_YES_TEXT_MISSING")
+
+    reason_codes: list[str] = []
+    if family_key != FULL_GAME_SPREAD:
+        reason_codes.append("unsupported_family")
+    if not payload.get("ticker") and market is None:
+        reason_codes.append("missing_market_data")
+    if parsed_line is None:
+        reason_codes.append("missing_line")
+    if parsed_selection not in team_codes or selection_source is None:
+        reason_codes.append("team_selection_not_verified")
+        warnings.append("SPREAD_SELECTION_NOT_VERIFIED_FROM_KALSHI_TEXT")
+    if not yes_text:
+        reason_codes.append("yes_contract_text_missing")
+        warnings.append("SPREAD_YES_TEXT_MISSING")
+    if parsed_line is not None and line_source is None:
+        reason_codes.append("line_direction_not_verified_from_text")
+        warnings.append("SPREAD_LINE_NOT_VERIFIED_FROM_KALSHI_TEXT")
+    if no_text is None:
+        reason_codes.append("no_contract_text_missing")
+    elif not no_text_mentions_expected:
+        reason_codes.append("no_contract_text_conflicts_with_expected_complement")
+    if rules_text is None:
+        reason_codes.append("settlement_text_missing")
+    if _push_possible(parsed_line) and not _rules_verify_push(parsed_line, rules_text):
+        reason_codes.append("push_behavior_unverified")
+
+    audit_status = _reason_status(reason_codes)
+    verified = audit_status == "trusted_audit_only"
 
     actual_display = None
     no_display = None
     no_equivalent = None
+    yes_interpretation = None
+    no_interpretation = None
+    push_condition = None
     if parsed_selection and parsed_line is not None:
         scope_label = _scope_display(scope)
         actual_display = f"YES on {team or parsed_selection} {_format_line(parsed_line)} {scope_label}".upper()
         no_display = f"NO on {team or parsed_selection} {_format_line(parsed_line)} {scope_label}".upper()
+        yes_interpretation = f"{team or parsed_selection} {_format_line(parsed_line)} covers {scope_label}"
+        no_interpretation = f"{team or parsed_selection} {_format_line(parsed_line)} does not cover {scope_label}"
+        push_condition = f"selected_team_margin + {_format_line(parsed_line)} equals 0"
         if opponent:
             inverse_line = -parsed_line
             no_equivalent = f"{opponent} {_format_line(inverse_line)} {scope_label} equivalent".upper()
@@ -255,10 +398,20 @@ def verify_spread_market(
         raw_contract_text={
             "yes": yes_text,
             "no": no_text,
-            "rules": str(payload.get("rules") or payload.get("rules_primary") or payload.get("rules_secondary") or "")
-            or None,
+            "rules": rules_text,
         },
         warnings=warnings,
+        audit_status=audit_status,
+        reason_codes=reason_codes,
+        yes_interpretation=yes_interpretation.upper() if yes_interpretation else None,
+        no_interpretation=no_interpretation.upper() if no_interpretation else None,
+        no_is_true_complement=parsed_selection in team_codes and parsed_line is not None and bool(no_text_mentions_expected),
+        complement_safe_for_paper_settlement=verified,
+        line_sign=_line_sign(parsed_line),
+        line_direction=_line_direction(parsed_line),
+        push_possible=_push_possible(parsed_line),
+        push_condition=push_condition,
+        push_rule_verified=_rules_verify_push(parsed_line, rules_text),
     )
 
 
@@ -291,6 +444,17 @@ def spread_verification_from_mapping(
             parse_source=str(existing.get("parse_source") or "metadata"),
             raw_contract_text=existing.get("raw_contract_text") if isinstance(existing.get("raw_contract_text"), dict) else {},
             warnings=list(existing.get("warnings") or []) if isinstance(existing.get("warnings"), list) else [],
+            audit_status=str(existing.get("audit_status") or "trusted_audit_only"),
+            reason_codes=list(existing.get("reason_codes") or []) if isinstance(existing.get("reason_codes"), list) else [],
+            yes_interpretation=existing.get("yes_interpretation") if isinstance(existing.get("yes_interpretation"), str) else None,
+            no_interpretation=existing.get("no_interpretation") if isinstance(existing.get("no_interpretation"), str) else None,
+            no_is_true_complement=bool(existing.get("no_is_true_complement", True)),
+            complement_safe_for_paper_settlement=bool(existing.get("complement_safe_for_paper_settlement", True)),
+            line_sign=existing.get("line_sign") if isinstance(existing.get("line_sign"), str) else None,
+            line_direction=existing.get("line_direction") if isinstance(existing.get("line_direction"), str) else None,
+            push_possible=bool(existing.get("push_possible", False)),
+            push_condition=existing.get("push_condition") if isinstance(existing.get("push_condition"), str) else None,
+            push_rule_verified=bool(existing.get("push_rule_verified", False)),
         )
     return verify_spread_market(
         game=game,
