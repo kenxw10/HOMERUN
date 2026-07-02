@@ -9645,6 +9645,49 @@ def test_lineup_sync_handles_missing_lineup_without_500(monkeypatch) -> None:
     assert lineup.features["missing_reason"] == "LINEUP_NOT_POSTED_YET"
 
 
+def test_lineup_sync_marks_live_feed_failure_unavailable(monkeypatch) -> None:
+    monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "true")
+    get_settings.cache_clear()
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    class FailingFeedClient:
+        def get_game_feed(self, *_args, **_kwargs):
+            raise HttpJsonError("live feed unavailable", endpoint="https://statsapi.test/feed", params={})
+
+    monkeypatch.setattr(features, "MLBStatsClient", FailingFeedClient)
+
+    try:
+        with Session(engine) as session:
+            session.add(
+                MlbGame(
+                    external_game_id="123456",
+                    home_team="Pittsburgh Pirates",
+                    away_team="Seattle Mariners",
+                    home_abbreviation="PIT",
+                    away_abbreviation="SEA",
+                    scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+                    status="scheduled",
+                    raw_payload={"venue": {"id": 31, "name": "PNC Park"}},
+                )
+            )
+            session.commit()
+
+            result = features.sync_mlb_lineups(session, date(2026, 7, 1))
+            lineup = session.scalar(select(LineupSnapshot).where(LineupSnapshot.team_code == "PIT"))
+            game = session.scalar(select(MlbGame).where(MlbGame.external_game_id == "123456"))
+    finally:
+        get_settings.cache_clear()
+
+    assert result["validation_status"] == "degraded_with_errors"
+    assert result["errors"][0]["table"] == "mlb_games_feed"
+    assert lineup is not None
+    assert lineup.source_status == "missing"
+    assert lineup.features["missing_reason"] == features.LIVE_FEED_UNAVAILABLE
+    assert game is not None
+    assert game.raw_payload[features.LIVE_FEED_HYDRATION_KEY]["errors"][0]["table"] == "mlb_games_feed"
+
+
 def test_feature_ingestion_scope_excludes_live_execution_team_totals_and_umpires() -> None:
     searchable = " ".join(
         [

@@ -55,6 +55,7 @@ PYBASEBALL_SOURCE = "pybaseball_public_stats_v1"
 STATCAST_SOURCE = "statcast_savant_secondary_v1"
 KALSHI_MARKET_DATA_SOURCE = "kalshi_public_market_data"
 PREGAME_CONTEXT_SYNC_MODE = "pregame_context_refresh_lightweight"
+LIVE_FEED_HYDRATION_KEY = "homerun_live_feed_hydration"
 LINEUP_NOT_POSTED_YET = "LINEUP_NOT_POSTED_YET"
 PARTIAL_LINEUP_POSTED = "PARTIAL_LINEUP_POSTED"
 LIVE_FEED_LINEUP_EMPTY = "LIVE_FEED_LINEUP_EMPTY"
@@ -1231,6 +1232,7 @@ def _pitcher_pybaseball_row(
 def _merge_game_payload(game: MlbGame, payload: dict[str, object]) -> None:
     merged = dict(game.raw_payload or {})
     merged.update(payload)
+    merged.pop(LIVE_FEED_HYDRATION_KEY, None)
     game.raw_payload = merged
 
 
@@ -3820,6 +3822,12 @@ def _lineup_missing_reason(game: MlbGame, starter_count: int) -> str | None:
         isinstance(error, dict) and error.get("table") == "mlb_games_feed" for error in errors
     ):
         return LIVE_FEED_UNAVAILABLE
+    live_feed = raw.get(LIVE_FEED_HYDRATION_KEY) if isinstance(raw, dict) else None
+    live_feed_errors = live_feed.get("errors") if isinstance(live_feed, dict) else None
+    if isinstance(live_feed_errors, list) and any(
+        isinstance(error, dict) and error.get("table") == "mlb_games_feed" for error in live_feed_errors
+    ):
+        return LIVE_FEED_UNAVAILABLE
     if _game_phase(game) == "pregame":
         return LINEUP_NOT_POSTED_YET
     return LIVE_FEED_LINEUP_EMPTY
@@ -4652,14 +4660,24 @@ def _hydrate_game_endpoint_if_available(game: MlbGame) -> dict[str, object] | No
     try:
         payload = MLBStatsClient().get_game_feed(game.external_game_id)
     except HttpJsonError as exc:
-        return _source_error(source=MLB_STATS_SOURCE, table="mlb_games_feed", game_pk=game.external_game_id, exc=exc)
+        error = _source_error(source=MLB_STATS_SOURCE, table="mlb_games_feed", game_pk=game.external_game_id, exc=exc)
     except (ValueError, KeyError, TypeError) as exc:
-        return _source_error(source=MLB_STATS_SOURCE, table="mlb_games_feed", game_pk=game.external_game_id, exc=exc)
+        error = _source_error(source=MLB_STATS_SOURCE, table="mlb_games_feed", game_pk=game.external_game_id, exc=exc)
     except Exception as exc:  # defensive: source failures should degrade the sync, not 500
-        return _source_error(source=MLB_STATS_SOURCE, table="mlb_games_feed", game_pk=game.external_game_id, exc=exc)
-    if payload:
-        _merge_game_payload(game, payload)
-    return None
+        error = _source_error(source=MLB_STATS_SOURCE, table="mlb_games_feed", game_pk=game.external_game_id, exc=exc)
+    else:
+        if payload:
+            _merge_game_payload(game, payload)
+        return None
+
+    raw = dict(game.raw_payload or {})
+    raw[LIVE_FEED_HYDRATION_KEY] = {
+        "status": "unavailable",
+        "checked_at": utc_now().isoformat(),
+        "errors": [error],
+    }
+    game.raw_payload = raw
+    return error
 
 
 def _merge_boxscore_payload(game: MlbGame, payload: dict[str, object]) -> None:
