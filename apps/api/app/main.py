@@ -42,6 +42,7 @@ from app.services.features import (
     feature_detail,
     source_status_report,
     starter_status_report,
+    sync_mlb_pregame_context,
     sync_mlb_starters,
     sync_mlb_bullpen_features,
     sync_mlb_features,
@@ -659,6 +660,17 @@ def run_mlb_starter_sync(
     with _db_session_or_503() as session:
         result = sync_mlb_starters(session, resolved_target_date)
     return RunResponse(ok=result.get("validation_status") != "failed", action="mlb_starter_sync", result=result)
+
+
+@app.post("/v1/sync/mlb-pregame-context", response_model=RunResponse)
+def run_mlb_pregame_context_sync(
+    target_date: str | None = Query(default=None),
+    _: None = Depends(require_internal_api_key),
+) -> RunResponse:
+    resolved_target_date = _resolve_api_target_date(target_date)
+    with _db_session_or_503() as session:
+        result = sync_mlb_pregame_context(session, resolved_target_date)
+    return RunResponse(ok=result.get("validation_status") != "failed", action="mlb_pregame_context_sync", result=result)
 
 
 @app.get("/v1/model/starter-status", response_model=RunResponse)

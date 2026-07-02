@@ -2071,7 +2071,14 @@ def test_candidate_sweep_refreshes_marks_after_candidate_engine(monkeypatch) -> 
         "sync_market_family_mappings",
         lambda *_args, **_kwargs: record("market_family_mappings", {}),
     )
-    monkeypatch.setattr(job_runs, "sync_mlb_starters", lambda *_args, **_kwargs: record("starter_refresh", {}))
+    monkeypatch.setattr(
+        job_runs,
+        "sync_mlb_pregame_context",
+        lambda *_args, **_kwargs: record(
+            "pregame_context_refresh",
+            {"validation_status": "ok", "feature_sync_mode": features.PREGAME_CONTEXT_SYNC_MODE},
+        ),
+    )
     monkeypatch.setattr(job_runs, "generate_candidates", lambda *_args, **_kwargs: record("candidate_engine", {}))
     monkeypatch.setattr(job_runs, "refresh_open_position_prices", lambda *_args, **_kwargs: record("price_refresh", {}))
     monkeypatch.setattr(
@@ -2106,7 +2113,7 @@ def test_candidate_sweep_refreshes_marks_after_candidate_engine(monkeypatch) -> 
 
     assert call_order == [
         "schedule",
-        "starter_refresh",
+        "pregame_context_refresh",
         "market_family_mappings",
         "candidate_engine",
         "price_refresh",
@@ -2115,6 +2122,8 @@ def test_candidate_sweep_refreshes_marks_after_candidate_engine(monkeypatch) -> 
     assert result["feature_sync"] == {
         "skipped": True,
         "feature_sync_mode": "cache_only",
+        "feature_sync_skipped": True,
+        "heavy_feature_sync_skipped": True,
         "reason": "candidate_sweep_uses_cached_feature_snapshots",
     }
     assert result["cached_features"]["status"] == "low_quality_missing_cached_features"
@@ -2160,10 +2169,10 @@ def test_candidate_sweep_cache_only_does_not_call_advanced_public_sources(monkey
     )
     monkeypatch.setattr(
         job_runs,
-        "sync_mlb_starters",
+        "sync_mlb_pregame_context",
         lambda *_args, **_kwargs: {
             "validation_status": "ok",
-            "feature_sync_mode": "starter_refresh_lightweight",
+            "feature_sync_mode": features.PREGAME_CONTEXT_SYNC_MODE,
         },
     )
     monkeypatch.setattr(job_runs, "sync_market_family_mappings", lambda *_args, **_kwargs: {})
@@ -2223,7 +2232,14 @@ def test_candidate_sweep_dry_run_skips_price_refresh_and_snapshot(monkeypatch) -
         "sync_market_family_mappings",
         lambda *_args, **_kwargs: record("market_family_mappings", {}),
     )
-    monkeypatch.setattr(job_runs, "sync_mlb_starters", lambda *_args, **_kwargs: record("starter_refresh", {}))
+    monkeypatch.setattr(
+        job_runs,
+        "sync_mlb_pregame_context",
+        lambda *_args, **_kwargs: record(
+            "pregame_context_refresh",
+            {"validation_status": "ok", "feature_sync_mode": features.PREGAME_CONTEXT_SYNC_MODE},
+        ),
+    )
     captured_generate_kwargs: dict[str, object] = {}
 
     def fake_generate_candidates(*_args, **kwargs):
@@ -2279,7 +2295,7 @@ def test_candidate_sweep_dry_run_skips_price_refresh_and_snapshot(monkeypatch) -
             dry_run_candidates_only=True,
         )
 
-    assert call_order == ["schedule", "starter_refresh", "market_family_mappings", "candidate_engine"]
+    assert call_order == ["schedule", "pregame_context_refresh", "market_family_mappings", "candidate_engine"]
     assert captured_generate_kwargs == {
         "min_time_to_start_minutes": 45,
         "max_time_to_start_minutes": 180,
@@ -2319,8 +2335,11 @@ def test_candidate_sweep_completes_cleanly_when_cached_feature_snapshots_missing
     )
     monkeypatch.setattr(
         job_runs,
-        "sync_mlb_starters",
-        lambda *_args, **_kwargs: pytest.fail("missing cached features should skip starter refresh"),
+        "sync_mlb_pregame_context",
+        lambda *_args, **_kwargs: record(
+            "pregame_context_refresh",
+            {"validation_status": "ok", "feature_sync_mode": features.PREGAME_CONTEXT_SYNC_MODE},
+        ),
     )
     monkeypatch.setattr(
         job_runs,
@@ -2355,7 +2374,7 @@ def test_candidate_sweep_completes_cleanly_when_cached_feature_snapshots_missing
             sweep_label="rolling_pregame_window",
         )
 
-    assert call_order == ["schedule", "price_refresh", "balance_snapshot"]
+    assert call_order == ["schedule", "pregame_context_refresh", "price_refresh", "balance_snapshot"]
     assert result["feature_sync_mode"] == "cache_only"
     assert result["feature_sync_skipped"] is True
     assert result["cached_features"]["status"] == "missing_cached_feature_snapshots"
@@ -2385,7 +2404,7 @@ def test_candidate_sweep_continues_when_lightweight_starter_refresh_fails(monkey
         call_order.append(name)
         return result
 
-    def fail_starter_refresh(*_args, **_kwargs):
+    def fail_pregame_context_refresh(*_args, **_kwargs):
         raise TimeoutError("mlb starter timeout")
 
     monkeypatch.setattr(job_runs, "sync_schedule", lambda *_args, **_kwargs: record("schedule", 0))
@@ -2394,7 +2413,7 @@ def test_candidate_sweep_continues_when_lightweight_starter_refresh_fails(monkey
         "sync_mlb_features",
         lambda *_args, **_kwargs: pytest.fail("candidate-sweep must not run full feature sync"),
     )
-    monkeypatch.setattr(job_runs, "sync_mlb_starters", fail_starter_refresh)
+    monkeypatch.setattr(job_runs, "sync_mlb_pregame_context", fail_pregame_context_refresh)
     monkeypatch.setattr(
         job_runs,
         "sync_market_family_mappings",
@@ -2434,7 +2453,9 @@ def test_candidate_sweep_continues_when_lightweight_starter_refresh_fails(monkey
 
     assert call_order == ["schedule", "market_family_mappings", "candidate_engine", "price_refresh", "balance_snapshot"]
     assert result["feature_sync_mode"] == "cache_only"
-    assert result["starter_refresh"]["status"] == "degraded_starter_refresh_failed"
+    assert result["pregame_context_refresh"]["status"] == "degraded_pregame_context_refresh_failed"
+    assert result["pregame_context_refresh"]["heavy_feature_sync_skipped"] is True
+    assert result["starter_refresh"]["status"] == "degraded_pregame_context_refresh_failed"
     assert result["starter_refresh"]["heavy_feature_sync_skipped"] is True
     assert result["starter_refresh"]["error"]["type"] == "TimeoutError"
 
@@ -2659,12 +2680,15 @@ def test_starter_endpoints_return_422_for_invalid_dates() -> None:
 
     try:
         sync_response = client.post("/v1/sync/mlb-starters?target_date=not-a-date")
+        pregame_response = client.post("/v1/sync/mlb-pregame-context?target_date=not-a-date")
         status_response = client.get("/v1/model/starter-status?date=not-a-date")
     finally:
         app.dependency_overrides.clear()
 
     assert sync_response.status_code == 422
     assert sync_response.json()["detail"] == "Invalid target_date. Use YYYY-MM-DD, today_et, or yesterday_et."
+    assert pregame_response.status_code == 422
+    assert pregame_response.json()["detail"] == "Invalid target_date. Use YYYY-MM-DD, today_et, or yesterday_et."
     assert status_response.status_code == 422
     assert status_response.json()["detail"] == "Invalid date. Use YYYY-MM-DD, today_et, or yesterday_et."
 
@@ -9621,6 +9645,96 @@ def test_lineup_sync_handles_missing_lineup_without_500(monkeypatch) -> None:
     assert lineup.features["missing_reason"] == "LINEUP_NOT_POSTED_YET"
 
 
+def test_lineup_sync_marks_live_feed_failure_unavailable(monkeypatch) -> None:
+    monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "true")
+    get_settings.cache_clear()
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    class FailingFeedClient:
+        def get_game_feed(self, *_args, **_kwargs):
+            raise HttpJsonError("live feed unavailable", endpoint="https://statsapi.test/feed", params={})
+
+    monkeypatch.setattr(features, "MLBStatsClient", FailingFeedClient)
+
+    try:
+        with Session(engine) as session:
+            session.add(
+                MlbGame(
+                    external_game_id="123456",
+                    home_team="Pittsburgh Pirates",
+                    away_team="Seattle Mariners",
+                    home_abbreviation="PIT",
+                    away_abbreviation="SEA",
+                    scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+                    status="scheduled",
+                    raw_payload={"venue": {"id": 31, "name": "PNC Park"}},
+                )
+            )
+            session.commit()
+
+            result = features.sync_mlb_lineups(session, date(2026, 7, 1))
+            lineup = session.scalar(select(LineupSnapshot).where(LineupSnapshot.team_code == "PIT"))
+            game = session.scalar(select(MlbGame).where(MlbGame.external_game_id == "123456"))
+    finally:
+        get_settings.cache_clear()
+
+    assert result["validation_status"] == "degraded_with_errors"
+    assert result["errors"][0]["table"] == "mlb_games_feed"
+    assert lineup is not None
+    assert lineup.source_status == "missing"
+    assert lineup.features["missing_reason"] == features.LIVE_FEED_UNAVAILABLE
+    assert game is not None
+    assert game.raw_payload[features.LIVE_FEED_HYDRATION_KEY]["errors"][0]["table"] == "mlb_games_feed"
+
+
+def test_lineup_sync_ignores_stale_starter_feed_error_after_feed_success(monkeypatch) -> None:
+    monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "true")
+    get_settings.cache_clear()
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    class SuccessfulFeedClient:
+        def get_game_feed(self, *_args, **_kwargs):
+            return {"gameData": {"datetime": {"dateTime": "2026-07-01T23:00:00Z"}}}
+
+    monkeypatch.setattr(features, "MLBStatsClient", SuccessfulFeedClient)
+
+    try:
+        with Session(engine) as session:
+            session.add(
+                MlbGame(
+                    external_game_id="123456",
+                    home_team="Pittsburgh Pirates",
+                    away_team="Seattle Mariners",
+                    home_abbreviation="PIT",
+                    away_abbreviation="SEA",
+                    scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+                    status="scheduled",
+                    raw_payload={
+                        "venue": {"id": 31, "name": "PNC Park"},
+                        "homerun_starter_hydration": {
+                            "errors": [{"table": "mlb_games_feed", "message": "older feed outage"}]
+                        },
+                    },
+                )
+            )
+            session.commit()
+
+            result = features.sync_mlb_lineups(session, date(2026, 7, 1))
+            lineup = session.scalar(select(LineupSnapshot).where(LineupSnapshot.team_code == "PIT"))
+            game = session.scalar(select(MlbGame).where(MlbGame.external_game_id == "123456"))
+    finally:
+        get_settings.cache_clear()
+
+    assert result["validation_status"] == "degraded_no_available_public_rows"
+    assert lineup is not None
+    assert lineup.source_status == "missing"
+    assert lineup.features["missing_reason"] == features.LINEUP_NOT_POSTED_YET
+    assert game is not None
+    assert features.LIVE_FEED_HYDRATION_KEY not in game.raw_payload
+
+
 def test_feature_ingestion_scope_excludes_live_execution_team_totals_and_umpires() -> None:
     searchable = " ".join(
         [
@@ -10961,6 +11075,23 @@ def _starter_schedule_game(*, home_probable: bool = True, away_probable: bool = 
     }
 
 
+def _boxscore_lineup_team(start_id: int, pitcher_id: int, *, starter_count: int = 9) -> dict[str, object]:
+    batters = list(range(start_id, start_id + starter_count))
+    players: dict[str, object] = {}
+    for slot, person_id in enumerate(batters, start=1):
+        players[f"ID{person_id}"] = {
+            "person": {"id": person_id, "fullName": f"Lineup Starter {person_id}"},
+            "battingOrder": str(slot * 100),
+            "batSide": {"code": "R" if slot % 2 else "L"},
+            "position": {"abbreviation": "C" if slot == 9 else "CF"},
+        }
+    players[f"ID{pitcher_id}"] = {
+        "person": {"id": pitcher_id, "fullName": f"Pitcher {pitcher_id}"},
+        "pitchHand": {"code": "R"},
+    }
+    return {"batters": batters, "pitchers": [pitcher_id], "players": players}
+
+
 def _seed_existing_starter_feature_snapshot(
     session: Session,
     *,
@@ -11168,6 +11299,292 @@ def test_sync_mlb_starters_skips_snapshot_without_existing_mature_feature(monkey
     assert result["feature_snapshots_upserted"] == 0
     assert result["feature_snapshots_skipped_missing_existing"] == 1
     assert snapshot is None
+
+
+def test_sync_mlb_pregame_context_updates_official_lineups_and_snapshot(monkeypatch) -> None:
+    monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "true")
+    get_settings.cache_clear()
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    class FakeMLBStatsClient:
+        def get_schedule(self, *_args, **_kwargs):
+            return {"dates": [{"games": [_starter_schedule_game()]}]}
+
+        def get_game_feed(self, *_args, **_kwargs):
+            return {
+                "liveData": {
+                    "boxscore": {
+                        "teams": {
+                            "home": _boxscore_lineup_team(1000, 1999),
+                            "away": _boxscore_lineup_team(2000, 2999),
+                        }
+                    }
+                }
+            }
+
+        def get_pitcher_game_log_stats(self, *_args, **_kwargs):
+            return _starter_game_log_payload()
+
+    monkeypatch.setattr(features, "MLBStatsClient", FakeMLBStatsClient)
+
+    try:
+        with Session(engine) as session:
+            _seed_existing_starter_feature_snapshot(session)
+            result = features.sync_mlb_pregame_context(session, date(2026, 7, 1))
+            home_lineup = session.scalar(select(LineupSnapshot).where(LineupSnapshot.team_code == "PIT"))
+            snapshot = session.scalar(select(MlbFeatureSnapshot).where(MlbFeatureSnapshot.source == features.FEATURE_VERSION))
+    finally:
+        get_settings.cache_clear()
+
+    assert result["validation_status"] == "ok"
+    assert result["feature_sync_mode"] == features.PREGAME_CONTEXT_SYNC_MODE
+    assert result["heavy_feature_sync_skipped"] is True
+    assert result["confirmed_lineup_count"] == 2
+    assert result["pybaseball_functions_attempted"] == []
+    assert result["statcast_rows_seen"] == 0
+    assert home_lineup is not None
+    assert home_lineup.source_status == "available"
+    assert home_lineup.features["missing_reason"] is None
+    assert snapshot is not None
+    assert snapshot.source_statuses["lineup"] == {"home": "available", "away": "available"}
+    assert snapshot.source_statuses["starter_identity"] == {"home": "available", "away": "available"}
+
+
+def test_sync_mlb_pregame_context_fetches_boxscore_lineups_when_starters_known(monkeypatch) -> None:
+    monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "true")
+    get_settings.cache_clear()
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    boxscore_calls: list[str] = []
+
+    class FakeMLBStatsClient:
+        def get_schedule(self, *_args, **_kwargs):
+            return {"dates": [{"games": [_starter_schedule_game()]}]}
+
+        def get_game_feed(self, *_args, **_kwargs):
+            return {
+                "gameData": {
+                    "datetime": {"dateTime": "2026-07-01T23:00:00Z"},
+                    "probablePitchers": {
+                        "home": {"id": 1999, "fullName": "Home Feed Starter", "pitchHand": {"code": "R"}},
+                        "away": {"id": 2999, "fullName": "Away Feed Starter", "pitchHand": {"code": "L"}},
+                    },
+                }
+            }
+
+        def get_game_boxscore(self, game_pk: str):
+            boxscore_calls.append(str(game_pk))
+            return {
+                "teams": {
+                    "home": _boxscore_lineup_team(1000, 1999),
+                    "away": _boxscore_lineup_team(2000, 2999),
+                }
+            }
+
+        def get_pitcher_game_log_stats(self, *_args, **_kwargs):
+            return _starter_game_log_payload()
+
+    monkeypatch.setattr(features, "MLBStatsClient", FakeMLBStatsClient)
+
+    try:
+        with Session(engine) as session:
+            _seed_existing_starter_feature_snapshot(session)
+            result = features.sync_mlb_pregame_context(session, date(2026, 7, 1))
+            home_lineup = session.scalar(select(LineupSnapshot).where(LineupSnapshot.team_code == "PIT"))
+            snapshot = session.scalar(select(MlbFeatureSnapshot).where(MlbFeatureSnapshot.source == features.FEATURE_VERSION))
+    finally:
+        get_settings.cache_clear()
+
+    assert boxscore_calls == ["123456"]
+    assert result["validation_status"] == "ok"
+    assert result["confirmed_lineup_count"] == 2
+    assert home_lineup is not None
+    assert home_lineup.source_status == "available"
+    assert home_lineup.features["missing_reason"] is None
+    assert snapshot is not None
+    assert snapshot.source_statuses["lineup"] == {"home": "available", "away": "available"}
+
+
+def test_sync_mlb_pregame_context_reconciles_boxscore_starter_changes(monkeypatch) -> None:
+    monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "true")
+    get_settings.cache_clear()
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    game_log_calls: list[str] = []
+
+    class FakeMLBStatsClient:
+        def get_schedule(self, *_args, **_kwargs):
+            return {"dates": [{"games": [_starter_schedule_game()]}]}
+
+        def get_game_feed(self, *_args, **_kwargs):
+            return {
+                "gameData": {
+                    "datetime": {"dateTime": "2026-07-01T23:00:00Z"},
+                    "probablePitchers": {
+                        "home": {"id": 1999, "fullName": "Scratched Home Starter", "pitchHand": {"code": "R"}},
+                        "away": {"id": 2999, "fullName": "Scratched Away Starter", "pitchHand": {"code": "L"}},
+                    },
+                }
+            }
+
+        def get_game_boxscore(self, *_args, **_kwargs):
+            return {
+                "teams": {
+                    "home": _boxscore_lineup_team(1000, 3999),
+                    "away": _boxscore_lineup_team(2000, 4999),
+                }
+            }
+
+        def get_pitcher_game_log_stats(self, person_id: str, _season: int):
+            game_log_calls.append(str(person_id))
+            return _starter_game_log_payload()
+
+    monkeypatch.setattr(features, "MLBStatsClient", FakeMLBStatsClient)
+
+    try:
+        with Session(engine) as session:
+            _seed_existing_starter_feature_snapshot(session)
+            result = features.sync_mlb_pregame_context(session, date(2026, 7, 1))
+            game = session.scalar(select(MlbGame).where(MlbGame.external_game_id == "123456"))
+            reconciled_pitcher = session.scalar(
+                select(PitcherDailyFeature)
+                .where(PitcherDailyFeature.pitcher_id == "3999")
+                .where(PitcherDailyFeature.source == features.MLB_STATS_SOURCE)
+            )
+            snapshot = session.scalar(select(MlbFeatureSnapshot).where(MlbFeatureSnapshot.source == features.FEATURE_VERSION))
+    finally:
+        get_settings.cache_clear()
+
+    assert game_log_calls == ["1999", "2999", "3999", "4999"]
+    assert result["boxscore_starter_reconcile_count"] == 1
+    assert game is not None
+    assert features.probable_pitcher_from_payload(game.raw_payload or {}, "home")["id"] == "3999"
+    assert reconciled_pitcher is not None
+    assert reconciled_pitcher.source_status == "available"
+    assert snapshot is not None
+    assert snapshot.features["starter_identity"]["home"]["id"] == "3999"
+    assert snapshot.source_statuses["starter_recent"]["home"] == "available"
+    assert snapshot.source_statuses["starter_workload"]["home"] == "available"
+
+
+def test_sync_mlb_pregame_context_does_not_overwrite_feature_sync_audit(monkeypatch) -> None:
+    monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "true")
+    get_settings.cache_clear()
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    class FakeMLBStatsClient:
+        def get_schedule(self, *_args, **_kwargs):
+            return {"dates": [{"games": [_starter_schedule_game()]}]}
+
+        def get_game_feed(self, *_args, **_kwargs):
+            return {
+                "liveData": {
+                    "boxscore": {
+                        "teams": {
+                            "home": _boxscore_lineup_team(1000, 1999),
+                            "away": _boxscore_lineup_team(2000, 2999),
+                        }
+                    }
+                }
+            }
+
+        def get_pitcher_game_log_stats(self, *_args, **_kwargs):
+            return _starter_game_log_payload()
+
+    monkeypatch.setattr(features, "MLBStatsClient", FakeMLBStatsClient)
+
+    try:
+        with Session(engine) as session:
+            _seed_existing_starter_feature_snapshot(session)
+            session.add(
+                MlbFeatureSnapshot(
+                    mlb_game_id=None,
+                    target_date=date(2026, 7, 1),
+                    source=features.FEATURE_SYNC_AUDIT_SOURCE,
+                    captured_at=datetime(2026, 7, 1, 13, 0, tzinfo=UTC),
+                    data_quality=Decimal("0.0000"),
+                    source_statuses={},
+                    features={
+                        "sync_status": {
+                            "action": "mlb_feature_sync",
+                            "validation_status": "degraded_with_errors",
+                            "statcast_source_status": "statcast_empty_result",
+                            "errors": [{"source": features.STATCAST_SOURCE, "message": "empty response"}],
+                        }
+                    },
+                )
+            )
+            session.commit()
+
+            result = features.sync_mlb_pregame_context(session, date(2026, 7, 1))
+            audit = session.scalar(
+                select(MlbFeatureSnapshot).where(MlbFeatureSnapshot.source == features.FEATURE_SYNC_AUDIT_SOURCE)
+            )
+    finally:
+        get_settings.cache_clear()
+
+    assert result["validation_status"] == "ok"
+    assert result["feature_sync_audit_skipped"] is True
+    assert result["audit_skipped_reason"] == "pregame_context_refresh_does_not_replace_full_feature_sync_audit"
+    assert audit is not None
+    assert audit.features["sync_status"]["action"] == "mlb_feature_sync"
+    assert audit.features["sync_status"]["validation_status"] == "degraded_with_errors"
+    assert audit.features["sync_status"]["statcast_source_status"] == "statcast_empty_result"
+
+
+def test_sync_mlb_pregame_context_reports_partial_and_unposted_lineups(monkeypatch) -> None:
+    monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "true")
+    get_settings.cache_clear()
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    class FakeMLBStatsClient:
+        def get_schedule(self, *_args, **_kwargs):
+            return {"dates": [{"games": [_starter_schedule_game()]}]}
+
+        def get_game_feed(self, *_args, **_kwargs):
+            return {
+                "liveData": {
+                    "boxscore": {
+                        "teams": {
+                            "home": _boxscore_lineup_team(1000, 1999, starter_count=4),
+                            "away": {"batters": [], "pitchers": [2999], "players": {}},
+                        }
+                    }
+                }
+            }
+
+        def get_pitcher_game_log_stats(self, *_args, **_kwargs):
+            return _starter_game_log_payload()
+
+    monkeypatch.setattr(features, "MLBStatsClient", FakeMLBStatsClient)
+
+    try:
+        with Session(engine) as session:
+            _seed_existing_starter_feature_snapshot(session)
+            result = features.sync_mlb_pregame_context(session, date(2026, 7, 1))
+            home_lineup = session.scalar(select(LineupSnapshot).where(LineupSnapshot.team_code == "PIT"))
+            away_lineup = session.scalar(select(LineupSnapshot).where(LineupSnapshot.team_code == "SEA"))
+            snapshot = session.scalar(select(MlbFeatureSnapshot).where(MlbFeatureSnapshot.source == features.FEATURE_VERSION))
+    finally:
+        get_settings.cache_clear()
+
+    assert result["partial_lineup_count"] == 1
+    assert result["missing_lineup_count"] == 1
+    assert result["lineup_missing_reasons"] == {
+        features.PARTIAL_LINEUP_POSTED: 1,
+        features.LINEUP_NOT_POSTED_YET: 1,
+    }
+    assert home_lineup is not None
+    assert home_lineup.source_status == "partial"
+    assert home_lineup.features["missing_reason"] == features.PARTIAL_LINEUP_POSTED
+    assert away_lineup is not None
+    assert away_lineup.source_status == "missing"
+    assert away_lineup.features["missing_reason"] == features.LINEUP_NOT_POSTED_YET
+    assert snapshot is not None
+    assert snapshot.source_statuses["lineup"] == {"home": "partial", "away": "missing"}
 
 
 def test_sync_mlb_starters_preserves_cached_statcast_pitcher_fields(monkeypatch) -> None:
