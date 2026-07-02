@@ -10095,6 +10095,55 @@ def test_source_status_report_marks_pybaseball_unavailable_statcast_as_cached(mo
     assert inventory["statcast_savant"]["fallback_reason"] == "unavailable_pybaseball_not_installed"
 
 
+def test_source_status_report_does_not_fail_unattempted_statcast(monkeypatch) -> None:
+    get_settings.cache_clear()
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    monkeypatch.setattr(
+        features.pybaseball_client,
+        "import_status",
+        lambda: {
+            "available": False,
+            "version": None,
+            "module_path": None,
+            "import_error": "No module named pybaseball",
+        },
+    )
+
+    try:
+        with Session(engine) as session:
+            session.add(
+                MlbFeatureSnapshot(
+                    mlb_game_id=None,
+                    target_date=date(2026, 7, 2),
+                    source=features.FEATURE_SYNC_AUDIT_SOURCE,
+                    captured_at=datetime(2026, 7, 2, 21, 0, tzinfo=UTC),
+                    data_quality=None,
+                    source_statuses={"sync": "completed"},
+                    features={
+                        "sync_status": {
+                            "attempted_at": datetime(2026, 7, 2, 21, 0, tzinfo=UTC).isoformat(),
+                            "validation_status": "completed",
+                            "statcast_source_status": "not_attempted",
+                            "errors": [],
+                            "warnings": [],
+                        }
+                    },
+                )
+            )
+            session.commit()
+            report = features.source_status_report(session)
+    finally:
+        get_settings.cache_clear()
+
+    inventory = {item["source_name"]: item for item in report["source_inventory"]}
+    assert report["statcast_savant_status"] == "not_attempted"
+    assert report["statcast_savant_last_error"] is None
+    assert inventory["statcast_savant"]["status"] == "not_attempted"
+    assert inventory["statcast_savant"]["fallback_used"] is False
+    assert inventory["statcast_savant"]["last_error"] is None
+
+
 def test_source_status_report_ignores_pybaseball_player_mapping_misses(monkeypatch) -> None:
     get_settings.cache_clear()
     engine = create_engine("sqlite+pysqlite:///:memory:")

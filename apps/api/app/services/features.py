@@ -5321,6 +5321,11 @@ def _statcast_audit_issue(feature_audit: dict[str, object]) -> dict[str, object]
     return issue
 
 
+def _statcast_source_attempted(feature_audit: dict[str, object]) -> bool:
+    status = str(feature_audit.get("statcast_source_status") or "")
+    return status not in {"", "not_attempted", "skipped_future_window"}
+
+
 def _cached_status_from_timestamp(timestamp: object, max_stale_hours: int) -> str:
     parsed = _parsed_status_timestamp(timestamp)
     if parsed is None:
@@ -5402,8 +5407,10 @@ def _statcast_db_status(session: Session, feature_audit: dict[str, object]) -> d
         status = _cache_age_limited_status("available", last_success, settings.statcast_cache_max_stale_hours)
     elif status_counts.get("partial", 0) > 0:
         status = _cache_age_limited_status("partial", last_success, settings.statcast_cache_max_stale_hours)
-    elif feature_audit.get("last_attempted_sync"):
+    elif _statcast_source_attempted(feature_audit):
         status = "failed" if not pybaseball_available() else "partial"
+    elif feature_audit.get("last_attempted_sync"):
+        status = "not_attempted"
     else:
         status = "not_wired"
     return {
