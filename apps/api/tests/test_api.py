@@ -10268,6 +10268,61 @@ def test_source_status_report_marks_old_pybaseball_cache_stale_without_error(mon
     assert inventory["pybaseball_fangraphs"]["last_error"] is None
 
 
+def test_source_status_report_marks_pybaseball_import_failure_as_cached_fallback(monkeypatch) -> None:
+    fixed_now = datetime(2026, 7, 2, 21, 0, tzinfo=UTC)
+    cached_at = fixed_now - timedelta(hours=3)
+    monkeypatch.setenv("ADVANCED_PUBLIC_STATS_MAX_STALE_HOURS", "72")
+    monkeypatch.setattr(features, "utc_now", lambda: fixed_now)
+    get_settings.cache_clear()
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    monkeypatch.setattr(
+        features.pybaseball_client,
+        "import_status",
+        lambda: {
+            "available": False,
+            "version": None,
+            "module_path": None,
+            "import_error": {"error_type": "ImportError", "message": "No module named pybaseball"},
+        },
+    )
+
+    try:
+        with Session(engine) as session:
+            session.add(
+                TeamDailyFeature(
+                    target_date=date(2026, 7, 2),
+                    team_code="PIT",
+                    captured_at=cached_at,
+                    source=features.PYBASEBALL_SOURCE,
+                    source_status="available",
+                    confidence=Decimal("0.8500"),
+                    completeness=Decimal("0.7500"),
+                    stale=False,
+                    features={"wrc_plus": 112},
+                    raw_payload={"source_function": "batting_stats"},
+                )
+            )
+            session.commit()
+            report = features.source_status_report(session)
+    finally:
+        get_settings.cache_clear()
+
+    inventory = {item["source_name"]: item for item in report["source_inventory"]}
+    pybaseball_inventory = inventory["pybaseball_fangraphs"]
+    assert report["pybaseball_available"] is False
+    assert report["pybaseball_import_error"]["message"] == "No module named pybaseball"
+    assert report["pybaseball_last_successful_sync"] == cached_at.isoformat()
+    assert pybaseball_inventory["status"] == "cached"
+    assert pybaseball_inventory["fallback_used"] is True
+    assert pybaseball_inventory["fallback_source"] == "last_good_pybaseball_cache"
+    assert pybaseball_inventory["fallback_reason"] == "pybaseball_import_failed"
+    assert pybaseball_inventory["last_error"] == {
+        "error_code": "pybaseball_import_failed",
+        "message": "No module named pybaseball",
+    }
+
+
 def test_mlb_primary_team_daily_preserves_cached_statcast_when_current_fetch_empty() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)

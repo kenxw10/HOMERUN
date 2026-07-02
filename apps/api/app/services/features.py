@@ -5481,6 +5481,13 @@ def _source_health_entry(
     }
 
 
+def _source_issue_reason(issue: object) -> str | None:
+    if isinstance(issue, dict):
+        value = issue.get("error_code") or issue.get("message") or issue.get("error_type")
+        return str(value) if value else None
+    return str(issue) if issue else None
+
+
 def _source_inventory(
     session: Session,
     table_status: dict[str, dict[str, object]],
@@ -5499,13 +5506,23 @@ def _source_inventory(
     pybaseball_last_error = _latest_pybaseball_source_audit_error(feature_audit) or pybaseball_status.get(
         "pybaseball_last_error"
     )
+    pybaseball_import_error = pybaseball_status.get("pybaseball_import_error")
+    pybaseball_import_issue = (
+        {
+            "error_code": "pybaseball_import_failed",
+            "message": _source_issue_reason(pybaseball_import_error) or "pybaseball import failed",
+        }
+        if pybaseball_import_error
+        else None
+    )
+    pybaseball_source_issue = pybaseball_last_error or pybaseball_import_issue
     pybaseball_last_success = pybaseball_status.get("pybaseball_last_successful_sync")
-    if pybaseball_last_error and pybaseball_last_success:
+    if pybaseball_source_issue and pybaseball_last_success:
         pybaseball_health = _cached_status_from_timestamp(
             pybaseball_last_success,
             settings.advanced_public_stats_max_stale_hours,
         )
-    elif pybaseball_last_error or pybaseball_status.get("pybaseball_import_error"):
+    elif pybaseball_source_issue:
         pybaseball_health = "failed"
     elif pybaseball_status.get("advanced_public_stats_status") in {"available", "partial"}:
         pybaseball_health = _cache_age_limited_status(
@@ -5578,13 +5595,11 @@ def _source_inventory(
             modules_affected=["offense_season", "starter_season", "bullpen_season"],
             last_successful_sync=pybaseball_last_success,
             last_attempted_sync=last_attempted,
-            last_error=pybaseball_last_error,
+            last_error=pybaseball_source_issue,
             sample_count=int(pybaseball_status.get("pybaseball_row_sample_count") or 0),
-            fallback_used=bool(pybaseball_last_error and pybaseball_last_success),
-            fallback_source="last_good_pybaseball_cache" if pybaseball_last_error and pybaseball_last_success else None,
-            fallback_reason=str((pybaseball_last_error or {}).get("error_code") or (pybaseball_last_error or {}).get("message"))
-            if isinstance(pybaseball_last_error, dict)
-            else None,
+            fallback_used=bool(pybaseball_source_issue and pybaseball_last_success),
+            fallback_source="last_good_pybaseball_cache" if pybaseball_source_issue and pybaseball_last_success else None,
+            fallback_reason=_source_issue_reason(pybaseball_source_issue),
         ),
         _source_health_entry(
             source_name="statcast_savant",
