@@ -12216,6 +12216,105 @@ def test_low_price_sweep_cap_refills_after_sizing_rejection(monkeypatch) -> None
     assert refill_candidate.decision == "paper_trade"
 
 
+def test_same_side_cap_refills_after_sizing_and_post_cap_rejections(monkeypatch) -> None:
+    _relax_data_quality_gate(monkeypatch)
+    monkeypatch.setenv("PAPER_MAX_SAME_SIDE_TRADES_PER_SLATE", "1")
+    monkeypatch.setenv("PAPER_MAX_NEW_TRADES_PER_SWEEP", "10")
+    monkeypatch.setenv("PAPER_MAX_DAILY_NEW_RISK_PCT", "0.008")
+    monkeypatch.setenv("PAPER_MAX_OPEN_RISK_PCT", "0.008")
+    monkeypatch.setenv("PAPER_MAX_MARKET_FAMILY_RISK_PCT", "0.008")
+    monkeypatch.setenv("PAPER_MAX_SCOPE_RISK_PCT", "0.008")
+    monkeypatch.setenv("PAPER_MIN_NET_EV", "0.05")
+    monkeypatch.setenv("PAPER_MIN_PROB_EDGE", "0.03")
+    get_settings.cache_clear()
+    now = datetime(2026, 7, 1, 20, 0, tzinfo=UTC)
+    monkeypatch.setattr(candidates, "utc_now", lambda: now)
+    monkeypatch.setattr(candidates, "score_mature_candidate", lambda *_args, **_kwargs: _fixed_model_score("0.990000"))
+    monkeypatch.setattr(
+        candidates,
+        "_trade_rank_score",
+        lambda candidate: Decimal("2.0000")
+        if candidate.executable_price == Decimal("0.9000")
+        else Decimal("1.0000"),
+    )
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    try:
+        with Session(engine, autoflush=False) as session:
+            high_rank_game = MlbGame(
+                external_game_id="same-side-refill-high",
+                home_team="Pittsburgh Pirates",
+                away_team="Seattle Mariners",
+                home_abbreviation="PIT",
+                away_abbreviation="SEA",
+                scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+                status="scheduled",
+            )
+            high_rank_market = KalshiMarket(
+                kalshi_market_id="KX-SAME-SIDE-REFILL-HIGH",
+                ticker="KXMLBGAME-SAME-SIDE-REFILL-HIGH-PIT",
+                title="Will Pittsburgh win?",
+                status="open",
+                implied_yes_ask=Decimal("0.9000"),
+            )
+            refill_game = MlbGame(
+                external_game_id="same-side-refill-valid",
+                home_team="Pittsburgh Pirates",
+                away_team="Seattle Mariners",
+                home_abbreviation="PIT",
+                away_abbreviation="SEA",
+                scheduled_start=datetime(2026, 7, 1, 23, 5, tzinfo=UTC),
+                status="scheduled",
+            )
+            refill_market = KalshiMarket(
+                kalshi_market_id="KX-SAME-SIDE-REFILL-VALID",
+                ticker="KXMLBGAME-SAME-SIDE-REFILL-VALID-PIT",
+                title="Will Pittsburgh win?",
+                status="open",
+                implied_yes_ask=Decimal("0.4000"),
+            )
+            session.add_all([high_rank_game, high_rank_market, refill_game, refill_market])
+            session.flush()
+            _add_candidate_mapping(
+                session,
+                high_rank_game,
+                high_rank_market,
+                mapping_status="confirmed",
+                market_type="full_game_winner",
+            )
+            _add_candidate_mapping(
+                session,
+                refill_game,
+                refill_market,
+                mapping_status="confirmed",
+                market_type="full_game_winner",
+            )
+            session.commit()
+
+            result = candidates.generate_candidates(session)
+            trades = list(session.scalars(select(PaperTrade).order_by(PaperTrade.id.asc())))
+            high_rank_candidate = session.scalar(
+                select(ModelCandidate).where(ModelCandidate.kalshi_market_id == high_rank_market.id)
+            )
+            refill_candidate = session.scalar(
+                select(ModelCandidate).where(ModelCandidate.kalshi_market_id == refill_market.id)
+            )
+    finally:
+        get_settings.cache_clear()
+
+    assert result["paper_trades"] == 1
+    assert result["cap_counts"]["no_trade_post_cap_size_too_small"] == 1
+    assert result["cap_counts"]["no_trade_side_concentration_cap"] == 0
+    assert result["trade_allocation"]["side_new_this_sweep"] == {"yes": 1}
+    assert trades[0].market_ticker == "KXMLBGAME-SAME-SIDE-REFILL-VALID-PIT"
+    assert high_rank_candidate is not None
+    assert high_rank_candidate.decision == "no_trade_post_cap_size_too_small"
+    assert refill_candidate is not None
+    assert refill_candidate.decision == "paper_trade"
+
+
 def test_pr3c_trade_policy_counts_settled_trades_against_daily_caps(monkeypatch) -> None:
     monkeypatch.setenv("PAPER_MAX_TRADES_PER_GAME", "1")
     monkeypatch.setenv("PAPER_MAX_TRADES_PER_SLATE", "20")

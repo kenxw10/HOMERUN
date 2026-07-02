@@ -1429,6 +1429,7 @@ def _apply_trade_caps(
     enforce_sweep_cap: bool = True,
     enforce_time_reserve: bool = True,
     enforce_low_price_new_caps: bool = True,
+    enforce_side_new_caps: bool = True,
 ) -> tuple[list[TradeIntent], dict[str, int], dict[str, object]]:
     settings = get_settings()
     (
@@ -1522,7 +1523,8 @@ def _apply_trade_caps(
             candidate.decision = "no_trade_low_price_sweep_cap"
             _update_gate(candidate, "gate_caps_ok", False)
         elif (
-            side in {"yes", "no"}
+            enforce_side_new_caps
+            and side in {"yes", "no"}
             and side_counts.get(side, 0) + selected_side_counts.get(side, 0)
             >= settings.paper_max_same_side_trades_per_slate
         ):
@@ -1698,6 +1700,8 @@ def _apply_aggregate_risk_caps(
     existing_low_price_trades: int = 0,
     max_low_price_trades_per_slate: int | None = None,
     max_low_price_trades_per_sweep: int | None = None,
+    existing_side_trades: dict[str, int] | None = None,
+    max_same_side_trades_per_slate: int | None = None,
 ) -> tuple[list[TradeIntent], dict[str, int], dict[str, object]]:
     settings = get_settings()
     usage = _daily_and_open_risk_usage(session, target_date, day_start, day_end, epoch_id)
@@ -1724,15 +1728,19 @@ def _apply_aggregate_risk_caps(
         "no_trade_time_bucket_reserve": 0,
         "no_trade_low_price_slate_cap": 0,
         "no_trade_low_price_sweep_cap": 0,
+        "no_trade_side_concentration_cap": 0,
         "aggregate_risk_quantity_reduced": 0,
     }
     selected: list[TradeIntent] = []
     selected_low_price = 0
+    side_existing = existing_side_trades or {}
+    selected_side_counts: dict[str, int] = {}
 
     for intent in intents:
         candidate = intent.candidate
         family = candidate.market_family or "unknown"
         scope = candidate.inning_scope or _risk_scope(family)
+        side = (candidate.contract_side or "unknown").lower()
         low_price_trade = intent.price < settings.paper_low_price_threshold
         cost = _intent_cost(intent)
         available = {
@@ -1800,6 +1808,17 @@ def _apply_aggregate_risk_caps(
             session.add(candidate)
             continue
 
+        if (
+            side in {"yes", "no"}
+            and max_same_side_trades_per_slate is not None
+            and side_existing.get(side, 0) + selected_side_counts.get(side, 0) >= max_same_side_trades_per_slate
+        ):
+            candidate.decision = "no_trade_side_concentration_cap"
+            _update_gate(candidate, "gate_caps_ok", False)
+            cap_counts["no_trade_side_concentration_cap"] += 1
+            session.add(candidate)
+            continue
+
         candidate.decision = "paper_trade"
         _update_gate(candidate, "gate_caps_ok", True)
         selected.append(intent)
@@ -1810,6 +1829,8 @@ def _apply_aggregate_risk_caps(
         if low_price_trade:
             low_price_used += cost
             selected_low_price += 1
+        if side in {"yes", "no"}:
+            selected_side_counts[side] = selected_side_counts.get(side, 0) + 1
 
     summary = {
         "risk_limit_basis_type": "active_epoch_portfolio_value",
@@ -1830,6 +1851,9 @@ def _apply_aggregate_risk_caps(
         "existing_low_price_trades": existing_low_price_trades,
         "max_low_price_trades_per_slate": max_low_price_trades_per_slate,
         "max_low_price_trades_per_sweep": max_low_price_trades_per_sweep,
+        "side_existing_slate": side_existing,
+        "side_new_after_sizing_and_risk": selected_side_counts,
+        "max_same_side_trades_per_slate": max_same_side_trades_per_slate,
         "new_trades_after_sizing_and_risk": len(selected),
         "low_price_new_after_sizing_and_risk": selected_low_price,
     }
@@ -2794,6 +2818,7 @@ def generate_candidates(
         enforce_sweep_cap=False,
         enforce_time_reserve=False,
         enforce_low_price_new_caps=False,
+        enforce_side_new_caps=False,
     )
     session.flush()
     for intent in line_selected_trades:
@@ -2885,6 +2910,8 @@ def generate_candidates(
         existing_low_price_trades=int(trade_allocation_summary["low_price_existing_slate"]),
         max_low_price_trades_per_slate=settings.paper_low_price_max_trades_per_slate,
         max_low_price_trades_per_sweep=settings.paper_low_price_max_trades_per_sweep,
+        existing_side_trades=dict(trade_allocation_summary["side_existing_slate"]),
+        max_same_side_trades_per_slate=settings.paper_max_same_side_trades_per_slate,
     )
     risk_selected_trades, post_cap_size_counts = _apply_post_cap_size_guard(session, risk_selected_trades)
     trade_allocation_summary = {
@@ -2896,6 +2923,7 @@ def generate_candidates(
         if trade_allocation_summary["early_window"]
         else None,
         "low_price_new_this_sweep": risk_cap_summary["low_price_new_after_sizing_and_risk"],
+        "side_new_this_sweep": risk_cap_summary["side_new_after_sizing_and_risk"],
     }
     for intent in sized_selected_trades:
         output = outputs_by_candidate_id.get(intent.candidate.id)
