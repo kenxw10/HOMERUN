@@ -9758,6 +9758,70 @@ def test_source_status_report_exposes_source_inventory_and_cached_fallbacks(monk
     assert report["statcast_savant_row_sample_count"] == 1
 
 
+def test_source_status_report_marks_empty_statcast_attempt_as_cached_fallback(monkeypatch) -> None:
+    monkeypatch.setenv("STATCAST_CACHE_MAX_STALE_HOURS", "48")
+    get_settings.cache_clear()
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    cached_at = datetime(2026, 7, 1, 20, 0, tzinfo=UTC)
+
+    try:
+        with Session(engine) as session:
+            session.add_all(
+                [
+                    TeamDailyFeature(
+                        target_date=date(2026, 7, 1),
+                        team_code="PIT",
+                        captured_at=cached_at,
+                        source=features.MLB_STATS_SOURCE,
+                        source_status="available",
+                        confidence=Decimal("0.8500"),
+                        completeness=Decimal("0.8000"),
+                        stale=False,
+                        features={
+                            "contact_quality": {
+                                "source": features.STATCAST_SOURCE,
+                                "batted_ball_events_count": 30,
+                                "hard_hit_pct": 0.42,
+                            },
+                            "contact_quality_status": "available",
+                        },
+                        raw_payload={"bounded_before": "2026-07-01"},
+                    ),
+                    MlbFeatureSnapshot(
+                        mlb_game_id=None,
+                        target_date=date(2026, 7, 1),
+                        source=features.FEATURE_SYNC_AUDIT_SOURCE,
+                        captured_at=datetime(2026, 7, 1, 21, 0, tzinfo=UTC),
+                        data_quality=None,
+                        source_statuses={"sync": "completed"},
+                        features={
+                            "sync_status": {
+                                "attempted_at": datetime(2026, 7, 1, 21, 0, tzinfo=UTC).isoformat(),
+                                "validation_status": "completed",
+                                "statcast_source_status": "statcast_empty_result",
+                                "errors": [],
+                                "warnings": [
+                                    "Statcast/Savant team contact returned no rows for the completed date range."
+                                ],
+                            }
+                        },
+                    ),
+                ]
+            )
+            session.commit()
+            report = features.source_status_report(session)
+    finally:
+        get_settings.cache_clear()
+
+    inventory = {item["source_name"]: item for item in report["source_inventory"]}
+    assert report["statcast_savant_status"] == "cached"
+    assert report["statcast_savant_last_error"]["error_code"] == "statcast_empty_result"
+    assert inventory["statcast_savant"]["status"] == "cached"
+    assert inventory["statcast_savant"]["fallback_used"] is True
+    assert inventory["statcast_savant"]["fallback_reason"] == "statcast_empty_result"
+
+
 def test_mlb_primary_team_daily_preserves_cached_statcast_when_current_fetch_empty() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)

@@ -5150,6 +5150,7 @@ def _latest_feature_sync_audit(session: Session) -> dict[str, object]:
     return {
         "last_attempted_sync": latest_audit.get("attempted_at") if latest_audit else None,
         "validation_status": latest_audit.get("validation_status") if latest_audit else None,
+        "statcast_source_status": latest_audit.get("statcast_source_status") if latest_audit else None,
         "last_error": last_error,
         "latest_errors": latest_errors[:20],
     }
@@ -5245,6 +5246,17 @@ def _latest_audit_error(feature_audit: dict[str, object], source: str) -> dict[s
     return None
 
 
+def _statcast_audit_issue(feature_audit: dict[str, object]) -> dict[str, object] | None:
+    if feature_audit.get("statcast_source_status") != "statcast_empty_result":
+        return None
+    return {
+        "source": STATCAST_SOURCE,
+        "table": "statcast_team_contact",
+        "error_code": "statcast_empty_result",
+        "message": "Statcast/Savant team contact returned no rows for the completed date range.",
+    }
+
+
 def _cached_status_from_timestamp(timestamp: object, max_stale_hours: int) -> str:
     parsed = _parsed_status_timestamp(timestamp)
     if parsed is None:
@@ -5287,7 +5299,7 @@ def _statcast_db_status(session: Session, feature_audit: dict[str, object]) -> d
         status_counts[status] = status_counts.get(status, 0) + 1
         if last_success is None and status in {"available", "partial"}:
             last_success = ensure_aware_utc(row.captured_at).isoformat()
-    last_error = _latest_audit_error(feature_audit, STATCAST_SOURCE)
+    last_error = _latest_audit_error(feature_audit, STATCAST_SOURCE) or _statcast_audit_issue(feature_audit)
     settings = get_settings()
     if last_error and last_success:
         status = _cached_status_from_timestamp(last_success, settings.statcast_cache_max_stale_hours)
