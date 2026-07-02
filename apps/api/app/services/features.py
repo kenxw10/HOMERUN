@@ -5319,6 +5319,12 @@ def _cached_status_from_timestamp(timestamp: object, max_stale_hours: int) -> st
     return "cached" if utc_now() - parsed <= timedelta(hours=max_stale_hours) else "stale"
 
 
+def _statcast_available_status(base_status: str, timestamp: object, max_stale_hours: int) -> str:
+    if _cached_status_from_timestamp(timestamp, max_stale_hours) == "stale":
+        return "stale"
+    return base_status
+
+
 def _statcast_contact_from_row(row: object) -> dict[str, object] | None:
     features_payload = getattr(row, "features", None)
     if isinstance(features_payload, dict):
@@ -5384,9 +5390,9 @@ def _statcast_db_status(session: Session, feature_audit: dict[str, object]) -> d
     elif last_error:
         status = "failed"
     elif status_counts.get("available", 0) > 0:
-        status = "available"
+        status = _statcast_available_status("available", last_success, settings.statcast_cache_max_stale_hours)
     elif status_counts.get("partial", 0) > 0:
-        status = "partial"
+        status = _statcast_available_status("partial", last_success, settings.statcast_cache_max_stale_hours)
     elif feature_audit.get("last_attempted_sync"):
         status = "failed" if not pybaseball_available() else "partial"
     else:
