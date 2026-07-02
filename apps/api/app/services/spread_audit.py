@@ -8,10 +8,7 @@ from sqlalchemy.orm import Session
 
 from app.models import KalshiMarket, MarketMapping, MlbGame
 from app.services.contracts import FULL_GAME_SPREAD
-from app.services.spread_verification import (
-    FULL_GAME_SPREAD_AUDIT_STATUSES,
-    spread_verification_from_mapping,
-)
+from app.services.spread_verification import FULL_GAME_SPREAD_AUDIT_STATUSES, SpreadVerification, spread_verification_from_mapping
 from app.time_utils import ensure_aware_utc, get_dashboard_zone, today_eastern, utc_now
 
 
@@ -49,16 +46,48 @@ def _spread_result(value: Decimal) -> str:
     return "push"
 
 
-def _settlement_preview(game: MlbGame, selection_code: str | None, line_value: Decimal | None) -> dict[str, object]:
+def _format_line(value: Decimal | None) -> str | None:
+    if value is None:
+        return None
+    numeric = float(value)
+    return f"+{numeric:g}" if numeric > 0 else f"{numeric:g}"
+
+
+def _preview_formula_fields(game: MlbGame, verification: SpreadVerification) -> dict[str, object]:
+    selected_code = verification.selection_code
+    opponent_code = None
+    if selected_code == (game.home_abbreviation or "").upper():
+        opponent_code = (game.away_abbreviation or "").upper() or None
+    elif selected_code == (game.away_abbreviation or "").upper():
+        opponent_code = (game.home_abbreviation or "").upper() or None
+    return {
+        "selected_team": selected_code,
+        "opponent_team": opponent_code,
+        "threshold_runs": str(verification.threshold_runs) if verification.threshold_runs is not None else None,
+        "selected_margin_required_gt": (
+            str(verification.selected_team_margin_required_gt)
+            if verification.selected_team_margin_required_gt is not None
+            else None
+        ),
+        "normalized_spread_line_display": _format_line(verification.display_spread_line or verification.line_value),
+        "yes_condition": verification.settlement_formula,
+        "condition_type": verification.condition_type,
+    }
+
+
+def _settlement_preview(game: MlbGame, verification: SpreadVerification) -> dict[str, object]:
+    selection_code = verification.selection_code
+    line_value = verification.line_value
+    formula_fields = _preview_formula_fields(game, verification)
     if _status_kind(game.status) == "void":
-        return {"preview_status": "void_game"}
+        return {"preview_status": "void_game", **formula_fields}
     if _status_kind(game.status) != "final":
-        return {"preview_status": "pending_final"}
+        return {"preview_status": "pending_final", **formula_fields}
     if line_value is None:
-        return {"preview_status": "missing_line"}
+        return {"preview_status": "missing_line", **formula_fields}
     scores = _selected_score_pair(game, selection_code)
     if scores is None:
-        return {"preview_status": "missing_score_or_selection"}
+        return {"preview_status": "missing_score_or_selection", **formula_fields}
     selected_runs, opponent_runs = scores
     margin = selected_runs - opponent_runs
     adjusted_margin = Decimal(margin) + line_value
@@ -78,6 +107,7 @@ def _settlement_preview(game: MlbGame, selection_code: str | None, line_value: D
         "yes_outcome": yes_outcome,
         "no_outcome": no_outcome,
         "push": yes_outcome == "push",
+        **formula_fields,
     }
 
 
@@ -146,7 +176,7 @@ def run_spread_audit(
         family_counts = by_family.setdefault(family, {"checked": 0, "verified": 0, "unverified": 0})
         result = spread_verification_from_mapping(game=game, mapping=mapping, market=market)
         metadata = result.as_metadata()
-        settlement_preview = _settlement_preview(game, result.selection_code, result.line_value)
+        settlement_preview = _settlement_preview(game, result)
 
         checked += 1
         family_counts["checked"] += 1
@@ -192,6 +222,17 @@ def run_spread_audit(
             "line_value_raw": str(result.line_value) if result.line_value is not None else None,
             "line_sign": result.line_sign,
             "line_direction": result.line_direction,
+            "condition_type": result.condition_type,
+            "rules_threshold_runs": str(result.threshold_runs) if result.threshold_runs is not None else None,
+            "raw_threshold_runs": str(result.raw_threshold_runs) if result.raw_threshold_runs is not None else None,
+            "selected_team_margin_required_gt": (
+                str(result.selected_team_margin_required_gt)
+                if result.selected_team_margin_required_gt is not None
+                else None
+            ),
+            "display_spread_line": str(result.display_spread_line) if result.display_spread_line is not None else None,
+            "settlement_formula": result.settlement_formula,
+            "ticker_suffix_line_raw": result.ticker_suffix_line_raw,
             "over_under_side": None,
             "title": market.title,
             "subtitle": market.subtitle,
@@ -205,6 +246,9 @@ def run_spread_audit(
             "yes_outcome_interpretation": result.yes_interpretation,
             "no_outcome_interpretation": result.no_interpretation,
             "no_is_true_complement": result.no_is_true_complement,
+            "no_text_source": result.no_text_source,
+            "no_complement_source": result.no_complement_source,
+            "no_complement_confidence": result.no_complement_confidence,
             "complement_safe_for_paper_settlement": result.complement_safe_for_paper_settlement,
             "push_possible": result.push_possible,
             "push_condition": result.push_condition,

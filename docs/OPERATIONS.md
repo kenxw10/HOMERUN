@@ -254,18 +254,18 @@ Audit taxonomy:
 - `missing_line`: line value cannot be verified.
 - `ambiguous_team_selection`: selected team cannot be uniquely verified against the mapped MLB game.
 - `ambiguous_yes_no_semantics`: YES/NO text or complement relation is missing or contradictory.
-- `ambiguous_line_direction`: line sign/direction was not verified from Kalshi text.
+- `ambiguous_line_direction`: line sign/direction was not verified from Kalshi rules text or supporting text conflicts with rules text.
 - `settlement_text_unverified`: rules/settlement text is missing.
 - `push_behavior_uncertain`: integer spread can push but rules do not verify push/void/refund behavior.
 - `unsupported`, `parse_error`, `missing_market_data`, and `missing_game_mapping`: audit cannot safely evaluate the row.
 
-Per-market rows should include ticker, event ticker, title/subtitle/rules/YES/NO text, mapped MLB game, selected team, line value/sign/direction, `YES selected team covers`, `NO selected team does not cover`, normalized NO equivalent, whether NO is a true complement, push condition, push-rule verification, and read-only settlement preview. Final-game previews compute selected score, opponent score, adjusted margin, YES outcome, NO outcome, and push state without writing settlement rows. Non-final games report `preview_status=pending_final`.
+Per-market rows should include ticker, event ticker, title/subtitle/rules/YES/NO text, mapped MLB game, selected team, line value/sign/direction, rules threshold, settlement formula, `YES selected team covers`, `NO selected team does not cover`, normalized NO equivalent, NO text/complement provenance, whether NO is a true complement, push condition, push-rule verification, and read-only settlement preview. Full-game spread rules text is primary: `Team wins by more than X runs` normalizes to the selected team laying `-X`. Final-game previews compute selected score, opponent score, adjusted margin, YES outcome, NO outcome, and push state without writing settlement rows. Non-final games report `preview_status=pending_final` plus the same formula fields.
 
 Interpretation:
 
 - `trusted_audit_only_count` is evidence for manual PR3p review only.
 - Any `needs_review`, ambiguous, missing, or push-uncertain status must remain blocked.
-- Candidate sweeps should still show full-game spread candidates as no-trade, usually `no_trade_spread_trading_disabled` while spread trading is disabled.
+- Candidate sweeps should still show full-game spread candidates as no-trade with `no_trade_full_game_spread_audit_only`. The broad spread flag still controls first-five spread diagnostics, but full-game spread paper trading remains disabled until a future PR3p.
 - PR3p is the only future PR allowed to enable full-game spread paper trading, and only for rows that PR3o evidence proves safe.
 
 After deployment, validate:
@@ -413,9 +413,9 @@ Invoke-RestMethod -Method Post -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-
 Expected audit behavior:
 
 - The job is read-only; it does not create paper trades, settlement rows, candidates, or mapping/market metadata mutations.
-- Verified spread rows include parsed selection, line, inning scope, settlement rule status, actual contract display, normalized equivalent display, and raw Kalshi contract text.
+- Verified full-game spread rows include rules-primary parsed selection, normalized lay line, threshold, formula, inning scope, settlement rule status, actual contract display, normalized equivalent display, NO complement provenance, push metadata, and raw Kalshi contract text.
 - Ticker-only spread rows remain `needs_review` / parser-unverified.
-- Spread candidates still return `no_trade_spread_trading_disabled` while `PAPER_SPREAD_TRADING_ENABLED=false`.
+- Full-game spread candidates still return `no_trade_full_game_spread_audit_only`; first-five spread candidates remain controlled by `PAPER_SPREAD_TRADING_ENABLED`.
 
 Display checks:
 

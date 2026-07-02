@@ -93,6 +93,7 @@ from app.services.paper_epoch import (
 from app.services.portfolio import calculate_paper_portfolio
 from app.services.settlement import settle_paper_trades
 from app.services.spread_audit import run_spread_audit
+from app.services.spread_verification import verify_spread_market
 from app.time_utils import classify_time_bucket, eastern_display
 from app.workers import kalshi_ws_paper
 
@@ -16951,7 +16952,7 @@ def test_market_family_mapping_sync_promotes_only_parseable_supported_families()
                 title="Pittsburgh Pirates spread -1.5 vs Seattle Mariners",
                 yes_sub_title="Pittsburgh -1.5",
                 no_sub_title="Seattle +1.5",
-                rules_primary="If Pittsburgh wins by exactly 1 run, the market pushes and contracts are void.",
+                rules_primary="If Pittsburgh wins by more than 1.5 runs, this market resolves to Yes.",
                 raw_status="open",
                 confidence=Decimal("0.9500"),
                 line_value=Decimal("-1.5000"),
@@ -17070,7 +17071,7 @@ def test_market_family_mapping_parses_event_level_spread_selection_from_yes_text
                 title="Seattle Mariners vs Pittsburgh Pirates run line",
                 yes_sub_title="Pittsburgh -1.5",
                 no_sub_title="Seattle +1.5",
-                rules_primary="If Pittsburgh wins by exactly 1 run, the market pushes and contracts are void.",
+                rules_primary="If Pittsburgh wins by more than 1.5 runs, this market resolves to Yes.",
                 raw_status="open",
                 confidence=Decimal("0.9500"),
                 line_value=Decimal("-1.5000"),
@@ -17092,6 +17093,131 @@ def test_market_family_mapping_parses_event_level_spread_selection_from_yes_text
     assert mapping.mapping_metadata["spread_verification"]["verified"] is True
     assert market is not None
     assert market.selection_code == "PIT"
+
+
+@pytest.mark.parametrize(
+    ("threshold", "expected_line"),
+    [
+        ("1.5", Decimal("-1.5000")),
+        ("2.5", Decimal("-2.5000")),
+        ("3.5", Decimal("-3.5000")),
+    ],
+)
+def test_full_game_spread_rules_wins_by_more_than_normalizes_to_lay_line(
+    threshold: str,
+    expected_line: Decimal,
+) -> None:
+    game = MlbGame(
+        external_game_id=f"rules-spread-{threshold}",
+        home_team="Pittsburgh Pirates",
+        away_team="Seattle Mariners",
+        home_abbreviation="PIT",
+        away_abbreviation="SEA",
+        scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+        status="scheduled",
+    )
+
+    verification = verify_spread_market(
+        game=game,
+        family_key="full_game_spread",
+        raw={
+            "ticker": f"KXMLBSPREAD-26JUL011900SEAPIT-PIT{int(Decimal(threshold) + Decimal('0.5'))}",
+            "title": "Seattle Mariners vs Pittsburgh Pirates run line",
+            "yes_sub_title": f"If Pittsburgh wins by more than {threshold} runs, this market resolves to Yes.",
+            "no_sub_title": f"If Pittsburgh wins by more than {threshold} runs, this market resolves to Yes.",
+            "rules_primary": f"If Pittsburgh wins by more than {threshold} runs, this market resolves to Yes.",
+        },
+    )
+
+    assert verification.verified is True
+    assert verification.audit_status == "trusted_audit_only"
+    assert verification.parse_source == "rules_text"
+    assert verification.condition_type == "team_wins_by_more_than"
+    assert verification.selection_code == "PIT"
+    assert verification.threshold_runs == Decimal(threshold).quantize(Decimal("0.0001"))
+    assert verification.line_value == expected_line
+    assert verification.display_spread_line == expected_line
+    assert verification.line_direction == "selected_team_lays_runs"
+    assert verification.actual_contract_display == f"YES ON PITTSBURGH PIRATES {float(expected_line):g} FULL GAME"
+    assert verification.no_contract_display == f"NO ON PITTSBURGH PIRATES {float(expected_line):g} FULL GAME"
+    assert verification.normalized_no_equivalent_display == (
+        f"SEATTLE MARINERS +{float(abs(expected_line)):g} FULL GAME EQUIVALENT"
+    )
+    assert verification.yes_interpretation == f"PITTSBURGH PIRATES {float(expected_line):g} COVERS FULL GAME"
+    assert verification.no_interpretation == (
+        f"PITTSBURGH PIRATES {float(expected_line):g} DOES NOT COVER FULL GAME"
+    )
+    assert verification.no_text_source == "duplicated_yes_text"
+    assert verification.no_complement_source == "binary_market_complement"
+    assert verification.no_complement_confidence == "high"
+    assert verification.no_is_true_complement is True
+    assert verification.push_possible is False
+    assert verification.push_rule_verified is True
+    assert verification.push_condition == "not_applicable_half_run_line"
+    assert verification.settlement_formula == f"selected_team_runs - opponent_runs > {threshold}"
+    assert "SPREAD_LINE_NOT_VERIFIED_FROM_KALSHI_TEXT" not in verification.warnings
+    assert "rules_text_spread_condition_verified" in verification.reason_codes
+    assert "binary_yes_no_complement_verified" in verification.reason_codes
+    assert "half_run_no_push_verified" in verification.reason_codes
+
+
+def test_full_game_spread_explicit_contradictory_no_text_remains_unsafe() -> None:
+    game = MlbGame(
+        external_game_id="rules-spread-conflicting-no",
+        home_team="Pittsburgh Pirates",
+        away_team="Seattle Mariners",
+        home_abbreviation="PIT",
+        away_abbreviation="SEA",
+        scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+        status="scheduled",
+    )
+
+    verification = verify_spread_market(
+        game=game,
+        family_key="full_game_spread",
+        raw={
+            "ticker": "KXMLBSPREAD-26JUL011900SEAPIT-PIT2",
+            "yes_sub_title": "Pittsburgh wins by more than 1.5 runs",
+            "no_sub_title": "Seattle -1.5",
+            "rules_primary": "If Pittsburgh wins by more than 1.5 runs, this market resolves to Yes.",
+        },
+    )
+
+    assert verification.verified is False
+    assert verification.audit_status == "unsafe"
+    assert verification.no_text_source == "explicit_no_text"
+    assert verification.no_is_true_complement is False
+    assert "explicit_no_text_conflicts_with_binary_complement" in verification.reason_codes
+    assert "no_contract_text_conflicts_with_expected_complement" in verification.reason_codes
+
+
+def test_full_game_spread_integer_line_requires_verified_push_behavior() -> None:
+    game = MlbGame(
+        external_game_id="rules-spread-integer",
+        home_team="Pittsburgh Pirates",
+        away_team="Seattle Mariners",
+        home_abbreviation="PIT",
+        away_abbreviation="SEA",
+        scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+        status="scheduled",
+    )
+
+    verification = verify_spread_market(
+        game=game,
+        family_key="full_game_spread",
+        raw={
+            "ticker": "KXMLBSPREAD-26JUL011900SEAPIT-PIT1",
+            "yes_sub_title": "Pittsburgh wins by more than 1 run",
+            "no_sub_title": "Pittsburgh wins by more than 1 run",
+            "rules_primary": "If Pittsburgh wins by more than 1 run, this market resolves to Yes.",
+        },
+    )
+
+    assert verification.line_value == Decimal("-1.0000")
+    assert verification.push_possible is True
+    assert verification.push_rule_verified is False
+    assert verification.audit_status == "push_behavior_uncertain"
+    assert "integer_push_rule_unverified" in verification.reason_codes
 
 
 def test_market_family_mapping_preserves_first_five_spread_verification() -> None:
@@ -17315,8 +17441,8 @@ def test_paper_supported_market_family_can_create_pre_model_paper_trade(monkeypa
     assert candidate.model_probability != Decimal("0.500000")
     assert candidate.model_version_tag == modeling.MATURE_MODEL_TAG
     assert candidate.training_eligible is False
-    assert candidate.training_exclusion_reason == "spread_trading_disabled"
-    assert candidate.decision == "no_trade_spread_trading_disabled"
+    assert candidate.training_exclusion_reason == "full_game_spread_audit_only"
+    assert candidate.decision == "no_trade_full_game_spread_audit_only"
     assert feature_snapshot is not None
     assert feature_snapshot.source == features.FEATURE_VERSION
     assert trade is None
@@ -17375,9 +17501,9 @@ def test_event_level_spread_with_parsed_selection_can_create_paper_trade(monkeyp
 
     assert result["paper_trades"] == 0
     assert candidate is not None
-    assert candidate.decision == "no_trade_spread_trading_disabled"
+    assert candidate.decision == "no_trade_full_game_spread_audit_only"
     assert candidate.training_eligible is False
-    assert candidate.training_exclusion_reason == "spread_trading_disabled"
+    assert candidate.training_exclusion_reason == "full_game_spread_audit_only"
     assert candidate.selection_code == "PIT"
     assert candidate.selection_display == "PIT -1.5"
     assert trade is None
@@ -17897,7 +18023,7 @@ def test_spread_audit_reports_verified_spread_without_trades(monkeypatch) -> Non
             title="Seattle Mariners vs Pittsburgh Pirates run line",
             yes_subtitle="Pittsburgh -1.5",
             no_subtitle="Seattle +1.5",
-            rules="If Pittsburgh wins by exactly 1 run, the market pushes and contracts are void.",
+            rules="If Pittsburgh wins by more than 1.5 runs, this market resolves to Yes.",
             status="open",
             market_family="full_game_spread",
             market_type="full_game_spread",
@@ -17944,10 +18070,20 @@ def test_spread_audit_reports_verified_spread_without_trades(monkeypatch) -> Non
     assert result["paper_trades_created"] == 0
     item = result["items"][0]
     assert item["audit_status"] == "trusted_audit_only"
-    assert item["reason_codes"] == []
+    assert "rules_text_spread_condition_verified" in item["reason_codes"]
+    assert "selected_team_threshold_verified" in item["reason_codes"]
+    assert "binary_yes_no_complement_verified" in item["reason_codes"]
+    assert "half_run_no_push_verified" in item["reason_codes"]
+    assert "settlement_formula_verified" in item["reason_codes"]
     assert item["market_family"] == "full_game_spread"
     assert item["inning_scope"] == "full_game"
     assert item["selected_team"] == "PIT"
+    assert item["condition_type"] == "team_wins_by_more_than"
+    assert item["rules_threshold_runs"] == "1.5000"
+    assert item["selected_team_margin_required_gt"] == "1.5000"
+    assert item["settlement_formula"] == "selected_team_runs - opponent_runs > 1.5"
+    assert item["no_text_source"] == "explicit_no_text"
+    assert item["no_complement_source"] == "binary_market_complement"
     assert item["line_sign"] == "negative"
     assert item["line_direction"] == "selected_team_lays_runs"
     assert item["actual_contract_display"] == "YES ON PITTSBURGH PIRATES -1.5 FULL GAME"
@@ -17958,7 +18094,13 @@ def test_spread_audit_reports_verified_spread_without_trades(monkeypatch) -> Non
     assert item["no_is_true_complement"] is True
     assert item["complement_safe_for_paper_settlement"] is True
     assert item["push_possible"] is False
+    assert item["push_condition"] == "not_applicable_half_run_line"
     assert item["settlement_preview"]["preview_status"] == "pending_final"
+    assert item["settlement_preview"]["selected_team"] == "PIT"
+    assert item["settlement_preview"]["opponent_team"] == "SEA"
+    assert item["settlement_preview"]["threshold_runs"] == "1.5000"
+    assert item["settlement_preview"]["selected_margin_required_gt"] == "1.5000"
+    assert item["settlement_preview"]["yes_condition"] == "selected_team_runs - opponent_runs > 1.5"
     assert trade is None
     assert settlement is None
     assert mapping is not None
@@ -18004,8 +18146,9 @@ def test_spread_audit_reaudits_legacy_verified_metadata(monkeypatch) -> None:
     assert result["verified"] == 0
     item = result["items"][0]
     assert item["audit_status"] == "ambiguous_yes_no_semantics"
-    assert "no_contract_text_missing" in item["reason_codes"]
+    assert "binary_complement_unverified" in item["reason_codes"]
     assert "settlement_text_missing" in item["reason_codes"]
+    assert item["no_text_source"] == "missing"
     assert item["trusted_audit_only"] is False
     assert item["no_is_true_complement"] is False
     assert persisted_mapping is not None
@@ -18023,7 +18166,7 @@ def _add_spread_audit_case(
     away_score: int | None = None,
     yes_subtitle: str | None = "Pittsburgh -1.5",
     no_subtitle: str | None = "Seattle +1.5",
-    rules: str | None = "If the adjusted score is tied, the market pushes and contracts are void.",
+    rules: str | None = None,
     line_value: Decimal | None = Decimal("-1.5000"),
     selection_code: str | None = "PIT",
 ) -> tuple[MlbGame, KalshiMarket, MarketMapping]:
@@ -18135,7 +18278,7 @@ def test_spread_audit_classifies_ambiguous_full_game_spreads(monkeypatch) -> Non
     assert statuses["KXMLBSPREAD-AMBIGUOUS-TEAM"] == "ambiguous_team_selection"
     assert statuses["KXMLBSPREAD-AMBIGUOUS-LINE"] == "ambiguous_line_direction"
     assert statuses["KXMLBSPREAD-PUSH-UNCERTAIN"] == "push_behavior_uncertain"
-    assert statuses["KXMLBSPREAD-NO-WRONG-SIGN"] == "ambiguous_yes_no_semantics"
+    assert statuses["KXMLBSPREAD-NO-WRONG-SIGN"] == "unsafe"
     assert "missing_line" in reasons["KXMLBSPREAD-MISSING-LINE"]
     assert "team_selection_not_verified" in reasons["KXMLBSPREAD-AMBIGUOUS-TEAM"]
     assert "line_direction_not_verified_from_text" in reasons["KXMLBSPREAD-AMBIGUOUS-LINE"]
@@ -18143,7 +18286,7 @@ def test_spread_audit_classifies_ambiguous_full_game_spreads(monkeypatch) -> Non
     assert "no_contract_text_conflicts_with_expected_complement" in reasons["KXMLBSPREAD-NO-WRONG-SIGN"]
     assert result["missing_line_count"] == 1
     assert result["ambiguous_team_selection_count"] == 1
-    assert result["ambiguous_yes_no_semantics_count"] == 1
+    assert result["unsafe_count"] == 1
     assert result["ambiguous_line_direction_count"] == 1
     assert result["push_behavior_uncertain_count"] == 1
     assert result["examples_by_reason"]["missing_line"][0]["market_ticker"] == "KXMLBSPREAD-MISSING-LINE"
