@@ -8204,13 +8204,31 @@ def test_fielding_fetch_failure_preserves_cached_defense_sections() -> None:
             mlb_context,
             {"team_contact_by_code": {}},
         )
+        defense_status = features._defense_db_status(session)
+        source_report = features.source_status_report(session)
 
     assert daily is not None
     assert recent is not None
     assert daily.raw_payload["fielding_rows"] == 0
     assert recent.raw_payload["fielding_rows"] == 0
-    assert daily.features["defense_season"] == cached_season
-    assert recent.features["defense_recent"] == cached_recent
+    assert daily.features["defense_season"]["fielding_percentage"] == cached_season["fielding_percentage"]
+    assert daily.features["defense_season"]["captured_at"] == cached_at.isoformat()
+    assert daily.features["defense_season"]["cache_reused_at"] == captured_at.isoformat()
+    assert daily.features["defense_season"]["stale"] is True
+    assert daily.features["defense_season"]["cache_reused"] is True
+    assert recent.features["defense_recent"]["double_plays_per_game"] == cached_recent["double_plays_per_game"]
+    assert recent.features["defense_recent"]["captured_at"] == cached_at.isoformat()
+    assert recent.features["defense_recent"]["cache_reused_at"] == captured_at.isoformat()
+    assert recent.features["defense_recent"]["stale"] is True
+    assert recent.features["defense_recent"]["cache_reused"] is True
+    assert defense_status["status"] == "cached"
+    assert defense_status["last_successful_sync"] == cached_at.isoformat()
+    assert defense_status["cache_reused_count"] == 2
+    source_health = {item["source_name"]: item for item in source_report["source_health"]}
+    assert source_health["mlb_stats_api_fielding"]["status"] == "cached"
+    assert source_health["mlb_stats_api_fielding"]["last_successful_sync"] == cached_at.isoformat()
+    assert source_health["mlb_stats_api_fielding"]["fallback_used"] is True
+    assert source_health["mlb_stats_api_fielding"]["fallback_source"] == "last_good_mlb_fielding_cache"
 
 
 def test_fielding_source_failure_degrades_defense_without_blocking_offense(monkeypatch) -> None:

@@ -3136,10 +3136,23 @@ def _defense_feature_section(
     }
 
 
-def _cached_defense_feature_section(row: TeamDailyFeature | TeamRecentFeature | None, key: str) -> dict[str, object] | None:
+def _cached_defense_feature_section(
+    row: TeamDailyFeature | TeamRecentFeature | None,
+    key: str,
+    reused_at: datetime,
+) -> dict[str, object] | None:
     values = row.features if row is not None and isinstance(row.features, dict) else None
     component = values.get(key) if isinstance(values, dict) else None
-    return dict(component) if isinstance(component, dict) else None
+    if not isinstance(component, dict):
+        return None
+    cached = dict(component)
+    if cached.get("captured_at") is None and row.captured_at is not None:
+        cached["captured_at"] = ensure_aware_utc(row.captured_at).isoformat()
+    cached["stale"] = True
+    cached["cache_reused"] = True
+    cached["cache_reused_at"] = ensure_aware_utc(reused_at).isoformat()
+    cached["cache_reuse_reason"] = "fielding rows unavailable during latest MLB Stats refresh"
+    return cached
 
 
 def _defense_feature_section_or_cached(
@@ -3150,9 +3163,10 @@ def _defense_feature_section_or_cached(
     component: str,
     reason_available: str,
     reason_missing: str,
+    captured_at: datetime,
 ) -> dict[str, object]:
     if int(fielding.get("game_count") or 0) == 0:
-        cached = _cached_defense_feature_section(row, key)
+        cached = _cached_defense_feature_section(row, key, captured_at)
         if cached is not None:
             return cached
     return _defense_feature_section(
@@ -3287,6 +3301,7 @@ def _upsert_mlb_primary_team_daily(
             component="defense_season",
             reason_available="team defense season from MLB Stats API fielding game logs",
             reason_missing="team defense season missing because MLB Stats API fielding game logs were unavailable or empty",
+            captured_at=captured_at,
         ),
         "wrc_plus_status": "missing",
         "xfip_status": "missing",
@@ -3374,6 +3389,7 @@ def _upsert_mlb_primary_team_recent(
             component="defense_recent",
             reason_available=f"team defense recent from MLB Stats API fielding game logs over {window_days} days",
             reason_missing=f"team defense recent missing because no MLB Stats API fielding game logs were available in the last {window_days} days",
+            captured_at=captured_at,
         ),
     }
     row = row or TeamRecentFeature(target_date=day, team_code=team_code, window_days=window_days, source=MLB_STATS_SOURCE)
@@ -5910,6 +5926,15 @@ def _defense_component_from_row(row: object) -> dict[str, object] | None:
     return None
 
 
+def _defense_component_timestamp(row: object, component: dict[str, object]) -> datetime | None:
+    for key in ("captured_at", "fielding_captured_at", "synced_at"):
+        parsed = _parsed_status_timestamp(component.get(key))
+        if parsed is not None:
+            return parsed
+    captured_at = getattr(row, "captured_at", None)
+    return ensure_aware_utc(captured_at) if captured_at is not None else None
+
+
 def _defense_db_status(session: Session) -> dict[str, object]:
     rows: list[object] = []
     for model in (TeamDailyFeature, TeamRecentFeature):
@@ -5923,8 +5948,10 @@ def _defense_db_status(session: Session) -> dict[str, object]:
         )
     rows = sorted(rows, key=lambda row: row.captured_at, reverse=True)[:200]
     counts: dict[str, int] = {}
-    last_success = None
+    last_success_timestamp = None
     component_rows = 0
+    cache_reused_count = 0
+    fresh_success_count = 0
     for row in rows:
         component = _defense_component_from_row(row)
         if not component:
@@ -5932,21 +5959,32 @@ def _defense_db_status(session: Session) -> dict[str, object]:
         component_rows += 1
         status = str(component.get("source_status") or "missing")
         counts[status] = counts.get(status, 0) + 1
-        if last_success is None and status in {"available", "partial"}:
-            last_success = ensure_aware_utc(row.captured_at).isoformat()
+        if status in {"available", "partial"}:
+            if component.get("cache_reused") or component.get("stale"):
+                cache_reused_count += 1
+            else:
+                fresh_success_count += 1
+            component_timestamp = _defense_component_timestamp(row, component)
+            if component_timestamp is not None and (
+                last_success_timestamp is None or component_timestamp > last_success_timestamp
+            ):
+                last_success_timestamp = component_timestamp
     if counts.get("available", 0) > 0:
-        status = "available"
+        status = "cached" if cache_reused_count and not fresh_success_count else "available"
     elif counts.get("partial", 0) > 0:
-        status = "partial"
+        status = "cached" if cache_reused_count and not fresh_success_count else "partial"
     elif component_rows:
         status = "missing"
     else:
         status = "not_attempted"
     return {
         "status": status,
-        "last_successful_sync": last_success,
+        "last_successful_sync": ensure_aware_utc(last_success_timestamp).isoformat()
+        if last_success_timestamp is not None
+        else None,
         "row_sample_count": component_rows,
         "status_counts": counts,
+        "cache_reused_count": cache_reused_count,
     }
 
 
@@ -6186,6 +6224,11 @@ def _source_inventory(
         defense_health = "cached"
     elif fielding_error:
         defense_health = "failed"
+    defense_cache_reused = bool(defense_status.get("cache_reused_count") and defense_status.get("last_successful_sync"))
+    defense_fallback_used = bool((fielding_error or defense_cache_reused) and defense_status.get("last_successful_sync"))
+    defense_fallback_reason = _source_issue_reason(fielding_error)
+    if defense_cache_reused and not defense_fallback_reason:
+        defense_fallback_reason = "latest MLB Stats fielding rows unavailable; using last good fielding cache"
     weather_status = table_status["weather_snapshots"]
     lineup_status = table_status["lineup_snapshots"]
     pybaseball_last_error = _latest_pybaseball_source_audit_error(feature_audit) or pybaseball_status.get(
@@ -6242,11 +6285,11 @@ def _source_inventory(
             last_attempted_sync=last_attempted,
             last_error=fielding_error,
             sample_count=int(defense_status.get("row_sample_count") or 0),
-            fallback_used=bool(fielding_error and defense_status.get("last_successful_sync")),
+            fallback_used=defense_fallback_used,
             fallback_source="last_good_mlb_fielding_cache"
-            if fielding_error and defense_status.get("last_successful_sync")
+            if defense_fallback_used
             else None,
-            fallback_reason=_source_issue_reason(fielding_error),
+            fallback_reason=defense_fallback_reason,
         ),
         _source_health_entry(
             source_name="kalshi_public_market_data",
