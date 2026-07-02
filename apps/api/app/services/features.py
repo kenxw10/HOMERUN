@@ -1576,9 +1576,12 @@ def _statcast_fetch_context(
                 if identity and identity.get("id")
             }
         )
+        pitcher_fetch_attempted = False
+        pitcher_rows_matched = 0
         for pitcher_id in pitcher_ids:
             try:
                 result = pybaseball_client.get_pitcher_statcast_range(pitcher_id, start, end)
+                pitcher_fetch_attempted = True
                 rows = _statcast_rows(result)
                 stats["statcast_pitcher_rows_seen"] = int(stats.get("statcast_pitcher_rows_seen", 0)) + len(rows)
                 if rows:
@@ -1593,10 +1596,24 @@ def _statcast_fetch_context(
                         "statcast_unmatched_team_rows",
                     }:
                         stats["statcast_source_status"] = "available"
+                    pitcher_rows_matched += len(rows)
                     stats["statcast_pitcher_rows_matched"] = int(stats.get("statcast_pitcher_rows_matched", 0)) + len(rows)
             except Exception as exc:
                 stats["statcast_error_count"] = int(stats.get("statcast_error_count", 0)) + 1
                 _append_error(stats, _source_error(source=STATCAST_SOURCE, table="statcast_pitcher_contact", exc=exc))
+        if (
+            pitcher_fetch_attempted
+            and pitcher_rows_matched == 0
+            and stats.get("statcast_source_status") not in {
+                "statcast_empty_result",
+                "statcast_unmatched_team_rows",
+            }
+        ):
+            stats["statcast_source_status"] = "statcast_pitcher_empty_result"
+            _append_warning(
+                stats,
+                "Statcast/Savant pitcher contact returned no rows for probable starters in the completed date range.",
+            )
     return context
 
 
@@ -5328,6 +5345,12 @@ def _statcast_audit_issue(feature_audit: dict[str, object]) -> dict[str, object]
             "table": "statcast_team_contact",
             "error_code": "statcast_unmatched_team_rows",
             "message": "Statcast/Savant team contact returned rows but none mapped to known team codes.",
+        },
+        "statcast_pitcher_empty_result": {
+            "source": STATCAST_SOURCE,
+            "table": "statcast_pitcher_contact",
+            "error_code": "statcast_pitcher_empty_result",
+            "message": "Statcast/Savant pitcher contact returned no rows for probable starters in the completed date range.",
         },
     }
     issue = issues.get(str(status))

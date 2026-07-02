@@ -9480,6 +9480,36 @@ def test_statcast_empty_team_result_survives_pitcher_rows(monkeypatch) -> None:
     assert stats["statcast_pitcher_rows_matched"] == 1
 
 
+def test_statcast_empty_pitcher_result_marks_source_attempted(monkeypatch) -> None:
+    monkeypatch.setattr(
+        features.pybaseball_client,
+        "import_status",
+        lambda: {"available": True, "version": "2.2.7", "module_path": "mocked", "import_error": None},
+    )
+    monkeypatch.setattr(features.pybaseball_client, "get_pitcher_statcast_range", lambda *_args, **_kwargs: {"rows": []})
+    game = MlbGame(
+        external_game_id="statcast-empty-pitcher",
+        home_team="Pittsburgh Pirates",
+        away_team="Seattle Mariners",
+        home_abbreviation="PIT",
+        away_abbreviation="SEA",
+        scheduled_start=datetime(2026, 6, 24, 23, 0, tzinfo=UTC),
+        status="scheduled",
+        raw_payload={"teams": {"home": {"probablePitcher": {"id": 1999, "fullName": "Home Starter"}}}},
+    )
+
+    stats = features._new_sync_stats(date(2026, 6, 24), {"pitcher"})
+    context = features._statcast_fetch_context([game], date(2026, 6, 24), {"pitcher"}, stats)
+
+    assert context["pitcher_contact_by_id"] == {}
+    assert stats["statcast_pitcher_rows_seen"] == 0
+    assert stats["statcast_pitcher_rows_matched"] == 0
+    assert stats["statcast_source_status"] == "statcast_pitcher_empty_result"
+    assert stats["warnings"] == [
+        "Statcast/Savant pitcher contact returned no rows for probable starters in the completed date range."
+    ]
+
+
 def test_statcast_contact_uses_all_release_speed_and_numeric_barrels() -> None:
     contact = features._aggregate_statcast_contact(
         [
@@ -9999,6 +10029,73 @@ def test_source_status_report_marks_unmatched_statcast_rows_as_cached_fallback(m
     assert inventory["statcast_savant"]["status"] == "cached"
     assert inventory["statcast_savant"]["fallback_used"] is True
     assert inventory["statcast_savant"]["fallback_reason"] == "statcast_unmatched_team_rows"
+
+
+def test_source_status_report_marks_empty_pitcher_statcast_as_cached_fallback(monkeypatch) -> None:
+    monkeypatch.setenv("STATCAST_CACHE_MAX_STALE_HOURS", "48")
+    get_settings.cache_clear()
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    cached_at = datetime(2026, 7, 1, 20, 0, tzinfo=UTC)
+
+    try:
+        with Session(engine) as session:
+            session.add_all(
+                [
+                    PitcherDailyFeature(
+                        target_date=date(2026, 7, 1),
+                        team_code="PIT",
+                        pitcher_id="1999",
+                        pitcher_name="Home Starter",
+                        captured_at=cached_at,
+                        source=features.MLB_STATS_SOURCE,
+                        source_status="available",
+                        sample_size=30,
+                        confidence=Decimal("0.8500"),
+                        completeness=Decimal("0.8000"),
+                        stale=False,
+                        features={
+                            "season_contact_quality": {
+                                "source": features.STATCAST_SOURCE,
+                                "captured_at": cached_at.isoformat(),
+                                "batted_ball_events_count": 30,
+                                "average_release_speed": 95.4,
+                            }
+                        },
+                        raw_payload={"bounded_before": "2026-07-01"},
+                    ),
+                    MlbFeatureSnapshot(
+                        mlb_game_id=None,
+                        target_date=date(2026, 7, 1),
+                        source=features.FEATURE_SYNC_AUDIT_SOURCE,
+                        captured_at=datetime(2026, 7, 1, 21, 0, tzinfo=UTC),
+                        data_quality=None,
+                        source_statuses={"sync": "completed"},
+                        features={
+                            "sync_status": {
+                                "attempted_at": datetime(2026, 7, 1, 21, 0, tzinfo=UTC).isoformat(),
+                                "validation_status": "completed",
+                                "statcast_source_status": "statcast_pitcher_empty_result",
+                                "errors": [],
+                                "warnings": [
+                                    "Statcast/Savant pitcher contact returned no rows for probable starters in the completed date range."
+                                ],
+                            }
+                        },
+                    ),
+                ]
+            )
+            session.commit()
+            report = features.source_status_report(session)
+    finally:
+        get_settings.cache_clear()
+
+    inventory = {item["source_name"]: item for item in report["source_inventory"]}
+    assert report["statcast_savant_status"] == "cached"
+    assert report["statcast_savant_last_error"]["error_code"] == "statcast_pitcher_empty_result"
+    assert inventory["statcast_savant"]["status"] == "cached"
+    assert inventory["statcast_savant"]["fallback_used"] is True
+    assert inventory["statcast_savant"]["fallback_reason"] == "statcast_pitcher_empty_result"
 
 
 def test_source_status_report_uses_statcast_contact_timestamp_for_cache_age(monkeypatch) -> None:
