@@ -3017,6 +3017,7 @@ def _fielding_stat_decimal(stat: dict[str, object], *names: str) -> Decimal | No
 def _aggregate_team_fielding_logs(splits: list[dict[str, object]], limit: int) -> dict[str, object]:
     sample = splits[:limit]
     innings = Decimal("0")
+    innings_present = False
     totals = {
         key: Decimal("0")
         for key in (
@@ -3031,43 +3032,69 @@ def _aggregate_team_fielding_logs(splits: list[dict[str, object]], limit: int) -
             "caughtStealing",
         )
     }
+    present_fields: set[str] = set()
+
+    def add_total(total_key: str, stat: dict[str, object], *names: str) -> None:
+        value = _fielding_stat_decimal(stat, *names)
+        if value is None:
+            return
+        totals[total_key] += value
+        present_fields.add(total_key)
+
     for split in sample:
         stat = split.get("stat") if isinstance(split.get("stat"), dict) else {}
-        innings += _baseball_innings(
-            _row_value(stat, "innings", "inningsPlayed", "inningsPitched")
-        ) or Decimal("0")
-        totals["errors"] += _fielding_stat_decimal(stat, "errors") or Decimal("0")
-        totals["assists"] += _fielding_stat_decimal(stat, "assists") or Decimal("0")
-        totals["putOuts"] += _fielding_stat_decimal(stat, "putOuts", "putouts") or Decimal("0")
-        totals["chances"] += _fielding_stat_decimal(stat, "chances") or Decimal("0")
-        totals["doublePlays"] += _fielding_stat_decimal(stat, "doublePlays") or Decimal("0")
-        totals["passedBalls"] += _fielding_stat_decimal(stat, "passedBalls", "passedBall") or Decimal("0")
-        totals["wildPitches"] += _fielding_stat_decimal(stat, "wildPitches", "wildPitch") or Decimal("0")
-        totals["stolenBases"] += _fielding_stat_decimal(stat, "stolenBases", "stolenBasesAllowed") or Decimal("0")
-        totals["caughtStealing"] += _fielding_stat_decimal(stat, "caughtStealing", "caughtStealingByCatcher") or Decimal("0")
+        inning_value = _baseball_innings(_row_value(stat, "innings", "inningsPlayed", "inningsPitched"))
+        if inning_value is not None:
+            innings += inning_value
+            innings_present = True
+        add_total("errors", stat, "errors")
+        add_total("assists", stat, "assists")
+        add_total("putOuts", stat, "putOuts", "putouts")
+        add_total("chances", stat, "chances")
+        add_total("doublePlays", stat, "doublePlays")
+        add_total("passedBalls", stat, "passedBalls", "passedBall")
+        add_total("wildPitches", stat, "wildPitches", "wildPitch")
+        add_total("stolenBases", stat, "stolenBases", "stolenBasesAllowed")
+        add_total("caughtStealing", stat, "caughtStealing", "caughtStealingByCatcher")
     games = len(sample)
-    chances = totals["chances"] or totals["putOuts"] + totals["assists"] + totals["errors"]
-    fielding_percentage = _ratio(totals["putOuts"] + totals["assists"], chances)
+    has_chances_components = bool(present_fields & {"putOuts", "assists", "errors"})
+    chances = (
+        totals["chances"]
+        if "chances" in present_fields
+        else totals["putOuts"] + totals["assists"] + totals["errors"]
+        if has_chances_components
+        else None
+    )
+    fielding_percentage = (
+        _ratio(totals["putOuts"] + totals["assists"], chances)
+        if chances is not None and {"putOuts", "assists"}.issubset(present_fields)
+        else None
+    )
     stolen_attempts = totals["stolenBases"] + totals["caughtStealing"]
     return {
         "source": MLB_STATS_SOURCE,
         "basis": "team_fielding_game_logs_before_target_date",
         "game_count": games,
         "last_date": _game_log_date(sample[0]) if sample else None,
-        "innings": _float(innings) if innings else None,
-        "errors": _float(totals["errors"]) if games else None,
-        "errors_per_game": _float(_ratio(totals["errors"], games)) if games else None,
-        "assists": _float(totals["assists"]) if games else None,
-        "putouts": _float(totals["putOuts"]) if games else None,
-        "chances": _float(chances) if games and chances else None,
+        "source_fields_present": sorted(present_fields),
+        "innings": _float(innings) if innings_present else None,
+        "errors": _float(totals["errors"]) if "errors" in present_fields else None,
+        "errors_per_game": _float(_ratio(totals["errors"], games)) if games and "errors" in present_fields else None,
+        "assists": _float(totals["assists"]) if "assists" in present_fields else None,
+        "putouts": _float(totals["putOuts"]) if "putOuts" in present_fields else None,
+        "chances": _float(chances) if chances is not None else None,
         "fielding_percentage": _float(fielding_percentage),
-        "double_plays": _float(totals["doublePlays"]) if games else None,
-        "double_plays_per_game": _float(_ratio(totals["doublePlays"], games)) if games else None,
-        "passed_balls": _float(totals["passedBalls"]) if games else None,
-        "wild_pitches": _float(totals["wildPitches"]) if games else None,
-        "stolen_bases_allowed": _float(totals["stolenBases"]) if games else None,
-        "caught_stealing": _float(totals["caughtStealing"]) if games else None,
-        "caught_stealing_rate": _float(_ratio(totals["caughtStealing"], stolen_attempts)),
+        "double_plays": _float(totals["doublePlays"]) if "doublePlays" in present_fields else None,
+        "double_plays_per_game": _float(_ratio(totals["doublePlays"], games))
+        if games and "doublePlays" in present_fields
+        else None,
+        "passed_balls": _float(totals["passedBalls"]) if "passedBalls" in present_fields else None,
+        "wild_pitches": _float(totals["wildPitches"]) if "wildPitches" in present_fields else None,
+        "stolen_bases_allowed": _float(totals["stolenBases"]) if "stolenBases" in present_fields else None,
+        "caught_stealing": _float(totals["caughtStealing"]) if "caughtStealing" in present_fields else None,
+        "caught_stealing_rate": _float(_ratio(totals["caughtStealing"], stolen_attempts))
+        if present_fields & {"stolenBases", "caughtStealing"}
+        else None,
     }
 
 
@@ -3082,7 +3109,7 @@ def _defense_feature_section(
     has_metric = any(
         fielding.get(key) is not None
         for key in ("fielding_percentage", "errors", "assists", "putouts", "double_plays")
-    )
+    ) and bool(fielding.get("source_fields_present"))
     if game_count and has_metric:
         status = "available"
         reason = reason_available

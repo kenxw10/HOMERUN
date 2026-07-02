@@ -8017,6 +8017,29 @@ def test_mlb_stats_fielding_populates_baseline_defense_and_source_health(monkeyp
     assert source_names["umpire"]["status"] == "excluded"
 
 
+def test_empty_fielding_logs_remain_partial_without_fabricated_zero_metrics() -> None:
+    fielding = features._aggregate_team_fielding_logs(
+        [{"date": "2026-06-30", "stat": {"gamesPlayed": 1}}],
+        1,
+    )
+    section = features._defense_feature_section(
+        fielding,
+        component="defense_season",
+        reason_available="team defense season from MLB Stats API fielding game logs",
+        reason_missing="team defense season missing because MLB Stats API fielding game logs were unavailable or empty",
+    )
+
+    assert fielding["game_count"] == 1
+    assert fielding["source_fields_present"] == []
+    assert fielding["errors"] is None
+    assert fielding["assists"] is None
+    assert fielding["putouts"] is None
+    assert fielding["double_plays"] is None
+    assert fielding["fielding_percentage"] is None
+    assert section["source_status"] == "partial"
+    assert section["reason"] == "MLB Stats API fielding logs returned games but limited fielding metrics."
+
+
 def test_fielding_source_failure_degrades_defense_without_blocking_offense(monkeypatch) -> None:
     monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "true")
     get_settings.cache_clear()
