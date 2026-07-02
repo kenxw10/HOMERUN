@@ -3816,12 +3816,6 @@ def _lineup_missing_reason(game: MlbGame, starter_count: int) -> str | None:
     if starter_count > 0:
         return PARTIAL_LINEUP_POSTED
     raw = game.raw_payload or {}
-    hydration = raw.get("homerun_starter_hydration") if isinstance(raw, dict) else None
-    errors = hydration.get("errors") if isinstance(hydration, dict) else None
-    if isinstance(errors, list) and any(
-        isinstance(error, dict) and error.get("table") == "mlb_games_feed" for error in errors
-    ):
-        return LIVE_FEED_UNAVAILABLE
     live_feed = raw.get(LIVE_FEED_HYDRATION_KEY) if isinstance(raw, dict) else None
     live_feed_errors = live_feed.get("errors") if isinstance(live_feed, dict) else None
     if isinstance(live_feed_errors, list) and any(
@@ -4654,6 +4648,21 @@ def sync_mlb_features(
     return stats
 
 
+def _set_live_feed_hydration_error(
+    game: MlbGame,
+    error: dict[str, object],
+    *,
+    checked_at: datetime | None = None,
+) -> None:
+    raw = dict(game.raw_payload or {})
+    raw[LIVE_FEED_HYDRATION_KEY] = {
+        "status": "unavailable",
+        "checked_at": (checked_at or utc_now()).isoformat(),
+        "errors": [error],
+    }
+    game.raw_payload = raw
+
+
 def _hydrate_game_endpoint_if_available(game: MlbGame) -> dict[str, object] | None:
     if not game.external_game_id or not str(game.external_game_id).isdigit():
         return None
@@ -4670,13 +4679,7 @@ def _hydrate_game_endpoint_if_available(game: MlbGame) -> dict[str, object] | No
             _merge_game_payload(game, payload)
         return None
 
-    raw = dict(game.raw_payload or {})
-    raw[LIVE_FEED_HYDRATION_KEY] = {
-        "status": "unavailable",
-        "checked_at": utc_now().isoformat(),
-        "errors": [error],
-    }
-    game.raw_payload = raw
+    _set_live_feed_hydration_error(game, error)
     return error
 
 
@@ -4840,7 +4843,9 @@ def _refresh_game_starter_sources(
             _replace_starter_identities(refreshed, lambda side: _fresh_feed_starter_identity(feed_payload, side))
             _merge_game_payload(game, feed_payload)
         except Exception as exc:
-            errors.append(_source_error(source=MLB_STATS_SOURCE, table="mlb_games_feed", game_pk=game.external_game_id, exc=exc))
+            error = _source_error(source=MLB_STATS_SOURCE, table="mlb_games_feed", game_pk=game.external_game_id, exc=exc)
+            errors.append(error)
+            _set_live_feed_hydration_error(game, error, checked_at=checked_at)
     if _starter_identity_missing(refreshed) and game.external_game_id and str(game.external_game_id).isdigit():
         try:
             boxscore_payload = client.get_game_boxscore(game.external_game_id)

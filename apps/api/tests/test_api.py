@@ -9688,6 +9688,53 @@ def test_lineup_sync_marks_live_feed_failure_unavailable(monkeypatch) -> None:
     assert game.raw_payload[features.LIVE_FEED_HYDRATION_KEY]["errors"][0]["table"] == "mlb_games_feed"
 
 
+def test_lineup_sync_ignores_stale_starter_feed_error_after_feed_success(monkeypatch) -> None:
+    monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "true")
+    get_settings.cache_clear()
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    class SuccessfulFeedClient:
+        def get_game_feed(self, *_args, **_kwargs):
+            return {"gameData": {"datetime": {"dateTime": "2026-07-01T23:00:00Z"}}}
+
+    monkeypatch.setattr(features, "MLBStatsClient", SuccessfulFeedClient)
+
+    try:
+        with Session(engine) as session:
+            session.add(
+                MlbGame(
+                    external_game_id="123456",
+                    home_team="Pittsburgh Pirates",
+                    away_team="Seattle Mariners",
+                    home_abbreviation="PIT",
+                    away_abbreviation="SEA",
+                    scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+                    status="scheduled",
+                    raw_payload={
+                        "venue": {"id": 31, "name": "PNC Park"},
+                        "homerun_starter_hydration": {
+                            "errors": [{"table": "mlb_games_feed", "message": "older feed outage"}]
+                        },
+                    },
+                )
+            )
+            session.commit()
+
+            result = features.sync_mlb_lineups(session, date(2026, 7, 1))
+            lineup = session.scalar(select(LineupSnapshot).where(LineupSnapshot.team_code == "PIT"))
+            game = session.scalar(select(MlbGame).where(MlbGame.external_game_id == "123456"))
+    finally:
+        get_settings.cache_clear()
+
+    assert result["validation_status"] == "degraded_no_available_public_rows"
+    assert lineup is not None
+    assert lineup.source_status == "missing"
+    assert lineup.features["missing_reason"] == features.LINEUP_NOT_POSTED_YET
+    assert game is not None
+    assert features.LIVE_FEED_HYDRATION_KEY not in game.raw_payload
+
+
 def test_feature_ingestion_scope_excludes_live_execution_team_totals_and_umpires() -> None:
     searchable = " ".join(
         [
