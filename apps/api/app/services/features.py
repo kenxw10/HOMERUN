@@ -109,6 +109,7 @@ QUALITY_WEIGHTS: dict[str, dict[str, Decimal]] = {
         "bullpen_season": Decimal("0.08"),
         "bullpen_recent_workload": Decimal("0.05"),
         "lineup": Decimal("0.06"),
+        "defense_catcher": Decimal("0.04"),
         "park_weather": Decimal("0.04"),
         "travel_schedule": Decimal("0.04"),
         "injuries": Decimal("0.04"),
@@ -128,6 +129,7 @@ QUALITY_WEIGHTS: dict[str, dict[str, Decimal]] = {
         "bullpen_season": Decimal("0.09"),
         "bullpen_recent_workload": Decimal("0.06"),
         "lineup": Decimal("0.08"),
+        "defense_catcher": Decimal("0.03"),
         "park_weather": Decimal("0.09"),
         "travel_schedule": Decimal("0.04"),
         "injuries": Decimal("0.03"),
@@ -146,6 +148,7 @@ QUALITY_WEIGHTS: dict[str, dict[str, Decimal]] = {
         "bullpen_season": Decimal("0.02"),
         "bullpen_recent_workload": Decimal("0.02"),
         "lineup": Decimal("0.10"),
+        "defense_catcher": Decimal("0.03"),
         "park_weather": Decimal("0.04"),
         "travel_schedule": Decimal("0.06"),
         "injuries": Decimal("0.03"),
@@ -156,6 +159,7 @@ QUALITY_WEIGHTS: dict[str, dict[str, Decimal]] = {
 QUALITY_WEIGHTS[FULL_GAME_SPREAD] = QUALITY_WEIGHTS[FULL_GAME_WINNER]
 QUALITY_WEIGHTS[FIRST_FIVE_SPREAD] = QUALITY_WEIGHTS[FIRST_FIVE_WINNER]
 QUALITY_WEIGHTS[FIRST_FIVE_TOTAL] = QUALITY_WEIGHTS[FIRST_FIVE_WINNER]
+MODEL_QUALITY_EXCLUDED_MODULES = frozenset({"defense_catcher"})
 
 def _park(
     latitude: float,
@@ -2130,12 +2134,18 @@ def _nested_module_score(value: object) -> Decimal:
     return sum(scores) / Decimal(len(scores))
 
 
-def _quality_score(
+def _model_quality_weights(weights: dict[str, Decimal]) -> dict[str, Decimal]:
+    return {
+        module_name: weight
+        for module_name, weight in weights.items()
+        if module_name not in MODEL_QUALITY_EXCLUDED_MODULES
+    }
+
+
+def _weighted_quality_components(
     features: dict[str, object],
-    market_family: str | None,
-    minutes_to_start: int | None,
-) -> tuple[Decimal, dict[str, object]]:
-    weights = QUALITY_WEIGHTS.get(market_family or FULL_GAME_WINNER, QUALITY_WEIGHTS[FULL_GAME_WINNER])
+    weights: dict[str, Decimal],
+) -> tuple[Decimal, dict[str, float]]:
     total_weight = sum(weights.values())
     weighted = Decimal("0")
     module_scores: dict[str, float] = {}
@@ -2144,6 +2154,17 @@ def _quality_score(
         module_scores[module_name] = float(score.quantize(Decimal("0.0001")))
         weighted += score * weight
     quality = weighted / total_weight if total_weight else Decimal("0")
+    return quality, module_scores
+
+
+def _quality_score(
+    features: dict[str, object],
+    market_family: str | None,
+    minutes_to_start: int | None,
+) -> tuple[Decimal, dict[str, object]]:
+    weights = QUALITY_WEIGHTS.get(market_family or FULL_GAME_WINNER, QUALITY_WEIGHTS[FULL_GAME_WINNER])
+    diagnostic_quality, module_scores = _weighted_quality_components(features, weights)
+    quality, _ = _weighted_quality_components(features, _model_quality_weights(weights))
     reasons: list[str] = []
 
     starter_identity = features.get("starter_identity")
@@ -2171,8 +2192,14 @@ def _quality_score(
             reasons.append("CAP_LINEUP_MISSING_WITHIN_90M")
 
     quality = min(max(quality, Decimal("0.0000")), Decimal("1.0000")).quantize(Decimal("0.0001"))
+    diagnostic_quality = min(max(diagnostic_quality, Decimal("0.0000")), Decimal("1.0000")).quantize(
+        Decimal("0.0001")
+    )
     return quality, {
         "score": float(quality),
+        "model_quality_score": float(quality),
+        "diagnostic_score": float(diagnostic_quality),
+        "model_quality_excluded_modules": sorted(MODEL_QUALITY_EXCLUDED_MODULES),
         "module_scores": module_scores,
         "data_quality_reason": reasons,
         "weight_profile": market_family or FULL_GAME_WINNER,

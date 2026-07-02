@@ -7375,10 +7375,15 @@ def test_candidate_diagnostics_include_defense_module_status(monkeypatch) -> Non
     defense = candidate.features["defense_catcher"]
     assert defense["source_status"] == "partial"
     assert defense["home"]["team_defense_season"]["source_status"] == "available"
-    quality = candidate.gate_diagnostics["quality_decomposition"]["paper_observation"]
-    assert quality["module_status"]["defense_catcher"] == "partial"
-    assert "defense_catcher" in quality["quality_contribution_by_module"]
-    assert "defense_catcher" in quality["quality_penalty_by_module"]
+    raw_quality = candidate.gate_diagnostics["quality_decomposition"]["raw_feature_snapshot"]
+    paper_quality = candidate.gate_diagnostics["quality_decomposition"]["paper_observation"]
+    assert raw_quality["module_status"]["defense_catcher"] == "partial"
+    assert raw_quality["quality_weight_by_module"]["defense_catcher"] > 0
+    assert raw_quality["quality_contribution_by_module"]["defense_catcher"] > 0
+    assert raw_quality["quality_penalty_by_module"]["defense_catcher"] > 0
+    assert paper_quality["module_status"]["defense_catcher"] == "partial"
+    assert "defense_catcher" in paper_quality["quality_contribution_by_module"]
+    assert "defense_catcher" in paper_quality["quality_penalty_by_module"]
 
 
 def test_model_governance_skips_training_and_records_runs_when_samples_are_too_small() -> None:
@@ -13386,9 +13391,13 @@ def test_defense_catcher_diagnostics_do_not_change_model_quality() -> None:
         180,
     )
 
-    assert "defense_catcher" not in features.QUALITY_WEIGHTS[features.FULL_GAME_WINNER]
+    assert "defense_catcher" in features.QUALITY_WEIGHTS[features.FULL_GAME_WINNER]
     assert missing_quality == available_quality
-    assert missing_summary["module_scores"] == available_summary["module_scores"]
+    assert missing_summary["model_quality_score"] == available_summary["model_quality_score"]
+    assert missing_summary["diagnostic_score"] < available_summary["diagnostic_score"]
+    assert missing_summary["module_scores"]["defense_catcher"] == 0.0
+    assert available_summary["module_scores"]["defense_catcher"] == 1.0
+    assert "defense_catcher" in missing_summary["model_quality_excluded_modules"]
     assert missing_summary["source_statuses"]["defense_catcher"] == "missing"
     assert available_summary["source_statuses"]["defense_catcher"] == "available"
 
