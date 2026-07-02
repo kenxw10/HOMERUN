@@ -3136,6 +3136,33 @@ def _defense_feature_section(
     }
 
 
+def _cached_defense_feature_section(row: TeamDailyFeature | TeamRecentFeature | None, key: str) -> dict[str, object] | None:
+    values = row.features if row is not None and isinstance(row.features, dict) else None
+    component = values.get(key) if isinstance(values, dict) else None
+    return dict(component) if isinstance(component, dict) else None
+
+
+def _defense_feature_section_or_cached(
+    fielding: dict[str, object],
+    row: TeamDailyFeature | TeamRecentFeature | None,
+    key: str,
+    *,
+    component: str,
+    reason_available: str,
+    reason_missing: str,
+) -> dict[str, object]:
+    if int(fielding.get("game_count") or 0) == 0:
+        cached = _cached_defense_feature_section(row, key)
+        if cached is not None:
+            return cached
+    return _defense_feature_section(
+        fielding,
+        component=component,
+        reason_available=reason_available,
+        reason_missing=reason_missing,
+    )
+
+
 def _map_handedness_splits(payload: dict[str, object] | None, group: str) -> dict[str, object]:
     mapped: dict[str, object] = {"source": MLB_STATS_SOURCE, "basis": group, "vsLeft": None, "vsRight": None}
     for split in _stats_splits(payload):
@@ -3253,8 +3280,10 @@ def _upsert_mlb_primary_team_daily(
         "run_differential_per_game": _float(_ratio((runs or Decimal("0")) - (runs_allowed or Decimal("0")), games_played)) if runs is not None and runs_allowed is not None else None,
         "contact_quality": contact,
         "contact_quality_status": _statcast_status(contact if isinstance(contact, dict) else None),
-        "defense_season": _defense_feature_section(
+        "defense_season": _defense_feature_section_or_cached(
             fielding,
+            row,
+            "defense_season",
             component="defense_season",
             reason_available="team defense season from MLB Stats API fielding game logs",
             reason_missing="team defense season missing because MLB Stats API fielding game logs were unavailable or empty",
@@ -3338,8 +3367,10 @@ def _upsert_mlb_primary_team_recent(
         "barrel_pct": contact.get("barrel_pct") if isinstance(contact, dict) else None,
         "contact_quality": contact,
         "contact_quality_status": _statcast_status(contact if isinstance(contact, dict) else None),
-        "defense_recent": _defense_feature_section(
+        "defense_recent": _defense_feature_section_or_cached(
             fielding,
+            row,
+            "defense_recent",
             component="defense_recent",
             reason_available=f"team defense recent from MLB Stats API fielding game logs over {window_days} days",
             reason_missing=f"team defense recent missing because no MLB Stats API fielding game logs were available in the last {window_days} days",

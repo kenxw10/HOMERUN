@@ -8125,6 +8125,94 @@ def test_caught_stealing_rate_requires_both_running_game_fields() -> None:
     assert complete["caught_stealing_rate"] == 0.3333
 
 
+def test_fielding_fetch_failure_preserves_cached_defense_sections() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    day = date(2026, 7, 1)
+    cached_at = datetime(2026, 7, 1, 12, 0, tzinfo=UTC)
+    captured_at = datetime(2026, 7, 1, 15, 0, tzinfo=UTC)
+    cached_season = {
+        "component": "defense_season",
+        "source_status": "available",
+        "source": features.MLB_STATS_SOURCE,
+        "reason": "team defense season from MLB Stats API fielding game logs",
+        "fielding_percentage": 0.985,
+        "source_fields_present": ["errors", "putOuts", "assists"],
+    }
+    cached_recent = {
+        "component": "defense_recent",
+        "source_status": "available",
+        "source": features.MLB_STATS_SOURCE,
+        "reason": "team defense recent from MLB Stats API fielding game logs over 14 days",
+        "double_plays_per_game": 0.8,
+        "source_fields_present": ["doublePlays"],
+    }
+
+    with Session(engine) as session:
+        game = _fielding_test_game()
+        session.add(game)
+        session.flush()
+        session.add(
+            TeamDailyFeature(
+                target_date=day,
+                team_code="PIT",
+                captured_at=cached_at,
+                source=features.MLB_STATS_SOURCE,
+                source_status="available",
+                confidence=Decimal("0.8500"),
+                completeness=Decimal("0.8000"),
+                stale=False,
+                features={"defense_season": cached_season},
+            )
+        )
+        session.add(
+            TeamRecentFeature(
+                target_date=day,
+                team_code="PIT",
+                window_days=14,
+                captured_at=cached_at,
+                source=features.MLB_STATS_SOURCE,
+                source_status="available",
+                confidence=Decimal("0.8000"),
+                completeness=Decimal("0.7500"),
+                stale=False,
+                features={"defense_recent": cached_recent},
+            )
+        )
+        session.flush()
+        mlb_context = {
+            "team_hitting_logs_by_id": {"134": _team_log_rows("hitting")},
+            "team_pitching_logs_by_id": {"134": _team_log_rows("pitching")},
+        }
+
+        daily = features._upsert_mlb_primary_team_daily(
+            session,
+            game,
+            "home",
+            day,
+            captured_at,
+            mlb_context,
+            {"team_contact_by_code": {}},
+        )
+        recent = features._upsert_mlb_primary_team_recent(
+            session,
+            game,
+            "home",
+            day,
+            captured_at,
+            14,
+            mlb_context,
+            {"team_contact_by_code": {}},
+        )
+
+    assert daily is not None
+    assert recent is not None
+    assert daily.raw_payload["fielding_rows"] == 0
+    assert recent.raw_payload["fielding_rows"] == 0
+    assert daily.features["defense_season"] == cached_season
+    assert recent.features["defense_recent"] == cached_recent
+
+
 def test_fielding_source_failure_degrades_defense_without_blocking_offense(monkeypatch) -> None:
     monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "true")
     get_settings.cache_clear()
