@@ -6344,6 +6344,48 @@ def test_dashboard_default_excludes_pre_observation_rows_with_history_opt_in() -
     assert next(trade for trade in trades if trade.market_ticker == "KXMLBGAME-POST-OPEN-PIT").status == "open"
 
 
+def test_dashboard_observation_cutoff_uses_fixed_eastern_time(monkeypatch) -> None:
+    monkeypatch.setenv("DASHBOARD_TIMEZONE", "UTC")
+    get_settings.cache_clear()
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        epoch_id = _active_epoch_id(session)
+        session.add_all(
+            [
+                PaperTrade(
+                    paper_trading_epoch_id=epoch_id,
+                    market_ticker="KXMLBGAME-UTC-BEFORE-ET-CUTOFF",
+                    contract_side="yes",
+                    entry_price=Decimal("0.4000"),
+                    current_price=Decimal("0.7000"),
+                    quantity=1,
+                    entry_time=datetime(2026, 7, 2, 3, 30, tzinfo=UTC),
+                    status="open",
+                ),
+                PaperTrade(
+                    paper_trading_epoch_id=epoch_id,
+                    market_ticker="KXMLBGAME-UTC-AT-ET-CUTOFF",
+                    contract_side="yes",
+                    entry_price=Decimal("0.4000"),
+                    current_price=Decimal("0.7000"),
+                    quantity=1,
+                    entry_time=datetime(2026, 7, 2, 4, 0, tzinfo=UTC),
+                    status="open",
+                ),
+            ]
+        )
+        session.commit()
+
+        summary = dashboard.dashboard_summary_from_db(session, date(2026, 7, 2))
+
+    assert summary.observation_filter is not None
+    assert summary.observation_filter.observation_start_at == "2026-07-02T04:00:00+00:00"
+    assert summary.observation_filter.excluded_pre_observation_count == 1
+    assert [position.market_ticker for position in summary.positions] == ["KXMLBGAME-UTC-AT-ET-CUTOFF"]
+
+
 def test_resolver_uses_event_ticker_time_and_team_codes_for_validation() -> None:
     game = MlbGame(
         external_game_id="resolver-pr3-1",

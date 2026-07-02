@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
@@ -45,6 +46,7 @@ from app.time_utils import eastern_display, ensure_aware_utc, get_dashboard_zone
 
 MAPPING_STATUS_PRIORITY = {"confirmed": 0, "candidate": 1, "needs_review": 2}
 OBSERVATION_START_DATE = date(2026, 7, 2)
+OBSERVATION_TIME_ZONE = ZoneInfo("America/New_York")
 OBSERVATION_FILTER_REASON = "default_dashboard_excludes_pre_2026_07_02_validation_rows"
 
 
@@ -296,7 +298,7 @@ def _observation_start_at() -> datetime:
     local_start = datetime.combine(
         OBSERVATION_START_DATE,
         time.min,
-        tzinfo=get_dashboard_zone(),
+        tzinfo=OBSERVATION_TIME_ZONE,
     )
     return ensure_aware_utc(local_start)
 
