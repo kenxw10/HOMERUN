@@ -697,3 +697,10 @@ Every future PR must update this section with:
 - Feature coverage/detail reasons now describe official lineup states and optional-provider gaps more explicitly, instead of using one generic cached-lineup message.
 - Daily setup remains the owner of heavy public-source feature ingestion. PR3m does not call pybaseball, FanGraphs, Statcast/Savant, Open-Meteo, sportsbook APIs, team totals, umpire logic, full feature sync, market discovery, WebSocket, settlement, risk caps, model math, thresholds, live execution, production credentials, or cron schedule changes from candidate-sweep.
 - No schema migration, dependency, environment-variable, secret, frontend, live order, or production credential change was added.
+
+### PR3m.1 - Dashboard Observation Cutover
+
+- Default `/v1/dashboard/summary` results now apply a dashboard-only observation cutoff of midnight ET on `2026-07-02`. Pre-cutoff active-epoch paper trades and legacy positions stay in the database, but they are excluded from default open positions, closed positions, portfolio value, P/L, ROI, record, family/scope performance, and dashboard candidate counts.
+- Historical/audit access is preserved with `include_pre_observation=true`, which can be combined with existing `closed_date`, `epoch_key`, and `include_archived` parameters. The summary includes `observation_filter` metadata with the cutoff date, display time, excluded counts, history parameter, and reason.
+- The frontend shows a compact note that default dashboard views exclude pre-Jul 2 validation rows. It does not add reset/admin controls and does not delete, archive, close, or mutate any paper rows.
+- PR3m.1 does not change candidate generation, settlement, source sync, pregame context refresh, model math, risk caps, cron schedules, WebSocket behavior, live execution, spread activation, sportsbook/team-total/umpire logic, secrets, or migrations.

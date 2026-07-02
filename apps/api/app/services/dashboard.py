@@ -27,6 +27,7 @@ from app.schemas import (
     BotMode,
     DashboardSummary,
     ModelStatus,
+    ObservationFilterSummary,
     PerformanceMetrics,
     PortfolioPoint,
     PositionSummary,
@@ -43,11 +44,14 @@ from app.services.ws_market_data import ws_status_running_is_fresh
 from app.time_utils import eastern_display, ensure_aware_utc, get_dashboard_zone, to_eastern_iso, today_eastern, utc_now
 
 MAPPING_STATUS_PRIORITY = {"confirmed": 0, "candidate": 1, "needs_review": 2}
+OBSERVATION_START_DATE = date(2026, 7, 2)
+OBSERVATION_FILTER_REASON = "default_dashboard_excludes_pre_2026_07_02_validation_rows"
 
 
 def empty_dashboard_summary(closed_date: date | None = None) -> DashboardSummary:
     settings = get_settings()
     selected_closed_date = closed_date or today_eastern()
+    observation_start = _observation_start_at()
     return DashboardSummary(
         portfolio_series=[],
         performance=PerformanceMetrics(win_rate=None, roi=None, profit_loss=0.0, record="0-0-0"),
@@ -88,6 +92,14 @@ def empty_dashboard_summary(closed_date: date | None = None) -> DashboardSummary
             notes=["No mature model run has been recorded yet."],
         ),
         paper_starting_balance=float(settings.paper_starting_balance),
+        observation_filter=ObservationFilterSummary(
+            active=True,
+            include_pre_observation=False,
+            observation_start_date=OBSERVATION_START_DATE.isoformat(),
+            observation_start_at=to_eastern_iso(observation_start) or observation_start.isoformat(),
+            observation_start_display=eastern_display(observation_start) or observation_start.isoformat(),
+            reason=OBSERVATION_FILTER_REASON,
+        ),
         performance_by_scope={},
         performance_by_family={},
         decision_breakdown_by_scope={},
@@ -280,6 +292,91 @@ def _date_bounds(day: date) -> tuple[datetime, datetime]:
     return start, start + timedelta(days=1)
 
 
+def _observation_start_at() -> datetime:
+    local_start = datetime.combine(
+        OBSERVATION_START_DATE,
+        time.min,
+        tzinfo=get_dashboard_zone(),
+    )
+    return ensure_aware_utc(local_start)
+
+
+def _apply_trade_observation_filter(statement, include_pre_observation: bool, cutoff: datetime):
+    if include_pre_observation:
+        return statement
+    return statement.where(PaperTrade.entry_time >= cutoff)
+
+
+def _apply_candidate_observation_filter(statement, include_pre_observation: bool, cutoff: datetime):
+    if include_pre_observation:
+        return statement
+    return statement.where(ModelCandidate.evaluated_at >= cutoff)
+
+
+def _filtered_portfolio_totals(
+    *,
+    starting_balance: Decimal,
+    trades: list[PaperTrade],
+) -> tuple[Decimal, Decimal]:
+    realized = sum((trade.realized_pnl or Decimal("0")) for trade in trades if trade.status != "open") or Decimal("0")
+    open_trades = [trade for trade in trades if trade.status == "open"]
+    open_cost = sum(
+        (trade.entry_price * Decimal(trade.quantity)) + paper_trade_fee(trade) for trade in open_trades
+    ) or Decimal("0")
+    open_mark = sum(
+        (trade.current_price if trade.current_price is not None else trade.entry_price) * Decimal(trade.quantity)
+        for trade in open_trades
+    ) or Decimal("0")
+    cash = (starting_balance + realized - open_cost).quantize(Decimal("0.01"))
+    portfolio = (cash + open_mark).quantize(Decimal("0.01"))
+    return cash, portfolio
+
+
+def _observation_filter_summary(
+    session: Session,
+    *,
+    active_epoch: PaperTradingEpoch,
+    selected_closed_date: date,
+    include_pre_observation: bool,
+    cutoff: datetime,
+) -> ObservationFilterSummary:
+    closed_start, closed_end = _date_bounds(selected_closed_date)
+    excluded_total = (
+        session.scalar(
+            select(func.count(PaperTrade.id))
+            .where(PaperTrade.paper_trading_epoch_id == active_epoch.id)
+            .where(PaperTrade.entry_time < cutoff)
+        )
+        or 0
+    )
+    excluded_closed = (
+        session.scalar(
+            select(func.count(PaperTrade.id))
+            .where(PaperTrade.paper_trading_epoch_id == active_epoch.id)
+            .where(PaperTrade.status.in_(["settled", "closed", "void"]))
+            .where(PaperTrade.entry_time < cutoff)
+            .where(
+                or_(
+                    (PaperTrade.exit_time >= closed_start) & (PaperTrade.exit_time < closed_end),
+                    (PaperTrade.settled_at >= closed_start) & (PaperTrade.settled_at < closed_end),
+                )
+            )
+        )
+        or 0
+    )
+    return ObservationFilterSummary(
+        active=not include_pre_observation,
+        include_pre_observation=include_pre_observation,
+        observation_start_date=OBSERVATION_START_DATE.isoformat(),
+        observation_start_at=to_eastern_iso(cutoff) or cutoff.isoformat(),
+        observation_start_display=eastern_display(cutoff) or cutoff.isoformat(),
+        excluded_pre_observation_count=int(excluded_total),
+        excluded_pre_observation_closed_count=int(excluded_closed),
+        historical_rows_available=bool(excluded_total),
+        reason=OBSERVATION_FILTER_REASON,
+    )
+
+
 def _feature_status_summary(rows: list[MlbFeatureSnapshot]) -> tuple[dict[str, object], dict[str, object], list[str]]:
     source_statuses: dict[str, object] = {}
     module_counts: dict[str, dict[str, int]] = {}
@@ -459,11 +556,20 @@ def dashboard_summary_from_db(
     *,
     epoch_key: str | None = None,
     include_archived: bool = False,
+    include_pre_observation: bool = False,
 ) -> DashboardSummary:
     selected_closed_date = closed_date or today_eastern()
     summary = empty_dashboard_summary(selected_closed_date)
     epoch_filter = resolve_epoch_filter(session, epoch_key=epoch_key, include_archived=include_archived)
     active_epoch = epoch_filter.epoch
+    observation_cutoff = _observation_start_at()
+    summary.observation_filter = _observation_filter_summary(
+        session,
+        active_epoch=active_epoch,
+        selected_closed_date=selected_closed_date,
+        include_pre_observation=include_pre_observation,
+        cutoff=observation_cutoff,
+    )
     summary.active_epoch = ActiveEpochSummary(
         epoch_key=active_epoch.epoch_key,
         display_name=active_epoch.display_name,
@@ -473,34 +579,62 @@ def dashboard_summary_from_db(
         started_at=to_eastern_iso(active_epoch.started_at),
     )
     summary.paper_starting_balance = float(active_epoch.starting_balance)
-    newest_snapshots = list(
+    snapshot_query = select(BalanceSnapshot).where(BalanceSnapshot.paper_trading_epoch_id == active_epoch.id)
+    if not include_pre_observation:
+        snapshot_query = snapshot_query.where(BalanceSnapshot.captured_at >= observation_cutoff)
+    newest_snapshots = list(session.scalars(snapshot_query.order_by(BalanceSnapshot.captured_at.desc()).limit(500)))
+    snapshots = list(reversed(newest_snapshots))
+    filtered_trades = list(
         session.scalars(
-            select(BalanceSnapshot)
-            .where(BalanceSnapshot.paper_trading_epoch_id == active_epoch.id)
-            .order_by(BalanceSnapshot.captured_at.desc())
-            .limit(500)
+            _apply_trade_observation_filter(
+                select(PaperTrade).where(PaperTrade.paper_trading_epoch_id == active_epoch.id),
+                include_pre_observation,
+                observation_cutoff,
+            )
         )
     )
-    snapshots = list(reversed(newest_snapshots))
-    summary.portfolio_series = [
-        PortfolioPoint(timestamp=snapshot.captured_at, value=float(snapshot.portfolio_value)) for snapshot in snapshots
-    ]
-    if snapshots:
+    if include_pre_observation:
+        summary.portfolio_series = [
+            PortfolioPoint(timestamp=snapshot.captured_at, value=float(snapshot.portfolio_value))
+            for snapshot in snapshots
+        ]
+    elif summary.observation_filter.excluded_pre_observation_count:
+        now = utc_now()
+        _, clean_portfolio_value = _filtered_portfolio_totals(
+            starting_balance=active_epoch.starting_balance,
+            trades=filtered_trades,
+        )
+        summary.portfolio_series = [
+            PortfolioPoint(timestamp=observation_cutoff, value=float(active_epoch.starting_balance)),
+            PortfolioPoint(timestamp=now, value=float(clean_portfolio_value)),
+        ]
+    else:
+        summary.portfolio_series = [
+            PortfolioPoint(timestamp=snapshot.captured_at, value=float(snapshot.portfolio_value))
+            for snapshot in snapshots
+        ]
+    if snapshots and include_pre_observation:
+        latest_snapshot = snapshots[-1]
+        summary.cash_balance = float(latest_snapshot.cash_balance)
+        summary.portfolio_value = float(latest_snapshot.portfolio_value)
+    elif snapshots and not summary.observation_filter.excluded_pre_observation_count:
         latest_snapshot = snapshots[-1]
         summary.cash_balance = float(latest_snapshot.cash_balance)
         summary.portfolio_value = float(latest_snapshot.portfolio_value)
     else:
-        totals = calculate_paper_portfolio(session, epoch=active_epoch)
-        summary.cash_balance = float(totals.cash_balance)
-        summary.portfolio_value = float(totals.portfolio_value)
+        if include_pre_observation:
+            totals = calculate_paper_portfolio(session, epoch=active_epoch)
+            summary.cash_balance = float(totals.cash_balance)
+            summary.portfolio_value = float(totals.portfolio_value)
+        else:
+            cash_balance, portfolio_value = _filtered_portfolio_totals(
+                starting_balance=active_epoch.starting_balance,
+                trades=filtered_trades,
+            )
+            summary.cash_balance = float(cash_balance)
+            summary.portfolio_value = float(portfolio_value)
 
-    settled = list(
-        session.scalars(
-            select(PaperTrade)
-            .where(PaperTrade.paper_trading_epoch_id == active_epoch.id)
-            .where(PaperTrade.status.in_(["settled", "closed", "void"]))
-        )
-    )
+    settled = [trade for trade in filtered_trades if trade.status in {"settled", "closed", "void"}]
     wins = sum(1 for trade in settled if trade.outcome == "win" or (trade.realized_pnl or Decimal("0")) > 0)
     losses = sum(1 for trade in settled if trade.outcome == "loss" or (trade.realized_pnl or Decimal("0")) < 0)
     pushes = sum(1 for trade in settled if trade.outcome in {"push", "void"})
@@ -513,16 +647,26 @@ def dashboard_summary_from_db(
         record=f"{wins}-{losses}-{pushes}",
     )
 
-    open_positions = [] if not include_archived else list(session.scalars(select(Position).where(Position.status == "open").limit(100)))
+    open_position_query = select(Position).where(Position.status == "open")
+    if not include_pre_observation:
+        open_position_query = open_position_query.where(Position.opened_at >= observation_cutoff)
+    open_positions = [] if not include_archived else list(session.scalars(open_position_query.limit(100)))
+    open_trade_statement = (
+        select(PaperTrade, MlbGame, KalshiMarket, ModelCandidate)
+        .outerjoin(ModelCandidate, PaperTrade.candidate_id == ModelCandidate.id)
+        .outerjoin(MlbGame, ModelCandidate.mlb_game_id == MlbGame.id)
+        .outerjoin(KalshiMarket, ModelCandidate.kalshi_market_id == KalshiMarket.id)
+        .where(PaperTrade.paper_trading_epoch_id == active_epoch.id)
+        .where(PaperTrade.status == "open")
+    )
+    open_trade_statement = _apply_trade_observation_filter(
+        open_trade_statement,
+        include_pre_observation,
+        observation_cutoff,
+    )
     open_trade_rows = list(
         session.execute(
-            select(PaperTrade, MlbGame, KalshiMarket, ModelCandidate)
-            .outerjoin(ModelCandidate, PaperTrade.candidate_id == ModelCandidate.id)
-            .outerjoin(MlbGame, ModelCandidate.mlb_game_id == MlbGame.id)
-            .outerjoin(KalshiMarket, ModelCandidate.kalshi_market_id == KalshiMarket.id)
-            .where(PaperTrade.paper_trading_epoch_id == active_epoch.id)
-            .where(PaperTrade.status == "open")
-            .limit(100)
+            open_trade_statement.limit(100)
         )
     )
     summary.positions = [_position_from_position(position) for position in open_positions]
@@ -533,22 +677,31 @@ def dashboard_summary_from_db(
         if (trade.market_ticker, trade.contract_side) not in position_keys
     )
     closed_start, closed_end = _date_bounds(selected_closed_date)
+    closed_trade_statement = (
+        select(PaperTrade, MlbGame, KalshiMarket, ModelCandidate)
+        .outerjoin(ModelCandidate, PaperTrade.candidate_id == ModelCandidate.id)
+        .outerjoin(MlbGame, ModelCandidate.mlb_game_id == MlbGame.id)
+        .outerjoin(KalshiMarket, ModelCandidate.kalshi_market_id == KalshiMarket.id)
+        .where(PaperTrade.paper_trading_epoch_id == active_epoch.id)
+        .where(PaperTrade.status.in_(["settled", "closed", "void"]))
+        .where(
+            or_(
+                (PaperTrade.exit_time >= closed_start) & (PaperTrade.exit_time < closed_end),
+                (PaperTrade.settled_at >= closed_start) & (PaperTrade.settled_at < closed_end),
+            )
+        )
+    )
+    closed_trade_statement = _apply_trade_observation_filter(
+        closed_trade_statement,
+        include_pre_observation,
+        observation_cutoff,
+    )
     closed_trade_rows = list(
         session.execute(
-            select(PaperTrade, MlbGame, KalshiMarket, ModelCandidate)
-            .outerjoin(ModelCandidate, PaperTrade.candidate_id == ModelCandidate.id)
-            .outerjoin(MlbGame, ModelCandidate.mlb_game_id == MlbGame.id)
-            .outerjoin(KalshiMarket, ModelCandidate.kalshi_market_id == KalshiMarket.id)
-            .where(PaperTrade.paper_trading_epoch_id == active_epoch.id)
-            .where(PaperTrade.status.in_(["settled", "closed", "void"]))
-            .where(
-                or_(
-                    (PaperTrade.exit_time >= closed_start) & (PaperTrade.exit_time < closed_end),
-                    (PaperTrade.settled_at >= closed_start) & (PaperTrade.settled_at < closed_end),
-                )
-            )
-            .order_by(PaperTrade.exit_time.desc().nullslast(), PaperTrade.settled_at.desc().nullslast())
-            .limit(200)
+            closed_trade_statement.order_by(
+                PaperTrade.exit_time.desc().nullslast(),
+                PaperTrade.settled_at.desc().nullslast(),
+            ).limit(200)
         )
     )
     summary.closed_positions = [
@@ -578,40 +731,47 @@ def dashboard_summary_from_db(
         )
     )
     feature_completeness, source_statuses, critical_warnings = _feature_status_summary(today_feature_rows)
-    candidate_count = (
-        session.scalar(
-            select(func.count(ModelCandidate.id)).where(ModelCandidate.paper_trading_epoch_id == active_epoch.id)
-        )
-        or 0
+    candidate_count_statement = _apply_candidate_observation_filter(
+        select(func.count(ModelCandidate.id)).where(ModelCandidate.paper_trading_epoch_id == active_epoch.id),
+        include_pre_observation,
+        observation_cutoff,
     )
-    training_eligible_count = (
-        session.scalar(
-            select(func.count(ModelCandidate.id))
-            .where(ModelCandidate.paper_trading_epoch_id == active_epoch.id)
-            .where(ModelCandidate.training_eligible.is_(True))
-        )
-        or 0
-    )
-    resolved_mature_samples = (
-        session.scalar(
-            select(func.count(ModelCandidate.id))
-            .where(ModelCandidate.paper_trading_epoch_id == active_epoch.id)
-            .where(ModelCandidate.training_eligible.is_(True))
-            .where(ModelCandidate.outcome.in_(["win", "loss"]))
-            .where(ModelCandidate.feature_version == FEATURE_VERSION)
-        )
-        or 0
-    )
-    candidate_avg_data_quality = session.scalar(
-        select(func.avg(ModelCandidate.data_quality)).where(ModelCandidate.feature_version == FEATURE_VERSION)
+    candidate_count = session.scalar(candidate_count_statement) or 0
+    training_eligible_statement = _apply_candidate_observation_filter(
+        select(func.count(ModelCandidate.id))
         .where(ModelCandidate.paper_trading_epoch_id == active_epoch.id)
+        .where(ModelCandidate.training_eligible.is_(True)),
+        include_pre_observation,
+        observation_cutoff,
+    )
+    training_eligible_count = session.scalar(training_eligible_statement) or 0
+    resolved_mature_statement = _apply_candidate_observation_filter(
+        select(func.count(ModelCandidate.id))
+        .where(ModelCandidate.paper_trading_epoch_id == active_epoch.id)
+        .where(ModelCandidate.training_eligible.is_(True))
+        .where(ModelCandidate.outcome.in_(["win", "loss"]))
+        .where(ModelCandidate.feature_version == FEATURE_VERSION),
+        include_pre_observation,
+        observation_cutoff,
+    )
+    resolved_mature_samples = session.scalar(resolved_mature_statement) or 0
+    candidate_avg_data_quality = session.scalar(
+        _apply_candidate_observation_filter(
+            select(func.avg(ModelCandidate.data_quality))
+            .where(ModelCandidate.feature_version == FEATURE_VERSION)
+            .where(ModelCandidate.paper_trading_epoch_id == active_epoch.id),
+            include_pre_observation,
+            observation_cutoff,
+        )
+    )
+    active_candidates_statement = _apply_candidate_observation_filter(
+        select(ModelCandidate).where(ModelCandidate.paper_trading_epoch_id == active_epoch.id),
+        include_pre_observation,
+        observation_cutoff,
     )
     active_candidates = list(
         session.scalars(
-            select(ModelCandidate)
-            .where(ModelCandidate.paper_trading_epoch_id == active_epoch.id)
-            .order_by(ModelCandidate.evaluated_at.desc())
-            .limit(1000)
+            active_candidates_statement.order_by(ModelCandidate.evaluated_at.desc()).limit(1000)
         )
     )
     summary.decision_breakdown_by_family, summary.decision_breakdown_by_scope = _decision_breakdown(active_candidates)

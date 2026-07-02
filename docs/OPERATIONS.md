@@ -177,6 +177,8 @@ The dashboard shows the last setup, candidate sweep, price refresh, settlement, 
 
 PR3m pregame context refresh uses only official MLB Stats API calls: target-date schedule with `probablePitcher(note)`, per-game live feed probable pitchers and lineups, boxscore starter/lineup data, and pitcher game-log stats for known starter IDs. Live feed/boxscore identities are preferred over stale schedule probables when both exist. It does not call pybaseball, FanGraphs, Statcast/Savant, Open-Meteo, full `sync_mlb_features`, sportsbook APIs, team totals, or umpire logic. If official MLB sources do not identify a starter or lineup, the status remains missing or partial with a reason; no neutral starter or fake lineup is inserted.
 
+PR3m.1 dashboard observation cutover is reporting-only. Default `/v1/dashboard/summary` excludes active-epoch paper trades and legacy positions entered before midnight ET on `2026-07-02`; those rows remain in the database and are visible only when `include_pre_observation=true` is supplied. The response includes `observation_filter` metadata with excluded counts and the history parameter. This cutover must not reset epochs, close open positions, delete rows, alter candidate generation, change settlement, change cron schedules, or enable live execution.
+
 After deployment, validate:
 
 1. `POST /v1/sync/mlb-pregame-context?target_date=today_et` returns `feature_sync_mode=pregame_context_refresh_lightweight`, target-date games checked, starter IDs/names where MLB has announced them, lineup counts, and explicit lineup missing reasons such as `LINEUP_NOT_POSTED_YET`, `PARTIAL_LINEUP_POSTED`, or `LIVE_FEED_UNAVAILABLE`.
@@ -193,6 +195,9 @@ After deployment, validate:
 12. Price refresh updates all open positions.
 13. The dashboard shows the last sweep window, starter hydration aggregate, and paper trades created in that sweep.
 14. No live execution path or live order placement is enabled.
+15. `GET /v1/dashboard/summary` shows `observation_filter.active=true`, `observation_start_date=2026-07-02`, clean July 2+ performance/portfolio metrics, and the compact frontend note about excluding pre-Jul 2 validation rows.
+16. `GET /v1/dashboard/summary?closed_date=2026-07-01` returns no default pre-cutover closed rows, while `GET /v1/dashboard/summary?closed_date=2026-07-01&include_pre_observation=true` returns the preserved historical rows for audit/debugging.
+17. The active July 2 paper position remains open and visible if it was entered at or after the observation cutoff.
 
 PR3i widens the persisted candidate decision field so post-eligibility rejection reasons from line selection, same-game/scope correlation, and caps can be saved safely. After deploying and running `alembic upgrade head`, include one normal non-dry candidate-sweep validation during the 45-180 minute window and confirm it completes without `StringDataRightTruncation`; paper trades should open only if the existing gates and caps allow them.
 

@@ -107,6 +107,7 @@ def dashboard_summary(
     closed_date: date | None = Query(default=None),
     epoch_key: str | None = Query(default=None),
     include_archived: bool = Query(default=False),
+    include_pre_observation: bool = Query(default=False),
 ) -> DashboardSummary:
     if not database_status()["ready"]:
         return empty_dashboard_summary(closed_date)
@@ -119,6 +120,7 @@ def dashboard_summary(
                 closed_date,
                 epoch_key=epoch_key,
                 include_archived=include_archived,
+                include_pre_observation=include_pre_observation,
             )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc

@@ -179,6 +179,17 @@ button {
   letter-spacing: 0.4px;
 }
 
+.observation-note {
+  margin-bottom: 14px;
+  border-left: 5px solid #6b7280;
+  padding: 8px 11px;
+  background: #ffffff;
+  color: #4b5563;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.4px;
+}
+
 .panel {
   border: 1px solid #d3dae4;
   border-radius: 4px;
