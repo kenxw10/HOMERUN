@@ -127,6 +127,10 @@ class Settings(BaseSettings):
     ws_price_stale_after_seconds: int = Field(default=120, alias="WS_PRICE_STALE_AFTER_SECONDS")
     feature_sync_enable_network_sources: bool = Field(default=True, alias="FEATURE_SYNC_ENABLE_NETWORK_SOURCES")
     open_meteo_base_url: str = Field(default="https://api.open-meteo.com/v1", alias="OPEN_METEO_BASE_URL")
+    advanced_public_stats_max_stale_hours: int = Field(
+        default=72, alias="ADVANCED_PUBLIC_STATS_MAX_STALE_HOURS"
+    )
+    statcast_cache_max_stale_hours: int = Field(default=48, alias="STATCAST_CACHE_MAX_STALE_HOURS")
     injury_provider_api_key: SecretStr | None = Field(default=None, alias="INJURY_PROVIDER_API_KEY")
     lineup_provider_api_key: SecretStr | None = Field(default=None, alias="LINEUP_PROVIDER_API_KEY")
     weather_provider_api_key: SecretStr | None = Field(default=None, alias="WEATHER_PROVIDER_API_KEY")
@@ -226,6 +230,8 @@ class Settings(BaseSettings):
         "ws_reconnect_backoff_seconds",
         "ws_heartbeat_timeout_seconds",
         "ws_price_stale_after_seconds",
+        "advanced_public_stats_max_stale_hours",
+        "statcast_cache_max_stale_hours",
         "model_min_samples_train",
         "model_min_samples_calibrate",
         "model_min_samples_promote",

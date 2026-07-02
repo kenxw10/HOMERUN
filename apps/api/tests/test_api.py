@@ -2122,6 +2122,86 @@ def test_candidate_sweep_refreshes_marks_after_candidate_engine(monkeypatch) -> 
     assert result["balance_snapshot"] == {"snapshot_id": 123}
 
 
+def test_candidate_sweep_cache_only_does_not_call_advanced_public_sources(monkeypatch) -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    target = date(2026, 7, 2)
+
+    monkeypatch.setattr(job_runs, "sync_schedule", lambda *_args, **_kwargs: 0)
+    monkeypatch.setattr(
+        job_runs,
+        "sync_mlb_features",
+        lambda *_args, **_kwargs: pytest.fail("candidate-sweep must not run full feature sync"),
+    )
+    monkeypatch.setattr(
+        features.pybaseball_client,
+        "get_batting_stats",
+        lambda *_args, **_kwargs: pytest.fail("candidate-sweep must not call FanGraphs batting_stats"),
+    )
+    monkeypatch.setattr(
+        features.pybaseball_client,
+        "get_pitching_stats",
+        lambda *_args, **_kwargs: pytest.fail("candidate-sweep must not call FanGraphs pitching_stats"),
+    )
+    monkeypatch.setattr(
+        features.pybaseball_client,
+        "get_statcast_range",
+        lambda *_args, **_kwargs: pytest.fail("candidate-sweep must not call Statcast/Savant team feed"),
+    )
+    monkeypatch.setattr(
+        features.pybaseball_client,
+        "get_pitcher_statcast_range",
+        lambda *_args, **_kwargs: pytest.fail("candidate-sweep must not call Statcast/Savant pitcher feed"),
+    )
+    monkeypatch.setattr(
+        features,
+        "_fetch_open_meteo",
+        lambda *_args, **_kwargs: pytest.fail("candidate-sweep must not call Open-Meteo"),
+    )
+    monkeypatch.setattr(
+        job_runs,
+        "sync_mlb_starters",
+        lambda *_args, **_kwargs: {
+            "validation_status": "ok",
+            "feature_sync_mode": "starter_refresh_lightweight",
+        },
+    )
+    monkeypatch.setattr(job_runs, "sync_market_family_mappings", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(job_runs, "generate_candidates", lambda *_args, **_kwargs: {"status": "completed"})
+    monkeypatch.setattr(job_runs, "refresh_open_position_prices", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(job_runs, "create_balance_snapshot", lambda *_args, **_kwargs: SimpleNamespace(id=124))
+
+    with Session(engine) as session:
+        run = JobRun(
+            job_name="candidate-sweep",
+            job_type="paper_ops",
+            target_date=target,
+            status="running",
+            started_at=datetime(2026, 7, 2, 12, 0, tzinfo=UTC),
+            lock_key="candidate-sweep:2026-07-02",
+            triggered_by="api",
+            steps=[],
+        )
+        session.add(
+            MlbFeatureSnapshot(
+                mlb_game_id=1,
+                target_date=target,
+                source=features.FEATURE_VERSION,
+                captured_at=datetime(2026, 7, 2, 11, 45, tzinfo=UTC),
+                data_quality=Decimal("0.7500"),
+                source_statuses={},
+                features={},
+            )
+        )
+        result = job_runs._execute_job_steps(session, run, "candidate-sweep", target)
+
+    assert result["feature_sync_mode"] == "cache_only"
+    assert result["feature_sync_skipped"] is True
+    assert result["starter_refresh"]["status"] == "ok"
+    assert result["starter_refresh"]["feature_sync_mode"] == "starter_refresh_lightweight"
+    assert result["starter_refresh"]["heavy_feature_sync_skipped"] is True
+
+
 def test_candidate_sweep_dry_run_skips_price_refresh_and_snapshot(monkeypatch) -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
@@ -9576,6 +9656,213 @@ def test_source_status_report_exposes_public_source_diagnostics() -> None:
     assert report["optional_weather_provider_configured"] is False
     assert report["last_successful_sync"]["weather_snapshots"] == captured_at.isoformat()
     assert "weather_snapshots" in report["tables"]
+
+
+def test_source_status_report_exposes_source_inventory_and_cached_fallbacks(monkeypatch) -> None:
+    monkeypatch.setenv("ADVANCED_PUBLIC_STATS_MAX_STALE_HOURS", "72")
+    monkeypatch.setenv("STATCAST_CACHE_MAX_STALE_HOURS", "48")
+    get_settings.cache_clear()
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    captured_at = datetime(2026, 7, 1, 20, 0, tzinfo=UTC)
+    attempted_at = datetime(2026, 7, 1, 21, 0, tzinfo=UTC).isoformat()
+    cached_contact = {
+        "source": features.STATCAST_SOURCE,
+        "batted_ball_events_count": 30,
+        "hard_hit_pct": 0.42,
+    }
+    monkeypatch.setattr(
+        features.pybaseball_client,
+        "import_status",
+        lambda: {"available": True, "version": "2.2.7", "module_path": "mocked", "import_error": None},
+    )
+
+    with Session(engine) as session:
+        session.add_all(
+            [
+                TeamDailyFeature(
+                    target_date=date(2026, 7, 1),
+                    team_code="PIT",
+                    captured_at=captured_at,
+                    source=features.PYBASEBALL_SOURCE,
+                    source_status="available",
+                    confidence=Decimal("0.8500"),
+                    completeness=Decimal("0.7500"),
+                    stale=False,
+                    features={"wrc_plus": 112},
+                    raw_payload={"source_function": "batting_stats"},
+                ),
+                TeamDailyFeature(
+                    target_date=date(2026, 7, 1),
+                    team_code="PIT",
+                    captured_at=captured_at,
+                    source=features.MLB_STATS_SOURCE,
+                    source_status="available",
+                    confidence=Decimal("0.8500"),
+                    completeness=Decimal("0.8000"),
+                    stale=False,
+                    features={"contact_quality": cached_contact, "contact_quality_status": "available"},
+                    raw_payload={"bounded_before": "2026-07-01"},
+                ),
+                MlbFeatureSnapshot(
+                    mlb_game_id=None,
+                    target_date=date(2026, 7, 1),
+                    source=features.FEATURE_SYNC_AUDIT_SOURCE,
+                    captured_at=datetime(2026, 7, 1, 21, 1, tzinfo=UTC),
+                    data_quality=None,
+                    source_statuses={"sync": "degraded_with_errors"},
+                    features={
+                        "sync_status": {
+                            "attempted_at": attempted_at,
+                            "validation_status": "degraded_with_errors",
+                            "errors": [
+                                {
+                                    "source": features.PYBASEBALL_SOURCE,
+                                    "function": "batting_stats",
+                                    "error_code": "fan_graphs_http_403",
+                                    "message": "HTTP Error 403: Forbidden",
+                                },
+                                {
+                                    "source": features.STATCAST_SOURCE,
+                                    "table": "statcast_team_contact",
+                                    "error_code": "statcast_request_failed",
+                                    "message": "Statcast timeout",
+                                },
+                            ],
+                            "warnings": [],
+                        }
+                    },
+                ),
+            ]
+        )
+        session.commit()
+        report = features.source_status_report(session)
+
+    inventory = {item["source_name"]: item for item in report["source_inventory"]}
+    assert {
+        "mlb_stats_api",
+        "kalshi_public_market_data",
+        "open_meteo",
+        "static_homerun_reference",
+        "derived_homerun",
+        "pybaseball_fangraphs",
+        "statcast_savant",
+    } <= set(inventory)
+    assert inventory["pybaseball_fangraphs"]["status"] == "cached"
+    assert inventory["pybaseball_fangraphs"]["fallback_used"] is True
+    assert inventory["pybaseball_fangraphs"]["fallback_reason"] == "fan_graphs_http_403"
+    assert inventory["statcast_savant"]["status"] == "cached"
+    assert inventory["statcast_savant"]["fallback_used"] is True
+    assert inventory["statcast_savant"]["fallback_reason"] == "statcast_request_failed"
+    assert report["statcast_savant_status"] == "cached"
+    assert report["statcast_savant_row_sample_count"] == 1
+
+
+def test_mlb_primary_team_daily_preserves_cached_statcast_when_current_fetch_empty() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    day = date(2026, 7, 1)
+    captured_at = datetime(2026, 7, 1, 20, 0, tzinfo=UTC)
+    cached_contact = {
+        "source": features.STATCAST_SOURCE,
+        "batted_ball_events_count": 35,
+        "average_exit_velocity": 90.1,
+        "hard_hit_pct": 0.44,
+    }
+    hitting_log = {
+        "stats": [
+            {
+                "splits": [
+                    {
+                        "date": "2026-06-30",
+                        "stat": {
+                            "runs": 5,
+                            "hits": 8,
+                            "homeRuns": 1,
+                            "baseOnBalls": 3,
+                            "strikeOuts": 7,
+                            "atBats": 34,
+                            "plateAppearances": 38,
+                            "totalBases": 14,
+                        },
+                    }
+                ]
+            }
+        ]
+    }
+    pitching_log = {
+        "stats": [
+            {
+                "splits": [
+                    {
+                        "date": "2026-06-30",
+                        "stat": {
+                            "inningsPitched": "9.0",
+                            "runs": 3,
+                            "earnedRuns": 3,
+                            "hits": 7,
+                            "homeRuns": 1,
+                            "baseOnBalls": 2,
+                            "strikeOuts": 8,
+                            "battersFaced": 36,
+                            "numberOfPitches": 142,
+                        },
+                    }
+                ]
+            }
+        ]
+    }
+
+    with Session(engine) as session:
+        game = MlbGame(
+            external_game_id="statcast-cache-preserve",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+            status="scheduled",
+            raw_payload={
+                "teams": {"home": {"team": {"id": 134, "name": "Pittsburgh Pirates"}}},
+                "venue": {"id": 31, "name": "PNC Park"},
+            },
+        )
+        session.add(game)
+        session.flush()
+        session.add(
+            TeamDailyFeature(
+                target_date=day,
+                team_code="PIT",
+                captured_at=datetime(2026, 7, 1, 19, 0, tzinfo=UTC),
+                source=features.MLB_STATS_SOURCE,
+                source_status="available",
+                confidence=Decimal("0.8500"),
+                completeness=Decimal("0.8000"),
+                stale=False,
+                features={"contact_quality": cached_contact, "contact_quality_status": "available"},
+                raw_payload={"cached": True},
+            )
+        )
+        session.flush()
+
+        row = features._upsert_mlb_primary_team_daily(
+            session,
+            game,
+            "home",
+            day,
+            captured_at,
+            {
+                "team_hitting_logs_by_id": {"134": hitting_log},
+                "team_pitching_logs_by_id": {"134": pitching_log},
+                "team_hitting_splits_by_id": {},
+                "team_pitching_splits_by_id": {},
+            },
+            {"team_contact_by_code": {}},
+        )
+
+    assert row is not None
+    assert row.features["contact_quality"] == cached_contact
+    assert row.features["contact_quality_status"] == "available"
 
 
 def test_static_stadium_table_covers_current_mlb_venues() -> None:

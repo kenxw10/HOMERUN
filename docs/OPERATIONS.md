@@ -222,6 +222,55 @@ After deployment, validate:
 5. Dashboard open/closed position tables show side, entry cost, current/exit value, fee, mark time, and P/L.
 6. No live execution, WebSocket, spread activation, cron schedule, feature threshold, EV/model, settlement, market discovery, sportsbook, team-total, umpire, or defense behavior changed.
 
+## PR3l Source Reliability And Statcast Fallbacks
+
+Daily setup remains the owner of heavy public-source feature ingestion. Candidate-sweep remains cache-only and must not call full MLB feature sync, pybaseball, FanGraphs, Statcast/Savant, Open-Meteo, sportsbook APIs, team totals, or umpire logic.
+
+Source hierarchy:
+
+- MLB Stats API: critical official baseball source for schedule, game context, probable starters, game logs, boxscore, linescore, and live-feed payloads already used by the feature pipeline.
+- Kalshi public market data: critical market source for market context, prices, and orderbook-derived paper marks.
+- Open-Meteo: weather enrichment source.
+- Statcast/Savant: secondary cached public enrichment for contact quality.
+- FanGraphs-backed pybaseball batting/pitching: optional cached enrichment only.
+- Static HOMERUN reference data: park profiles, venue metadata, and team mappings.
+- Derived HOMERUN: travel/rest/fatigue/workload proxies.
+- Optional providers: injuries, external lineups, and optional weather keys are not configured unless their env vars are set.
+
+`GET /v1/model/sources/status` now includes `source_inventory` and `source_health`. Each item is machine-readable and includes `source_name`, `source_kind`, `criticality`, `status`, `last_successful_sync`, `last_attempted_sync`, `last_error`, `sample_count`, `modules_affected`, `fallback_used`, `fallback_source`, `fallback_reason`, and `freshness_age_minutes` where meaningful.
+
+Interpretation:
+
+- `available`: current source rows are usable.
+- `cached`: a latest source attempt failed, but a last-good cache within the configured age window is being used.
+- `stale`: a last-good cache exists but is older than the configured source staleness window.
+- `partial`: the source is present but incomplete.
+- `failed`: no usable cache is available after a source failure.
+- `not_configured`: optional provider or network-backed source is intentionally off.
+- `not_wired`: an optional configured source is not implemented as a production input.
+
+Cache age settings:
+
+- `ADVANCED_PUBLIC_STATS_MAX_STALE_HOURS=72`
+- `STATCAST_CACHE_MAX_STALE_HOURS=48`
+
+Expected fail-soft behavior:
+
+- FanGraphs HTTP 403 should appear as `fan_graphs_http_403` for `pybaseball_fangraphs`.
+- Statcast/Savant request failures should appear as `statcast_request_failed` or `statcast_schema_changed`.
+- Existing same-date Statcast contact-quality fields should be preserved when a later Statcast fetch fails or returns empty.
+- MLB Stats API primary rows and mature feature snapshots should still write when enrichment sources degrade.
+- Degraded enrichment should produce warnings/source-health state, not a candidate-sweep crash.
+
+PR3l validation checklist:
+
+1. `GET /v1/model/sources/status` shows `source_inventory` with MLB Stats API, Kalshi public market data, Open-Meteo, static HOMERUN reference, derived HOMERUN, pybaseball/FanGraphs, Statcast/Savant, and optional provider entries.
+2. Run daily setup only when operationally safe: `POST /v1/jobs/run/daily-setup?target_date=today_et`.
+3. If FanGraphs returns 403, confirm the daily setup job succeeds or succeeds with warnings, source health shows `pybaseball_fangraphs` as `cached`, `stale`, or `failed`, and MLB Stats API baseline rows still populate.
+4. If Statcast/Savant fails, confirm source health shows `statcast_savant` fallback state and mature snapshots keep same-date cached contact-quality fields when present.
+5. Run a dry candidate sweep and confirm `feature_sync_mode=cache_only`, `feature_sync_skipped=true`, and no heavy source sync step.
+6. Confirm no live execution, sportsbook data, full-game spread enablement, defense module, pregame context polling, team totals, umpire factors, model threshold loosening, or cron cadence change.
+
 ## PR3g Candidate-Stage Quality And EV Diagnostics
 
 PR3g does not change thresholds, cron schedules, trading gates, settlement, WebSocket behavior, or spread activation. It makes candidate-sweep results explain whether no-trade behavior is caused by data quality, price/mapping gates, EV/edge filters, duplicate market surfaces, or caps.

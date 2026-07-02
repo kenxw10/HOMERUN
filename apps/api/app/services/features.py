@@ -53,6 +53,7 @@ OPEN_METEO_SOURCE = "open_meteo"
 DERIVED_SOURCE = "derived_homerun_v2"
 PYBASEBALL_SOURCE = "pybaseball_public_stats_v1"
 STATCAST_SOURCE = "statcast_savant_secondary_v1"
+KALSHI_MARKET_DATA_SOURCE = "kalshi_public_market_data"
 NETWORK_SOURCE_MODULES = {"team", "pitcher", "bullpen", "lineup", "weather"}
 ALL_SYNC_MODULES = NETWORK_SOURCE_MODULES | {"injuries", "travel"}
 RAW_TABLES_BY_MODULE = {
@@ -1040,14 +1041,49 @@ def _pybaseball_function(result: dict[str, object] | None) -> str | None:
 
 
 def _pybaseball_error(source_function: str, exc: BaseException) -> dict[str, object]:
+    error_code = _classify_pybaseball_error(source_function, exc)
     if isinstance(exc, pybaseball_client.PybaseballSourceError):
-        return exc.to_detail()
+        detail = exc.to_detail()
+        detail["error_code"] = error_code
+        return detail
     return {
         "source": PYBASEBALL_SOURCE,
         "function": source_function,
+        "error_code": error_code,
         "error_type": exc.__class__.__name__,
         "message": str(exc),
     }
+
+
+def _classify_pybaseball_error(source_function: str, exc: BaseException) -> str:
+    if _is_pybaseball_http_403(exc) and source_function in {"batting_stats", "pitching_stats"}:
+        return "fan_graphs_http_403"
+    if source_function == "import_pybaseball":
+        return "pybaseball_import_failed"
+    if isinstance(exc, pybaseball_client.PybaseballSourceError):
+        message = str(exc).lower()
+        if "function unavailable" in message:
+            return "pybaseball_function_unavailable"
+        wrapped = getattr(exc, "error", None)
+        if isinstance(wrapped, (KeyError, TypeError, ValueError)):
+            return "pybaseball_schema_changed"
+    if isinstance(exc, (KeyError, TypeError, ValueError)):
+        return "pybaseball_schema_changed"
+    return "pybaseball_request_failed"
+
+
+def _classify_source_error(source: str, table: str, exc: BaseException) -> str:
+    if source == STATCAST_SOURCE:
+        if isinstance(exc, (KeyError, TypeError, ValueError)):
+            return "statcast_schema_changed"
+        return "statcast_request_failed"
+    if source == PYBASEBALL_SOURCE:
+        return _classify_pybaseball_error(table, exc)
+    if isinstance(exc, HttpJsonError):
+        return "http_source_request_failed"
+    if isinstance(exc, (KeyError, TypeError, ValueError)):
+        return "source_schema_changed"
+    return "source_request_failed"
 
 
 def _pybaseball_fetch_context(day: date, requested_modules: set[str], stats: dict[str, object]) -> dict[str, object]:
@@ -1250,6 +1286,7 @@ def _source_error(
     error: dict[str, object] = {
         "source": source,
         "table": table,
+        "error_code": _classify_source_error(source, table, exc),
         "error_type": exc.__class__.__name__,
         "message": str(getattr(exc, "orig", exc)),
     }
@@ -1431,6 +1468,13 @@ def _cached_pitcher_statcast_contact(row: PitcherDailyFeature | None) -> dict[st
     return statcast if isinstance(statcast, dict) else None
 
 
+def _cached_team_statcast_contact(row: TeamDailyFeature | TeamRecentFeature | None) -> dict[str, object] | None:
+    if row is None or not isinstance(row.features, dict):
+        return None
+    contact = row.features.get("contact_quality")
+    return contact if isinstance(contact, dict) else None
+
+
 def _statcast_batting_team_code(row: dict[str, object]) -> str | None:
     direct = _canonical_public_team_code(_row_value(row, "bat_team"))
     if direct:
@@ -1468,6 +1512,9 @@ def _statcast_fetch_context(
             result = pybaseball_client.get_statcast_range(start, end)
             rows = _statcast_rows(result)
             stats["statcast_rows_seen"] = int(stats.get("statcast_rows_seen", 0)) + len(rows)
+            if not rows:
+                stats["statcast_source_status"] = "statcast_empty_result"
+                _append_warning(stats, "Statcast/Savant team contact returned no rows for the completed date range.")
             by_team: dict[str, list[dict[str, object]]] = {}
             for row in rows:
                 normalized = _statcast_batting_team_code(row)
@@ -1477,6 +1524,8 @@ def _statcast_fetch_context(
                 team_code: {**_aggregate_statcast_contact(team_rows), "date_range": {"start": start.isoformat(), "end": end.isoformat()}}
                 for team_code, team_rows in by_team.items()
             }
+            if by_team:
+                stats["statcast_source_status"] = "available"
             stats["statcast_rows_matched"] = int(stats.get("statcast_rows_matched", 0)) + sum(len(rows) for rows in by_team.values())
         except Exception as exc:
             stats["statcast_error_count"] = int(stats.get("statcast_error_count", 0)) + 1
@@ -1502,6 +1551,7 @@ def _statcast_fetch_context(
                         **_aggregate_statcast_contact(rows),
                         "date_range": {"start": start.isoformat(), "end": end.isoformat()},
                     }
+                    stats["statcast_source_status"] = "available"
                     stats["statcast_pitcher_rows_matched"] = int(stats.get("statcast_pitcher_rows_matched", 0)) + len(rows)
             except Exception as exc:
                 stats["statcast_error_count"] = int(stats.get("statcast_error_count", 0)) + 1
@@ -2771,7 +2821,14 @@ def _upsert_mlb_primary_team_daily(
     walks = _decimal(hitting.get("walks"))
     innings = _decimal(pitching.get("innings_pitched"))
     pitching_home_runs = _decimal(pitching.get("home_runs"))
+    row = session.scalar(
+        select(TeamDailyFeature)
+        .where(TeamDailyFeature.target_date == day)
+        .where(TeamDailyFeature.team_code == team_code)
+        .where(TeamDailyFeature.source == MLB_STATS_SOURCE)
+    )
     contact = statcast_context.get("team_contact_by_code", {}).get(team_code) if isinstance(statcast_context.get("team_contact_by_code"), dict) else None
+    contact = contact if isinstance(contact, dict) else _cached_team_statcast_contact(row)
     status = "available" if hitting.get("game_count") and pitching.get("game_count") else "partial"
     features = {
         **_team_record(game, side),
@@ -2827,12 +2884,6 @@ def _upsert_mlb_primary_team_daily(
             "pitching": _map_handedness_splits(mlb_context.get("team_pitching_splits_by_id", {}).get(team_id) if isinstance(mlb_context.get("team_pitching_splits_by_id"), dict) else None, "pitching"),
         },
     }
-    row = session.scalar(
-        select(TeamDailyFeature)
-        .where(TeamDailyFeature.target_date == day)
-        .where(TeamDailyFeature.team_code == team_code)
-        .where(TeamDailyFeature.source == MLB_STATS_SOURCE)
-    )
     row = row or TeamDailyFeature(target_date=day, team_code=team_code, source=MLB_STATS_SOURCE)
     row.captured_at = captured_at
     row.source_status = status
@@ -2873,7 +2924,15 @@ def _upsert_mlb_primary_team_recent(
         return None
     hitting = _aggregate_team_hitting_logs(hitting_splits, len(hitting_splits))
     pitching = _aggregate_team_pitching_logs(pitching_splits, len(pitching_splits))
+    row = session.scalar(
+        select(TeamRecentFeature)
+        .where(TeamRecentFeature.target_date == day)
+        .where(TeamRecentFeature.team_code == team_code)
+        .where(TeamRecentFeature.window_days == window_days)
+        .where(TeamRecentFeature.source == MLB_STATS_SOURCE)
+    )
     contact = statcast_context.get("team_contact_by_code", {}).get(team_code) if isinstance(statcast_context.get("team_contact_by_code"), dict) else None
+    contact = contact if isinstance(contact, dict) else _cached_team_statcast_contact(row)
     status = "available" if hitting["game_count"] and pitching["game_count"] else "partial"
     features = {
         "window_days": window_days,
@@ -2891,13 +2950,6 @@ def _upsert_mlb_primary_team_recent(
         "contact_quality": contact,
         "contact_quality_status": _statcast_status(contact if isinstance(contact, dict) else None),
     }
-    row = session.scalar(
-        select(TeamRecentFeature)
-        .where(TeamRecentFeature.target_date == day)
-        .where(TeamRecentFeature.team_code == team_code)
-        .where(TeamRecentFeature.window_days == window_days)
-        .where(TeamRecentFeature.source == MLB_STATS_SOURCE)
-    )
     row = row or TeamRecentFeature(target_date=day, team_code=team_code, window_days=window_days, source=MLB_STATS_SOURCE)
     row.captured_at = captured_at
     row.source_status = status
@@ -4080,6 +4132,7 @@ def _new_sync_stats(day: date, include_modules: set[str] | None) -> dict[str, ob
         "statcast_pitcher_rows_seen": 0,
         "statcast_pitcher_rows_matched": 0,
         "statcast_error_count": 0,
+        "statcast_source_status": "not_attempted",
         "probable_starters_seen": 0,
         "pitcher_season_stats_available_count": 0,
         "pitcher_game_log_available_count": 0,
@@ -4275,6 +4328,7 @@ def _sync_game_feature_modules(
                     mlb_context,
                     statcast_context,
                     stats,
+                    preserve_missing_statcast=True,
                 ),
             )
             _record_feature_row(
@@ -4462,6 +4516,12 @@ def sync_mlb_features(
         "pybaseball_error_count": stats["pybaseball_error_count"],
         "advanced_available_count": stats["advanced_available_count"],
         "advanced_partial_count": stats["advanced_partial_count"],
+        "statcast_source_status": stats["statcast_source_status"],
+        "statcast_rows_seen": stats["statcast_rows_seen"],
+        "statcast_rows_matched": stats["statcast_rows_matched"],
+        "statcast_pitcher_rows_seen": stats["statcast_pitcher_rows_seen"],
+        "statcast_pitcher_rows_matched": stats["statcast_pitcher_rows_matched"],
+        "statcast_error_count": stats["statcast_error_count"],
     }
     for row in snapshot_rows:
         row.features = {**(row.features or {}), "sync_status": sync_status}
@@ -5160,6 +5220,289 @@ def _pybaseball_db_status(session: Session) -> dict[str, object]:
     }
 
 
+def _parsed_status_timestamp(value: object) -> datetime | None:
+    if isinstance(value, datetime):
+        return ensure_aware_utc(value)
+    if isinstance(value, str):
+        return parse_datetime(value)
+    return None
+
+
+def _freshness_age_minutes(value: object) -> int | None:
+    timestamp = _parsed_status_timestamp(value)
+    if timestamp is None:
+        return None
+    return max(0, int((utc_now() - timestamp).total_seconds() // 60))
+
+
+def _latest_audit_error(feature_audit: dict[str, object], source: str) -> dict[str, object] | None:
+    latest_errors = feature_audit.get("latest_errors")
+    if not isinstance(latest_errors, list):
+        return None
+    for error in latest_errors:
+        if isinstance(error, dict) and str(error.get("source") or "") == source:
+            return error
+    return None
+
+
+def _cached_status_from_timestamp(timestamp: object, max_stale_hours: int) -> str:
+    parsed = _parsed_status_timestamp(timestamp)
+    if parsed is None:
+        return "cached"
+    return "cached" if utc_now() - parsed <= timedelta(hours=max_stale_hours) else "stale"
+
+
+def _statcast_contact_from_row(row: object) -> dict[str, object] | None:
+    features_payload = getattr(row, "features", None)
+    if isinstance(features_payload, dict):
+        for key in ("contact_quality", "season_contact_quality", "recent_contact_quality"):
+            value = features_payload.get(key)
+            if isinstance(value, dict):
+                return value
+    raw_payload = getattr(row, "raw_payload", None)
+    if isinstance(raw_payload, dict):
+        value = raw_payload.get("statcast")
+        if isinstance(value, dict):
+            return value
+    return None
+
+
+def _statcast_db_status(session: Session, feature_audit: dict[str, object]) -> dict[str, object]:
+    rows: list[object] = []
+    for model in (TeamDailyFeature, TeamRecentFeature, PitcherDailyFeature):
+        rows.extend(
+            session.scalars(
+                select(model)
+                .where(model.source == MLB_STATS_SOURCE)
+                .order_by(model.captured_at.desc())
+                .limit(100)
+            )
+        )
+    rows = sorted(rows, key=lambda row: row.captured_at, reverse=True)[:200]
+    contact_rows = [row for row in rows if _statcast_contact_from_row(row)]
+    status_counts: dict[str, int] = {}
+    last_success = None
+    for row in contact_rows:
+        status = _statcast_status(_statcast_contact_from_row(row))
+        status_counts[status] = status_counts.get(status, 0) + 1
+        if last_success is None and status in {"available", "partial"}:
+            last_success = ensure_aware_utc(row.captured_at).isoformat()
+    last_error = _latest_audit_error(feature_audit, STATCAST_SOURCE)
+    settings = get_settings()
+    if last_error and last_success:
+        status = _cached_status_from_timestamp(last_success, settings.statcast_cache_max_stale_hours)
+    elif last_error:
+        status = "failed"
+    elif status_counts.get("available", 0) > 0:
+        status = "available"
+    elif status_counts.get("partial", 0) > 0:
+        status = "partial"
+    elif feature_audit.get("last_attempted_sync"):
+        status = "failed" if not pybaseball_available() else "partial"
+    else:
+        status = "not_wired"
+    return {
+        "statcast_savant_status": status,
+        "statcast_savant_last_successful_sync": last_success,
+        "statcast_savant_last_error": last_error,
+        "statcast_savant_cache_status": "db_cached" if contact_rows else "empty",
+        "statcast_savant_row_sample_count": len(contact_rows),
+        "statcast_savant_status_counts": status_counts,
+    }
+
+
+def _kalshi_market_data_status(session: Session) -> dict[str, object]:
+    rows = list(
+        session.scalars(
+            select(KalshiMarket)
+            .order_by(KalshiMarket.updated_at.desc())
+            .limit(200)
+        )
+    )
+    latest = rows[0] if rows else None
+    latest_timestamp = None
+    if latest is not None:
+        latest_timestamp = (
+            latest.market_price_updated_at
+            or latest.websocket_updated_at
+            or latest.updated_at
+            or latest.created_at
+        )
+    return {
+        "latest_captured_at": ensure_aware_utc(latest_timestamp).isoformat() if latest_timestamp else None,
+        "row_sample_count": len(rows),
+        "status": "available" if rows else "partial",
+    }
+
+
+def _source_health_entry(
+    *,
+    source_name: str,
+    source_kind: str,
+    criticality: str,
+    status: str,
+    modules_affected: list[str],
+    last_successful_sync: object | None = None,
+    last_attempted_sync: object | None = None,
+    last_error: object | None = None,
+    row_count: int | None = None,
+    sample_count: int | None = None,
+    fallback_used: bool = False,
+    fallback_source: str | None = None,
+    fallback_reason: str | None = None,
+) -> dict[str, object]:
+    return {
+        "source_name": source_name,
+        "source_kind": source_kind,
+        "criticality": criticality,
+        "status": status,
+        "last_successful_sync": last_successful_sync,
+        "last_attempted_sync": last_attempted_sync,
+        "last_error": last_error,
+        "row_count": row_count,
+        "sample_count": sample_count,
+        "modules_affected": modules_affected,
+        "fallback_used": fallback_used,
+        "fallback_source": fallback_source,
+        "fallback_reason": fallback_reason,
+        "freshness_age_minutes": _freshness_age_minutes(last_successful_sync),
+    }
+
+
+def _source_inventory(
+    session: Session,
+    table_status: dict[str, dict[str, object]],
+    feature_audit: dict[str, object],
+    pybaseball_status: dict[str, object],
+    statcast_status: dict[str, object],
+) -> list[dict[str, object]]:
+    settings = get_settings()
+    last_attempted = feature_audit.get("last_attempted_sync")
+    mlb_error = _latest_audit_error(feature_audit, MLB_STATS_SOURCE)
+    mlb_last_success = table_status["mlb_feature_snapshots"]["last_successful_sync"] or table_status["team_daily_features"][
+        "last_successful_sync"
+    ]
+    mlb_status = "available" if mlb_last_success else "failed" if mlb_error else "partial"
+    weather_status = table_status["weather_snapshots"]
+    pybaseball_last_error = _latest_audit_error(feature_audit, PYBASEBALL_SOURCE) or pybaseball_status.get(
+        "pybaseball_last_error"
+    )
+    pybaseball_last_success = pybaseball_status.get("pybaseball_last_successful_sync")
+    if pybaseball_last_error and pybaseball_last_success:
+        pybaseball_health = _cached_status_from_timestamp(
+            pybaseball_last_success,
+            settings.advanced_public_stats_max_stale_hours,
+        )
+    elif pybaseball_last_error or pybaseball_status.get("pybaseball_import_error"):
+        pybaseball_health = "failed"
+    elif pybaseball_status.get("advanced_public_stats_status") in {"available", "partial"}:
+        pybaseball_health = str(pybaseball_status["advanced_public_stats_status"])
+    else:
+        pybaseball_health = "not_wired" if not last_attempted else "failed"
+    kalshi_status = _kalshi_market_data_status(session)
+    statcast_error = statcast_status.get("statcast_savant_last_error")
+    statcast_last_success = statcast_status.get("statcast_savant_last_successful_sync")
+    return [
+        _source_health_entry(
+            source_name="mlb_stats_api",
+            source_kind="official",
+            criticality="critical_path",
+            status=mlb_status,
+            modules_affected=["schedule", "game_context", "probable_starters", "team", "pitcher", "lineup"],
+            last_successful_sync=mlb_last_success,
+            last_attempted_sync=last_attempted,
+            last_error=mlb_error,
+            sample_count=int(table_status["mlb_feature_snapshots"]["row_sample_count"] or 0),
+        ),
+        _source_health_entry(
+            source_name="kalshi_public_market_data",
+            source_kind="market_data",
+            criticality="critical_path",
+            status=str(kalshi_status["status"]),
+            modules_affected=["market_context", "prices", "orderbook"],
+            last_successful_sync=kalshi_status["latest_captured_at"],
+            row_count=int(kalshi_status["row_sample_count"] or 0),
+        ),
+        _source_health_entry(
+            source_name="open_meteo",
+            source_kind="optional_provider",
+            criticality="enrichment",
+            status="not_configured"
+            if not settings.feature_sync_enable_network_sources
+            else "available"
+            if weather_status["last_successful_sync"]
+            else "partial",
+            modules_affected=["park_weather"],
+            last_successful_sync=weather_status["last_successful_sync"],
+            last_attempted_sync=last_attempted,
+            last_error=weather_status["last_error"],
+            sample_count=int(weather_status["row_sample_count"] or 0),
+        ),
+        _source_health_entry(
+            source_name="static_homerun_reference",
+            source_kind="static",
+            criticality="critical_path",
+            status="available",
+            modules_affected=["park_profiles", "park_factors", "venue_metadata", "team_mappings"],
+            fallback_used=False,
+        ),
+        _source_health_entry(
+            source_name="derived_homerun",
+            source_kind="derived",
+            criticality="critical_path",
+            status="available",
+            modules_affected=["travel", "rest", "fatigue", "workload_proxies", "team_strength_prior"],
+            fallback_used=False,
+        ),
+        _source_health_entry(
+            source_name="pybaseball_fangraphs",
+            source_kind="public_scrape",
+            criticality="enrichment",
+            status=pybaseball_health,
+            modules_affected=["offense_season", "starter_season", "bullpen_season"],
+            last_successful_sync=pybaseball_last_success,
+            last_attempted_sync=last_attempted,
+            last_error=pybaseball_last_error,
+            sample_count=int(pybaseball_status.get("pybaseball_row_sample_count") or 0),
+            fallback_used=bool(pybaseball_last_error and pybaseball_last_success),
+            fallback_source="last_good_pybaseball_cache" if pybaseball_last_error and pybaseball_last_success else None,
+            fallback_reason=str((pybaseball_last_error or {}).get("error_code") or (pybaseball_last_error or {}).get("message"))
+            if isinstance(pybaseball_last_error, dict)
+            else None,
+        ),
+        _source_health_entry(
+            source_name="statcast_savant",
+            source_kind="public_statcast",
+            criticality="enrichment",
+            status=str(statcast_status["statcast_savant_status"]),
+            modules_affected=["contact_quality", "offense_recent", "starter_recent"],
+            last_successful_sync=statcast_last_success,
+            last_attempted_sync=last_attempted,
+            last_error=statcast_error,
+            sample_count=int(statcast_status["statcast_savant_row_sample_count"] or 0),
+            fallback_used=bool(statcast_error and statcast_last_success),
+            fallback_source="last_good_statcast_cache" if statcast_error and statcast_last_success else None,
+            fallback_reason=str((statcast_error or {}).get("error_code") or (statcast_error or {}).get("message"))
+            if isinstance(statcast_error, dict)
+            else None,
+        ),
+        _source_health_entry(
+            source_name="optional_injuries",
+            source_kind="optional_provider",
+            criticality="optional",
+            status="not_configured" if not _secret_configured(settings.injury_provider_api_key) else "not_wired",
+            modules_affected=["injuries"],
+        ),
+        _source_health_entry(
+            source_name="optional_external_lineups",
+            source_kind="optional_provider",
+            criticality="optional",
+            status="not_configured" if not _secret_configured(settings.lineup_provider_api_key) else "not_wired",
+            modules_affected=["lineup"],
+        ),
+    ]
+
+
 def source_status_report(session: Session) -> dict[str, object]:
     settings = get_settings()
     table_status = {
@@ -5179,13 +5522,18 @@ def source_status_report(session: Session) -> dict[str, object]:
             table = str(error.get("table") or "feature_sync")
             table_errors.setdefault(table, error)
     pybaseball_status = _pybaseball_db_status(session)
+    statcast_status = _statcast_db_status(session, feature_audit)
+    source_inventory = _source_inventory(session, table_status, feature_audit, pybaseball_status, statcast_status)
     latest_feature_completeness = _latest_feature_completeness(session)
     return {
         "feature_sync_enable_network_sources": settings.feature_sync_enable_network_sources,
         "mlb_stats_base_url": settings.mlb_stats_base_url,
         "open_meteo_base_url": settings.open_meteo_base_url,
         **pybaseball_status,
+        **statcast_status,
         "public_sources_enabled": settings.feature_sync_enable_network_sources,
+        "source_inventory": source_inventory,
+        "source_health": source_inventory,
         "optional_injury_provider_configured": _secret_configured(settings.injury_provider_api_key),
         "optional_lineup_provider_configured": _secret_configured(settings.lineup_provider_api_key),
         "optional_weather_provider_configured": _secret_configured(settings.weather_provider_api_key),

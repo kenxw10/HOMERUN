@@ -678,3 +678,12 @@ Every future PR must update this section with:
 - Daily, low-price, and side cap accounting counts same-day paper trades in the active epoch even after settlement, so early resolved trades do not reopen same-day slots.
 - Dashboard position summaries now expose side, entry notional, fee-aware entry total cost, current/exit value, fee paid/estimated fee, mark timestamp, and realized P/L. The frontend keeps compact tables and removes duplicate middle market description text.
 - PR3k does not change candidate-sweep timing, cache-only feature behavior, EV/probability math, settlement, market discovery, WebSocket, live execution, credentials, sportsbook/Odds API logic, team totals, umpire factors, defense modules, full-game spread activation, or production cron schedules.
+
+### PR3l - Source Reliability and Statcast Fallbacks
+
+- Added a machine-readable source inventory to `/v1/model/sources/status` so operators can distinguish MLB Stats API, Kalshi public market data, Open-Meteo, static HOMERUN reference data, derived HOMERUN features, pybaseball/FanGraphs, Statcast/Savant, and optional provider gaps.
+- Statcast/Savant remains secondary cached enrichment, not a critical-path trading source. Full feature sync keeps same-date last-good Statcast contact-quality fields when a later Statcast/Savant fetch is empty or fails, and source health reports cached/stale fallback state using `STATCAST_CACHE_MAX_STALE_HOURS`.
+- FanGraphs-backed `pybaseball` batting and pitching calls remain optional enrichment. HTTP 403 and other pybaseball failures are classified in source health, preserve last-good cached advanced rows, and do not block MLB Stats API primary rows or candidate-sweep stability.
+- Added cache-age settings: `ADVANCED_PUBLIC_STATS_MAX_STALE_HOURS=72` and `STATCAST_CACHE_MAX_STALE_HOURS=48`. Stale rows stay available for diagnostics but are labeled as cached/stale source health instead of being treated as fresh public ingestion.
+- Candidate-sweep remains cache-only. It still must not call full `sync_mlb_features`, pybaseball, FanGraphs, Statcast/Savant, Open-Meteo, sportsbook APIs, team totals, or umpire logic.
+- No schema migration, frontend redesign, live execution, credential change, sportsbook data, defense module, pregame context refresh, full-game spread paper enablement, model math change, threshold change, risk-cap change, or cron schedule change was added.
