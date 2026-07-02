@@ -179,6 +179,29 @@ PR3m pregame context refresh uses only official MLB Stats API calls: target-date
 
 PR3m.1 dashboard observation cutover is reporting-only. Default `/v1/dashboard/summary` excludes active-epoch paper trades and legacy positions entered before midnight ET on `2026-07-02`; those rows remain in the database and are visible only when `include_pre_observation=true` is supplied. The response includes `observation_filter` metadata with excluded counts and the history parameter. This cutover must not reset epochs, close open positions, delete rows, alter candidate generation, change settlement, change cron schedules, or enable live execution.
 
+## PR3n Defense Feature Transparency
+
+Daily setup and explicit feature-sync endpoints own defense ingestion. Candidate-sweep remains heavy-source cache-only and must not call full `sync_mlb_features`, pybaseball, FanGraphs, Statcast/Savant ingestion, Open-Meteo, sportsbook APIs, team totals, or umpire sources.
+
+Defense source hierarchy:
+
+- MLB Stats API team fielding game logs are the baseline source for `defense_season` and `defense_recent`.
+- Stored official baseline fields include errors, assists, putouts, chances, fielding percentage, double plays, passed balls, wild pitches, and stolen-base/caught-stealing fields when MLB provides them.
+- Official MLB lineup/boxscore data is the source for catcher starter inference.
+- Advanced catcher framing, blocking, throwing, OAA/DRS/UZR, and similar advanced defense metrics are not configured unless a future PR adds a reliable source.
+- Umpire factors are explicitly excluded and are not a model blocker.
+
+After deployment, validate:
+
+1. Run daily setup or explicit feature sync for the target date.
+2. Confirm `/v1/model/sources/status` includes `mlb_stats_api_fielding`, `catcher_from_official_lineup`, `advanced_catcher_metrics`, and `umpire`.
+3. Confirm `/v1/model/features/coverage?date=YYYY-MM-DD` and `/v1/model/features/detail?date=YYYY-MM-DD` show `defense_catcher` as partial instead of opaque missing when baseline fielding exists.
+4. Confirm detail reasons distinguish baseline team defense, recent defense, catcher inferred/not posted, advanced catcher metrics unavailable, and umpire excluded.
+5. Run a dry candidate sweep and confirm `feature_sync_mode=cache_only`, `feature_sync_skipped=true`, and `heavy_feature_sync_skipped=true`.
+6. Confirm candidate diagnostics include `defense_catcher` in quality contribution/penalty output.
+7. Confirm PR3k selection controls, PR3m pregame context refresh, and PR3m.1 observation cutoff behavior still hold.
+8. Keep PR3o spread audit and PR3p spread enablement separate.
+
 After deployment, validate:
 
 1. `POST /v1/sync/mlb-pregame-context?target_date=today_et` returns `feature_sync_mode=pregame_context_refresh_lightweight`, target-date games checked, starter IDs/names where MLB has announced them, lineup counts, and explicit lineup missing reasons such as `LINEUP_NOT_POSTED_YET`, `PARTIAL_LINEUP_POSTED`, or `LIVE_FEED_UNAVAILABLE`.
