@@ -33,6 +33,19 @@ type JobRunSummary = {
   result: Record<string, unknown>;
 };
 
+type ObservationFilterSummary = {
+  active: boolean;
+  include_pre_observation: boolean;
+  observation_start_date: string;
+  observation_start_at: string;
+  observation_start_display: string;
+  excluded_pre_observation_count: number;
+  excluded_pre_observation_closed_count: number;
+  historical_rows_available: boolean;
+  history_param: string;
+  reason: string;
+};
+
 type WebSocketStatusSummary = {
   enabled: boolean;
   running: boolean;
@@ -94,6 +107,7 @@ type DashboardSummary = {
   cash_balance: number | null;
   portfolio_value: number | null;
   paper_starting_balance: number | null;
+  observation_filter: ObservationFilterSummary | null;
   performance_by_scope: Record<string, Record<string, unknown>>;
   performance_by_family: Record<string, Record<string, unknown>>;
   decision_breakdown_by_scope: Record<string, Record<string, number>>;
@@ -238,6 +252,7 @@ const emptySummary: DashboardSummary = {
   cash_balance: null,
   portfolio_value: null,
   paper_starting_balance: 1000,
+  observation_filter: null,
   performance_by_scope: {},
   performance_by_family: {},
   decision_breakdown_by_scope: {},
@@ -1615,6 +1630,15 @@ export default function DashboardPage() {
       {summary.model_status.calibration_status !== "calibrated" ? (
         <section className="model-warning" role="status">
           MODEL UNCALIBRATED OR SAMPLE-LIMITED: PAPER TRADES USE STRICT PR3C CAPS AND CONSERVATIVE SHRINKAGE.
+        </section>
+      ) : null}
+
+      {summary.observation_filter?.active ? (
+        <section className="observation-note" role="status">
+          DEFAULT DASHBOARD EXCLUDES PRE-JUL 2 VALIDATION ROWS.
+          {summary.observation_filter.historical_rows_available
+            ? ` HISTORY AVAILABLE WITH ${summary.observation_filter.history_param}.`
+            : ""}
         </section>
       ) : null}
 

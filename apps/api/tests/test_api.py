@@ -385,6 +385,8 @@ def test_dashboard_summary_shape_is_empty_and_safe() -> None:
     assert payload["bot"]["live_trading_enabled"] is False
     assert payload["bot"]["execution_kill_switch"] is True
     assert payload["model_status"]["candidate_count"] == 0
+    assert payload["observation_filter"]["observation_start_date"] == "2026-07-02"
+    assert payload["observation_filter"]["active"] is True
 
 
 def test_paper_epoch_reset_archives_old_rows_and_starts_at_500() -> None:
@@ -1947,10 +1949,11 @@ def test_paper_portfolio_charges_open_trade_fee_estimates() -> None:
     assert totals.portfolio_value == Decimal("500.17")
 
 
-def test_job_lock_skips_existing_running_job() -> None:
+def test_job_lock_skips_existing_running_job(monkeypatch) -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
     target = date(2026, 7, 2)
+    monkeypatch.setattr(job_runs, "utc_now", lambda: datetime(2026, 7, 2, 12, 1, tzinfo=UTC))
 
     with Session(engine) as session:
         epoch = get_or_create_active_paper_epoch(session)
@@ -1978,10 +1981,11 @@ def test_job_lock_skips_existing_running_job() -> None:
     assert skipped.result["existing_run_id"] == running_id
 
 
-def test_price_refresh_lock_key_is_date_insensitive() -> None:
+def test_price_refresh_lock_key_is_date_insensitive(monkeypatch) -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
     target = date(2026, 7, 2)
+    monkeypatch.setattr(job_runs, "utc_now", lambda: datetime(2026, 7, 2, 12, 1, tzinfo=UTC))
 
     with Session(engine) as session:
         epoch = get_or_create_active_paper_epoch(session)
@@ -2016,6 +2020,7 @@ def test_default_date_scoped_job_lock_uses_today(monkeypatch) -> None:
     Base.metadata.create_all(engine)
     target = date(2026, 7, 2)
     monkeypatch.setattr(job_runs, "today_eastern", lambda: target)
+    monkeypatch.setattr(job_runs, "utc_now", lambda: datetime(2026, 7, 2, 12, 1, tzinfo=UTC))
 
     def fake_execute_steps(*_args, **_kwargs):
         return {"should_not_run": True}
@@ -6062,7 +6067,7 @@ def test_list_today_markets_uses_occurrence_or_mapped_game_time(monkeypatch) -> 
 def test_dashboard_uses_newest_portfolio_snapshots() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
-    captured_at = datetime(2026, 7, 1, 12, 0, tzinfo=UTC)
+    captured_at = datetime(2026, 7, 2, 12, 0, tzinfo=UTC)
 
     with Session(engine) as session:
         epoch_id = _active_epoch_id(session)
@@ -6129,7 +6134,7 @@ def test_dashboard_preserves_zero_current_prices() -> None:
 
 
 def test_dashboard_includes_paper_trades_alongside_positions() -> None:
-    opened_at = datetime(2026, 7, 1, 12, 0, tzinfo=UTC)
+    opened_at = datetime(2026, 7, 2, 12, 0, tzinfo=UTC)
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
 
@@ -6220,13 +6225,165 @@ def test_dashboard_summary_filters_closed_positions_by_selected_date() -> None:
         )
         session.commit()
 
-        summary = dashboard.dashboard_summary_from_db(session, date(2026, 7, 1))
+        summary = dashboard.dashboard_summary_from_db(session, date(2026, 7, 1), include_pre_observation=True)
 
     assert summary.closed_positions_date == "2026-07-01"
     assert summary.closed_positions_count == 1
     assert summary.closed_positions[0].market_ticker == "KXMLBGAME-CLOSED-JULY1-PIT"
     assert summary.closed_positions[0].exit_price == 1.0
     assert summary.closed_positions[0].outcome == "win"
+
+
+def test_dashboard_default_excludes_pre_observation_rows_with_history_opt_in() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        epoch_id = _active_epoch_id(session)
+        session.add_all(
+            [
+                PaperTrade(
+                    paper_trading_epoch_id=epoch_id,
+                    market_ticker="KXMLBGAME-PRE-CLOSED-PIT",
+                    contract_side="yes",
+                    entry_price=Decimal("0.4000"),
+                    current_price=Decimal("1.0000"),
+                    exit_price=Decimal("1.0000"),
+                    quantity=1,
+                    entry_time=datetime(2026, 7, 1, 20, 0, tzinfo=UTC),
+                    exit_time=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+                    status="settled",
+                    outcome="win",
+                    resolution="WIN",
+                    realized_pnl=Decimal("0.60"),
+                ),
+                PaperTrade(
+                    paper_trading_epoch_id=epoch_id,
+                    market_ticker="KXMLBGAME-PRE-OPEN-PIT",
+                    contract_side="yes",
+                    entry_price=Decimal("0.4000"),
+                    current_price=Decimal("0.7000"),
+                    quantity=1,
+                    entry_time=datetime(2026, 7, 1, 22, 0, tzinfo=UTC),
+                    status="open",
+                ),
+                PaperTrade(
+                    paper_trading_epoch_id=epoch_id,
+                    market_ticker="KXMLBGAME-POST-CLOSED-PIT",
+                    contract_side="yes",
+                    entry_price=Decimal("0.4000"),
+                    current_price=Decimal("0.0000"),
+                    exit_price=Decimal("0.0000"),
+                    quantity=1,
+                    entry_time=datetime(2026, 7, 2, 12, 0, tzinfo=UTC),
+                    exit_time=datetime(2026, 7, 2, 18, 0, tzinfo=UTC),
+                    status="settled",
+                    outcome="loss",
+                    resolution="LOSS",
+                    realized_pnl=Decimal("-0.40"),
+                ),
+                PaperTrade(
+                    paper_trading_epoch_id=epoch_id,
+                    market_ticker="KXMLBGAME-POST-OPEN-PIT",
+                    contract_side="yes",
+                    entry_price=Decimal("0.5000"),
+                    current_price=Decimal("0.6000"),
+                    quantity=2,
+                    entry_time=datetime(2026, 7, 2, 13, 0, tzinfo=UTC),
+                    status="open",
+                    total_fee_estimate=Decimal("0.020000"),
+                ),
+                BalanceSnapshot(
+                    paper_trading_epoch_id=epoch_id,
+                    captured_at=datetime(2026, 7, 2, 20, 0, tzinfo=UTC),
+                    cash_balance=Decimal("999.00"),
+                    portfolio_value=Decimal("999.00"),
+                    source="paper",
+                ),
+            ]
+        )
+        session.commit()
+
+        default_july2 = dashboard.dashboard_summary_from_db(session, date(2026, 7, 2))
+        default_july1 = dashboard.dashboard_summary_from_db(session, date(2026, 7, 1))
+        historical_july1 = dashboard.dashboard_summary_from_db(
+            session,
+            date(2026, 7, 1),
+            include_pre_observation=True,
+        )
+        trades = list(session.scalars(select(PaperTrade).order_by(PaperTrade.market_ticker)))
+
+    assert default_july2.observation_filter is not None
+    assert default_july2.observation_filter.active is True
+    assert default_july2.observation_filter.observation_start_date == "2026-07-02"
+    assert default_july2.observation_filter.excluded_pre_observation_count == 2
+    assert default_july2.observation_filter.historical_rows_available is True
+    assert default_july2.positions[0].market_ticker == "KXMLBGAME-POST-OPEN-PIT"
+    assert [position.market_ticker for position in default_july2.closed_positions] == [
+        "KXMLBGAME-POST-CLOSED-PIT"
+    ]
+    assert default_july2.performance.record == "0-1-0"
+    assert default_july2.performance.profit_loss == -0.4
+    assert default_july2.cash_balance == 498.58
+    assert default_july2.portfolio_value == 499.78
+    assert default_july2.portfolio_series[0].value == 500.0
+    assert default_july2.portfolio_series[-1].value == 499.78
+
+    assert default_july1.closed_positions_count == 0
+    assert default_july1.observation_filter is not None
+    assert default_july1.observation_filter.excluded_pre_observation_closed_count == 1
+
+    assert historical_july1.observation_filter is not None
+    assert historical_july1.observation_filter.active is False
+    assert historical_july1.closed_positions_count == 1
+    assert historical_july1.closed_positions[0].market_ticker == "KXMLBGAME-PRE-CLOSED-PIT"
+    assert historical_july1.performance.record == "1-1-0"
+    assert historical_july1.performance.profit_loss == 0.2
+
+    assert len(trades) == 4
+    assert next(trade for trade in trades if trade.market_ticker == "KXMLBGAME-POST-OPEN-PIT").status == "open"
+
+
+def test_dashboard_observation_cutoff_uses_fixed_eastern_time(monkeypatch) -> None:
+    monkeypatch.setenv("DASHBOARD_TIMEZONE", "UTC")
+    get_settings.cache_clear()
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        epoch_id = _active_epoch_id(session)
+        session.add_all(
+            [
+                PaperTrade(
+                    paper_trading_epoch_id=epoch_id,
+                    market_ticker="KXMLBGAME-UTC-BEFORE-ET-CUTOFF",
+                    contract_side="yes",
+                    entry_price=Decimal("0.4000"),
+                    current_price=Decimal("0.7000"),
+                    quantity=1,
+                    entry_time=datetime(2026, 7, 2, 3, 30, tzinfo=UTC),
+                    status="open",
+                ),
+                PaperTrade(
+                    paper_trading_epoch_id=epoch_id,
+                    market_ticker="KXMLBGAME-UTC-AT-ET-CUTOFF",
+                    contract_side="yes",
+                    entry_price=Decimal("0.4000"),
+                    current_price=Decimal("0.7000"),
+                    quantity=1,
+                    entry_time=datetime(2026, 7, 2, 4, 0, tzinfo=UTC),
+                    status="open",
+                ),
+            ]
+        )
+        session.commit()
+
+        summary = dashboard.dashboard_summary_from_db(session, date(2026, 7, 2))
+
+    assert summary.observation_filter is not None
+    assert summary.observation_filter.observation_start_at == "2026-07-02T04:00:00+00:00"
+    assert summary.observation_filter.excluded_pre_observation_count == 1
+    assert [position.market_ticker for position in summary.positions] == ["KXMLBGAME-UTC-AT-ET-CUTOFF"]
 
 
 def test_resolver_uses_event_ticker_time_and_team_codes_for_validation() -> None:
@@ -6480,7 +6637,7 @@ def test_paper_settlement_charges_stored_trade_fee_estimates() -> None:
 
         result = settle_paper_trades(session, date(2026, 7, 1), now=settled_at)
         settlement = session.scalar(select(Settlement))
-        summary = dashboard.dashboard_summary_from_db(session)
+        summary = dashboard.dashboard_summary_from_db(session, include_pre_observation=True)
         trade_values = {
             "fee_paid": trade.fee_paid,
             "realized_pnl": trade.realized_pnl,
@@ -6966,7 +7123,7 @@ def test_dashboard_summary_uses_labels_snapshots_and_settled_performance() -> No
         )
         session.commit()
 
-        summary = dashboard.dashboard_summary_from_db(session)
+        summary = dashboard.dashboard_summary_from_db(session, include_pre_observation=True)
 
     assert summary.cash_balance == 999.6
     assert summary.portfolio_value == 1000.15
@@ -7071,7 +7228,7 @@ def test_dashboard_feature_status_uses_active_feature_source(monkeypatch) -> Non
         )
         session.commit()
 
-        summary = dashboard.dashboard_summary_from_db(session)
+        summary = dashboard.dashboard_summary_from_db(session, include_pre_observation=True)
 
     assert summary.model_status.feature_completeness["park_weather"] == {"partial": 1, "missing": 1}
     assert summary.model_status.feature_completeness["lineup"] == {"available": 1, "missing": 1}
@@ -16063,7 +16220,7 @@ def test_open_position_price_refresh_updates_only_open_paper_trades() -> None:
         session.refresh(legacy_position)
         session.refresh(settled_trade)
         snapshot = session.scalar(select(BalanceSnapshot))
-        summary = dashboard.dashboard_summary_from_db(session)
+        summary = dashboard.dashboard_summary_from_db(session, include_pre_observation=True)
 
     assert result["checked"] == 1
     assert result["updated"] == 1

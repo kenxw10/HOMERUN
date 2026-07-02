@@ -44,6 +44,19 @@ class JobRunSummary(BaseModel):
     result: dict[str, object] = Field(default_factory=dict)
 
 
+class ObservationFilterSummary(BaseModel):
+    active: bool
+    include_pre_observation: bool
+    observation_start_date: str
+    observation_start_at: str
+    observation_start_display: str
+    excluded_pre_observation_count: int = 0
+    excluded_pre_observation_closed_count: int = 0
+    historical_rows_available: bool = False
+    history_param: str = "include_pre_observation=true"
+    reason: str
+
+
 class WebSocketStatusSummary(BaseModel):
     enabled: bool
     running: bool
@@ -144,6 +157,7 @@ class DashboardSummary(BaseModel):
     cash_balance: float | None = None
     portfolio_value: float | None = None
     paper_starting_balance: float | None = None
+    observation_filter: ObservationFilterSummary | None = None
     performance_by_scope: dict[str, dict[str, object]] = Field(default_factory=dict)
     performance_by_family: dict[str, dict[str, object]] = Field(default_factory=dict)
     decision_breakdown_by_scope: dict[str, dict[str, int]] = Field(default_factory=dict)
