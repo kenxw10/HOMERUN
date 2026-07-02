@@ -159,6 +159,7 @@ QUALITY_WEIGHTS: dict[str, dict[str, Decimal]] = {
 QUALITY_WEIGHTS[FULL_GAME_SPREAD] = QUALITY_WEIGHTS[FULL_GAME_WINNER]
 QUALITY_WEIGHTS[FIRST_FIVE_SPREAD] = QUALITY_WEIGHTS[FIRST_FIVE_WINNER]
 QUALITY_WEIGHTS[FIRST_FIVE_TOTAL] = QUALITY_WEIGHTS[FIRST_FIVE_WINNER]
+MODEL_QUALITY_EXCLUDED_MODULES = frozenset({"defense_catcher"})
 
 def _park(
     latitude: float,
@@ -1329,6 +1330,7 @@ def _mlb_primary_fetch_context(
         "team_season_pitching_by_id": {},
         "team_hitting_logs_by_id": {},
         "team_pitching_logs_by_id": {},
+        "team_fielding_logs_by_id": {},
         "team_hitting_splits_by_id": {},
         "team_pitching_splits_by_id": {},
         "pitcher_game_logs_by_id": {},
@@ -1358,6 +1360,10 @@ def _mlb_primary_fetch_context(
                     context["team_pitching_logs_by_id"][team_id] = client.get_team_game_log_stats(team_id, "pitching", season)
                 except Exception as exc:
                     _record_mlb_source_error(stats, table="team_pitching_game_log", exc=exc)
+                try:
+                    context["team_fielding_logs_by_id"][team_id] = client.get_team_game_log_stats(team_id, "fielding", season)
+                except Exception as exc:
+                    _record_mlb_source_error(stats, table="team_fielding_game_log", exc=exc)
             if hasattr(client, "get_team_stat_splits"):
                 try:
                     context["team_hitting_splits_by_id"][team_id] = client.get_team_stat_splits(team_id, "hitting", season)
@@ -1732,6 +1738,27 @@ def _cached_team_daily(session: Session | None, day: date, team_code: str | None
     return _preferred_feature_row(rows)
 
 
+def _cached_team_daily_source(
+    session: Session | None,
+    day: date,
+    team_code: str | None,
+    source: str,
+) -> TeamDailyFeature | None:
+    if session is None or not team_code:
+        return None
+    rows = list(
+        session.scalars(
+            select(TeamDailyFeature)
+            .where(TeamDailyFeature.target_date == day)
+            .where(TeamDailyFeature.team_code == team_code)
+            .where(TeamDailyFeature.source == source)
+            .order_by(TeamDailyFeature.updated_at.desc())
+            .limit(10)
+        )
+    )
+    return _preferred_feature_row(rows)
+
+
 def _cached_team_recent(
     session: Session | None,
     day: date,
@@ -1748,6 +1775,29 @@ def _cached_team_recent(
         .where(TeamRecentFeature.window_days == window_days)
         .order_by(TeamRecentFeature.updated_at.desc())
         .limit(10)
+        )
+    )
+    return _preferred_feature_row(rows)
+
+
+def _cached_team_recent_source(
+    session: Session | None,
+    day: date,
+    team_code: str | None,
+    source: str,
+    window_days: int = 14,
+) -> TeamRecentFeature | None:
+    if session is None or not team_code:
+        return None
+    rows = list(
+        session.scalars(
+            select(TeamRecentFeature)
+            .where(TeamRecentFeature.target_date == day)
+            .where(TeamRecentFeature.team_code == team_code)
+            .where(TeamRecentFeature.window_days == window_days)
+            .where(TeamRecentFeature.source == source)
+            .order_by(TeamRecentFeature.updated_at.desc())
+            .limit(10)
         )
     )
     return _preferred_feature_row(rows)
@@ -2084,12 +2134,18 @@ def _nested_module_score(value: object) -> Decimal:
     return sum(scores) / Decimal(len(scores))
 
 
-def _quality_score(
+def _model_quality_weights(weights: dict[str, Decimal]) -> dict[str, Decimal]:
+    return {
+        module_name: weight
+        for module_name, weight in weights.items()
+        if module_name not in MODEL_QUALITY_EXCLUDED_MODULES
+    }
+
+
+def _weighted_quality_components(
     features: dict[str, object],
-    market_family: str | None,
-    minutes_to_start: int | None,
-) -> tuple[Decimal, dict[str, object]]:
-    weights = QUALITY_WEIGHTS.get(market_family or FULL_GAME_WINNER, QUALITY_WEIGHTS[FULL_GAME_WINNER])
+    weights: dict[str, Decimal],
+) -> tuple[Decimal, dict[str, float]]:
     total_weight = sum(weights.values())
     weighted = Decimal("0")
     module_scores: dict[str, float] = {}
@@ -2098,6 +2154,17 @@ def _quality_score(
         module_scores[module_name] = float(score.quantize(Decimal("0.0001")))
         weighted += score * weight
     quality = weighted / total_weight if total_weight else Decimal("0")
+    return quality, module_scores
+
+
+def _quality_score(
+    features: dict[str, object],
+    market_family: str | None,
+    minutes_to_start: int | None,
+) -> tuple[Decimal, dict[str, object]]:
+    weights = QUALITY_WEIGHTS.get(market_family or FULL_GAME_WINNER, QUALITY_WEIGHTS[FULL_GAME_WINNER])
+    diagnostic_quality, module_scores = _weighted_quality_components(features, weights)
+    quality, _ = _weighted_quality_components(features, _model_quality_weights(weights))
     reasons: list[str] = []
 
     starter_identity = features.get("starter_identity")
@@ -2125,8 +2192,14 @@ def _quality_score(
             reasons.append("CAP_LINEUP_MISSING_WITHIN_90M")
 
     quality = min(max(quality, Decimal("0.0000")), Decimal("1.0000")).quantize(Decimal("0.0001"))
+    diagnostic_quality = min(max(diagnostic_quality, Decimal("0.0000")), Decimal("1.0000")).quantize(
+        Decimal("0.0001")
+    )
     return quality, {
         "score": float(quality),
+        "model_quality_score": float(quality),
+        "diagnostic_score": float(diagnostic_quality),
+        "model_quality_excluded_modules": sorted(MODEL_QUALITY_EXCLUDED_MODULES),
         "module_scores": module_scores,
         "data_quality_reason": reasons,
         "weight_profile": market_family or FULL_GAME_WINNER,
@@ -2155,6 +2228,10 @@ def build_feature_snapshot(
     away_daily = _cached_team_daily(session, target_date, away_code)
     home_recent = _cached_team_recent(session, target_date, home_code)
     away_recent = _cached_team_recent(session, target_date, away_code)
+    home_defense_daily = _cached_team_daily_source(session, target_date, home_code, MLB_STATS_SOURCE)
+    away_defense_daily = _cached_team_daily_source(session, target_date, away_code, MLB_STATS_SOURCE)
+    home_defense_recent = _cached_team_recent_source(session, target_date, home_code, MLB_STATS_SOURCE)
+    away_defense_recent = _cached_team_recent_source(session, target_date, away_code, MLB_STATS_SOURCE)
     home_identity = probable_pitcher_from_payload(game.raw_payload or {}, "home")
     away_identity = probable_pitcher_from_payload(game.raw_payload or {}, "away")
     home_pitcher = _cached_pitcher(session, target_date, home_code, home_identity)
@@ -2320,7 +2397,15 @@ def build_feature_snapshot(
             "home": _injury_module(home_injury, "home", captured_at),
             "away": _injury_module(away_injury, "away", captured_at),
         },
-        "defense_catcher": _defense_catcher_module(home_lineup, away_lineup, captured_at),
+        "defense_catcher": _defense_catcher_module(
+            home_defense_daily,
+            away_defense_daily,
+            home_defense_recent,
+            away_defense_recent,
+            home_lineup,
+            away_lineup,
+            captured_at,
+        ),
         "park_weather": _park_weather_module(park, weather, game, captured_at),
         "travel_schedule": {
             "home": _travel_module(home_travel, "home", captured_at),
@@ -2674,31 +2759,181 @@ def _injury_module(row: InjurySnapshot | None, side: str, captured_at: datetime)
     )
 
 
+def _stored_component(
+    row: TeamDailyFeature | TeamRecentFeature | None,
+    key: str,
+    fallback_component: str,
+    fallback_reason: str,
+    captured_at: datetime,
+) -> dict[str, object]:
+    values = row.features.get(key) if row is not None and isinstance(row.features, dict) else None
+    if isinstance(values, dict):
+        return {
+            "component": values.get("component") or fallback_component,
+            "source_status": values.get("source_status") or row.source_status,
+            "source": values.get("source") or row.source,
+            "reason": values.get("reason") or "cached feature component",
+            "captured_at": ensure_aware_utc(row.captured_at).isoformat(),
+            "confidence": values.get("confidence") if values.get("confidence") is not None else _float(row.confidence),
+            "completeness": values.get("completeness") if values.get("completeness") is not None else _float(row.completeness),
+            "stale": row.stale,
+            **values,
+        }
+    return {
+        "component": fallback_component,
+        "source_status": "missing",
+        "source": MLB_STATS_SOURCE,
+        "reason": fallback_reason,
+        "captured_at": captured_at.isoformat(),
+        "confidence": 0.0,
+        "completeness": 0.0,
+    }
+
+
+def _lineup_missing_reason_for_catcher(row: LineupSnapshot | None) -> str:
+    if row is None:
+        return "catcher unavailable because official lineup snapshot is missing"
+    features_payload = row.features if isinstance(row.features, dict) else {}
+    missing_reason = features_payload.get("missing_reason")
+    if missing_reason == LINEUP_NOT_POSTED_YET:
+        return "catcher unavailable because official lineup not posted yet"
+    if missing_reason == PARTIAL_LINEUP_POSTED:
+        return "catcher unavailable because official lineup is only partially posted"
+    if missing_reason == LIVE_FEED_UNAVAILABLE:
+        return "catcher unavailable because official MLB live feed is unavailable"
+    if missing_reason == LIVE_FEED_LINEUP_EMPTY:
+        return "catcher unavailable because official MLB live feed lineup is empty"
+    return "catcher unavailable because official lineup did not include a catcher"
+
+
+def _catcher_component(row: LineupSnapshot | None, side: str, captured_at: datetime) -> dict[str, object]:
+    catcher = _catcher_from_lineup(row)
+    if catcher:
+        return {
+            "component": f"{side}_catcher_starting_lineup",
+            "source_status": "available",
+            "source": MLB_STATS_SOURCE,
+            "reason": "catcher starts inferred from official lineup",
+            "captured_at": ensure_aware_utc(row.captured_at).isoformat() if row else captured_at.isoformat(),
+            "confidence": 0.75,
+            "completeness": 0.60,
+            "catcher": catcher,
+        }
+    return {
+        "component": f"{side}_catcher_starting_lineup",
+        "source_status": "missing",
+        "source": MLB_STATS_SOURCE,
+        "reason": _lineup_missing_reason_for_catcher(row),
+        "captured_at": ensure_aware_utc(row.captured_at).isoformat() if row else captured_at.isoformat(),
+        "confidence": 0.0,
+        "completeness": 0.0,
+        "catcher": None,
+    }
+
+
+def _component_status(component: dict[str, object] | None) -> str:
+    return str((component or {}).get("source_status") or "missing")
+
+
+def _component_score(component: dict[str, object]) -> Decimal:
+    return _status_score(component)
+
+
 def _defense_catcher_module(
+    home_daily: TeamDailyFeature | None,
+    away_daily: TeamDailyFeature | None,
+    home_recent: TeamRecentFeature | None,
+    away_recent: TeamRecentFeature | None,
     home_lineup: LineupSnapshot | None,
     away_lineup: LineupSnapshot | None,
     captured_at: datetime,
 ) -> dict[str, object]:
-    home_catcher = _catcher_from_lineup(home_lineup)
-    away_catcher = _catcher_from_lineup(away_lineup)
-    if home_catcher or away_catcher:
-        return _partial(
-            "defense_catcher",
-            "catcher starts inferred from lineup; advanced catcher metrics unavailable",
-            captured_at=captured_at,
-            source=DERIVED_SOURCE,
-            confidence="0.35",
-            completeness="0.25",
-            values={
-                "home_catcher": home_catcher,
-                "away_catcher": away_catcher,
-                "team_defense_proxy": None,
-                "outs_above_average": None,
-                "catcher_framing": None,
-                "umpire": "excluded",
+    home_season = _stored_component(
+        home_daily,
+        "defense_season",
+        "home_defense_season",
+        "home team defense season missing from MLB Stats API fielding cache",
+        captured_at,
+    )
+    away_season = _stored_component(
+        away_daily,
+        "defense_season",
+        "away_defense_season",
+        "away team defense season missing from MLB Stats API fielding cache",
+        captured_at,
+    )
+    home_recent_component = _stored_component(
+        home_recent,
+        "defense_recent",
+        "home_defense_recent",
+        "home team recent defense missing from MLB Stats API fielding cache",
+        captured_at,
+    )
+    away_recent_component = _stored_component(
+        away_recent,
+        "defense_recent",
+        "away_defense_recent",
+        "away team recent defense missing from MLB Stats API fielding cache",
+        captured_at,
+    )
+    home_catcher = _catcher_component(home_lineup, "home", captured_at)
+    away_catcher = _catcher_component(away_lineup, "away", captured_at)
+    advanced_catcher = {
+        "component": "advanced_catcher_metrics",
+        "source_status": "unavailable",
+        "source": "not_configured",
+        "reason": "advanced catcher metrics not configured/unavailable",
+        "catcher_framing": None,
+        "catcher_blocking": None,
+        "catcher_throwing": None,
+    }
+    umpire = {
+        "component": "umpire",
+        "source_status": "excluded",
+        "source": "not_supported",
+        "reason": "umpire factors excluded by design",
+    }
+    components = [
+        home_season,
+        away_season,
+        home_recent_component,
+        away_recent_component,
+        home_catcher,
+        away_catcher,
+    ]
+    baseline_statuses = {_component_status(component) for component in components}
+    has_baseline = any(status in {"available", "partial"} for status in baseline_statuses)
+    status = "partial" if has_baseline else "missing"
+    reason = (
+        "baseline team defense/catcher context partially available; advanced catcher metrics unavailable; umpire excluded"
+        if has_baseline
+        else "baseline defense/catcher context unavailable; advanced catcher metrics unavailable; umpire excluded"
+    )
+    score_values = [_component_score(component) for component in components]
+    avg_score = (sum(score_values) / Decimal(len(score_values))).quantize(Decimal("0.0001")) if score_values else Decimal("0")
+    return _module(
+        "defense_catcher",
+        status,
+        reason,
+        captured_at=captured_at,
+        source=MLB_STATS_SOURCE if has_baseline else DERIVED_SOURCE,
+        confidence=max(avg_score, Decimal("0.25") if has_baseline else Decimal("0")),
+        completeness=max(avg_score, Decimal("0.20") if has_baseline else Decimal("0")),
+        values={
+            "home": {
+                "team_defense_season": home_season,
+                "team_defense_recent": home_recent_component,
+                "catcher_starting_lineup": home_catcher,
             },
-        )
-    return _missing("defense_catcher", "defense and catcher metrics unavailable; umpire excluded", captured_at)
+            "away": {
+                "team_defense_season": away_season,
+                "team_defense_recent": away_recent_component,
+                "catcher_starting_lineup": away_catcher,
+            },
+            "advanced_catcher_metrics": advanced_catcher,
+            "umpire": umpire,
+        },
+    )
 
 
 def _catcher_from_lineup(row: LineupSnapshot | None) -> dict[str, object] | None:
@@ -2847,6 +3082,173 @@ def _aggregate_team_pitching_logs(splits: list[dict[str, object]], limit: int) -
     }
 
 
+def _fielding_stat_decimal(stat: dict[str, object], *names: str) -> Decimal | None:
+    return _mlb_stat_decimal(stat, *names)
+
+
+def _aggregate_team_fielding_logs(splits: list[dict[str, object]], limit: int) -> dict[str, object]:
+    sample = splits[:limit]
+    innings = Decimal("0")
+    innings_present = False
+    totals = {
+        key: Decimal("0")
+        for key in (
+            "errors",
+            "assists",
+            "putOuts",
+            "chances",
+            "doublePlays",
+            "passedBalls",
+            "wildPitches",
+            "stolenBases",
+            "caughtStealing",
+        )
+    }
+    present_fields: set[str] = set()
+
+    def add_total(total_key: str, stat: dict[str, object], *names: str) -> None:
+        value = _fielding_stat_decimal(stat, *names)
+        if value is None:
+            return
+        totals[total_key] += value
+        present_fields.add(total_key)
+
+    for split in sample:
+        stat = split.get("stat") if isinstance(split.get("stat"), dict) else {}
+        inning_value = _baseball_innings(_row_value(stat, "innings", "inningsPlayed", "inningsPitched"))
+        if inning_value is not None:
+            innings += inning_value
+            innings_present = True
+        add_total("errors", stat, "errors")
+        add_total("assists", stat, "assists")
+        add_total("putOuts", stat, "putOuts", "putouts")
+        add_total("chances", stat, "chances")
+        add_total("doublePlays", stat, "doublePlays")
+        add_total("passedBalls", stat, "passedBalls", "passedBall")
+        add_total("wildPitches", stat, "wildPitches", "wildPitch")
+        add_total("stolenBases", stat, "stolenBases", "stolenBasesAllowed")
+        add_total("caughtStealing", stat, "caughtStealing", "caughtStealingByCatcher")
+    games = len(sample)
+    has_complete_chances_components = {"putOuts", "assists", "errors"}.issubset(present_fields)
+    chances = (
+        totals["chances"]
+        if "chances" in present_fields
+        else totals["putOuts"] + totals["assists"] + totals["errors"]
+        if has_complete_chances_components
+        else None
+    )
+    fielding_percentage = (
+        _ratio(totals["putOuts"] + totals["assists"], chances)
+        if chances is not None and {"putOuts", "assists"}.issubset(present_fields)
+        else None
+    )
+    stolen_attempts = totals["stolenBases"] + totals["caughtStealing"]
+    return {
+        "source": MLB_STATS_SOURCE,
+        "basis": "team_fielding_game_logs_before_target_date",
+        "game_count": games,
+        "last_date": _game_log_date(sample[0]) if sample else None,
+        "source_fields_present": sorted(present_fields),
+        "innings": _float(innings) if innings_present else None,
+        "errors": _float(totals["errors"]) if "errors" in present_fields else None,
+        "errors_per_game": _float(_ratio(totals["errors"], games)) if games and "errors" in present_fields else None,
+        "assists": _float(totals["assists"]) if "assists" in present_fields else None,
+        "putouts": _float(totals["putOuts"]) if "putOuts" in present_fields else None,
+        "chances": _float(chances) if chances is not None else None,
+        "fielding_percentage": _float(fielding_percentage),
+        "double_plays": _float(totals["doublePlays"]) if "doublePlays" in present_fields else None,
+        "double_plays_per_game": _float(_ratio(totals["doublePlays"], games))
+        if games and "doublePlays" in present_fields
+        else None,
+        "passed_balls": _float(totals["passedBalls"]) if "passedBalls" in present_fields else None,
+        "wild_pitches": _float(totals["wildPitches"]) if "wildPitches" in present_fields else None,
+        "stolen_bases_allowed": _float(totals["stolenBases"]) if "stolenBases" in present_fields else None,
+        "caught_stealing": _float(totals["caughtStealing"]) if "caughtStealing" in present_fields else None,
+        "caught_stealing_rate": _float(_ratio(totals["caughtStealing"], stolen_attempts))
+        if {"stolenBases", "caughtStealing"}.issubset(present_fields)
+        else None,
+    }
+
+
+def _defense_feature_section(
+    fielding: dict[str, object],
+    *,
+    component: str,
+    reason_available: str,
+    reason_missing: str,
+) -> dict[str, object]:
+    game_count = int(fielding.get("game_count") or 0)
+    has_metric = any(
+        fielding.get(key) is not None
+        for key in ("fielding_percentage", "errors", "double_plays", "passed_balls", "caught_stealing_rate")
+    ) and bool(fielding.get("source_fields_present"))
+    if game_count and has_metric:
+        status = "available"
+        reason = reason_available
+        confidence = 0.70
+        completeness = 0.65
+    elif game_count:
+        status = "partial"
+        reason = "MLB Stats API fielding logs returned games but limited fielding metrics."
+        confidence = 0.45
+        completeness = 0.35
+    else:
+        status = "missing"
+        reason = reason_missing
+        confidence = 0.0
+        completeness = 0.0
+    return {
+        "component": component,
+        "source_status": status,
+        "source": MLB_STATS_SOURCE,
+        "reason": reason,
+        "confidence": confidence,
+        "completeness": completeness,
+        **fielding,
+    }
+
+
+def _cached_defense_feature_section(
+    row: TeamDailyFeature | TeamRecentFeature | None,
+    key: str,
+    reused_at: datetime,
+) -> dict[str, object] | None:
+    values = row.features if row is not None and isinstance(row.features, dict) else None
+    component = values.get(key) if isinstance(values, dict) else None
+    if not isinstance(component, dict):
+        return None
+    cached = dict(component)
+    if cached.get("captured_at") is None and row.captured_at is not None:
+        cached["captured_at"] = ensure_aware_utc(row.captured_at).isoformat()
+    cached["stale"] = True
+    cached["cache_reused"] = True
+    cached["cache_reused_at"] = ensure_aware_utc(reused_at).isoformat()
+    cached["cache_reuse_reason"] = "fielding rows unavailable during latest MLB Stats refresh"
+    return cached
+
+
+def _defense_feature_section_or_cached(
+    fielding: dict[str, object],
+    row: TeamDailyFeature | TeamRecentFeature | None,
+    key: str,
+    *,
+    component: str,
+    reason_available: str,
+    reason_missing: str,
+    captured_at: datetime,
+) -> dict[str, object]:
+    if int(fielding.get("game_count") or 0) == 0:
+        cached = _cached_defense_feature_section(row, key, captured_at)
+        if cached is not None:
+            return cached
+    return _defense_feature_section(
+        fielding,
+        component=component,
+        reason_available=reason_available,
+        reason_missing=reason_missing,
+    )
+
+
 def _map_handedness_splits(payload: dict[str, object] | None, group: str) -> dict[str, object]:
     mapped: dict[str, object] = {"source": MLB_STATS_SOURCE, "basis": group, "vsLeft": None, "vsRight": None}
     for split in _stats_splits(payload):
@@ -2893,12 +3295,15 @@ def _upsert_mlb_primary_team_daily(
         return None
     hitting_payload = mlb_context.get("team_hitting_logs_by_id", {}).get(team_id) if isinstance(mlb_context.get("team_hitting_logs_by_id"), dict) else None
     pitching_payload = mlb_context.get("team_pitching_logs_by_id", {}).get(team_id) if isinstance(mlb_context.get("team_pitching_logs_by_id"), dict) else None
+    fielding_payload = mlb_context.get("team_fielding_logs_by_id", {}).get(team_id) if isinstance(mlb_context.get("team_fielding_logs_by_id"), dict) else None
     hitting_splits = _game_log_splits_before(hitting_payload if isinstance(hitting_payload, dict) else None, day)
     pitching_splits = _game_log_splits_before(pitching_payload if isinstance(pitching_payload, dict) else None, day)
+    fielding_splits = _game_log_splits_before(fielding_payload if isinstance(fielding_payload, dict) else None, day)
     if not hitting_splits and not pitching_splits:
         return None
     hitting = _aggregate_team_hitting_logs(hitting_splits, len(hitting_splits))
     pitching = _aggregate_team_pitching_logs(pitching_splits, len(pitching_splits))
+    fielding = _aggregate_team_fielding_logs(fielding_splits, len(fielding_splits))
     games_played = max(int(hitting.get("game_count") or 0), int(pitching.get("game_count") or 0)) or None
     runs = _decimal(hitting.get("runs"))
     runs_allowed = _decimal(pitching.get("runs"))
@@ -2961,6 +3366,15 @@ def _upsert_mlb_primary_team_daily(
         "run_differential_per_game": _float(_ratio((runs or Decimal("0")) - (runs_allowed or Decimal("0")), games_played)) if runs is not None and runs_allowed is not None else None,
         "contact_quality": contact,
         "contact_quality_status": _statcast_status(contact if isinstance(contact, dict) else None),
+        "defense_season": _defense_feature_section_or_cached(
+            fielding,
+            row,
+            "defense_season",
+            component="defense_season",
+            reason_available="team defense season from MLB Stats API fielding game logs",
+            reason_missing="team defense season missing because MLB Stats API fielding game logs were unavailable or empty",
+            captured_at=captured_at,
+        ),
         "wrc_plus_status": "missing",
         "xfip_status": "missing",
         "platoon_split_status": "available"
@@ -2983,6 +3397,7 @@ def _upsert_mlb_primary_team_daily(
         "bounded_before": day.isoformat(),
         "hitting_rows": len(hitting_splits),
         "pitching_rows": len(pitching_splits),
+        "fielding_rows": len(fielding_splits),
     }
     session.add(row)
     return row
@@ -3004,13 +3419,16 @@ def _upsert_mlb_primary_team_recent(
         return None
     hitting_payload = mlb_context.get("team_hitting_logs_by_id", {}).get(team_id) if isinstance(mlb_context.get("team_hitting_logs_by_id"), dict) else None
     pitching_payload = mlb_context.get("team_pitching_logs_by_id", {}).get(team_id) if isinstance(mlb_context.get("team_pitching_logs_by_id"), dict) else None
+    fielding_payload = mlb_context.get("team_fielding_logs_by_id", {}).get(team_id) if isinstance(mlb_context.get("team_fielding_logs_by_id"), dict) else None
     window_start = day - timedelta(days=window_days)
     hitting_splits = _game_log_splits_before(hitting_payload if isinstance(hitting_payload, dict) else None, day, window_start)
     pitching_splits = _game_log_splits_before(pitching_payload if isinstance(pitching_payload, dict) else None, day, window_start)
+    fielding_splits = _game_log_splits_before(fielding_payload if isinstance(fielding_payload, dict) else None, day, window_start)
     if not hitting_splits and not pitching_splits:
         return None
     hitting = _aggregate_team_hitting_logs(hitting_splits, len(hitting_splits))
     pitching = _aggregate_team_pitching_logs(pitching_splits, len(pitching_splits))
+    fielding = _aggregate_team_fielding_logs(fielding_splits, len(fielding_splits))
     row = session.scalar(
         select(TeamRecentFeature)
         .where(TeamRecentFeature.target_date == day)
@@ -3036,6 +3454,15 @@ def _upsert_mlb_primary_team_recent(
         "barrel_pct": contact.get("barrel_pct") if isinstance(contact, dict) else None,
         "contact_quality": contact,
         "contact_quality_status": _statcast_status(contact if isinstance(contact, dict) else None),
+        "defense_recent": _defense_feature_section_or_cached(
+            fielding,
+            row,
+            "defense_recent",
+            component="defense_recent",
+            reason_available=f"team defense recent from MLB Stats API fielding game logs over {window_days} days",
+            reason_missing=f"team defense recent missing because no MLB Stats API fielding game logs were available in the last {window_days} days",
+            captured_at=captured_at,
+        ),
     }
     row = row or TeamRecentFeature(target_date=day, team_code=team_code, window_days=window_days, source=MLB_STATS_SOURCE)
     row.captured_at = captured_at
@@ -3045,7 +3472,12 @@ def _upsert_mlb_primary_team_recent(
     row.completeness = Decimal("0.75") if status == "available" else Decimal("0.40")
     row.stale = False
     row.features = features
-    row.raw_payload = {"team_id": team_id, "hitting_rows": len(hitting_splits), "pitching_rows": len(pitching_splits)}
+    row.raw_payload = {
+        "team_id": team_id,
+        "hitting_rows": len(hitting_splits),
+        "pitching_rows": len(pitching_splits),
+        "fielding_rows": len(fielding_splits),
+    }
     session.add(row)
     return row
 
@@ -5468,7 +5900,7 @@ def _pybaseball_db_status(session: Session) -> dict[str, object]:
                 .limit(100)
             )
         )
-    rows = sorted(rows, key=lambda row: row.captured_at, reverse=True)[:200]
+    rows = sorted(rows, key=lambda row: ensure_aware_utc(row.captured_at), reverse=True)[:200]
     counts: dict[str, int] = {}
     functions_attempted: list[str] = []
     last_success = None
@@ -5535,6 +5967,117 @@ def _latest_audit_error(feature_audit: dict[str, object], source: str) -> dict[s
         if isinstance(error, dict) and str(error.get("source") or "") == source:
             return error
     return None
+
+
+def _latest_audit_error_for_tables(
+    feature_audit: dict[str, object],
+    source: str,
+    tables: set[str],
+) -> dict[str, object] | None:
+    latest_errors = feature_audit.get("latest_errors")
+    if not isinstance(latest_errors, list):
+        return None
+    for error in latest_errors:
+        if (
+            isinstance(error, dict)
+            and str(error.get("source") or "") == source
+            and str(error.get("table") or "") in tables
+        ):
+            return error
+    return None
+
+
+def _defense_component_from_row(row: object) -> dict[str, object] | None:
+    features_payload = getattr(row, "features", None)
+    if not isinstance(features_payload, dict):
+        return None
+    for key in ("defense_season", "defense_recent"):
+        value = features_payload.get(key)
+        if isinstance(value, dict):
+            return value
+    return None
+
+
+def _defense_component_timestamp(row: object, component: dict[str, object]) -> datetime | None:
+    for key in ("captured_at", "fielding_captured_at", "synced_at"):
+        parsed = _parsed_status_timestamp(component.get(key))
+        if parsed is not None:
+            return parsed
+    captured_at = getattr(row, "captured_at", None)
+    return ensure_aware_utc(captured_at) if captured_at is not None else None
+
+
+def _defense_db_status(session: Session) -> dict[str, object]:
+    rows: list[object] = []
+    for model in (TeamDailyFeature, TeamRecentFeature):
+        rows.extend(
+            session.scalars(
+                select(model)
+                .where(model.source == MLB_STATS_SOURCE)
+                .order_by(model.captured_at.desc())
+                .limit(100)
+            )
+        )
+    rows = sorted(rows, key=lambda row: ensure_aware_utc(row.captured_at), reverse=True)[:200]
+    counts: dict[str, int] = {}
+    last_success_timestamp = None
+    component_rows = 0
+    cache_reused_count = 0
+    fresh_success_count = 0
+    latest_row_timestamp: datetime | None = None
+    latest_counts: dict[str, int] = {}
+    latest_cache_reused_count = 0
+    latest_fresh_success_count = 0
+    for row in rows:
+        component = _defense_component_from_row(row)
+        if not component:
+            continue
+        component_rows += 1
+        status = str(component.get("source_status") or "missing")
+        counts[status] = counts.get(status, 0) + 1
+        row_timestamp = ensure_aware_utc(row.captured_at)
+        is_latest_row = latest_row_timestamp is None or row_timestamp > latest_row_timestamp
+        if is_latest_row:
+            latest_row_timestamp = row_timestamp
+            latest_counts = {}
+            latest_cache_reused_count = 0
+            latest_fresh_success_count = 0
+        if latest_row_timestamp is not None and row_timestamp == latest_row_timestamp:
+            latest_counts[status] = latest_counts.get(status, 0) + 1
+        if status in {"available", "partial"}:
+            if component.get("cache_reused") or component.get("stale"):
+                cache_reused_count += 1
+                if latest_row_timestamp is not None and row_timestamp == latest_row_timestamp:
+                    latest_cache_reused_count += 1
+            else:
+                fresh_success_count += 1
+                if latest_row_timestamp is not None and row_timestamp == latest_row_timestamp:
+                    latest_fresh_success_count += 1
+            component_timestamp = _defense_component_timestamp(row, component)
+            if component_timestamp is not None and (
+                last_success_timestamp is None or component_timestamp > last_success_timestamp
+            ):
+                last_success_timestamp = component_timestamp
+    if latest_counts.get("available", 0) > 0:
+        status = "cached" if latest_cache_reused_count else "available"
+    elif latest_counts.get("partial", 0) > 0:
+        status = "cached" if latest_cache_reused_count else "partial"
+    elif component_rows:
+        status = "missing"
+    else:
+        status = "not_attempted"
+    return {
+        "status": status,
+        "last_successful_sync": ensure_aware_utc(last_success_timestamp).isoformat()
+        if last_success_timestamp is not None
+        else None,
+        "row_sample_count": component_rows,
+        "status_counts": counts,
+        "cache_reused_count": cache_reused_count,
+        "fresh_success_count": fresh_success_count,
+        "latest_cache_reused_count": latest_cache_reused_count,
+        "latest_fresh_success_count": latest_fresh_success_count,
+    }
 
 
 def _latest_pybaseball_source_audit_error(feature_audit: dict[str, object]) -> dict[str, object] | None:
@@ -5646,7 +6189,7 @@ def _statcast_db_status(session: Session, feature_audit: dict[str, object]) -> d
                 .limit(100)
             )
         )
-    rows = sorted(rows, key=lambda row: row.captured_at, reverse=True)[:200]
+    rows = sorted(rows, key=lambda row: ensure_aware_utc(row.captured_at), reverse=True)[:200]
     contact_rows = [row for row in rows if _statcast_contact_from_row(row)]
     status_counts: dict[str, int] = {}
     last_success_timestamp = None
@@ -5711,6 +6254,46 @@ def _kalshi_market_data_status(session: Session) -> dict[str, object]:
     }
 
 
+def _catcher_lineup_source_status(session: Session) -> dict[str, object]:
+    rows = list(
+        session.scalars(
+            select(LineupSnapshot)
+            .where(LineupSnapshot.source == MLB_STATS_SOURCE)
+            .order_by(LineupSnapshot.captured_at.desc())
+            .limit(200)
+        )
+    )
+    counts: dict[str, int] = {}
+    catcher_success = None
+    partial_without_catcher = 0
+
+    for row in rows:
+        status = str(row.source_status or "missing")
+        counts[status] = counts.get(status, 0) + 1
+        catcher = _catcher_from_lineup(row)
+        if catcher is not None and catcher_success is None:
+            catcher_success = ensure_aware_utc(row.captured_at).isoformat()
+        elif status in {"available", "partial"}:
+            partial_without_catcher += 1
+
+    if catcher_success:
+        status = "available"
+    elif partial_without_catcher:
+        status = "partial"
+    elif rows:
+        status = "missing"
+    else:
+        status = "not_attempted"
+
+    return {
+        "status": status,
+        "last_successful_sync": catcher_success,
+        "last_attempted_sync": ensure_aware_utc(rows[0].captured_at).isoformat() if rows else None,
+        "row_sample_count": len(rows),
+        "status_counts": counts,
+    }
+
+
 def _source_health_entry(
     *,
     source_name: str,
@@ -5766,7 +6349,22 @@ def _source_inventory(
         "last_successful_sync"
     ]
     mlb_status = "available" if mlb_last_success else "failed" if mlb_error else "partial"
+    fielding_error = _latest_audit_error_for_tables(feature_audit, MLB_STATS_SOURCE, {"team_fielding_game_log"})
+    defense_status = _defense_db_status(session)
+    defense_health = str(defense_status["status"])
+    if fielding_error and defense_status.get("last_successful_sync"):
+        defense_health = "cached"
+    elif fielding_error:
+        defense_health = "failed"
+    defense_cache_reused = bool(
+        defense_status.get("latest_cache_reused_count") and defense_status.get("last_successful_sync")
+    )
+    defense_fallback_used = bool((fielding_error or defense_cache_reused) and defense_status.get("last_successful_sync"))
+    defense_fallback_reason = _source_issue_reason(fielding_error)
+    if defense_cache_reused and not defense_fallback_reason:
+        defense_fallback_reason = "latest MLB Stats fielding rows unavailable; using last good fielding cache"
     weather_status = table_status["weather_snapshots"]
+    lineup_status = table_status["lineup_snapshots"]
     pybaseball_last_error = _latest_pybaseball_source_audit_error(feature_audit) or pybaseball_status.get(
         "pybaseball_last_error"
     )
@@ -5799,17 +6397,34 @@ def _source_inventory(
     kalshi_status = _kalshi_market_data_status(session)
     statcast_error = statcast_status.get("statcast_savant_last_error")
     statcast_last_success = statcast_status.get("statcast_savant_last_successful_sync")
+    catcher_status = _catcher_lineup_source_status(session)
     return [
         _source_health_entry(
             source_name="mlb_stats_api",
             source_kind="official",
             criticality="critical_path",
             status=mlb_status,
-            modules_affected=["schedule", "game_context", "probable_starters", "team", "pitcher", "lineup"],
+            modules_affected=["schedule", "game_context", "probable_starters", "team", "pitcher", "lineup", "defense"],
             last_successful_sync=mlb_last_success,
             last_attempted_sync=last_attempted,
             last_error=mlb_error,
             sample_count=int(table_status["mlb_feature_snapshots"]["row_sample_count"] or 0),
+        ),
+        _source_health_entry(
+            source_name="mlb_stats_api_fielding",
+            source_kind="official",
+            criticality="baseline_model_context",
+            status=defense_health,
+            modules_affected=["defense_season", "defense_recent", "defense_catcher"],
+            last_successful_sync=defense_status.get("last_successful_sync"),
+            last_attempted_sync=last_attempted,
+            last_error=fielding_error,
+            sample_count=int(defense_status.get("row_sample_count") or 0),
+            fallback_used=defense_fallback_used,
+            fallback_source="last_good_mlb_fielding_cache"
+            if defense_fallback_used
+            else None,
+            fallback_reason=defense_fallback_reason,
         ),
         _source_health_entry(
             source_name="kalshi_public_market_data",
@@ -5880,6 +6495,44 @@ def _source_inventory(
             fallback_reason=str((statcast_error or {}).get("error_code") or (statcast_error or {}).get("message"))
             if isinstance(statcast_error, dict)
             else None,
+        ),
+        _source_health_entry(
+            source_name="statcast_savant_defense_contact_quality",
+            source_kind="public_statcast",
+            criticality="enrichment",
+            status="not_wired",
+            modules_affected=["defense_catcher"],
+            fallback_used=False,
+            fallback_reason="not used for defense in PR3n baseline",
+        ),
+        _source_health_entry(
+            source_name="catcher_from_official_lineup",
+            source_kind="official",
+            criticality="enrichment",
+            status=str(catcher_status["status"]),
+            modules_affected=["defense_catcher", "lineup"],
+            last_successful_sync=catcher_status["last_successful_sync"],
+            last_attempted_sync=catcher_status["last_attempted_sync"] or last_attempted,
+            last_error=lineup_status["last_error"],
+            sample_count=int(catcher_status["row_sample_count"] or 0),
+        ),
+        _source_health_entry(
+            source_name="advanced_catcher_metrics",
+            source_kind="optional_provider",
+            criticality="enrichment",
+            status="not_configured",
+            modules_affected=["defense_catcher"],
+            fallback_used=False,
+            fallback_reason="advanced catcher framing/blocking/throwing metrics are not sourced",
+        ),
+        _source_health_entry(
+            source_name="umpire",
+            source_kind="not_supported",
+            criticality="excluded",
+            status="excluded",
+            modules_affected=[],
+            fallback_used=False,
+            fallback_reason="umpire factors intentionally excluded from HOMERUN model inputs",
         ),
         _source_health_entry(
             source_name="optional_injuries",
