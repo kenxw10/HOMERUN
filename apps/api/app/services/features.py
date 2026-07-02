@@ -1588,7 +1588,10 @@ def _statcast_fetch_context(
                         end=end,
                         captured_at=statcast_captured_at,
                     )
-                    if stats.get("statcast_source_status") != "statcast_empty_result":
+                    if stats.get("statcast_source_status") not in {
+                        "statcast_empty_result",
+                        "statcast_unmatched_team_rows",
+                    }:
                         stats["statcast_source_status"] = "available"
                     stats["statcast_pitcher_rows_matched"] = int(stats.get("statcast_pitcher_rows_matched", 0)) + len(rows)
             except Exception as exc:
@@ -5642,6 +5645,13 @@ def _source_inventory(
             criticality="optional",
             status="not_configured" if not _secret_configured(settings.lineup_provider_api_key) else "not_wired",
             modules_affected=["lineup"],
+        ),
+        _source_health_entry(
+            source_name="optional_weather_provider",
+            source_kind="optional_provider",
+            criticality="optional",
+            status="not_configured" if not _secret_configured(settings.weather_provider_api_key) else "not_wired",
+            modules_affected=["park_weather"],
         ),
     ]
 

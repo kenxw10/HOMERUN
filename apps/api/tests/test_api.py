@@ -9412,6 +9412,42 @@ def test_statcast_unmatched_team_rows_mark_source_attempted(monkeypatch) -> None
     ]
 
 
+def test_statcast_unmatched_team_rows_survive_pitcher_rows(monkeypatch) -> None:
+    monkeypatch.setattr(
+        features.pybaseball_client,
+        "import_status",
+        lambda: {"available": True, "version": "2.2.7", "module_path": "mocked", "import_error": None},
+    )
+    monkeypatch.setattr(
+        features.pybaseball_client,
+        "get_statcast_range",
+        lambda *_args, **_kwargs: {"rows": [{"launch_speed": 96, "launch_angle": 18}]},
+    )
+    monkeypatch.setattr(
+        features.pybaseball_client,
+        "get_pitcher_statcast_range",
+        lambda *_args, **_kwargs: {"rows": [{"release_speed": 96.0, "launch_speed": 88.0, "launch_angle": 12.0}]},
+    )
+    game = MlbGame(
+        external_game_id="statcast-unmatched-team-pitcher-available",
+        home_team="Pittsburgh Pirates",
+        away_team="Seattle Mariners",
+        home_abbreviation="PIT",
+        away_abbreviation="SEA",
+        scheduled_start=datetime(2026, 6, 24, 23, 0, tzinfo=UTC),
+        status="scheduled",
+        raw_payload={"teams": {"home": {"probablePitcher": {"id": 1999, "fullName": "Home Starter"}}}},
+    )
+
+    stats = features._new_sync_stats(date(2026, 6, 24), {"team", "pitcher"})
+    context = features._statcast_fetch_context([game], date(2026, 6, 24), {"team", "pitcher"}, stats)
+
+    assert context["team_contact_by_code"] == {}
+    assert context["pitcher_contact_by_id"]["1999"]["average_release_speed"] == 96.0
+    assert stats["statcast_source_status"] == "statcast_unmatched_team_rows"
+    assert stats["statcast_pitcher_rows_matched"] == 1
+
+
 def test_statcast_empty_team_result_survives_pitcher_rows(monkeypatch) -> None:
     monkeypatch.setattr(
         features.pybaseball_client,
@@ -9714,6 +9750,24 @@ def test_source_status_report_exposes_public_source_diagnostics() -> None:
     assert report["optional_weather_provider_configured"] is False
     assert report["last_successful_sync"]["weather_snapshots"] == captured_at.isoformat()
     assert "weather_snapshots" in report["tables"]
+
+
+def test_source_status_report_includes_configured_optional_weather_provider(monkeypatch) -> None:
+    monkeypatch.setenv("WEATHER_PROVIDER_API_KEY", "weather-test-key")
+    get_settings.cache_clear()
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    try:
+        with Session(engine) as session:
+            report = features.source_status_report(session)
+    finally:
+        get_settings.cache_clear()
+
+    inventory = {item["source_name"]: item for item in report["source_inventory"]}
+    assert report["optional_weather_provider_configured"] is True
+    assert inventory["optional_weather_provider"]["status"] == "not_wired"
+    assert inventory["optional_weather_provider"]["modules_affected"] == ["park_weather"]
 
 
 def test_source_status_report_exposes_source_inventory_and_cached_fallbacks(monkeypatch) -> None:
