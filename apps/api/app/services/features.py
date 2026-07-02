@@ -5319,7 +5319,7 @@ def _cached_status_from_timestamp(timestamp: object, max_stale_hours: int) -> st
     return "cached" if utc_now() - parsed <= timedelta(hours=max_stale_hours) else "stale"
 
 
-def _statcast_available_status(base_status: str, timestamp: object, max_stale_hours: int) -> str:
+def _cache_age_limited_status(base_status: str, timestamp: object, max_stale_hours: int) -> str:
     if _cached_status_from_timestamp(timestamp, max_stale_hours) == "stale":
         return "stale"
     return base_status
@@ -5390,9 +5390,9 @@ def _statcast_db_status(session: Session, feature_audit: dict[str, object]) -> d
     elif last_error:
         status = "failed"
     elif status_counts.get("available", 0) > 0:
-        status = _statcast_available_status("available", last_success, settings.statcast_cache_max_stale_hours)
+        status = _cache_age_limited_status("available", last_success, settings.statcast_cache_max_stale_hours)
     elif status_counts.get("partial", 0) > 0:
-        status = _statcast_available_status("partial", last_success, settings.statcast_cache_max_stale_hours)
+        status = _cache_age_limited_status("partial", last_success, settings.statcast_cache_max_stale_hours)
     elif feature_audit.get("last_attempted_sync"):
         status = "failed" if not pybaseball_available() else "partial"
     else:
@@ -5492,7 +5492,11 @@ def _source_inventory(
     elif pybaseball_last_error or pybaseball_status.get("pybaseball_import_error"):
         pybaseball_health = "failed"
     elif pybaseball_status.get("advanced_public_stats_status") in {"available", "partial"}:
-        pybaseball_health = str(pybaseball_status["advanced_public_stats_status"])
+        pybaseball_health = _cache_age_limited_status(
+            str(pybaseball_status["advanced_public_stats_status"]),
+            pybaseball_last_success,
+            settings.advanced_public_stats_max_stale_hours,
+        )
     else:
         pybaseball_health = "not_wired" if not last_attempted else "failed"
     kalshi_status = _kalshi_market_data_status(session)

@@ -10176,6 +10176,49 @@ def test_source_status_report_ignores_pybaseball_player_mapping_misses(monkeypat
     assert inventory["pybaseball_fangraphs"]["last_error"] is None
 
 
+def test_source_status_report_marks_old_pybaseball_cache_stale_without_error(monkeypatch) -> None:
+    fixed_now = datetime(2026, 7, 2, 21, 0, tzinfo=UTC)
+    stale_cache_at = fixed_now - timedelta(hours=3)
+    monkeypatch.setenv("ADVANCED_PUBLIC_STATS_MAX_STALE_HOURS", "1")
+    monkeypatch.setattr(features, "utc_now", lambda: fixed_now)
+    get_settings.cache_clear()
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    monkeypatch.setattr(
+        features.pybaseball_client,
+        "import_status",
+        lambda: {"available": True, "version": "2.2.7", "module_path": "mocked", "import_error": None},
+    )
+
+    try:
+        with Session(engine) as session:
+            session.add(
+                TeamDailyFeature(
+                    target_date=date(2026, 7, 2),
+                    team_code="PIT",
+                    captured_at=stale_cache_at,
+                    source=features.PYBASEBALL_SOURCE,
+                    source_status="available",
+                    confidence=Decimal("0.8500"),
+                    completeness=Decimal("0.7500"),
+                    stale=False,
+                    features={"wrc_plus": 112},
+                    raw_payload={"source_function": "batting_stats"},
+                )
+            )
+            session.commit()
+            report = features.source_status_report(session)
+    finally:
+        get_settings.cache_clear()
+
+    inventory = {item["source_name"]: item for item in report["source_inventory"]}
+    assert report["pybaseball_last_successful_sync"] == stale_cache_at.isoformat()
+    assert report["advanced_public_stats_status"] == "available"
+    assert inventory["pybaseball_fangraphs"]["status"] == "stale"
+    assert inventory["pybaseball_fangraphs"]["fallback_used"] is False
+    assert inventory["pybaseball_fangraphs"]["last_error"] is None
+
+
 def test_mlb_primary_team_daily_preserves_cached_statcast_when_current_fetch_empty() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
