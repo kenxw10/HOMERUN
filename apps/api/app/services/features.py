@@ -5011,6 +5011,8 @@ def sync_mlb_pregame_context(
             "feature_snapshots_skipped_missing_existing": int(
                 stats.get("feature_snapshots_skipped_missing_existing", 0) or 0
             ),
+            "feature_sync_audit_skipped": True,
+            "audit_skipped_reason": "pregame_context_refresh_does_not_replace_full_feature_sync_audit",
         }
     )
     if stats.get("validation_status") == "skipped_network_disabled":
@@ -5054,35 +5056,6 @@ def sync_mlb_pregame_context(
         stats["validation_status"] = "degraded_no_games"
     else:
         stats["validation_status"] = "ok"
-    sync_status = {
-        "target_date": stats["target_date"],
-        "attempted_at": captured_at.isoformat(),
-        "validation_status": stats["validation_status"],
-        "action": stats["action"],
-        "feature_sync_mode": stats["feature_sync_mode"],
-        "heavy_feature_sync_skipped": True,
-        "error_count": stats.get("error_count", 0),
-        "errors": stats.get("errors", []),
-        "warnings": stats.get("warnings", []),
-        "hydration_validation_status": stats.get("hydration_validation_status"),
-        "hydration_error_count": stats.get("hydration_error_count", 0),
-        "hydration_duplicate_count": stats.get("hydration_duplicate_count", 0),
-        "lineup_missing_reasons": stats.get("lineup_missing_reasons", {}),
-        "pybaseball_available": stats.get("pybaseball_available"),
-        "pybaseball_functions_attempted": stats.get("pybaseball_functions_attempted", []),
-        "pybaseball_rows_seen": stats.get("pybaseball_rows_seen", 0),
-        "pybaseball_rows_matched": stats.get("pybaseball_rows_matched", 0),
-        "pybaseball_error_count": stats.get("pybaseball_error_count", 0),
-        "advanced_available_count": stats.get("advanced_available_count", 0),
-        "advanced_partial_count": stats.get("advanced_partial_count", 0),
-        "statcast_source_status": stats.get("statcast_source_status", "not_attempted"),
-        "statcast_rows_seen": stats.get("statcast_rows_seen", 0),
-        "statcast_rows_matched": stats.get("statcast_rows_matched", 0),
-        "statcast_pitcher_rows_seen": stats.get("statcast_pitcher_rows_seen", 0),
-        "statcast_pitcher_rows_matched": stats.get("statcast_pitcher_rows_matched", 0),
-        "statcast_error_count": stats.get("statcast_error_count", 0),
-    }
-    _upsert_feature_sync_audit(session, day, captured_at, sync_status)
     if commit:
         session.commit()
     return stats

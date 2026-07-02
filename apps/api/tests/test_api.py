@@ -11261,6 +11261,72 @@ def test_sync_mlb_pregame_context_updates_official_lineups_and_snapshot(monkeypa
     assert snapshot.source_statuses["starter_identity"] == {"home": "available", "away": "available"}
 
 
+def test_sync_mlb_pregame_context_does_not_overwrite_feature_sync_audit(monkeypatch) -> None:
+    monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "true")
+    get_settings.cache_clear()
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    class FakeMLBStatsClient:
+        def get_schedule(self, *_args, **_kwargs):
+            return {"dates": [{"games": [_starter_schedule_game()]}]}
+
+        def get_game_feed(self, *_args, **_kwargs):
+            return {
+                "liveData": {
+                    "boxscore": {
+                        "teams": {
+                            "home": _boxscore_lineup_team(1000, 1999),
+                            "away": _boxscore_lineup_team(2000, 2999),
+                        }
+                    }
+                }
+            }
+
+        def get_pitcher_game_log_stats(self, *_args, **_kwargs):
+            return _starter_game_log_payload()
+
+    monkeypatch.setattr(features, "MLBStatsClient", FakeMLBStatsClient)
+
+    try:
+        with Session(engine) as session:
+            _seed_existing_starter_feature_snapshot(session)
+            session.add(
+                MlbFeatureSnapshot(
+                    mlb_game_id=None,
+                    target_date=date(2026, 7, 1),
+                    source=features.FEATURE_SYNC_AUDIT_SOURCE,
+                    captured_at=datetime(2026, 7, 1, 13, 0, tzinfo=UTC),
+                    data_quality=Decimal("0.0000"),
+                    source_statuses={},
+                    features={
+                        "sync_status": {
+                            "action": "mlb_feature_sync",
+                            "validation_status": "degraded_with_errors",
+                            "statcast_source_status": "statcast_empty_result",
+                            "errors": [{"source": features.STATCAST_SOURCE, "message": "empty response"}],
+                        }
+                    },
+                )
+            )
+            session.commit()
+
+            result = features.sync_mlb_pregame_context(session, date(2026, 7, 1))
+            audit = session.scalar(
+                select(MlbFeatureSnapshot).where(MlbFeatureSnapshot.source == features.FEATURE_SYNC_AUDIT_SOURCE)
+            )
+    finally:
+        get_settings.cache_clear()
+
+    assert result["validation_status"] == "ok"
+    assert result["feature_sync_audit_skipped"] is True
+    assert result["audit_skipped_reason"] == "pregame_context_refresh_does_not_replace_full_feature_sync_audit"
+    assert audit is not None
+    assert audit.features["sync_status"]["action"] == "mlb_feature_sync"
+    assert audit.features["sync_status"]["validation_status"] == "degraded_with_errors"
+    assert audit.features["sync_status"]["statcast_source_status"] == "statcast_empty_result"
+
+
 def test_sync_mlb_pregame_context_reports_partial_and_unposted_lineups(monkeypatch) -> None:
     monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "true")
     get_settings.cache_clear()
