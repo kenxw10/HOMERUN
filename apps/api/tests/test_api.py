@@ -9386,6 +9386,38 @@ def test_statcast_team_rows_derive_batting_team_from_inning_half(monkeypatch) ->
     assert stats["statcast_rows_matched"] == 60
 
 
+def test_statcast_empty_team_result_survives_pitcher_rows(monkeypatch) -> None:
+    monkeypatch.setattr(
+        features.pybaseball_client,
+        "import_status",
+        lambda: {"available": True, "version": "2.2.7", "module_path": "mocked", "import_error": None},
+    )
+    monkeypatch.setattr(features.pybaseball_client, "get_statcast_range", lambda *_args, **_kwargs: {"rows": []})
+    monkeypatch.setattr(
+        features.pybaseball_client,
+        "get_pitcher_statcast_range",
+        lambda *_args, **_kwargs: {"rows": [{"release_speed": 96.0, "launch_speed": 88.0, "launch_angle": 12.0}]},
+    )
+    game = MlbGame(
+        external_game_id="statcast-empty-team-pitcher-available",
+        home_team="Pittsburgh Pirates",
+        away_team="Seattle Mariners",
+        home_abbreviation="PIT",
+        away_abbreviation="SEA",
+        scheduled_start=datetime(2026, 6, 24, 23, 0, tzinfo=UTC),
+        status="scheduled",
+        raw_payload={"teams": {"home": {"probablePitcher": {"id": 1999, "fullName": "Home Starter"}}}},
+    )
+
+    stats = features._new_sync_stats(date(2026, 6, 24), {"team", "pitcher"})
+    context = features._statcast_fetch_context([game], date(2026, 6, 24), {"team", "pitcher"}, stats)
+
+    assert context["team_contact_by_code"] == {}
+    assert context["pitcher_contact_by_id"]["1999"]["average_release_speed"] == 96.0
+    assert stats["statcast_source_status"] == "statcast_empty_result"
+    assert stats["statcast_pitcher_rows_matched"] == 1
+
+
 def test_statcast_contact_uses_all_release_speed_and_numeric_barrels() -> None:
     contact = features._aggregate_statcast_contact(
         [
@@ -9820,6 +9852,87 @@ def test_source_status_report_marks_empty_statcast_attempt_as_cached_fallback(mo
     assert inventory["statcast_savant"]["status"] == "cached"
     assert inventory["statcast_savant"]["fallback_used"] is True
     assert inventory["statcast_savant"]["fallback_reason"] == "statcast_empty_result"
+
+
+def test_source_status_report_ignores_pybaseball_player_mapping_misses(monkeypatch) -> None:
+    get_settings.cache_clear()
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    captured_at = datetime(2026, 7, 1, 20, 0, tzinfo=UTC)
+    mapping_error = {
+        "source": features.PYBASEBALL_SOURCE,
+        "table": "pitcher_daily_features",
+        "error_type": "PlayerMappingFailed",
+        "message": "PLAYER_MAPPING_FAILED",
+        "pitcher_id": "1999",
+        "pitcher_name": "Home Starter",
+        "team_code": "PIT",
+    }
+    monkeypatch.setattr(
+        features.pybaseball_client,
+        "import_status",
+        lambda: {"available": True, "version": "2.2.7", "module_path": "mocked", "import_error": None},
+    )
+
+    try:
+        with Session(engine) as session:
+            session.add_all(
+                [
+                    TeamDailyFeature(
+                        target_date=date(2026, 7, 1),
+                        team_code="PIT",
+                        captured_at=captured_at,
+                        source=features.PYBASEBALL_SOURCE,
+                        source_status="available",
+                        confidence=Decimal("0.8500"),
+                        completeness=Decimal("0.7500"),
+                        stale=False,
+                        features={"wrc_plus": 112},
+                        raw_payload={"source_function": "batting_stats"},
+                    ),
+                    PitcherDailyFeature(
+                        target_date=date(2026, 7, 1),
+                        team_code="PIT",
+                        pitcher_id="1999",
+                        pitcher_name="Home Starter",
+                        captured_at=datetime(2026, 7, 1, 21, 0, tzinfo=UTC),
+                        source=features.PYBASEBALL_SOURCE,
+                        source_status="partial",
+                        sample_size=None,
+                        confidence=Decimal("0.3500"),
+                        completeness=Decimal("0.2500"),
+                        stale=False,
+                        features={"season": {"era": None}},
+                        raw_payload={"error": mapping_error},
+                    ),
+                    MlbFeatureSnapshot(
+                        mlb_game_id=None,
+                        target_date=date(2026, 7, 1),
+                        source=features.FEATURE_SYNC_AUDIT_SOURCE,
+                        captured_at=datetime(2026, 7, 1, 21, 1, tzinfo=UTC),
+                        data_quality=None,
+                        source_statuses={"sync": "degraded_with_errors"},
+                        features={
+                            "sync_status": {
+                                "attempted_at": datetime(2026, 7, 1, 21, 1, tzinfo=UTC).isoformat(),
+                                "validation_status": "degraded_with_errors",
+                                "errors": [mapping_error],
+                                "warnings": [],
+                            }
+                        },
+                    ),
+                ]
+            )
+            session.commit()
+            report = features.source_status_report(session)
+    finally:
+        get_settings.cache_clear()
+
+    inventory = {item["source_name"]: item for item in report["source_inventory"]}
+    assert report["pybaseball_last_error"] is None
+    assert inventory["pybaseball_fangraphs"]["status"] == "available"
+    assert inventory["pybaseball_fangraphs"]["fallback_used"] is False
+    assert inventory["pybaseball_fangraphs"]["last_error"] is None
 
 
 def test_mlb_primary_team_daily_preserves_cached_statcast_when_current_fetch_empty() -> None:

@@ -1551,7 +1551,8 @@ def _statcast_fetch_context(
                         **_aggregate_statcast_contact(rows),
                         "date_range": {"start": start.isoformat(), "end": end.isoformat()},
                     }
-                    stats["statcast_source_status"] = "available"
+                    if stats.get("statcast_source_status") != "statcast_empty_result":
+                        stats["statcast_source_status"] = "available"
                     stats["statcast_pitcher_rows_matched"] = int(stats.get("statcast_pitcher_rows_matched", 0)) + len(rows)
             except Exception as exc:
                 stats["statcast_error_count"] = int(stats.get("statcast_error_count", 0)) + 1
@@ -5165,6 +5166,12 @@ def _secret_configured(value: object) -> bool:
     return bool(value)
 
 
+def _is_pybaseball_player_mapping_error(error: object) -> bool:
+    return isinstance(error, dict) and (
+        error.get("message") == "PLAYER_MAPPING_FAILED" or error.get("error_type") == "PlayerMappingFailed"
+    )
+
+
 def _pybaseball_db_status(session: Session) -> dict[str, object]:
     import_info = pybaseball_client.import_status()
     models = (TeamDailyFeature, TeamRecentFeature, PitcherDailyFeature, BullpenDailyFeature)
@@ -5193,8 +5200,9 @@ def _pybaseball_db_status(session: Session) -> dict[str, object]:
             function_name = raw_payload.get("source_function")
             if function_name and str(function_name) not in functions_attempted:
                 functions_attempted.append(str(function_name))
-            if last_error is None and isinstance(raw_payload.get("error"), dict):
-                last_error = raw_payload["error"]
+            error = raw_payload.get("error")
+            if last_error is None and isinstance(error, dict) and not _is_pybaseball_player_mapping_error(error):
+                last_error = error
     if counts.get("available", 0) > 0:
         advanced_status = "available"
     elif counts.get("partial", 0) > 0:
@@ -5242,6 +5250,20 @@ def _latest_audit_error(feature_audit: dict[str, object], source: str) -> dict[s
         return None
     for error in latest_errors:
         if isinstance(error, dict) and str(error.get("source") or "") == source:
+            return error
+    return None
+
+
+def _latest_pybaseball_source_audit_error(feature_audit: dict[str, object]) -> dict[str, object] | None:
+    latest_errors = feature_audit.get("latest_errors")
+    if not isinstance(latest_errors, list):
+        return None
+    for error in latest_errors:
+        if not isinstance(error, dict) or str(error.get("source") or "") != PYBASEBALL_SOURCE:
+            continue
+        if _is_pybaseball_player_mapping_error(error):
+            continue
+        if error.get("function") or error.get("error_code"):
             return error
     return None
 
@@ -5396,7 +5418,7 @@ def _source_inventory(
     ]
     mlb_status = "available" if mlb_last_success else "failed" if mlb_error else "partial"
     weather_status = table_status["weather_snapshots"]
-    pybaseball_last_error = _latest_audit_error(feature_audit, PYBASEBALL_SOURCE) or pybaseball_status.get(
+    pybaseball_last_error = _latest_pybaseball_source_audit_error(feature_audit) or pybaseball_status.get(
         "pybaseball_last_error"
     )
     pybaseball_last_success = pybaseball_status.get("pybaseball_last_successful_sync")
