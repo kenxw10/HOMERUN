@@ -54,6 +54,12 @@ DERIVED_SOURCE = "derived_homerun_v2"
 PYBASEBALL_SOURCE = "pybaseball_public_stats_v1"
 STATCAST_SOURCE = "statcast_savant_secondary_v1"
 KALSHI_MARKET_DATA_SOURCE = "kalshi_public_market_data"
+PREGAME_CONTEXT_SYNC_MODE = "pregame_context_refresh_lightweight"
+LINEUP_NOT_POSTED_YET = "LINEUP_NOT_POSTED_YET"
+PARTIAL_LINEUP_POSTED = "PARTIAL_LINEUP_POSTED"
+LIVE_FEED_LINEUP_EMPTY = "LIVE_FEED_LINEUP_EMPTY"
+LIVE_FEED_UNAVAILABLE = "LIVE_FEED_UNAVAILABLE"
+GAME_ALREADY_STARTED = "GAME_ALREADY_STARTED"
 NETWORK_SOURCE_MODULES = {"team", "pitcher", "bullpen", "lineup", "weather"}
 ALL_SYNC_MODULES = NETWORK_SOURCE_MODULES | {"injuries", "travel"}
 RAW_TABLES_BY_MODULE = {
@@ -1872,18 +1878,36 @@ def _pitcher_module(
 
 def _lineup_module(row: LineupSnapshot | None, side: str, captured_at: datetime) -> dict[str, object]:
     if row is not None:
+        values = {**(row.features or {}), "confirmed": row.confirmed}
+        missing_reason = values.get("missing_reason")
+        if row.source_status == "available":
+            reason = "official MLB confirmed lineup posted"
+        elif row.source_status == "partial":
+            reason = "partial official MLB lineup posted"
+        elif missing_reason == LINEUP_NOT_POSTED_YET:
+            reason = "official MLB lineup not posted yet"
+        elif missing_reason == LIVE_FEED_UNAVAILABLE:
+            reason = "official MLB live feed unavailable"
+        elif missing_reason == LIVE_FEED_LINEUP_EMPTY:
+            reason = "official MLB live feed lineup empty"
+        else:
+            reason = "official MLB lineup snapshot unavailable"
         return _module(
             f"{side}_lineup",
             row.source_status,
-            "cached lineup snapshot",
+            reason,
             captured_at=row.captured_at,
             source=row.source,
             confidence=row.confidence or Decimal("0"),
             completeness=row.completeness or Decimal("0"),
             stale=row.stale,
-            values={**row.features, "confirmed": row.confirmed},
+            values=values,
         )
-    return _missing(f"{side}_lineup", "confirmed or projected lineup cache missing", captured_at)
+    return _missing(
+        f"{side}_lineup",
+        "official MLB lineup snapshot missing; optional external lineup provider not configured",
+        captured_at,
+    )
 
 
 def _source_statuses(features: dict[str, object]) -> dict[str, object]:
@@ -3784,6 +3808,31 @@ def _upsert_pybaseball_bullpen(
     return row
 
 
+def _lineup_missing_reason(game: MlbGame, starter_count: int) -> str | None:
+    if starter_count >= 9:
+        return None
+    if starter_count > 0:
+        return PARTIAL_LINEUP_POSTED
+    raw = game.raw_payload or {}
+    hydration = raw.get("homerun_starter_hydration") if isinstance(raw, dict) else None
+    errors = hydration.get("errors") if isinstance(hydration, dict) else None
+    if isinstance(errors, list) and any(
+        isinstance(error, dict) and error.get("table") == "mlb_games_feed" for error in errors
+    ):
+        return LIVE_FEED_UNAVAILABLE
+    if _game_phase(game) == "pregame":
+        return LINEUP_NOT_POSTED_YET
+    return LIVE_FEED_LINEUP_EMPTY
+
+
+def _lineup_status(starter_count: int) -> str:
+    if starter_count >= 9:
+        return "available"
+    if starter_count > 0:
+        return "partial"
+    return "missing"
+
+
 def _upsert_lineup(
     session: Session,
     game: MlbGame,
@@ -3793,8 +3842,10 @@ def _upsert_lineup(
 ) -> LineupSnapshot:
     team_code = (game.home_abbreviation if side == "home" else game.away_abbreviation) or "UNK"
     starters = parse_starting_lineup_from_game_payload(game.raw_payload or {}, side)
-    confirmed = len(starters) == 9
-    status = "available" if confirmed else "missing"
+    starter_count = len(starters)
+    confirmed = starter_count == 9
+    status = _lineup_status(starter_count)
+    missing_reason = _lineup_missing_reason(game, starter_count)
     mix = _handedness_mix(starters)
     row = session.scalar(
         select(LineupSnapshot)
@@ -3813,14 +3864,15 @@ def _upsert_lineup(
     row.captured_at = captured_at
     row.source_status = status
     row.confirmed = confirmed
-    row.confidence = Decimal("0.80") if confirmed else Decimal("0")
-    row.completeness = Decimal("0.85") if confirmed else Decimal("0")
+    row.confidence = Decimal("0.80") if confirmed else Decimal("0.35") if status == "partial" else Decimal("0")
+    row.completeness = Decimal("0.85") if confirmed else Decimal("0.30") if status == "partial" else Decimal("0")
     row.stale = False
     row.features = {
         "confirmed_lineup": confirmed,
         "starters": starters,
         "projected_lineup_fallback": not confirmed,
-        "missing_reason": None if confirmed else "LINEUP_NOT_POSTED_YET",
+        "missing_reason": missing_reason,
+        "game_state_reason": GAME_ALREADY_STARTED if missing_reason == LIVE_FEED_LINEUP_EMPTY else None,
         "lineup_quality_aggregate": None,
         "top_9_wrc_plus_proxy": None,
         "top_9_woba_proxy": None,
@@ -3830,8 +3882,11 @@ def _upsert_lineup(
         "handedness_mix": mix,
         "bench_downgrade": None,
         "lineup_posted_at": None,
+        "official_source_status": status,
     }
-    row.raw_payload = {"starter_count": len(starters)}
+    row.raw_payload = {"starter_count": starter_count}
+    if missing_reason:
+        row.raw_payload["missing_reason"] = missing_reason
     session.add(row)
     return row
 
@@ -4926,6 +4981,108 @@ def sync_mlb_starters(
         stats["validation_status"] = "degraded_no_games"
     else:
         stats["validation_status"] = "ok"
+    if commit:
+        session.commit()
+    return stats
+
+
+def sync_mlb_pregame_context(
+    session: Session,
+    target_date: date | None = None,
+    *,
+    update_snapshots: bool = True,
+    commit: bool = True,
+) -> dict[str, object]:
+    day = target_date or today_eastern()
+    captured_at = utc_now()
+    stats = dict(sync_mlb_starters(session, day, update_snapshots=False, commit=False))
+    stats.update(
+        {
+            "action": "mlb_pregame_context_refresh",
+            "feature_sync_mode": PREGAME_CONTEXT_SYNC_MODE,
+            "heavy_feature_sync_skipped": True,
+            "include_modules": ["lineup", "pitcher"],
+            "lineup_sides_checked": 0,
+            "confirmed_lineup_count": 0,
+            "partial_lineup_count": 0,
+            "missing_lineup_count": 0,
+            "lineup_missing_reasons": {},
+            "feature_snapshots_upserted": 0,
+            "feature_snapshots_skipped_missing_existing": int(
+                stats.get("feature_snapshots_skipped_missing_existing", 0) or 0
+            ),
+        }
+    )
+    if stats.get("validation_status") == "skipped_network_disabled":
+        if commit:
+            session.commit()
+        return stats
+
+    games = _target_games(session, day)
+    stats["games_seen"] = len(games)
+    for game in games:
+        for side in ("home", "away"):
+            row = _upsert_lineup(session, game, side, day, captured_at)
+            _record_feature_row(stats, "lineup_snapshots", row)
+            stats["lineup_sides_checked"] = int(stats.get("lineup_sides_checked", 0)) + 1
+            if row.source_status == "available":
+                stats["confirmed_lineup_count"] = int(stats.get("confirmed_lineup_count", 0)) + 1
+            elif row.source_status == "partial":
+                stats["partial_lineup_count"] = int(stats.get("partial_lineup_count", 0)) + 1
+            else:
+                stats["missing_lineup_count"] = int(stats.get("missing_lineup_count", 0)) + 1
+            missing_reason = (row.features or {}).get("missing_reason") if isinstance(row.features, dict) else None
+            if missing_reason:
+                reasons = stats.setdefault("lineup_missing_reasons", {})
+                if isinstance(reasons, dict):
+                    reasons[str(missing_reason)] = int(reasons.get(str(missing_reason), 0) or 0) + 1
+
+    session.flush()
+    if update_snapshots:
+        for game in games:
+            row = _upsert_feature_snapshot_for_game(session, game, day, captured_at)
+            if row is None:
+                stats["feature_snapshots_skipped_missing_existing"] = int(
+                    stats.get("feature_snapshots_skipped_missing_existing", 0)
+                ) + 1
+                continue
+            stats["feature_snapshots_upserted"] = int(stats.get("feature_snapshots_upserted", 0)) + 1
+
+    if int(stats.get("error_count", 0)) > 0:
+        stats["validation_status"] = "degraded_with_errors"
+    elif int(stats.get("games_seen", 0)) == 0:
+        stats["validation_status"] = "degraded_no_games"
+    else:
+        stats["validation_status"] = "ok"
+    sync_status = {
+        "target_date": stats["target_date"],
+        "attempted_at": captured_at.isoformat(),
+        "validation_status": stats["validation_status"],
+        "action": stats["action"],
+        "feature_sync_mode": stats["feature_sync_mode"],
+        "heavy_feature_sync_skipped": True,
+        "error_count": stats.get("error_count", 0),
+        "errors": stats.get("errors", []),
+        "warnings": stats.get("warnings", []),
+        "hydration_validation_status": stats.get("hydration_validation_status"),
+        "hydration_error_count": stats.get("hydration_error_count", 0),
+        "hydration_duplicate_count": stats.get("hydration_duplicate_count", 0),
+        "lineup_missing_reasons": stats.get("lineup_missing_reasons", {}),
+        "pybaseball_available": stats.get("pybaseball_available"),
+        "pybaseball_functions_attempted": stats.get("pybaseball_functions_attempted", []),
+        "pybaseball_rows_seen": stats.get("pybaseball_rows_seen", 0),
+        "pybaseball_rows_matched": stats.get("pybaseball_rows_matched", 0),
+        "pybaseball_error_count": stats.get("pybaseball_error_count", 0),
+        "advanced_available_count": stats.get("advanced_available_count", 0),
+        "advanced_partial_count": stats.get("advanced_partial_count", 0),
+        "statcast_source_status": stats.get("statcast_source_status", "not_attempted"),
+        "statcast_rows_seen": stats.get("statcast_rows_seen", 0),
+        "statcast_rows_matched": stats.get("statcast_rows_matched", 0),
+        "statcast_pitcher_rows_seen": stats.get("statcast_pitcher_rows_seen", 0),
+        "statcast_pitcher_rows_matched": stats.get("statcast_pitcher_rows_matched", 0),
+        "statcast_error_count": stats.get("statcast_error_count", 0),
+    }
+    _upsert_feature_sync_audit(session, day, captured_at, sync_status)
     if commit:
         session.commit()
     return stats

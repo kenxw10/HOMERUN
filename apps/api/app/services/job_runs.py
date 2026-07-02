@@ -10,7 +10,13 @@ from sqlalchemy.orm import Session
 
 from app.models import JobRun
 from app.services.candidates import generate_candidates
-from app.services.features import feature_coverage, sync_mlb_features, sync_mlb_starters
+from app.services.features import (
+    PREGAME_CONTEXT_SYNC_MODE,
+    feature_coverage,
+    sync_mlb_features,
+    sync_mlb_pregame_context,
+    sync_mlb_starters,
+)
 from app.services.market_family_discovery import run_market_family_discovery
 from app.services.market_family_mapping import sync_market_family_mappings
 from app.services.mlb import sync_results, sync_schedule
@@ -117,6 +123,8 @@ def _feature_sync_skipped_result() -> dict[str, object]:
     return {
         "skipped": True,
         "feature_sync_mode": "cache_only",
+        "feature_sync_skipped": True,
+        "heavy_feature_sync_skipped": True,
         "reason": "candidate_sweep_uses_cached_feature_snapshots",
     }
 
@@ -188,6 +196,69 @@ def _safe_starter_refresh(session: Session, target_date: date) -> dict[str, obje
     }
 
 
+def _starter_refresh_summary(result: dict[str, object]) -> dict[str, object]:
+    return {
+        "status": result.get("validation_status"),
+        "feature_sync_mode": "starter_refresh_lightweight",
+        "heavy_feature_sync_skipped": True,
+        "starter_games_checked": result.get("starter_games_checked"),
+        "games_with_both_starters": result.get("games_with_both_starters"),
+        "games_missing_both_starters": result.get("games_missing_both_starters"),
+        "starter_identity_available_count": result.get("starter_identity_available_count"),
+        "pitcher_game_log_available_count": result.get("pitcher_game_log_available_count"),
+        "starter_recent_available_count": result.get("starter_recent_available_count"),
+        "starter_workload_available_count": result.get("starter_workload_available_count"),
+        "feature_snapshots_upserted": result.get("feature_snapshots_upserted"),
+        "errors": result.get("errors", []),
+        "warnings": result.get("warnings", []),
+    }
+
+
+def _safe_pregame_context_refresh(session: Session, target_date: date) -> dict[str, object]:
+    try:
+        with session.begin_nested():
+            result = sync_mlb_pregame_context(session, target_date, update_snapshots=True, commit=False)
+    except Exception as exc:
+        if not session.is_active:
+            session.rollback()
+        starter_summary = {
+            "status": "degraded_pregame_context_refresh_failed",
+            "feature_sync_mode": "starter_refresh_lightweight",
+            "heavy_feature_sync_skipped": True,
+            "error": {"message": str(exc), "type": exc.__class__.__name__},
+            "warnings": ["pregame_context_refresh_failed: candidate-sweep continued with cached feature data."],
+        }
+        return {
+            "status": "degraded_pregame_context_refresh_failed",
+            "feature_sync_mode": PREGAME_CONTEXT_SYNC_MODE,
+            "heavy_feature_sync_skipped": True,
+            "starter_refresh": starter_summary,
+            "error": {"message": str(exc), "type": exc.__class__.__name__},
+            "warnings": ["pregame_context_refresh_failed: candidate-sweep continued with cached feature data."],
+        }
+    return {
+        "status": result.get("validation_status"),
+        "feature_sync_mode": result.get("feature_sync_mode", PREGAME_CONTEXT_SYNC_MODE),
+        "heavy_feature_sync_skipped": True,
+        "starter_refresh": _starter_refresh_summary(result),
+        "starter_games_checked": result.get("starter_games_checked"),
+        "games_with_both_starters": result.get("games_with_both_starters"),
+        "starter_identity_available_count": result.get("starter_identity_available_count"),
+        "lineup_sides_checked": result.get("lineup_sides_checked"),
+        "confirmed_lineup_count": result.get("confirmed_lineup_count"),
+        "partial_lineup_count": result.get("partial_lineup_count"),
+        "missing_lineup_count": result.get("missing_lineup_count"),
+        "lineup_missing_reasons": result.get("lineup_missing_reasons", {}),
+        "pitcher_game_log_available_count": result.get("pitcher_game_log_available_count"),
+        "starter_recent_available_count": result.get("starter_recent_available_count"),
+        "starter_workload_available_count": result.get("starter_workload_available_count"),
+        "feature_snapshots_upserted": result.get("feature_snapshots_upserted"),
+        "feature_snapshots_skipped_missing_existing": result.get("feature_snapshots_skipped_missing_existing"),
+        "errors": result.get("errors", []),
+        "warnings": result.get("warnings", []),
+    }
+
+
 def _missing_cached_feature_candidate_result(
     target_date: date,
     cache_status: dict[str, object],
@@ -204,6 +275,7 @@ def _missing_cached_feature_candidate_result(
         "target_date": target_date.isoformat(),
         "feature_sync_mode": "cache_only",
         "feature_sync_skipped": True,
+        "heavy_feature_sync_skipped": True,
         "cached_feature_snapshot_count": int(cache_status.get("snapshot_count") or 0),
         "candidates": 0,
         "candidates_evaluated": 0,
@@ -410,7 +482,14 @@ def _execute_job_steps(
             "cached_features": cached_features,
             "feature_sync_mode": "cache_only",
             "feature_sync_skipped": True,
+            "heavy_feature_sync_skipped": True,
         }
+        result["pregame_context_refresh"] = _run_step(
+            run,
+            "pregame_context_refresh",
+            lambda: _safe_pregame_context_refresh(session, target),
+        )
+        result["starter_refresh"] = result["pregame_context_refresh"].get("starter_refresh", result["pregame_context_refresh"])
         if cached_features["status"] == "missing_cached_feature_snapshots":
             candidate_result = _missing_cached_feature_candidate_result(
                 target,
@@ -432,11 +511,6 @@ def _execute_job_steps(
                     run, "balance_snapshot", lambda: {"snapshot_id": create_balance_snapshot(session, source="candidate_sweep").id}
                 )
             return result
-        result["starter_refresh"] = _run_step(
-            run,
-            "starter_refresh",
-            lambda: _safe_starter_refresh(session, target),
-        )
         result.update({
             "market_family_mappings": _run_step(
                 run, "market_family_mappings", lambda: sync_market_family_mappings(session, target)

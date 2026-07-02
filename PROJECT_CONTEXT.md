@@ -687,3 +687,13 @@ Every future PR must update this section with:
 - Added cache-age settings: `ADVANCED_PUBLIC_STATS_MAX_STALE_HOURS=72` and `STATCAST_CACHE_MAX_STALE_HOURS=48`. Stale rows stay available for diagnostics but are labeled as cached/stale source health instead of being treated as fresh public ingestion.
 - Candidate-sweep remains cache-only. It still must not call full `sync_mlb_features`, pybaseball, FanGraphs, Statcast/Savant, Open-Meteo, sportsbook APIs, team totals, or umpire logic.
 - No schema migration, frontend redesign, live execution, credential change, sportsbook data, defense module, pregame context refresh, full-game spread paper enablement, model math change, threshold change, risk-cap change, or cron schedule change was added.
+
+### PR3m - Official Pregame Context Refresh and Feature Transparency
+
+- Added protected `POST /v1/sync/mlb-pregame-context?target_date=YYYY-MM-DD|today_et|yesterday_et`. It refreshes target-date starters, official lineups, MLB Stats API pitcher game-log cache rows, and existing mature feature snapshots from official MLB Stats API schedule/feed/boxscore data only.
+- Candidate-sweep remains cache-only for heavy features and now includes a bounded `pregame_context_refresh` step. Sweep results expose `feature_sync_mode=cache_only`, `feature_sync_skipped=true`, `heavy_feature_sync_skipped=true`, and the pregame context summary; no `sync_mlb_features` step is run.
+- The pregame refresh builds on PR3h starter hydration. It preserves the starter summary for existing job diagnostics while adding lineup counts and `lineup_missing_reasons`.
+- Official lineups are marked available only when the MLB feed has nine starting batting-order slots. Partial posted lineups are `partial` with `PARTIAL_LINEUP_POSTED`; empty pregame feeds are `missing` with `LINEUP_NOT_POSTED_YET`; feed failures are `LIVE_FEED_UNAVAILABLE`; live/final feeds without lineup rows are `LIVE_FEED_LINEUP_EMPTY`.
+- Feature coverage/detail reasons now describe official lineup states and optional-provider gaps more explicitly, instead of using one generic cached-lineup message.
+- Daily setup remains the owner of heavy public-source feature ingestion. PR3m does not call pybaseball, FanGraphs, Statcast/Savant, Open-Meteo, sportsbook APIs, team totals, umpire logic, full feature sync, market discovery, WebSocket, settlement, risk caps, model math, thresholds, live execution, production credentials, or cron schedule changes from candidate-sweep.
+- No schema migration, dependency, environment-variable, secret, frontend, live order, or production credential change was added.
