@@ -4690,6 +4690,30 @@ def _merge_boxscore_payload(game: MlbGame, payload: dict[str, object]) -> None:
     game.raw_payload = merged
 
 
+def _lineups_complete_in_payload(payload: dict[str, object]) -> bool:
+    return all(len(parse_starting_lineup_from_game_payload(payload, side)) >= 9 for side in ("home", "away"))
+
+
+def _hydrate_boxscore_lineups_if_needed(game: MlbGame, client: MLBStatsClient) -> dict[str, object] | None:
+    if not game.external_game_id or not str(game.external_game_id).isdigit():
+        return None
+    if _lineups_complete_in_payload(game.raw_payload or {}):
+        return None
+    if not hasattr(client, "get_game_boxscore"):
+        return None
+    try:
+        payload = client.get_game_boxscore(game.external_game_id)
+    except HttpJsonError as exc:
+        return _source_error(source=MLB_STATS_SOURCE, table="mlb_games_boxscore", game_pk=game.external_game_id, exc=exc)
+    except (ValueError, KeyError, TypeError) as exc:
+        return _source_error(source=MLB_STATS_SOURCE, table="mlb_games_boxscore", game_pk=game.external_game_id, exc=exc)
+    except Exception as exc:  # defensive: source failures should degrade the refresh, not 500
+        return _source_error(source=MLB_STATS_SOURCE, table="mlb_games_boxscore", game_pk=game.external_game_id, exc=exc)
+    if payload:
+        _merge_boxscore_payload(game, payload)
+    return None
+
+
 def _starter_side_payload(
     identity: dict[str, object] | None,
     *,
@@ -5040,6 +5064,11 @@ def sync_mlb_pregame_context(
 
     games = _target_games(session, day)
     stats["games_seen"] = len(games)
+    boxscore_client = MLBStatsClient()
+    for game in games:
+        boxscore_error = _hydrate_boxscore_lineups_if_needed(game, boxscore_client)
+        if boxscore_error:
+            _append_error(stats, boxscore_error)
     for game in games:
         for side in ("home", "away"):
             row = _upsert_lineup(session, game, side, day, captured_at)
