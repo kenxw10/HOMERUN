@@ -4697,6 +4697,27 @@ def _lineups_complete_in_payload(payload: dict[str, object]) -> bool:
     return all(len(parse_starting_lineup_from_game_payload(payload, side)) >= 9 for side in ("home", "away"))
 
 
+def _starter_identities_from_payload(payload: dict[str, object]) -> dict[str, dict[str, object] | None]:
+    return {
+        "home": probable_pitcher_from_payload(payload, "home"),
+        "away": probable_pitcher_from_payload(payload, "away"),
+    }
+
+
+def _starter_identities_require_pitcher_refresh(
+    previous: dict[str, dict[str, object] | None],
+    refreshed: dict[str, dict[str, object] | None],
+) -> bool:
+    for side in ("home", "away"):
+        previous_identity = previous.get(side)
+        refreshed_identity = refreshed.get(side)
+        if _pitcher_identity_id(previous_identity) != _pitcher_identity_id(refreshed_identity):
+            return True
+        if _pitcher_identity_requires_source_refresh(previous_identity, refreshed_identity):
+            return True
+    return False
+
+
 def _hydrate_boxscore_lineups_if_needed(game: MlbGame, client: MLBStatsClient) -> dict[str, object] | None:
     if not game.external_game_id or not str(game.external_game_id).isdigit():
         return None
@@ -4916,6 +4937,42 @@ def _upsert_feature_snapshot_for_game(
     return row
 
 
+def _upsert_pitcher_feature_rows_for_games(
+    session: Session,
+    games: list[MlbGame],
+    day: date,
+    captured_at: datetime,
+    stats: dict[str, object],
+) -> None:
+    if not games:
+        return
+    session.flush()
+    mlb_context = _mlb_primary_fetch_context(games, day, {"pitcher"}, stats)
+    statcast_context = {"pitcher_contact_by_id": {}}
+    for game in games:
+        for side in ("home", "away"):
+            _record_feature_row(
+                stats,
+                "pitcher_daily_features",
+                _upsert_mlb_primary_pitcher(
+                    session,
+                    game,
+                    side,
+                    day,
+                    captured_at,
+                    mlb_context,
+                    statcast_context,
+                    stats,
+                    preserve_missing_statcast=True,
+                ),
+            )
+            _record_feature_row(
+                stats,
+                "pitcher_daily_features",
+                _upsert_pitcher(session, game, side, day, captured_at),
+            )
+
+
 def sync_mlb_starters(
     session: Session,
     target_date: date | None = None,
@@ -4986,31 +5043,7 @@ def sync_mlb_starters(
                 stats["games_missing_away_starter"] = int(stats.get("games_missing_away_starter", 0)) + 1
         session.add(game)
 
-    session.flush()
-    mlb_context = _mlb_primary_fetch_context(games, day, {"pitcher"}, stats)
-    statcast_context = {"pitcher_contact_by_id": {}}
-    for game in games:
-        for side in ("home", "away"):
-            _record_feature_row(
-                stats,
-                "pitcher_daily_features",
-                _upsert_mlb_primary_pitcher(
-                    session,
-                    game,
-                    side,
-                    day,
-                    captured_at,
-                    mlb_context,
-                    statcast_context,
-                    stats,
-                    preserve_missing_statcast=True,
-                ),
-            )
-            _record_feature_row(
-                stats,
-                "pitcher_daily_features",
-                _upsert_pitcher(session, game, side, day, captured_at),
-            )
+    _upsert_pitcher_feature_rows_for_games(session, games, day, captured_at, stats)
     session.flush()
     if update_snapshots:
         for game in games:
@@ -5070,10 +5103,18 @@ def sync_mlb_pregame_context(
     games = _target_games(session, day)
     stats["games_seen"] = len(games)
     boxscore_client = MLBStatsClient()
+    starter_reconcile_games: list[MlbGame] = []
     for game in games:
+        previous_starters = _starter_identities_from_payload(game.raw_payload or {})
         boxscore_error = _hydrate_boxscore_lineups_if_needed(game, boxscore_client)
         if boxscore_error:
             _append_error(stats, boxscore_error)
+        refreshed_starters = _starter_identities_from_payload(game.raw_payload or {})
+        if _starter_identities_require_pitcher_refresh(previous_starters, refreshed_starters):
+            starter_reconcile_games.append(game)
+    if starter_reconcile_games:
+        stats["boxscore_starter_reconcile_count"] = len(starter_reconcile_games)
+        _upsert_pitcher_feature_rows_for_games(session, starter_reconcile_games, day, captured_at, stats)
     for game in games:
         for side in ("home", "away"):
             row = _upsert_lineup(session, game, side, day, captured_at)

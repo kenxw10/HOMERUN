@@ -11406,6 +11406,68 @@ def test_sync_mlb_pregame_context_fetches_boxscore_lineups_when_starters_known(m
     assert snapshot.source_statuses["lineup"] == {"home": "available", "away": "available"}
 
 
+def test_sync_mlb_pregame_context_reconciles_boxscore_starter_changes(monkeypatch) -> None:
+    monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "true")
+    get_settings.cache_clear()
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    game_log_calls: list[str] = []
+
+    class FakeMLBStatsClient:
+        def get_schedule(self, *_args, **_kwargs):
+            return {"dates": [{"games": [_starter_schedule_game()]}]}
+
+        def get_game_feed(self, *_args, **_kwargs):
+            return {
+                "gameData": {
+                    "datetime": {"dateTime": "2026-07-01T23:00:00Z"},
+                    "probablePitchers": {
+                        "home": {"id": 1999, "fullName": "Scratched Home Starter", "pitchHand": {"code": "R"}},
+                        "away": {"id": 2999, "fullName": "Scratched Away Starter", "pitchHand": {"code": "L"}},
+                    },
+                }
+            }
+
+        def get_game_boxscore(self, *_args, **_kwargs):
+            return {
+                "teams": {
+                    "home": _boxscore_lineup_team(1000, 3999),
+                    "away": _boxscore_lineup_team(2000, 4999),
+                }
+            }
+
+        def get_pitcher_game_log_stats(self, person_id: str, _season: int):
+            game_log_calls.append(str(person_id))
+            return _starter_game_log_payload()
+
+    monkeypatch.setattr(features, "MLBStatsClient", FakeMLBStatsClient)
+
+    try:
+        with Session(engine) as session:
+            _seed_existing_starter_feature_snapshot(session)
+            result = features.sync_mlb_pregame_context(session, date(2026, 7, 1))
+            game = session.scalar(select(MlbGame).where(MlbGame.external_game_id == "123456"))
+            reconciled_pitcher = session.scalar(
+                select(PitcherDailyFeature)
+                .where(PitcherDailyFeature.pitcher_id == "3999")
+                .where(PitcherDailyFeature.source == features.MLB_STATS_SOURCE)
+            )
+            snapshot = session.scalar(select(MlbFeatureSnapshot).where(MlbFeatureSnapshot.source == features.FEATURE_VERSION))
+    finally:
+        get_settings.cache_clear()
+
+    assert game_log_calls == ["1999", "2999", "3999", "4999"]
+    assert result["boxscore_starter_reconcile_count"] == 1
+    assert game is not None
+    assert features.probable_pitcher_from_payload(game.raw_payload or {}, "home")["id"] == "3999"
+    assert reconciled_pitcher is not None
+    assert reconciled_pitcher.source_status == "available"
+    assert snapshot is not None
+    assert snapshot.features["starter_identity"]["home"]["id"] == "3999"
+    assert snapshot.source_statuses["starter_recent"]["home"] == "available"
+    assert snapshot.source_statuses["starter_workload"]["home"] == "available"
+
+
 def test_sync_mlb_pregame_context_does_not_overwrite_feature_sync_audit(monkeypatch) -> None:
     monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "true")
     get_settings.cache_clear()
