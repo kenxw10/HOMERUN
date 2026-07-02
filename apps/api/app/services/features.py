@@ -5291,14 +5291,25 @@ def _latest_pybaseball_source_audit_error(feature_audit: dict[str, object]) -> d
 
 
 def _statcast_audit_issue(feature_audit: dict[str, object]) -> dict[str, object] | None:
-    if feature_audit.get("statcast_source_status") != "statcast_empty_result":
-        return None
-    return {
-        "source": STATCAST_SOURCE,
-        "table": "statcast_team_contact",
-        "error_code": "statcast_empty_result",
-        "message": "Statcast/Savant team contact returned no rows for the completed date range.",
+    status = feature_audit.get("statcast_source_status")
+    issues = {
+        "statcast_empty_result": {
+            "source": STATCAST_SOURCE,
+            "table": "statcast_team_contact",
+            "error_code": "statcast_empty_result",
+            "message": "Statcast/Savant team contact returned no rows for the completed date range.",
+        },
+        "unavailable_pybaseball_not_installed": {
+            "source": STATCAST_SOURCE,
+            "table": "statcast_fetch_context",
+            "error_code": "unavailable_pybaseball_not_installed",
+            "message": "Statcast/Savant unavailable because pybaseball is not installed.",
+        },
     }
+    issue = issues.get(str(status))
+    if issue is None:
+        return None
+    return issue
 
 
 def _cached_status_from_timestamp(timestamp: object, max_stale_hours: int) -> str:
@@ -5336,7 +5347,8 @@ def _statcast_contact_timestamp(row: object) -> datetime | None:
             parsed = _parsed_status_timestamp(raw_payload.get(key))
             if parsed is not None:
                 return parsed
-    return None
+    captured_at = getattr(row, "captured_at", None)
+    return ensure_aware_utc(captured_at) if captured_at is not None else None
 
 
 def _statcast_db_status(session: Session, feature_audit: dict[str, object]) -> dict[str, object]:
