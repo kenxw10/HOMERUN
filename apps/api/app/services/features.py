@@ -1074,7 +1074,8 @@ def _classify_pybaseball_error(source_function: str, exc: BaseException) -> str:
 
 def _classify_source_error(source: str, table: str, exc: BaseException) -> str:
     if source == STATCAST_SOURCE:
-        if isinstance(exc, (KeyError, TypeError, ValueError)):
+        wrapped = getattr(exc, "error", None) if isinstance(exc, pybaseball_client.PybaseballSourceError) else None
+        if isinstance(exc, (KeyError, TypeError, ValueError)) or isinstance(wrapped, (KeyError, TypeError, ValueError)):
             return "statcast_schema_changed"
         return "statcast_request_failed"
     if source == PYBASEBALL_SOURCE:
@@ -1283,12 +1284,14 @@ def _source_error(
     exc: BaseException,
     game_pk: object | None = None,
 ) -> dict[str, object]:
+    detail_exc = getattr(exc, "error", None) if isinstance(exc, pybaseball_client.PybaseballSourceError) else None
+    display_exc = detail_exc if isinstance(detail_exc, BaseException) else getattr(exc, "orig", exc)
     error: dict[str, object] = {
         "source": source,
         "table": table,
         "error_code": _classify_source_error(source, table, exc),
-        "error_type": exc.__class__.__name__,
-        "message": str(getattr(exc, "orig", exc)),
+        "error_type": display_exc.__class__.__name__,
+        "message": str(display_exc),
     }
     if game_pk is not None:
         error["game_pk"] = str(game_pk)

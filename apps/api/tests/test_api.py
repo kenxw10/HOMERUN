@@ -8419,6 +8419,19 @@ def test_pybaseball_fangraphs_status_detects_wrapped_403() -> None:
     assert stats["errors"][0]["message"] == "HTTP Error 403: Forbidden"
 
 
+def test_statcast_source_error_detects_wrapped_schema_error() -> None:
+    wrapped = features.pybaseball_client.PybaseballSourceError(
+        "pybaseball call failed.",
+        function_name="statcast",
+        error=ValueError("missing Statcast launch_speed column"),
+    )
+
+    error = features._source_error(source=features.STATCAST_SOURCE, table="statcast_team_contact", exc=wrapped)
+
+    assert error["error_code"] == "statcast_schema_changed"
+    assert error["message"] == "missing Statcast launch_speed column"
+
+
 def test_mlb_stats_primary_populates_features_when_fangraphs_403(monkeypatch) -> None:
     monkeypatch.setenv("FEATURE_SYNC_ENABLE_NETWORK_SOURCES", "true")
     get_settings.cache_clear()
