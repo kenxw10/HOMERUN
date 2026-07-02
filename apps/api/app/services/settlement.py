@@ -25,6 +25,7 @@ from app.time_utils import ensure_aware_utc, get_dashboard_zone, utc_now
 
 FINAL_STATUS_TOKENS = ("final", "game over", "completed")
 VOID_STATUS_TOKENS = ("cancel", "void")
+FIRST_FIVE_MARKET_TYPES = {FIRST_FIVE_WINNER, FIRST_FIVE_SPREAD, FIRST_FIVE_TOTAL}
 
 
 def _target_bounds(target_date: date | None) -> tuple[datetime, datetime] | None:
@@ -74,8 +75,16 @@ def _first_five_runs(game: MlbGame) -> tuple[int, int] | None:
     return away, home
 
 
-def _score_context(game: MlbGame, inning_scope: str | None) -> tuple[int, int] | None:
-    if inning_scope == "first_five":
+def first_five_complete(game: MlbGame | None) -> bool:
+    return game is not None and _first_five_runs(game) is not None
+
+
+def is_first_five_market(market_type: str | None, inning_scope: str | None = None) -> bool:
+    return inning_scope == "first_five" or market_type in FIRST_FIVE_MARKET_TYPES
+
+
+def _score_context(game: MlbGame, inning_scope: str | None, market_type: str | None = None) -> tuple[int, int] | None:
+    if is_first_five_market(market_type, inning_scope):
         return _first_five_runs(game)
     if game.away_score is None or game.home_score is None:
         return None
@@ -128,12 +137,14 @@ def _skip_reason(
 ) -> str:
     if market_type not in PAPER_SUPPORTED_MARKET_FAMILIES:
         return "unsupported"
-    if _status_kind(game.status) == "open":
-        return "not_final"
+    status_kind = _status_kind(game.status)
+    first_five_market = is_first_five_market(market_type, inning_scope)
     if market_type != FULL_GAME_WINNER and settlement_rule_status != "paper_supported":
         return "parse_uncertain"
-    if inning_scope == "first_five" and _first_five_runs(game) is None:
-        return "missing_f5_linescore"
+    if first_five_market and _first_five_runs(game) is None:
+        return "first_five_not_complete" if status_kind == "open" else "missing_f5_linescore"
+    if status_kind == "open":
+        return "not_final_full_game"
     if market_type in {FULL_GAME_SPREAD, FIRST_FIVE_SPREAD} and line_value is None:
         return "missing_line"
     if market_type in {FULL_GAME_TOTAL, FIRST_FIVE_TOTAL} and (line_value is None or over_under_side not in {"over", "under"}):
@@ -146,7 +157,7 @@ def _skip_reason(
             return "invalid_selection"
     if selection_code is None and market_type in {FULL_GAME_SPREAD, FIRST_FIVE_WINNER, FIRST_FIVE_SPREAD}:
         return "invalid_selection"
-    return "not_final"
+    return "not_final_full_game"
 
 
 def _contract_outcome(
@@ -165,16 +176,19 @@ def _contract_outcome(
         return None
 
     status_kind = _status_kind(game.status)
-    if status_kind == "open":
-        return None
     if status_kind == "void":
         return "void", "VOID"
+    first_five_market = is_first_five_market(market_type, inning_scope)
+    if status_kind == "open" and not first_five_market:
+        return None
+    if first_five_market and not first_five_complete(game):
+        return None
 
     if market_type != FULL_GAME_WINNER and settlement_rule_status != "paper_supported":
         return None
 
     side = (contract_side or "yes").lower()
-    scores = _score_context(game, inning_scope)
+    scores = _score_context(game, inning_scope, market_type)
     if scores is None:
         return None
 
@@ -279,6 +293,25 @@ def _candidate_outcome(
     )
 
 
+def _record_skip(result: dict[str, object], reason: str, *, prefix: str = "skipped") -> None:
+    key = f"{prefix}_{reason}"
+    if key in result:
+        result[key] = int(result[key]) + 1
+    skip_reasons_key = "candidate_label_skip_reasons" if prefix == "candidate_labels_skipped" else "skip_reasons"
+    skip_reasons = result.setdefault(skip_reasons_key, {})
+    if isinstance(skip_reasons, dict):
+        skip_reasons[reason] = int(skip_reasons.get(reason) or 0) + 1
+
+    legacy_reason = {
+        "not_final_full_game": "not_final",
+        "first_five_not_complete": "not_final",
+    }.get(reason)
+    if legacy_reason:
+        legacy_key = f"{prefix}_{legacy_reason}"
+        if legacy_key in result:
+            result[legacy_key] = int(result[legacy_key]) + 1
+
+
 def _settlement_amounts(trade: PaperTrade, outcome: str) -> tuple[Decimal, Decimal, Decimal, Decimal]:
     quantity = Decimal(trade.quantity)
     cost = trade.entry_price * quantity
@@ -353,21 +386,27 @@ def settle_paper_trades(
         "settled": 0,
         "voided": 0,
         "skipped_not_final": 0,
+        "skipped_not_final_full_game": 0,
+        "skipped_first_five_not_complete": 0,
         "skipped_unsupported": 0,
         "skipped_invalid_selection": 0,
         "skipped_parse_uncertain": 0,
         "skipped_missing_line": 0,
         "skipped_missing_f5_linescore": 0,
+        "skip_reasons": {},
         "already_settled": 0,
         "candidate_labels_checked": len(candidate_rows),
         "candidate_labels_created": 0,
         "candidate_labels_already_set": 0,
         "candidate_labels_skipped_not_final": 0,
+        "candidate_labels_skipped_not_final_full_game": 0,
+        "candidate_labels_skipped_first_five_not_complete": 0,
         "candidate_labels_skipped_unsupported": 0,
         "candidate_labels_skipped_invalid_selection": 0,
         "candidate_labels_skipped_parse_uncertain": 0,
         "candidate_labels_skipped_missing_line": 0,
         "candidate_labels_skipped_missing_f5_linescore": 0,
+        "candidate_label_skip_reasons": {},
         "snapshot_id": None,
     }
 
@@ -393,24 +432,7 @@ def settle_paper_trades(
                     market.settlement_rule_status,
                 ),
             )
-            if reason == "unsupported":
-                result["candidate_labels_skipped_unsupported"] = int(result["candidate_labels_skipped_unsupported"]) + 1
-            elif reason == "invalid_selection":
-                result["candidate_labels_skipped_invalid_selection"] = (
-                    int(result["candidate_labels_skipped_invalid_selection"]) + 1
-                )
-            elif reason == "parse_uncertain":
-                result["candidate_labels_skipped_parse_uncertain"] = (
-                    int(result["candidate_labels_skipped_parse_uncertain"]) + 1
-                )
-            elif reason == "missing_line":
-                result["candidate_labels_skipped_missing_line"] = int(result["candidate_labels_skipped_missing_line"]) + 1
-            elif reason == "missing_f5_linescore":
-                result["candidate_labels_skipped_missing_f5_linescore"] = (
-                    int(result["candidate_labels_skipped_missing_f5_linescore"]) + 1
-                )
-            else:
-                result["candidate_labels_skipped_not_final"] = int(result["candidate_labels_skipped_not_final"]) + 1
+            _record_skip(result, reason, prefix="candidate_labels_skipped")
             continue
 
         outcome_value, _resolution = outcome
@@ -445,18 +467,7 @@ def settle_paper_trades(
                     market.settlement_rule_status,
                 ),
             )
-            if reason == "unsupported":
-                result["skipped_unsupported"] = int(result["skipped_unsupported"]) + 1
-            elif reason == "invalid_selection":
-                result["skipped_invalid_selection"] = int(result["skipped_invalid_selection"]) + 1
-            elif reason == "parse_uncertain":
-                result["skipped_parse_uncertain"] = int(result["skipped_parse_uncertain"]) + 1
-            elif reason == "missing_line":
-                result["skipped_missing_line"] = int(result["skipped_missing_line"]) + 1
-            elif reason == "missing_f5_linescore":
-                result["skipped_missing_f5_linescore"] = int(result["skipped_missing_f5_linescore"]) + 1
-            else:
-                result["skipped_not_final"] = int(result["skipped_not_final"]) + 1
+            _record_skip(result, reason)
             continue
 
         outcome_value, resolution = outcome

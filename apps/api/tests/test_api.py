@@ -6802,6 +6802,348 @@ def test_paper_settlement_keeps_suspended_games_open() -> None:
     assert settlement is None
 
 
+def _linescore_payload(innings: list[tuple[int | None, int | None]]) -> dict[str, object]:
+    rows = []
+    for away_runs, home_runs in innings:
+        inning: dict[str, object] = {"away": {}, "home": {}}
+        if away_runs is not None:
+            inning["away"] = {"runs": away_runs}
+        if home_runs is not None:
+            inning["home"] = {"runs": home_runs}
+        rows.append(inning)
+    return {"linescore": {"innings": rows}}
+
+
+def _add_settlement_trade(
+    session: Session,
+    *,
+    epoch_id: int,
+    game: MlbGame,
+    ticker: str,
+    family: str,
+    contract_side: str = "yes",
+    line: Decimal | None = None,
+    selection: str | None = None,
+    total_side: str | None = None,
+    inning_scope: str = "full_game",
+    market_status: str = "closed",
+    current_price: Decimal = Decimal("0.4000"),
+    with_position: bool = False,
+) -> tuple[PaperTrade, ModelCandidate, KalshiMarket, Position | None]:
+    market = KalshiMarket(
+        kalshi_market_id=f"KX-{ticker}",
+        ticker=ticker,
+        title=ticker,
+        status=market_status,
+        market_family=family,
+        market_type=family,
+        line_value=line,
+        selection_code=selection,
+        over_under_side=total_side,
+        inning_scope=inning_scope,
+        settlement_rule_status="paper_supported",
+    )
+    session.add(market)
+    session.flush()
+    mapping = _add_candidate_mapping(
+        session,
+        game,
+        market,
+        mapping_status="confirmed",
+        market_family=family,
+        market_type=family,
+        line_value=line,
+        selection_code=selection,
+        over_under_side=total_side,
+        inning_scope=inning_scope,
+        settlement_rule_status="paper_supported",
+    )
+    session.flush()
+    candidate = ModelCandidate(
+        paper_trading_epoch_id=epoch_id,
+        mlb_game_id=game.id,
+        kalshi_market_id=market.id,
+        mapping_id=mapping.id,
+        evaluated_at=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
+        features={},
+        decision="paper_trade",
+        market_type=family,
+        contract_side=contract_side,
+        training_eligible=False,
+        line_value=line,
+        selection_code=selection,
+        over_under_side=total_side,
+        inning_scope=inning_scope,
+        settlement_rule_status="paper_supported",
+    )
+    session.add(candidate)
+    session.flush()
+    trade = PaperTrade(
+        paper_trading_epoch_id=epoch_id,
+        candidate_id=candidate.id,
+        market_ticker=ticker,
+        contract_side=contract_side,
+        entry_price=Decimal("0.4500"),
+        current_price=current_price,
+        quantity=1,
+        entry_time=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
+        status="open",
+        market_family=family,
+        line_value=line,
+        selection_code=selection,
+        over_under_side=total_side,
+        inning_scope=inning_scope,
+        settlement_rule_status="paper_supported",
+        training_eligible=False,
+    )
+    session.add(trade)
+    position = None
+    if with_position:
+        position = Position(
+            kalshi_market_id=market.id,
+            market_ticker=ticker,
+            contract_side=contract_side,
+            entry_price=trade.entry_price,
+            current_price=current_price,
+            quantity=1,
+            opened_at=trade.entry_time,
+            status="open",
+        )
+        session.add(position)
+    return trade, candidate, market, position
+
+
+def test_first_five_total_settles_before_full_game_final_and_is_idempotent() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    settled_at = datetime(2026, 7, 1, 22, 0, tzinfo=UTC)
+
+    with Session(engine) as session:
+        epoch_id = _active_epoch_id(session)
+        game = MlbGame(
+            external_game_id="settle-f5-total-early-win",
+            home_team="Milwaukee Brewers",
+            away_team="Cincinnati Reds",
+            home_abbreviation="MIL",
+            away_abbreviation="CIN",
+            scheduled_start=datetime(2026, 7, 1, 19, 10, tzinfo=UTC),
+            status="In Progress",
+            raw_payload=_linescore_payload([(1, 0), (0, 1), (1, 0), (0, 0), (1, 1)]),
+        )
+        session.add(game)
+        session.flush()
+        trade, candidate, _market, position = _add_settlement_trade(
+            session,
+            epoch_id=epoch_id,
+            game=game,
+            ticker="KXMLBF5TOTAL-26JUL011510CINMIL-OVER-3.5",
+            family="first_five_total",
+            line=Decimal("3.5000"),
+            total_side="over",
+            inning_scope="first_five",
+            current_price=Decimal("0.0000"),
+            with_position=True,
+        )
+        session.commit()
+
+        result = settle_paper_trades(session, date(2026, 7, 1), now=settled_at)
+        second_result = settle_paper_trades(session, date(2026, 7, 1), now=settled_at)
+        session.refresh(trade)
+        session.refresh(candidate)
+        assert position is not None
+        session.refresh(position)
+        settlements = list(session.scalars(select(Settlement)))
+
+    assert result["settled"] == 1
+    assert result["skipped_not_final"] == 0
+    assert result["skipped_first_five_not_complete"] == 0
+    assert second_result["settled"] == 0
+    assert len(settlements) == 1
+    assert trade.status == "settled"
+    assert trade.outcome == "win"
+    assert trade.current_price == Decimal("1.0000")
+    assert trade.exit_price == Decimal("1.0000")
+    assert position.status == "settled"
+    assert position.current_price == Decimal("1.0000")
+    assert candidate.outcome == "win"
+
+
+def test_first_five_total_loss_settles_before_full_game_final() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        epoch_id = _active_epoch_id(session)
+        game = MlbGame(
+            external_game_id="settle-f5-total-early-loss",
+            home_team="Milwaukee Brewers",
+            away_team="Cincinnati Reds",
+            home_abbreviation="MIL",
+            away_abbreviation="CIN",
+            scheduled_start=datetime(2026, 7, 1, 19, 10, tzinfo=UTC),
+            status="In Progress",
+            raw_payload=_linescore_payload([(0, 0), (1, 0), (0, 0), (0, 1), (0, 0)]),
+        )
+        session.add(game)
+        session.flush()
+        trade, _candidate, _market, _position = _add_settlement_trade(
+            session,
+            epoch_id=epoch_id,
+            game=game,
+            ticker="KXMLBF5TOTAL-26JUL011510CINMIL-OVER-3.5",
+            family="first_five_total",
+            line=Decimal("3.5000"),
+            total_side="over",
+            inning_scope="first_five",
+        )
+        session.commit()
+
+        result = settle_paper_trades(session, date(2026, 7, 1), now=datetime(2026, 7, 1, 22, 0, tzinfo=UTC))
+        session.refresh(trade)
+
+    assert result["settled"] == 1
+    assert trade.status == "settled"
+    assert trade.outcome == "loss"
+    assert trade.current_price == Decimal("0.0000")
+    assert trade.exit_price == Decimal("0.0000")
+
+
+def test_first_five_total_waits_when_linescore_incomplete() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        epoch_id = _active_epoch_id(session)
+        game = MlbGame(
+            external_game_id="settle-f5-total-incomplete",
+            home_team="Milwaukee Brewers",
+            away_team="Cincinnati Reds",
+            home_abbreviation="MIL",
+            away_abbreviation="CIN",
+            scheduled_start=datetime(2026, 7, 1, 19, 10, tzinfo=UTC),
+            status="In Progress",
+            raw_payload=_linescore_payload([(1, 0), (0, 1), (1, 0), (0, 0)]),
+        )
+        session.add(game)
+        session.flush()
+        trade, _candidate, _market, _position = _add_settlement_trade(
+            session,
+            epoch_id=epoch_id,
+            game=game,
+            ticker="KXMLBF5TOTAL-26JUL011510CINMIL-OVER-3.5",
+            family="first_five_total",
+            line=Decimal("3.5000"),
+            total_side="over",
+            inning_scope="first_five",
+        )
+        session.commit()
+
+        result = settle_paper_trades(session, date(2026, 7, 1), now=datetime(2026, 7, 1, 21, 0, tzinfo=UTC))
+        session.refresh(trade)
+
+    assert result["settled"] == 0
+    assert result["skipped_first_five_not_complete"] == 1
+    assert result["skipped_not_final"] == 1
+    assert result["skip_reasons"]["first_five_not_complete"] == 1
+    assert trade.status == "open"
+    assert trade.outcome is None
+
+
+def test_full_game_total_still_waits_until_full_game_final() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        epoch_id = _active_epoch_id(session)
+        game = MlbGame(
+            external_game_id="settle-full-total-open",
+            home_team="Milwaukee Brewers",
+            away_team="Cincinnati Reds",
+            home_abbreviation="MIL",
+            away_abbreviation="CIN",
+            scheduled_start=datetime(2026, 7, 1, 19, 10, tzinfo=UTC),
+            status="In Progress",
+            home_score=4,
+            away_score=3,
+            raw_payload=_linescore_payload([(1, 0), (0, 1), (1, 0), (0, 0), (1, 1)]),
+        )
+        session.add(game)
+        session.flush()
+        trade, _candidate, _market, _position = _add_settlement_trade(
+            session,
+            epoch_id=epoch_id,
+            game=game,
+            ticker="KXMLBTOTAL-26JUL011510CINMIL-OVER-8.5",
+            family="full_game_total",
+            line=Decimal("8.5000"),
+            total_side="over",
+            inning_scope="full_game",
+        )
+        session.commit()
+
+        result = settle_paper_trades(session, date(2026, 7, 1), now=datetime(2026, 7, 1, 22, 0, tzinfo=UTC))
+        session.refresh(trade)
+
+    assert result["settled"] == 0
+    assert result["skipped_not_final_full_game"] == 1
+    assert result["skipped_not_final"] == 1
+    assert result["skip_reasons"]["not_final_full_game"] == 1
+    assert trade.status == "open"
+    assert trade.outcome is None
+
+
+def test_first_five_winner_and_spread_settle_before_full_game_final() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        epoch_id = _active_epoch_id(session)
+        game = MlbGame(
+            external_game_id="settle-f5-winner-spread-open",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+            status="In Progress",
+            raw_payload=_linescore_payload([(1, 0), (0, 0), (0, 1), (1, 0), (0, 0)]),
+        )
+        session.add(game)
+        session.flush()
+        winner_trade, _winner_candidate, _winner_market, _winner_position = _add_settlement_trade(
+            session,
+            epoch_id=epoch_id,
+            game=game,
+            ticker="KXMLBF5-26JUL011900SEAPIT-SEA",
+            family="first_five_winner",
+            selection="SEA",
+            inning_scope="first_five",
+        )
+        spread_trade, _spread_candidate, _spread_market, _spread_position = _add_settlement_trade(
+            session,
+            epoch_id=epoch_id,
+            game=game,
+            ticker="KXMLBF5SPREAD-26JUL011900SEAPIT-PIT+1",
+            family="first_five_spread",
+            line=Decimal("1.0000"),
+            selection="PIT",
+            inning_scope="first_five",
+        )
+        session.commit()
+
+        result = settle_paper_trades(session, date(2026, 7, 1), now=datetime(2026, 7, 2, 1, 0, tzinfo=UTC))
+        session.refresh(winner_trade)
+        session.refresh(spread_trade)
+
+    assert result["settled"] == 2
+    assert winner_trade.status == "settled"
+    assert winner_trade.outcome == "win"
+    assert winner_trade.current_price == Decimal("1.0000")
+    assert spread_trade.status == "settled"
+    assert spread_trade.outcome == "push"
+    assert spread_trade.current_price == spread_trade.entry_price
+
+
 def test_paper_settlement_handles_spread_total_and_first_five_families() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
@@ -17126,6 +17468,144 @@ def test_open_position_price_refresh_complements_last_price_for_no_side_batch_ma
     assert result["request_counters"]["market_batch_requests"] == 1
     assert result["request_counters"]["orderbook_requests"] == 0
     assert open_trade.current_price == Decimal("0.3000")
+
+
+def test_open_position_price_refresh_skips_settlement_ready_first_five_trade() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    class FakeClosedF5Client:
+        request_count = 0
+        rate_limited_count = 0
+
+        def get_markets_by_tickers(self, tickers: list[str]):
+            self.request_count += 1
+            return {
+                "markets": [
+                    {
+                        "ticker": "KXMLBF5TOTAL-26JUL011510CINMIL-OVER-3.5",
+                        "id": "KX-F5-READY",
+                        "title": "First five total",
+                        "status": "closed",
+                        "yes_bid_dollars": "0.9900",
+                    }
+                ]
+            }
+
+        def get_orderbook(self, ticker: str):
+            raise AssertionError("settlement-ready F5 marks should not fall back to orderbook")
+
+    old_mark_time = datetime(2026, 7, 1, 19, 0, tzinfo=UTC)
+    with Session(engine) as session:
+        epoch_id = _active_epoch_id(session)
+        game = MlbGame(
+            external_game_id="refresh-f5-settlement-ready",
+            home_team="Milwaukee Brewers",
+            away_team="Cincinnati Reds",
+            home_abbreviation="MIL",
+            away_abbreviation="CIN",
+            scheduled_start=datetime(2026, 7, 1, 19, 10, tzinfo=UTC),
+            status="In Progress",
+            raw_payload=_linescore_payload([(1, 0), (0, 1), (1, 0), (0, 0), (1, 1)]),
+        )
+        session.add(game)
+        session.flush()
+        trade, _candidate, market, _position = _add_settlement_trade(
+            session,
+            epoch_id=epoch_id,
+            game=game,
+            ticker="KXMLBF5TOTAL-26JUL011510CINMIL-OVER-3.5",
+            family="first_five_total",
+            line=Decimal("3.5000"),
+            total_side="over",
+            inning_scope="first_five",
+            current_price=Decimal("0.4500"),
+            market_status="open",
+        )
+        trade.current_price_updated_at = old_mark_time
+        session.commit()
+
+        result = position_refresh.refresh_open_position_prices(session, client=FakeClosedF5Client())
+        session.refresh(trade)
+        session.refresh(market)
+
+    assert result["checked"] == 1
+    assert result["updated"] == 0
+    assert result["skipped"] == 1
+    assert result["skipped_first_five_settlement_ready"] == 1
+    assert result["skipped_closed_f5_market"] == 0
+    assert trade.current_price == Decimal("0.4500")
+    assert trade.current_price_updated_at == old_mark_time.replace(tzinfo=None)
+    assert market.status == "open"
+
+
+def test_open_position_price_refresh_skips_closed_first_five_market_before_linescore_complete() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    class FakeClosedF5Client:
+        request_count = 0
+        rate_limited_count = 0
+
+        def get_markets_by_tickers(self, tickers: list[str]):
+            self.request_count += 1
+            return {
+                "markets": [
+                    {
+                        "ticker": "KXMLBF5TOTAL-26JUL011510CINMIL-OVER-3.5",
+                        "id": "KX-F5-CLOSED-BEFORE-LINESCORE",
+                        "title": "First five total",
+                        "status": "closed",
+                        "yes_bid_dollars": "0.9900",
+                    }
+                ]
+            }
+
+        def get_orderbook(self, ticker: str):
+            raise AssertionError("closed F5 batch quote should not fall back to orderbook")
+
+    old_mark_time = datetime(2026, 7, 1, 19, 0, tzinfo=UTC)
+    with Session(engine) as session:
+        epoch_id = _active_epoch_id(session)
+        game = MlbGame(
+            external_game_id="refresh-f5-closed-before-linescore",
+            home_team="Milwaukee Brewers",
+            away_team="Cincinnati Reds",
+            home_abbreviation="MIL",
+            away_abbreviation="CIN",
+            scheduled_start=datetime(2026, 7, 1, 19, 10, tzinfo=UTC),
+            status="In Progress",
+            raw_payload=_linescore_payload([(1, 0), (0, 1), (1, 0), (0, 0)]),
+        )
+        session.add(game)
+        session.flush()
+        trade, _candidate, market, _position = _add_settlement_trade(
+            session,
+            epoch_id=epoch_id,
+            game=game,
+            ticker="KXMLBF5TOTAL-26JUL011510CINMIL-OVER-3.5",
+            family="first_five_total",
+            line=Decimal("3.5000"),
+            total_side="over",
+            inning_scope="first_five",
+            current_price=Decimal("0.4500"),
+            market_status="open",
+        )
+        trade.current_price_updated_at = old_mark_time
+        session.commit()
+
+        result = position_refresh.refresh_open_position_prices(session, client=FakeClosedF5Client())
+        session.refresh(trade)
+        session.refresh(market)
+
+    assert result["checked"] == 1
+    assert result["updated"] == 0
+    assert result["skipped"] == 1
+    assert result["skipped_first_five_settlement_ready"] == 0
+    assert result["skipped_closed_f5_market"] == 1
+    assert trade.current_price == Decimal("0.4500")
+    assert trade.current_price_updated_at == old_mark_time.replace(tzinfo=None)
+    assert market.status == "closed"
 
 
 def test_open_position_price_refresh_does_not_stamp_cached_prices_on_orderbook_error() -> None:
