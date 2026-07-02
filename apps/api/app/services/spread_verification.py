@@ -38,6 +38,14 @@ SPREAD_LINE_FIELDS = SPREAD_TEXT_FIELDS + ("custom_strike", "functional_strike",
 NO_SPREAD_TEXT_FIELDS = ("no_sub_title", "no_subtitle", "no_title")
 VERIFIED_STATUS = "verified"
 UNVERIFIED_STATUS = "text_present_unverified"
+CURRENT_AUDIT_METADATA_KEYS = {
+    "audit_status",
+    "reason_codes",
+    "no_is_true_complement",
+    "complement_safe_for_paper_settlement",
+    "push_possible",
+    "push_rule_verified",
+}
 
 
 @dataclass(frozen=True)
@@ -158,17 +166,18 @@ def _line_text(value: Decimal | None) -> str:
 def _line_text_variants(value: Decimal | None) -> set[str]:
     if value is None:
         return set()
-    base = _line_text(value)
-    variants = {base}
-    if value > 0:
-        variants.add(f"+{base}")
-    variants.add(_format_line(value))
+    variants = {_format_line(value)}
+    if value == Decimal("0"):
+        variants.add(_line_text(value))
     return {variant for variant in variants if variant}
 
 
 def _text_mentions_line(value: object, line_value: Decimal | None) -> bool:
     text = str(value or "").replace("−", "-")
-    return any(variant in text for variant in _line_text_variants(line_value))
+    return any(
+        re.search(rf"(?<![A-Z0-9.+-]){re.escape(variant)}(?![A-Z0-9.])", text, flags=re.IGNORECASE)
+        for variant in _line_text_variants(line_value)
+    )
 
 
 def _format_line(value: Decimal | None) -> str:
@@ -339,7 +348,7 @@ def verify_spread_market(
     )
 
     reason_codes: list[str] = []
-    if family_key != FULL_GAME_SPREAD:
+    if family_key not in SPREAD_FAMILIES:
         reason_codes.append("unsupported_family")
     if not payload.get("ticker") and market is None:
         reason_codes.append("missing_market_data")
@@ -424,7 +433,12 @@ def spread_verification_from_mapping(
     family_key = mapping.market_family or market.market_family or market.market_type or ""
     metadata = mapping.mapping_metadata or {}
     existing = metadata.get("spread_verification")
-    if isinstance(existing, dict) and existing.get("verified") is True:
+    if (
+        isinstance(existing, dict)
+        and existing.get("verified") is True
+        and CURRENT_AUDIT_METADATA_KEYS.issubset(existing.keys())
+        and existing.get("audit_status") in FULL_GAME_SPREAD_AUDIT_STATUSES
+    ):
         line = existing.get("line_value")
         return SpreadVerification(
             family_key=family_key,
