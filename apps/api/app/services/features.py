@@ -1737,6 +1737,27 @@ def _cached_team_daily(session: Session | None, day: date, team_code: str | None
     return _preferred_feature_row(rows)
 
 
+def _cached_team_daily_source(
+    session: Session | None,
+    day: date,
+    team_code: str | None,
+    source: str,
+) -> TeamDailyFeature | None:
+    if session is None or not team_code:
+        return None
+    rows = list(
+        session.scalars(
+            select(TeamDailyFeature)
+            .where(TeamDailyFeature.target_date == day)
+            .where(TeamDailyFeature.team_code == team_code)
+            .where(TeamDailyFeature.source == source)
+            .order_by(TeamDailyFeature.updated_at.desc())
+            .limit(10)
+        )
+    )
+    return _preferred_feature_row(rows)
+
+
 def _cached_team_recent(
     session: Session | None,
     day: date,
@@ -1753,6 +1774,29 @@ def _cached_team_recent(
         .where(TeamRecentFeature.window_days == window_days)
         .order_by(TeamRecentFeature.updated_at.desc())
         .limit(10)
+        )
+    )
+    return _preferred_feature_row(rows)
+
+
+def _cached_team_recent_source(
+    session: Session | None,
+    day: date,
+    team_code: str | None,
+    source: str,
+    window_days: int = 14,
+) -> TeamRecentFeature | None:
+    if session is None or not team_code:
+        return None
+    rows = list(
+        session.scalars(
+            select(TeamRecentFeature)
+            .where(TeamRecentFeature.target_date == day)
+            .where(TeamRecentFeature.team_code == team_code)
+            .where(TeamRecentFeature.window_days == window_days)
+            .where(TeamRecentFeature.source == source)
+            .order_by(TeamRecentFeature.updated_at.desc())
+            .limit(10)
         )
     )
     return _preferred_feature_row(rows)
@@ -2160,6 +2204,10 @@ def build_feature_snapshot(
     away_daily = _cached_team_daily(session, target_date, away_code)
     home_recent = _cached_team_recent(session, target_date, home_code)
     away_recent = _cached_team_recent(session, target_date, away_code)
+    home_defense_daily = _cached_team_daily_source(session, target_date, home_code, MLB_STATS_SOURCE)
+    away_defense_daily = _cached_team_daily_source(session, target_date, away_code, MLB_STATS_SOURCE)
+    home_defense_recent = _cached_team_recent_source(session, target_date, home_code, MLB_STATS_SOURCE)
+    away_defense_recent = _cached_team_recent_source(session, target_date, away_code, MLB_STATS_SOURCE)
     home_identity = probable_pitcher_from_payload(game.raw_payload or {}, "home")
     away_identity = probable_pitcher_from_payload(game.raw_payload or {}, "away")
     home_pitcher = _cached_pitcher(session, target_date, home_code, home_identity)
@@ -2326,10 +2374,10 @@ def build_feature_snapshot(
             "away": _injury_module(away_injury, "away", captured_at),
         },
         "defense_catcher": _defense_catcher_module(
-            home_daily,
-            away_daily,
-            home_recent,
-            away_recent,
+            home_defense_daily,
+            away_defense_daily,
+            home_defense_recent,
+            away_defense_recent,
             home_lineup,
             away_lineup,
             captured_at,

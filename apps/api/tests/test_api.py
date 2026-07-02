@@ -9122,6 +9122,116 @@ def test_pybaseball_ingestion_writes_available_advanced_rows_and_snapshots(monke
     assert report["advanced_stats_status"] == "available"
 
 
+def test_defense_catcher_reads_mlb_stats_row_when_offense_prefers_pybaseball() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    target_date = date(2026, 7, 1)
+    captured_at = datetime(2026, 7, 1, 20, 0, tzinfo=UTC)
+    defense_season = {
+        "component": "defense_season",
+        "source_status": "available",
+        "source": features.MLB_STATS_SOURCE,
+        "reason": "team defense season from MLB Stats API fielding game logs",
+        "fielding_percentage": 0.985,
+        "source_fields_present": ["errors", "putOuts", "assists"],
+    }
+    defense_recent = {
+        "component": "defense_recent",
+        "source_status": "available",
+        "source": features.MLB_STATS_SOURCE,
+        "reason": "team defense recent from MLB Stats API fielding game logs over 14 days",
+        "double_plays_per_game": 0.8,
+        "source_fields_present": ["doublePlays"],
+    }
+
+    with Session(engine) as session:
+        game = MlbGame(
+            external_game_id="defense-source-specific-1",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+            status="scheduled",
+        )
+        session.add(game)
+        session.flush()
+        session.add_all(
+            [
+                TeamDailyFeature(
+                    target_date=target_date,
+                    team_code="PIT",
+                    captured_at=captured_at,
+                    source=features.PYBASEBALL_SOURCE,
+                    source_status="available",
+                    confidence=Decimal("0.9000"),
+                    completeness=Decimal("0.9000"),
+                    stale=False,
+                    features={"runs_per_game": 5.0, "source_status": "available"},
+                ),
+                TeamDailyFeature(
+                    target_date=target_date,
+                    team_code="PIT",
+                    captured_at=captured_at - timedelta(hours=1),
+                    source=features.MLB_STATS_SOURCE,
+                    source_status="partial",
+                    confidence=Decimal("0.4500"),
+                    completeness=Decimal("0.4500"),
+                    stale=False,
+                    features={"defense_season": defense_season},
+                ),
+                TeamRecentFeature(
+                    target_date=target_date,
+                    team_code="PIT",
+                    window_days=14,
+                    captured_at=captured_at,
+                    source=features.DERIVED_SOURCE,
+                    source_status="available",
+                    confidence=Decimal("0.9000"),
+                    completeness=Decimal("0.9000"),
+                    stale=False,
+                    features={"runs_per_game": 4.8},
+                ),
+                TeamRecentFeature(
+                    target_date=target_date,
+                    team_code="PIT",
+                    window_days=14,
+                    captured_at=captured_at - timedelta(hours=1),
+                    source=features.MLB_STATS_SOURCE,
+                    source_status="partial",
+                    confidence=Decimal("0.4000"),
+                    completeness=Decimal("0.4000"),
+                    stale=False,
+                    features={"defense_recent": defense_recent},
+                ),
+            ]
+        )
+        market = KalshiMarket(
+            kalshi_market_id="KX-DEFENSE-SOURCE",
+            ticker="KXMLBGAME-DEFENSE-SOURCE-PIT",
+            title="Will Pittsburgh win?",
+            status="open",
+            market_family="full_game_winner",
+        )
+        mapping = MarketMapping(
+            mlb_game_id=game.id,
+            kalshi_market_id=1,
+            mapping_status="confirmed",
+            confidence=Decimal("0.9500"),
+            market_family="full_game_winner",
+            selection_code="PIT",
+        )
+        snapshot = features.build_feature_snapshot(game, market, mapping, session=session, now=captured_at)
+
+    assert snapshot["offense_season"]["home"]["source"] == features.PYBASEBALL_SOURCE
+    assert snapshot["offense_recent"]["home"]["source"] == features.DERIVED_SOURCE
+    defense = snapshot["defense_catcher"]["home"]
+    assert defense["team_defense_season"]["source"] == features.MLB_STATS_SOURCE
+    assert defense["team_defense_season"]["fielding_percentage"] == 0.985
+    assert defense["team_defense_recent"]["source"] == features.MLB_STATS_SOURCE
+    assert defense["team_defense_recent"]["double_plays_per_game"] == 0.8
+
+
 def test_handedness_platoon_requires_actual_split_values() -> None:
     captured_at = datetime(2026, 6, 24, 16, 0, tzinfo=UTC)
     empty_daily = TeamDailyFeature(
