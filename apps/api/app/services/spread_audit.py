@@ -90,13 +90,24 @@ def _settlement_preview(game: MlbGame, verification: SpreadVerification) -> dict
         return {"preview_status": "missing_score_or_selection", **formula_fields}
     selected_runs, opponent_runs = scores
     margin = selected_runs - opponent_runs
-    adjusted_margin = Decimal(margin) + line_value
-    yes_outcome = _spread_result(adjusted_margin)
-    no_outcome = yes_outcome
-    if yes_outcome == "win":
-        no_outcome = "loss"
-    elif yes_outcome == "loss":
-        no_outcome = "win"
+    if (
+        verification.condition_type == "team_wins_by_more_than"
+        and verification.selected_team_margin_required_gt is not None
+    ):
+        threshold = verification.selected_team_margin_required_gt
+        adjusted_margin = Decimal(margin) - threshold
+        yes_outcome = "win" if Decimal(margin) > threshold else "loss"
+        no_outcome = "loss" if yes_outcome == "win" else "win"
+        push = False
+    else:
+        adjusted_margin = Decimal(margin) + line_value
+        yes_outcome = _spread_result(adjusted_margin)
+        no_outcome = yes_outcome
+        if yes_outcome == "win":
+            no_outcome = "loss"
+        elif yes_outcome == "loss":
+            no_outcome = "win"
+        push = yes_outcome == "push"
     return {
         "preview_status": "computed",
         "selected_team_score": selected_runs,
@@ -106,7 +117,7 @@ def _settlement_preview(game: MlbGame, verification: SpreadVerification) -> dict
         "line_adjusted_margin": str(adjusted_margin.quantize(Decimal("0.0001"))),
         "yes_outcome": yes_outcome,
         "no_outcome": no_outcome,
-        "push": yes_outcome == "push",
+        "push": push,
         **formula_fields,
     }
 
