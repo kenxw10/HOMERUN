@@ -758,3 +758,13 @@ Every future PR must update this section with:
 - `/v1/model/governance/status` now defaults to the compact registry and accepts `include_details=true` for the full protected diagnostic registry.
 - Lightweight endpoint metrics were added for dashboard summary and protected model diagnostics: duration, approximate response size, RSS before/after when available, and non-secret flag values.
 - No candidate generation, cron schedule, model math, settlement, risk-cap, WebSocket, market-discovery, live execution, credentials, environment-variable, schema, or trading behavior changed.
+
+### PR3p.2 - Governance and Dashboard Query Materialization Hotfix
+
+- Root cause: production validation showed compact response bodies but `/v1/model/governance/status` and `/v1/dashboard/summary` still took roughly 100 seconds and triggered Railway memory pressure. The remaining problem was backend query/materialization work, especially governance status constructing full candidate datasets and dashboard summary loading full candidate/feature ORM rows before compacting.
+- Governance status now uses SQL aggregate count helpers for raw mature resolved samples, clean mature resolved samples, and pre-clean exclusion counts. The full `_resolved_mature_candidates` row loader remains reserved for explicit `run_model_governance` training jobs.
+- Dashboard summary now reuses compact governance status, builds decision breakdowns with grouped SQL counts, reads only `source_statuses`/`data_quality` for feature completeness, and avoids loading `ModelCandidate.features` / `scoring_rationale` JSON on compact position/count paths.
+- Added non-destructive status-query indexes for mature candidate counts, dashboard decision grouping, feature snapshot date/source status lookup, balance snapshot epoch/time reads, and latest job status by epoch/job/time.
+- Endpoint metrics now also cover `/v1/model/parameters/active`; logs remain compact and do not include secrets or full payloads.
+- No candidate generation, cron schedule, governance promotion logic, model probability math, EV threshold, risk cap, settlement, source ingestion, market discovery, WebSocket, live execution, credentials, environment-variable, sportsbook/team-total/umpire, spread activation, or frontend behavior changed.
+- Production validation target: after deploy, `/v1/model/governance/status` and default `/v1/dashboard/summary` should return in under 5 seconds, stay compact, and avoid Railway memory staircase/OOM under repeated dashboard polling.

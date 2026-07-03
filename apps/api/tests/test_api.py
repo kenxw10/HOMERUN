@@ -8287,6 +8287,133 @@ def test_model_governance_clean_cutoff_excludes_pre_cutoff_samples(monkeypatch) 
     assert status["governance_parameter_registry"]["governed_now_count"] >= 1
 
 
+def test_governance_status_uses_aggregate_counts_without_candidate_loader(monkeypatch) -> None:
+    monkeypatch.setenv("MODEL_GOVERNANCE_CLEAN_START_AT", "2026-07-01T00:00:00-04:00")
+    get_settings.cache_clear()
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        epoch_id = _active_epoch_id(session)
+        game = MlbGame(
+            external_game_id="governance-status-aggregate",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 2, 3, 0, tzinfo=UTC),
+            status="Final",
+        )
+        mismatched_game = MlbGame(
+            external_game_id="governance-status-aggregate-mismatched-date",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 4, 23, 0, tzinfo=UTC),
+            status="Final",
+        )
+        session.add_all([game, mismatched_game])
+        session.flush()
+        _add_governance_candidate(
+            session,
+            epoch_id=epoch_id,
+            game_id=game.id,
+            target_date=date(2026, 7, 1),
+            evaluated_at=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
+            resolved_at=datetime(2026, 7, 3, 4, 0, tzinfo=UTC),
+        )
+        _add_governance_candidate(
+            session,
+            epoch_id=epoch_id,
+            game_id=mismatched_game.id,
+            target_date=date(2026, 7, 1),
+            evaluated_at=datetime(2026, 7, 1, 16, 5, tzinfo=UTC),
+            resolved_at=datetime(2026, 7, 3, 4, 5, tzinfo=UTC),
+            outcome="loss",
+        )
+        session.commit()
+
+        def fail_full_loader(*_args, **_kwargs):
+            raise AssertionError("governance status must not build the training candidate dataset")
+
+        monkeypatch.setattr(modeling, "_resolved_mature_candidates", fail_full_loader)
+        status = modeling.governance_status(session)
+
+    assert status["raw_resolved_mature_samples"] == 1
+    assert status["clean_resolved_mature_samples"] == 1
+    assert status["pre_clean_excluded_samples"] == 0
+
+
+def test_dashboard_summary_does_not_deserialize_candidate_json_for_compact_counts(monkeypatch) -> None:
+    def reject_model_candidate_json(value: object) -> object:
+        raw = value.decode("utf-8") if isinstance(value, bytes) else str(value)
+        if "candidate-large-json" in raw:
+            raise AssertionError("compact dashboard must not deserialize ModelCandidate JSON columns")
+        return json.loads(raw)
+
+    monkeypatch.setenv("MODEL_GOVERNANCE_CLEAN_START_AT", "2026-07-02T00:00:00-04:00")
+    get_settings.cache_clear()
+    engine = create_engine("sqlite+pysqlite:///:memory:", json_deserializer=reject_model_candidate_json)
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        epoch_id = _active_epoch_id(session)
+        game = MlbGame(
+            external_game_id="dashboard-compact-candidate-json",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 2, 23, 0, tzinfo=UTC),
+            status="Final",
+        )
+        session.add(game)
+        session.flush()
+        session.add(
+            ModelCandidate(
+                paper_trading_epoch_id=epoch_id,
+                mlb_game_id=game.id,
+                evaluated_at=datetime(2026, 7, 2, 16, 0, tzinfo=UTC),
+                features={"marker": "candidate-large-json"},
+                scoring_rationale={"marker": "candidate-large-json"},
+                probability=Decimal("0.550000"),
+                probability_calibrated=Decimal("0.550000"),
+                target_date=date(2026, 7, 2),
+                fee_estimate=Decimal("0.010000"),
+                price_status="fresh_executable",
+                time_to_start_minutes=420,
+                decision="no_trade_low_quality",
+                outcome="win",
+                resolved_at=datetime(2026, 7, 3, 4, 0, tzinfo=UTC),
+                model_version_tag=modeling.MATURE_MODEL_TAG,
+                feature_version=features.FEATURE_VERSION,
+                training_eligible=True,
+                market_family="full_game_winner",
+                data_quality=Decimal("0.5000"),
+            )
+        )
+        session.commit()
+
+        summary = dashboard.dashboard_summary_from_db(session, date(2026, 7, 2))
+
+    assert summary.model_status.raw_resolved_mature_samples == 1
+    assert summary.decision_breakdown_by_family["full_game_winner"]["no_trade_low_quality"] == 1
+
+
+def test_pr3p2_status_query_indexes_are_registered() -> None:
+    candidate_indexes = {index.name for index in ModelCandidate.__table__.indexes}
+    job_indexes = {index.name for index in JobRun.__table__.indexes}
+    feature_indexes = {index.name for index in MlbFeatureSnapshot.__table__.indexes}
+    balance_indexes = {index.name for index in BalanceSnapshot.__table__.indexes}
+
+    assert "ix_model_candidates_epoch_governance_counts" in candidate_indexes
+    assert "ix_model_candidates_epoch_decision_scope" in candidate_indexes
+    assert "ix_job_runs_epoch_name_started_id" in job_indexes
+    assert "ix_mlb_feature_snapshots_date_source_captured" in feature_indexes
+    assert "ix_balance_snapshots_epoch_captured" in balance_indexes
+
+
 def test_model_governance_keeps_only_one_active_champion() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)

@@ -343,6 +343,31 @@ After deployment, validate:
 5. Confirm `/v1/model/governance/status` is compact by default and `include_details=true` returns the protected full registry.
 6. Confirm no live execution, cron schedule, candidate generation, model math, EV threshold, risk cap, source sync behavior, settlement, market discovery, WebSocket, sportsbook/team-total/umpire, spread activation, secrets, or environment variables changed.
 
+## PR3p.2 Governance And Dashboard Query Materialization Hotfix
+
+PR3p.2 fixes the remaining production memory problem after PR3p.1. PR3p.1 made the response payload compact; PR3p.2 makes the backend query path compact so status endpoints do not materialize large candidate or feature JSON before returning the small payload.
+
+Expected behavior:
+
+- `/v1/model/governance/status` uses aggregate count queries for raw, clean, and pre-clean mature sample counts. It must not build the full training candidate dataset.
+- `/v1/dashboard/summary` uses compact governance status, grouped candidate decision counts, and column-only feature status rows by default.
+- Actual governance training still builds the full clean training dataset only when `POST /v1/run/model-governance` or the governance job is explicitly run.
+- Deep diagnostics remain protected and opt-in. Do not use debug dashboard flags as the frontend polling URL.
+
+After deployment, validate:
+
+1. Restart/redeploy the backend once and wait about 2 minutes for Railway memory to settle.
+2. Confirm `/health` returns quickly.
+3. Confirm `/v1/system/status` returns quickly and still reports paper mode, demo Kalshi environment, live trading disabled, execution kill switch enabled, and database ready.
+4. Call protected `GET /v1/model/governance/status`.
+5. Confirm it returns in under 5 seconds and includes `raw_resolved_mature_samples`, `clean_resolved_mature_samples`, `pre_clean_excluded_samples`, and `clean_filter_exclusion_counts`.
+6. Call default `GET /v1/dashboard/summary?closed_date=2026-07-02`.
+7. Confirm it returns in under 5 seconds, stays compact, and does not include candidate IDs, raw payloads, full source inventory, full job steps, or per-market spread audit rows.
+8. Repeat the default dashboard summary call 3-5 times with 30-45 seconds between calls.
+9. Confirm Railway memory does not staircase upward and there are no 502 responses or OOM warnings.
+10. Open one Vercel dashboard tab and watch Railway memory for about 5 minutes.
+11. Confirm no live execution, cron schedule, candidate generation, model math, EV threshold, risk cap, source sync behavior, settlement, market discovery, WebSocket, sportsbook/team-total/umpire, spread activation, secrets, or environment variables changed.
+
 After deployment, validate:
 
 1. `POST /v1/sync/mlb-pregame-context?target_date=today_et` returns `feature_sync_mode=pregame_context_refresh_lightweight`, target-date games checked, starter IDs/names where MLB has announced them, lineup counts, and explicit lineup missing reasons such as `LINEUP_NOT_POSTED_YET`, `PARTIAL_LINEUP_POSTED`, or `LIVE_FEED_UNAVAILABLE`.
