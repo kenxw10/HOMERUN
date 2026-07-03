@@ -1031,6 +1031,23 @@ def test_governance_status_defaults_to_compact_registry_and_allows_debug_details
     assert "governed_now" in detailed["governance_parameter_registry"]
 
 
+def test_dashboard_governance_details_flag_returns_registry_lists() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        get_or_create_active_paper_epoch(session, starting_balance=Decimal("500.00"))
+        compact = dashboard.dashboard_summary_from_db(session)
+        detailed = dashboard.dashboard_summary_from_db(session, include_governance_details=True)
+
+    compact_registry = compact.model_status.governance_parameter_registry
+    detailed_registry = detailed.model_status.governance_parameter_registry
+    assert "governed_now" not in compact_registry
+    assert compact_registry["governed_now_count"] >= 1
+    assert "governed_now" in detailed_registry
+    assert detailed_registry["governed_now"]["item_count"] >= 1
+
+
 def test_dashboard_source_status_is_summarized_for_model_status(monkeypatch) -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)

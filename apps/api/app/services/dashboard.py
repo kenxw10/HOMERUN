@@ -1020,7 +1020,12 @@ def dashboard_summary_from_db(
         select(ModelParameterVersion).where(ModelParameterVersion.is_active.is_(True))
     )
     last_training, last_calibration, last_threshold = latest_governance_artifacts(session, active_epoch.id)
-    governance_summary = model_governance_status(session, active_epoch.id)
+    include_governance_registry_details = include_diagnostics or include_governance_details
+    governance_summary = model_governance_status(
+        session,
+        active_epoch.id,
+        include_details=include_governance_registry_details,
+    )
     last_prediction = session.scalar(
         select(ModelPredictionRun)
         .where(ModelPredictionRun.paper_trading_epoch_id == active_epoch.id)
@@ -1127,7 +1132,7 @@ def dashboard_summary_from_db(
         ignored_pre_clean_artifacts=dict(governance_summary["ignored_pre_clean_artifacts"]),
         governance_parameter_registry=_compact_governance_registry(
             governance_summary.get("governance_parameter_registry"),
-            include_details=include_diagnostics or include_governance_details,
+            include_details=include_governance_registry_details,
         ),
         governance_status=last_training.status if last_training else "not_run",
         trade_policy=last_prediction.trade_policy if last_prediction and last_prediction.trade_policy else {},
