@@ -41,6 +41,10 @@ class JobRunSummary(BaseModel):
     completed_at: str | None = None
     duration_seconds: int | None = None
     target_date: str | None = None
+    result_is_compact: bool = True
+    step_count: int = 0
+    warning_count: int = 0
+    error_count: int = 0
     result: dict[str, object] = Field(default_factory=dict)
 
 

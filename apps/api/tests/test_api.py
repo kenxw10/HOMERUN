@@ -95,7 +95,7 @@ from app.services.portfolio import calculate_paper_portfolio
 from app.services.settlement import settle_paper_trades
 from app.services.spread_audit import run_spread_audit
 from app.services.spread_verification import verify_spread_market
-from app.time_utils import classify_time_bucket, eastern_display
+from app.time_utils import classify_time_bucket, eastern_display, today_eastern
 from app.workers import kalshi_ws_paper
 
 client = TestClient(app)
@@ -907,6 +907,168 @@ def test_dashboard_job_status_fetches_latest_per_job_without_global_truncation()
     assert summary.job_status["price-refresh"].result == {"refresh_index": 54}
     assert summary.job_status["governance"].result == {"governance": "present"}
     assert summary.job_status["full-paper-cycle"].result == {"cycle": "present"}
+
+
+def test_dashboard_summary_compacts_heavy_job_payloads_by_default() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    now = datetime(2026, 7, 3, 16, 0, tzinfo=UTC)
+    heavy_items = [
+        {
+            "market_ticker": f"KXMLBSPREAD-ROW-{index}",
+            "raw_payload": {"large": "x" * 1000},
+            "features": {"large": "y" * 1000},
+        }
+        for index in range(8)
+    ]
+
+    with Session(engine) as session:
+        active = get_or_create_active_paper_epoch(session, starting_balance=Decimal("500.00"))
+        session.add(
+            JobRun(
+                job_name="spread-audit",
+                job_type="paper_ops",
+                paper_trading_epoch_id=active.id,
+                status="succeeded",
+                started_at=now,
+                completed_at=now + timedelta(seconds=10),
+                result={
+                    "status": "completed",
+                    "checked": 8,
+                    "items": heavy_items,
+                    "examples_by_reason": {"needs_review": heavy_items},
+                },
+                warnings=[{"message": "sample warning"}],
+                errors=[],
+                steps=[{"name": "spread_audit", "status": "succeeded"}],
+            )
+        )
+        session.commit()
+
+        summary = dashboard.dashboard_summary_from_db(session)
+        debug_summary = dashboard.dashboard_summary_from_db(session, include_job_results=True)
+
+    compact = summary.job_status["spread-audit"]
+    assert compact.result_is_compact is True
+    assert compact.step_count == 1
+    assert compact.warning_count == 1
+    assert compact.result["checked"] == 8
+    assert compact.result["items_count"] == 8
+    assert compact.result["items_omitted"] is True
+    assert "raw_payload" not in json.dumps(compact.result)
+    assert "features" not in json.dumps(compact.result)
+
+    debug_result = debug_summary.job_status["spread-audit"].result
+    assert debug_result["items"]["item_count"] == 8
+    assert debug_result["items"]["truncated"] is False
+    assert "raw_payload" not in json.dumps(debug_result)
+    assert "features" not in json.dumps(debug_result)
+
+
+def test_dashboard_candidate_diagnostics_omit_candidate_level_lists_by_default() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    now = datetime(2026, 7, 3, 16, 0, tzinfo=UTC)
+    counterfactuals = [
+        {"candidate_id": index, "market_ticker": f"KXMLBGAME-{index}", "net_expected_value": "0.12"}
+        for index in range(6)
+    ]
+
+    with Session(engine) as session:
+        active = get_or_create_active_paper_epoch(session, starting_balance=Decimal("500.00"))
+        session.add(
+            ModelPredictionRun(
+                paper_trading_epoch_id=active.id,
+                started_at=now,
+                completed_at=now,
+                target_date=today_eastern(),
+                status="completed",
+                candidates_evaluated=6,
+                trades_created=0,
+                summary={
+                    "candidate_diagnostics": {
+                        "candidates_total": 6,
+                        "trade_eligible_after_quality": 0,
+                        "top_quality_blockers": counterfactuals,
+                    },
+                    "quality_ev_diagnostics": {
+                        "candidates_total": 6,
+                        "ev_pass_count": 2,
+                        "top_counterfactual_candidates_blocked_by_quality": counterfactuals,
+                    },
+                },
+            )
+        )
+        session.commit()
+
+        summary = dashboard.dashboard_summary_from_db(session)
+        debug_summary = dashboard.dashboard_summary_from_db(session, include_candidate_diagnostics=True)
+
+    compact = summary.latest_candidate_diagnostics
+    assert compact["candidate_diagnostics"]["candidates_total"] == 6
+    assert compact["candidate_diagnostics"]["top_quality_blockers_count"] == 6
+    assert "top_quality_blockers" not in compact["candidate_diagnostics"]
+    assert (
+        compact["quality_ev_diagnostics"]["top_counterfactual_candidates_blocked_by_quality_count"]
+        == 6
+    )
+    assert "candidate_id" not in json.dumps(compact)
+
+    debug_payload = debug_summary.latest_candidate_diagnostics
+    assert debug_payload["quality_ev_diagnostics"]["top_counterfactual_candidates_blocked_by_quality"]["item_count"] == 6
+
+
+def test_governance_status_defaults_to_compact_registry_and_allows_debug_details() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        compact = modeling.governance_status(session)
+        detailed = modeling.governance_status(session, include_details=True)
+
+    assert "governed_now" not in compact["governance_parameter_registry"]
+    assert compact["governance_parameter_registry"]["governed_now_count"] >= 1
+    assert "governed_now" in detailed["governance_parameter_registry"]
+
+
+def test_dashboard_source_status_is_summarized_for_model_status(monkeypatch) -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    def fake_source_status_report(_session):
+        return {
+            "feature_sync_enable_network_sources": True,
+            "public_sources_enabled": True,
+            "validation_status": "degraded_with_errors",
+            "last_attempted_sync": "2026-07-03T12:00:00+00:00",
+            "last_feature_sync_status": {
+                "validation_status": "degraded_with_errors",
+                "last_error": {"message": "source failed"},
+                "raw_payload": {"large": "x" * 1000},
+            },
+            "latest_errors": [
+                {"table": "weather_snapshots", "message": "failed"},
+                {"table": "statcast", "message": "empty"},
+                {"table": "pybaseball", "message": "403"},
+                {"table": "extra", "message": "ignored"},
+            ],
+            "source_health": [
+                {"source_name": "mlb_stats_api", "status": "available", "criticality": "critical"},
+                {"source_name": "statcast_savant", "status": "cached", "criticality": "secondary"},
+            ],
+            "tables": {"large": {"raw_payload": "x" * 1000}},
+            "source_inventory": [{"raw_payload": "x" * 1000}],
+            "latest_feature_completeness": {"date": "2026-07-03", "summary": {"total_modules": 17}},
+        }
+
+    with Session(engine) as session:
+        get_or_create_active_paper_epoch(session, starting_balance=Decimal("500.00"))
+        monkeypatch.setattr(dashboard, "source_status_report", fake_source_status_report)
+        summary = dashboard.dashboard_summary_from_db(session)
+
+    payload = summary.model_status.last_feature_sync_status
+    assert payload["validation_status"] == "degraded_with_errors"
+    assert "raw_payload" not in json.dumps(payload)
 
 
 def test_system_status_redacts_secrets_and_allows_missing_database() -> None:

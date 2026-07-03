@@ -30,6 +30,10 @@ type JobRunSummary = {
   completed_at: string | null;
   duration_seconds: number | null;
   target_date: string | null;
+  result_is_compact?: boolean;
+  step_count?: number;
+  warning_count?: number;
+  error_count?: number;
   result: Record<string, unknown>;
 };
 

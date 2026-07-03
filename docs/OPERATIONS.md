@@ -301,6 +301,48 @@ After deployment, validate:
 5. Confirm dashboard model status shows the same clean sample counts as `/v1/model/governance/status`.
 6. Confirm no live execution, WebSocket, cron schedule, model formula, EV threshold, risk-cap, source-sync, settlement, market discovery, sportsbook/team-total/umpire, or full-game spread activation behavior changed.
 
+## PR3p.1 Dashboard Payload Memory Hygiene
+
+Default dashboard summaries are intentionally compact. Use the compact default for the Vercel dashboard and normal operator refreshes:
+
+```powershell
+Invoke-RestMethod "https://YOUR-RAILWAY-API/v1/dashboard/summary"
+```
+
+The default response should not include full job result trees, `JobRun.steps`, source inventory tables, raw payloads, feature blobs, candidate IDs, candidate-level counterfactual arrays, full governance registry lists, or per-market spread audit rows. It should include compact status and counts for:
+
+- latest paper jobs
+- candidate sweep window and risk/cap summaries
+- source health status counts and latest sync status
+- governance clean sample counts and registry counts
+- aggregate candidate quality/EV diagnostics
+
+Use explicit dashboard debug flags only for short manual investigations, never as the frontend polling URL:
+
+```powershell
+Invoke-RestMethod "https://YOUR-RAILWAY-API/v1/dashboard/summary?include_job_results=true"
+Invoke-RestMethod "https://YOUR-RAILWAY-API/v1/dashboard/summary?include_candidate_diagnostics=true"
+Invoke-RestMethod "https://YOUR-RAILWAY-API/v1/dashboard/summary?include_source_details=true"
+Invoke-RestMethod "https://YOUR-RAILWAY-API/v1/dashboard/summary?include_governance_details=true"
+Invoke-RestMethod "https://YOUR-RAILWAY-API/v1/dashboard/summary?include_diagnostics=true"
+```
+
+Debug dashboard responses still cap samples and omit raw payload/features/rationale blobs. For full protected diagnostics, prefer the dedicated internal endpoints:
+
+- `GET /v1/model/sources/status`
+- `GET /v1/model/governance/status?include_details=true`
+- `GET /v1/model/training/latest`
+- `GET /v1/model/predictions?date=YYYY-MM-DD`
+
+After deployment, validate:
+
+1. Confirm `/v1/dashboard/summary` returns quickly and Railway logs include `endpoint_metrics endpoint=/v1/dashboard/summary`.
+2. Confirm the logged `response_size_bytes` is materially smaller than the prior failing payload.
+3. Confirm the Vercel dashboard still loads model, job, portfolio, open positions, and closed positions sections.
+4. Confirm default summary JSON does not contain `top_counterfactual_candidates_blocked_by_quality`, `source_inventory`, full `source_health`, raw payloads, or per-market spread audit `items`.
+5. Confirm `/v1/model/governance/status` is compact by default and `include_details=true` returns the protected full registry.
+6. Confirm no live execution, cron schedule, candidate generation, model math, EV threshold, risk cap, source sync behavior, settlement, market discovery, WebSocket, sportsbook/team-total/umpire, spread activation, secrets, or environment variables changed.
+
 After deployment, validate:
 
 1. `POST /v1/sync/mlb-pregame-context?target_date=today_et` returns `feature_sync_mode=pregame_context_refresh_lightweight`, target-date games checked, starter IDs/names where MLB has announced them, lineup counts, and explicit lineup missing reasons such as `LINEUP_NOT_POSTED_YET`, `PARTIAL_LINEUP_POSTED`, or `LIVE_FEED_UNAVAILABLE`.

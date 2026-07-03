@@ -1,5 +1,8 @@
 from datetime import UTC, date, datetime
 from decimal import Decimal
+import logging
+import os
+import time
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -25,6 +28,7 @@ from app.schemas import (
 from app.security import require_internal_api_key
 from app.services.candidates import generate_candidates
 from app.services.dashboard import (
+    compact_source_status_payload,
     dashboard_summary_from_db,
     empty_dashboard_summary,
     list_today_candidates,
@@ -70,6 +74,7 @@ from app.services.ws_market_data import ws_status_payload
 from app.time_utils import eastern_display, today_eastern, to_eastern_iso
 
 settings = get_settings()
+logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="HOMERUN API",
@@ -90,6 +95,49 @@ def utc_now() -> datetime:
     return datetime.now(UTC)
 
 
+def _process_rss_bytes() -> int | None:
+    try:
+        with open("/proc/self/statm", encoding="utf-8") as handle:
+            pages = int(handle.read().split()[1])
+        return pages * os.sysconf("SC_PAGE_SIZE")
+    except Exception:
+        return None
+
+
+def _payload_size_bytes(value: object) -> int | None:
+    try:
+        dump_json = getattr(value, "model_dump_json", None)
+        if callable(dump_json):
+            return len(dump_json().encode("utf-8"))
+    except Exception:
+        return None
+    return None
+
+
+def _log_endpoint_metrics(
+    endpoint: str,
+    started_at: float,
+    result: object | None,
+    *,
+    flags: dict[str, object] | None = None,
+    rss_before: int | None = None,
+) -> None:
+    try:
+        duration_ms = int((time.perf_counter() - started_at) * 1000)
+        rss_after = _process_rss_bytes()
+        logger.info(
+            "endpoint_metrics endpoint=%s duration_ms=%s response_size_bytes=%s rss_before_bytes=%s rss_after_bytes=%s flags=%s",
+            endpoint,
+            duration_ms,
+            _payload_size_bytes(result),
+            rss_before,
+            rss_after,
+            flags or {},
+        )
+    except Exception:
+        return
+
+
 @app.get("/health", response_model=HealthResponse)
 def health() -> HealthResponse:
     return HealthResponse(
@@ -108,24 +156,54 @@ def dashboard_summary(
     epoch_key: str | None = Query(default=None),
     include_archived: bool = Query(default=False),
     include_pre_observation: bool = Query(default=False),
+    include_diagnostics: bool = Query(default=False),
+    include_job_results: bool = Query(default=False),
+    include_source_details: bool = Query(default=False),
+    include_governance_details: bool = Query(default=False),
+    include_spread_audit_details: bool = Query(default=False),
+    include_candidate_diagnostics: bool = Query(default=False),
 ) -> DashboardSummary:
+    started_at = time.perf_counter()
+    rss_before = _process_rss_bytes()
+    flags = {
+        "include_archived": include_archived,
+        "include_pre_observation": include_pre_observation,
+        "include_diagnostics": include_diagnostics,
+        "include_job_results": include_job_results,
+        "include_source_details": include_source_details,
+        "include_governance_details": include_governance_details,
+        "include_spread_audit_details": include_spread_audit_details,
+        "include_candidate_diagnostics": include_candidate_diagnostics,
+    }
     if not database_status()["ready"]:
-        return empty_dashboard_summary(closed_date)
+        result = empty_dashboard_summary(closed_date)
+        _log_endpoint_metrics("/v1/dashboard/summary", started_at, result, flags=flags, rss_before=rss_before)
+        return result
 
     try:
         session_factory = get_session_factory()
         with session_factory() as session:
-            return dashboard_summary_from_db(
+            result = dashboard_summary_from_db(
                 session,
                 closed_date,
                 epoch_key=epoch_key,
                 include_archived=include_archived,
                 include_pre_observation=include_pre_observation,
+                include_diagnostics=include_diagnostics,
+                include_job_results=include_job_results,
+                include_source_details=include_source_details,
+                include_governance_details=include_governance_details,
+                include_spread_audit_details=include_spread_audit_details,
+                include_candidate_diagnostics=include_candidate_diagnostics,
             )
+            _log_endpoint_metrics("/v1/dashboard/summary", started_at, result, flags=flags, rss_before=rss_before)
+            return result
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     except Exception:
-        return empty_dashboard_summary(closed_date)
+        result = empty_dashboard_summary(closed_date)
+        _log_endpoint_metrics("/v1/dashboard/summary", started_at, result, flags=flags, rss_before=rss_before)
+        return result
 
 
 @app.get("/v1/system/status", response_model=SystemStatus)
@@ -142,7 +220,7 @@ def system_status() -> SystemStatus:
         try:
             session_factory = get_session_factory()
             with session_factory() as session:
-                source_status = source_status_report(session)
+                source_status = compact_source_status_payload(source_status_report(session))
         except Exception:
             source_status["last_error"] = "source status unavailable"
 
@@ -537,10 +615,23 @@ def run_model_governance_endpoint(_: None = Depends(require_internal_api_key)) -
 
 
 @app.get("/v1/model/governance/status", response_model=RunResponse)
-def model_governance_status(_: None = Depends(require_internal_api_key)) -> RunResponse:
+def model_governance_status(
+    include_details: bool = Query(default=False),
+    _: None = Depends(require_internal_api_key),
+) -> RunResponse:
+    started_at = time.perf_counter()
+    rss_before = _process_rss_bytes()
     with _db_session_or_503() as session:
-        result = governance_status(session)
-    return RunResponse(ok=True, action="model_governance_status", result=result)
+        result = governance_status(session, include_details=include_details)
+    response = RunResponse(ok=True, action="model_governance_status", result=result)
+    _log_endpoint_metrics(
+        "/v1/model/governance/status",
+        started_at,
+        response,
+        flags={"include_details": include_details},
+        rss_before=rss_before,
+    )
+    return response
 
 
 @app.get("/v1/model/features/coverage", response_model=RunResponse)
@@ -565,9 +656,13 @@ def model_feature_detail(
 
 @app.get("/v1/model/sources/status", response_model=RunResponse)
 def model_sources_status(_: None = Depends(require_internal_api_key)) -> RunResponse:
+    started_at = time.perf_counter()
+    rss_before = _process_rss_bytes()
     with _db_session_or_503() as session:
         result = source_status_report(session)
-    return RunResponse(ok=True, action="model_sources_status", result=result)
+    response = RunResponse(ok=True, action="model_sources_status", result=result)
+    _log_endpoint_metrics("/v1/model/sources/status", started_at, response, rss_before=rss_before)
+    return response
 
 
 @app.get("/v1/model/parameters/active", response_model=RunResponse)
@@ -580,9 +675,13 @@ def model_active_parameters(_: None = Depends(require_internal_api_key)) -> RunR
 
 @app.get("/v1/model/training/latest", response_model=RunResponse)
 def model_training_latest(_: None = Depends(require_internal_api_key)) -> RunResponse:
+    started_at = time.perf_counter()
+    rss_before = _process_rss_bytes()
     with _db_session_or_503() as session:
         result = latest_training_summary(session)
-    return RunResponse(ok=True, action="model_training_latest", result=result)
+    response = RunResponse(ok=True, action="model_training_latest", result=result)
+    _log_endpoint_metrics("/v1/model/training/latest", started_at, response, rss_before=rss_before)
+    return response
 
 
 def _model_predictions_for_date(target_date: date) -> dict[str, object]:

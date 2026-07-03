@@ -791,6 +791,16 @@ def governance_parameter_registry() -> dict[str, object]:
     }
 
 
+def governance_parameter_registry_summary() -> dict[str, object]:
+    registry = governance_parameter_registry()
+    return {
+        "policy": registry["policy"],
+        "governed_now_count": registry["governed_now_count"],
+        "future_governable_count": registry["future_governable_count"],
+        "intentionally_static_safety_count": registry["intentionally_static_safety_count"],
+    }
+
+
 def _resolved_mature_candidates(session: Session, paper_trading_epoch_id: int | None = None) -> list[ModelCandidate]:
     stmt = (
         select(ModelCandidate, MlbGame)
@@ -1395,7 +1405,12 @@ def run_model_governance(
     }
 
 
-def governance_status(session: Session, paper_trading_epoch_id: int | None = None) -> dict[str, object]:
+def governance_status(
+    session: Session,
+    paper_trading_epoch_id: int | None = None,
+    *,
+    include_details: bool = False,
+) -> dict[str, object]:
     if paper_trading_epoch_id is None:
         paper_trading_epoch_id = get_or_create_active_paper_epoch(session).id
     clean_window = _governance_clean_training_window()
@@ -1435,7 +1450,9 @@ def governance_status(session: Session, paper_trading_epoch_id: int | None = Non
         "last_governance_status": last_training.status if last_training else "not_run",
         "trade_threshold_policy": last_threshold.thresholds if last_threshold else {},
         "ignored_pre_clean_artifacts": ignored_artifacts,
-        "governance_parameter_registry": governance_parameter_registry(),
+        "governance_parameter_registry": (
+            governance_parameter_registry() if include_details else governance_parameter_registry_summary()
+        ),
         "notes": "PR3p clean governance trains and promotes only from active-epoch samples after the clean cutoff.",
     }
 
