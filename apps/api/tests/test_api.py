@@ -17196,6 +17196,40 @@ def test_full_game_spread_parses_secondary_rules_when_primary_is_generic() -> No
     assert "Pittsburgh wins by more than 1.5 runs" in str(verification.raw_contract_text["rules"])
 
 
+def test_full_game_spread_rules_or_more_runs_normalizes_to_half_run_line() -> None:
+    game = MlbGame(
+        external_game_id="rules-spread-or-more",
+        home_team="Pittsburgh Pirates",
+        away_team="Seattle Mariners",
+        home_abbreviation="PIT",
+        away_abbreviation="SEA",
+        scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+        status="scheduled",
+    )
+
+    verification = verify_spread_market(
+        game=game,
+        family_key="full_game_spread",
+        raw={
+            "ticker": "KXMLBSPREAD-26JUL011900SEAPIT-PIT2",
+            "title": "Seattle Mariners vs Pittsburgh Pirates run line",
+            "yes_sub_title": "Pittsburgh -1.5",
+            "no_sub_title": "Seattle +1.5",
+            "rules_primary": "If Pittsburgh wins by 2 or more runs, Yes wins.",
+            "functional_strike": "-1.5",
+        },
+    )
+
+    assert verification.verified is True
+    assert verification.audit_status == "trusted_audit_only"
+    assert verification.line_value == Decimal("-1.5000")
+    assert verification.threshold_runs == Decimal("1.5000")
+    assert verification.raw_threshold_runs == Decimal("2.0000")
+    assert verification.settlement_formula == "selected_team_runs - opponent_runs > 1.5"
+    assert "rules_text_unparseable" not in verification.reason_codes
+    assert "rules_text_spread_condition_verified" in verification.reason_codes
+
+
 def test_full_game_spread_formula_preserves_whole_number_threshold_digits() -> None:
     game = MlbGame(
         external_game_id="rules-spread-whole-threshold",

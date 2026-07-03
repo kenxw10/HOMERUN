@@ -200,6 +200,7 @@ class RulesSpreadCondition:
     condition_type: str
     selection_code: str
     threshold_runs: Decimal
+    raw_threshold_runs: Decimal
     normalized_spread_line: Decimal
     team_text: str
     source: str
@@ -213,16 +214,31 @@ def _parse_rules_spread_condition(
     if not rules_text:
         return None
     text = str(rules_text).replace("−", "-")
-    pattern = re.compile(
+    yes_result_pattern = r"(?:resolves?|settles?)\s+to\s+yes|yes\s+wins?"
+    more_than_pattern = re.compile(
         r"\bif\s+(?:the\s+)?(?P<team>.+?)\s+wins?\s+by\s+more\s+than\s+"
-        r"(?P<threshold>\d+(?:\.\d+)?)\s+runs?\b.*?\b(?:resolves?|settles?)\s+to\s+yes\b",
+        rf"(?P<threshold>\d+(?:\.\d+)?)\s+runs?\b.*?\b(?:{yes_result_pattern})\b",
         flags=re.IGNORECASE | re.DOTALL,
     )
-    match = pattern.search(text)
+    or_more_pattern = re.compile(
+        r"\bif\s+(?:the\s+)?(?P<team>.+?)\s+wins?\s+by\s+"
+        rf"(?P<threshold>\d+(?:\.\d+)?)\s+or\s+more\s+runs?\b.*?\b(?:{yes_result_pattern})\b",
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    match = more_than_pattern.search(text)
+    raw_threshold = None
+    normalized_threshold = None
+    if match is not None:
+        raw_threshold = Decimal(match.group("threshold")).quantize(Decimal("0.0001"))
+        normalized_threshold = raw_threshold
+    else:
+        match = or_more_pattern.search(text)
+        if match is not None:
+            raw_threshold = Decimal(match.group("threshold")).quantize(Decimal("0.0001"))
+            normalized_threshold = (raw_threshold - Decimal("0.5")).quantize(Decimal("0.0001"))
     if match is None:
         return None
-    threshold = Decimal(match.group("threshold")).quantize(Decimal("0.0001"))
-    if threshold <= 0:
+    if raw_threshold is None or normalized_threshold is None or normalized_threshold <= 0:
         return None
     team_text = re.sub(r"\s+", " ", match.group("team")).strip(" ,.;:-")
     selection = _team_selection_from_text(team_text, game)
@@ -231,8 +247,9 @@ def _parse_rules_spread_condition(
     return RulesSpreadCondition(
         condition_type="team_wins_by_more_than",
         selection_code=selection,
-        threshold_runs=threshold,
-        normalized_spread_line=(-threshold).quantize(Decimal("0.0001")),
+        threshold_runs=normalized_threshold,
+        raw_threshold_runs=raw_threshold,
+        normalized_spread_line=(-normalized_threshold).quantize(Decimal("0.0001")),
         team_text=team_text,
         source=source or "rules_text",
     )
@@ -680,7 +697,7 @@ def verify_spread_market(
         push_rule_verified=_rules_verify_push(parsed_line, rules_text),
         condition_type=condition_type,
         threshold_runs=threshold_runs,
-        raw_threshold_runs=rules_condition.threshold_runs if rules_condition is not None else None,
+        raw_threshold_runs=rules_condition.raw_threshold_runs if rules_condition is not None else None,
         selected_team_margin_required_gt=threshold_required_gt,
         display_spread_line=parsed_line,
         settlement_formula=settlement_formula,
