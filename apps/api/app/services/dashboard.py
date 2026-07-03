@@ -1247,6 +1247,7 @@ def dashboard_summary_from_db(
                 ModelCandidate.probability_edge,
                 ModelCandidate.net_expected_value,
                 ModelCandidate.data_quality,
+                ModelCandidate.scoring_rationale,
             ),
             load_only(
                 MlbGame.id,
@@ -1290,6 +1291,7 @@ def dashboard_summary_from_db(
                 ModelCandidate.probability_edge,
                 ModelCandidate.net_expected_value,
                 ModelCandidate.data_quality,
+                ModelCandidate.scoring_rationale,
             ),
             load_only(
                 MlbGame.id,

@@ -21,7 +21,10 @@ from app.services.contracts import (
 )
 from app.services.portfolio import create_balance_snapshot, paper_trade_fee
 from app.services.paper_epoch import get_or_create_active_paper_epoch
-from app.services.spread_verification import SpreadVerification, spread_verification_from_mapping
+from app.services.spread_verification import (
+    SpreadVerification,
+    spread_verification_from_cached_metadata,
+)
 from app.time_utils import ensure_aware_utc, get_dashboard_zone, utc_now
 
 FINAL_STATUS_TOKENS = ("final", "game over", "completed")
@@ -357,7 +360,7 @@ def _trade_outcome(
         return _full_game_spread_contract_outcome(
             game,
             contract_side=trade.contract_side,
-            verification=spread_verification_from_mapping(game=game, mapping=mapping, market=market),
+            verification=spread_verification_from_cached_metadata(mapping=mapping, market=market),
         )
     return _contract_outcome(
         game,
@@ -387,7 +390,7 @@ def _candidate_outcome(
         return _full_game_spread_contract_outcome(
             game,
             contract_side=candidate.contract_side,
-            verification=spread_verification_from_mapping(game=game, mapping=mapping, market=market),
+            verification=spread_verification_from_cached_metadata(mapping=mapping, market=market),
         )
     return _contract_outcome(
         game,
@@ -559,7 +562,7 @@ def settle_paper_trades(
                     market.settlement_rule_status,
                 ),
                 full_game_spread_verification=(
-                    spread_verification_from_mapping(game=game, mapping=_mapping, market=market)
+                    spread_verification_from_cached_metadata(mapping=_mapping, market=market)
                     if market_type == FULL_GAME_SPREAD
                     else None
                 ),
@@ -599,7 +602,7 @@ def settle_paper_trades(
                     market.settlement_rule_status,
                 ),
                 full_game_spread_verification=(
-                    spread_verification_from_mapping(game=game, mapping=_mapping, market=market)
+                    spread_verification_from_cached_metadata(mapping=_mapping, market=market)
                     if market_type == FULL_GAME_SPREAD
                     else None
                 ),

@@ -6635,6 +6635,93 @@ def test_dashboard_includes_paper_trades_alongside_positions() -> None:
     assert markets == ["KXMLB-POSITION", "KXMLB-TRADE"]
 
 
+def test_dashboard_position_rationale_includes_loaded_spread_audit() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    opened_at = datetime(2026, 7, 2, 13, 0, tzinfo=UTC)
+
+    with Session(engine) as session:
+        epoch_id = _active_epoch_id(session)
+        game = MlbGame(
+            external_game_id="dashboard-spread-audit-rationale",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 2, 23, 0, tzinfo=UTC),
+            status="scheduled",
+        )
+        market = KalshiMarket(
+            kalshi_market_id="KX-DASHBOARD-SPREAD-AUDIT",
+            ticker="KXMLBSPREAD-26JUL021900SEAPIT-PIT-1.5",
+            title="Pittsburgh Pirates spread -1.5 vs Seattle Mariners",
+            status="open",
+            market_family="full_game_spread",
+            market_type="full_game_spread",
+            line_value=Decimal("-1.5000"),
+            selection_code="PIT",
+            inning_scope="full_game",
+            settlement_rule_status="paper_supported",
+        )
+        session.add_all([game, market])
+        session.flush()
+        candidate = ModelCandidate(
+            paper_trading_epoch_id=epoch_id,
+            mlb_game_id=game.id,
+            kalshi_market_id=market.id,
+            evaluated_at=opened_at,
+            decision="paper_trade",
+            features={},
+            market_type="full_game_spread",
+            probability_edge=Decimal("0.080000"),
+            net_expected_value=Decimal("0.120000"),
+            data_quality=Decimal("0.7500"),
+            scoring_rationale={
+                "spread_verification": {
+                    "audit_status": "trusted_audit_only",
+                    "verified": True,
+                    "selection_code": "PIT",
+                    "line_value": "-1.5000",
+                    "inning_scope": "full_game",
+                    "settlement_formula": "selected_team_runs - opponent_runs > 1.5",
+                    "no_is_true_complement": True,
+                    "complement_safe_for_paper_settlement": True,
+                    "push_possible": False,
+                    "push_rule_verified": False,
+                    "raw_contract_text": {"large": "omitted"},
+                }
+            },
+        )
+        session.add(candidate)
+        session.flush()
+        session.add(
+            PaperTrade(
+                paper_trading_epoch_id=epoch_id,
+                candidate_id=candidate.id,
+                market_ticker=market.ticker,
+                contract_side="yes",
+                entry_price=Decimal("0.4000"),
+                current_price=Decimal("0.5000"),
+                quantity=1,
+                entry_time=opened_at,
+                status="open",
+                market_family="full_game_spread",
+                line_value=Decimal("-1.5000"),
+                selection_code="PIT",
+                inning_scope="full_game",
+                settlement_rule_status="paper_supported",
+            )
+        )
+        session.commit()
+
+        summary = dashboard.dashboard_summary_from_db(session)
+
+    rationale = summary.positions[0].selected_position_rationale
+    assert rationale["spread_audit"]["audit_status"] == "trusted_audit_only"
+    assert rationale["spread_audit"]["selection_code"] == "PIT"
+    assert "raw_contract_text" not in rationale["spread_audit"]
+
+
 def test_dashboard_summary_filters_closed_positions_by_selected_date() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
@@ -7754,7 +7841,7 @@ def test_paper_settlement_handles_spread_total_and_first_five_families() -> None
     assert next(trade for trade in trades if trade.market_family == "first_five_total").outcome == "loss"
 
 
-def test_full_game_spread_settlement_requires_trusted_audit_metadata() -> None:
+def test_full_game_spread_settlement_requires_cached_trusted_audit_metadata() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
 
@@ -7775,6 +7862,8 @@ def test_full_game_spread_settlement_requires_trusted_audit_metadata() -> None:
             kalshi_market_id="KX-SPREAD-UNTRUSTED-SETTLE",
             ticker="KXMLBSPREAD-26JUL011900SEAPIT-PIT-1.5",
             title="Pittsburgh Pirates spread -1.5 vs Seattle Mariners",
+            no_subtitle="Seattle Mariners +1.5",
+            rules="If Pittsburgh wins by more than 1.5 runs, this market resolves to Yes.",
             status="closed",
             market_family="full_game_spread",
             market_type="full_game_spread",
@@ -7840,8 +7929,8 @@ def test_full_game_spread_settlement_requires_trusted_audit_metadata() -> None:
         persisted_trade = session.scalar(select(PaperTrade).where(PaperTrade.id == trade.id))
 
     assert result["settled"] == 0
-    assert result["skipped_spread_audit_not_trusted"] == 1
-    assert result["candidate_labels_skipped_spread_audit_not_trusted"] == 1
+    assert result["skipped_spread_audit_missing"] == 1
+    assert result["candidate_labels_skipped_spread_audit_missing"] == 1
     assert persisted_trade is not None
     assert persisted_trade.status == "open"
     assert persisted_trade.outcome is None
@@ -18544,7 +18633,7 @@ def test_trusted_full_game_spread_can_create_paper_trade_when_enabled(monkeypatc
     assert trade.selection_code == "PIT"
 
 
-def test_full_game_spread_enabled_still_rejects_untrusted_audit(monkeypatch) -> None:
+def test_full_game_spread_enabled_still_rejects_missing_cached_audit(monkeypatch) -> None:
     _relax_data_quality_gate(monkeypatch)
     monkeypatch.setenv("PAPER_FULL_GAME_SPREAD_TRADING_ENABLED", "true")
     get_settings.cache_clear()
@@ -18569,6 +18658,8 @@ def test_full_game_spread_enabled_still_rejects_untrusted_audit(monkeypatch) -> 
             kalshi_market_id="KX-SPREAD-PAPER-UNTRUSTED",
             ticker="KXMLBSPREAD-26JUL011900SEAPIT-PIT-1.5",
             title="Pittsburgh Pirates spread -1.5 vs Seattle Mariners",
+            no_subtitle="Seattle Mariners +1.5",
+            rules="If Pittsburgh wins by more than 1.5 runs, this market resolves to Yes.",
             status="open",
             occurrence_datetime=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
             implied_yes_ask=Decimal("0.4000"),
@@ -18601,13 +18692,14 @@ def test_full_game_spread_enabled_still_rejects_untrusted_audit(monkeypatch) -> 
     assert result["paper_full_game_spread_trading_enabled"] is True
     assert result["paper_trades"] == 0
     assert candidate is not None
-    assert candidate.decision == "no_trade_full_game_spread_audit_not_trusted"
+    assert candidate.decision == "no_trade_full_game_spread_audit_missing"
     assert candidate.training_eligible is False
-    assert candidate.training_exclusion_reason == "full_game_spread_audit_not_trusted"
+    assert candidate.training_exclusion_reason == "full_game_spread_audit_missing"
     assert candidate.gate_diagnostics["gate_full_game_spread_audit_trusted"] is False
     assert candidate.gate_diagnostics["full_game_spread_audit_rejection_reason"] == (
-        "no_trade_full_game_spread_audit_not_trusted"
+        "no_trade_full_game_spread_audit_missing"
     )
+    assert candidate.scoring_rationale["spread_verification"] is None
     assert trade is None
 
 

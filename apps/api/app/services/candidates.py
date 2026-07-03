@@ -41,7 +41,12 @@ from app.services.modeling import (
 )
 from app.services.portfolio import calculate_paper_portfolio, create_balance_snapshot, paper_trade_fee
 from app.services.paper_epoch import get_or_create_active_paper_epoch
-from app.services.spread_verification import SPREAD_FAMILIES, SpreadVerification, spread_verification_from_mapping
+from app.services.spread_verification import (
+    SPREAD_FAMILIES,
+    SpreadVerification,
+    spread_verification_from_cached_metadata,
+    spread_verification_from_mapping,
+)
 from app.time_utils import classify_time_bucket, ensure_aware_utc, get_dashboard_zone, utc_now
 
 TRADABLE_MARKET_STATUSES = {"active", "open"}
@@ -885,10 +890,11 @@ def _diagnostics_payload(
     game_not_started = minutes_to_start > 0 and _eastern_date(game.scheduled_start) == target_date
     market_open = market.status.strip().lower() in TRADABLE_MARKET_STATUSES
     price_ok = price_context.status == "fresh_executable"
-    spread_verification = (
-        spread_verification_from_mapping(game=game, mapping=mapping, market=market)
-        if market_type in SPREAD_FAMILIES
-        else None
+    spread_verification = _spread_verification_for_candidate_gate(
+        game=game,
+        mapping=mapping,
+        market=market,
+        market_type=market_type,
     )
     full_game_spread_audit_reason = (
         _full_game_spread_audit_rejection_reason(spread_verification)
@@ -1181,6 +1187,20 @@ def _full_game_spread_audit_rejection_reason(verification: SpreadVerification | 
     return FULL_GAME_SPREAD_AUDIT_REASON_BY_STATUS.get(status, "no_trade_full_game_spread_audit_not_trusted")
 
 
+def _spread_verification_for_candidate_gate(
+    *,
+    game: MlbGame,
+    mapping: MarketMapping,
+    market: KalshiMarket,
+    market_type: str,
+) -> SpreadVerification | None:
+    if market_type == FULL_GAME_SPREAD:
+        return spread_verification_from_cached_metadata(mapping=mapping, market=market)
+    if market_type in SPREAD_FAMILIES:
+        return spread_verification_from_mapping(game=game, mapping=mapping, market=market)
+    return None
+
+
 def _spread_parser_verified(mapping: MarketMapping, game: MlbGame, market: KalshiMarket, market_type: str) -> bool:
     if market_type not in SPREAD_FAMILIES:
         return True
@@ -1218,7 +1238,7 @@ def _base_decision(
         if not settings.paper_full_game_spread_trading_enabled:
             return "no_trade_full_game_spread_trading_disabled"
         audit_reason = _full_game_spread_audit_rejection_reason(
-            spread_verification_from_mapping(game=game, mapping=mapping, market=market)
+            spread_verification_from_cached_metadata(mapping=mapping, market=market)
         )
         if audit_reason is not None:
             return audit_reason
@@ -2531,10 +2551,11 @@ def generate_candidates(
             or market.market_type
             or market_type_from_ticker(market.ticker, infer_market_type(_market_classification_text(market)))
         )
-        spread_verification = (
-            spread_verification_from_mapping(game=game, mapping=mapping, market=market)
-            if market_type in SPREAD_FAMILIES
-            else None
+        spread_verification = _spread_verification_for_candidate_gate(
+            game=game,
+            mapping=mapping,
+            market=market,
+            market_type=market_type,
         )
         spread_audit_metadata = _compact_spread_audit_metadata(spread_verification)
         parsed_selection_code = (
