@@ -138,6 +138,9 @@ class Settings(BaseSettings):
     model_min_samples_train: int = Field(default=250, alias="MODEL_MIN_SAMPLES_TRAIN")
     model_min_samples_calibrate: int = Field(default=250, alias="MODEL_MIN_SAMPLES_CALIBRATE")
     model_min_samples_promote: int = Field(default=500, alias="MODEL_MIN_SAMPLES_PROMOTE")
+    model_governance_clean_start_at: str = Field(
+        default="2026-07-02T00:00:00-04:00", alias="MODEL_GOVERNANCE_CLEAN_START_AT"
+    )
     model_promotion_min_logloss_improvement: Decimal = Field(
         default=Decimal("0.01"), alias="MODEL_PROMOTION_MIN_LOGLOSS_IMPROVEMENT"
     )

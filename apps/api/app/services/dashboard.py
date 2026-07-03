@@ -38,6 +38,7 @@ from app.schemas import (
 )
 from app.services.contracts import contract_labels, market_type_from_ticker
 from app.services.features import FEATURE_VERSION, source_status_report, starter_status_report
+from app.services.modeling import governance_status as model_governance_status
 from app.services.modeling import latest_governance_artifacts
 from app.services.portfolio import calculate_paper_portfolio, paper_trade_fee
 from app.services.paper_epoch import resolve_epoch_filter
@@ -717,6 +718,7 @@ def dashboard_summary_from_db(
         select(ModelParameterVersion).where(ModelParameterVersion.is_active.is_(True))
     )
     last_training, last_calibration, last_threshold = latest_governance_artifacts(session, active_epoch.id)
+    governance_summary = model_governance_status(session, active_epoch.id)
     last_prediction = session.scalar(
         select(ModelPredictionRun)
         .where(ModelPredictionRun.paper_trading_epoch_id == active_epoch.id)
@@ -747,16 +749,6 @@ def dashboard_summary_from_db(
         observation_cutoff,
     )
     training_eligible_count = session.scalar(training_eligible_statement) or 0
-    resolved_mature_statement = _apply_candidate_observation_filter(
-        select(func.count(ModelCandidate.id))
-        .where(ModelCandidate.paper_trading_epoch_id == active_epoch.id)
-        .where(ModelCandidate.training_eligible.is_(True))
-        .where(ModelCandidate.outcome.in_(["win", "loss"]))
-        .where(ModelCandidate.feature_version == FEATURE_VERSION),
-        include_pre_observation,
-        observation_cutoff,
-    )
-    resolved_mature_samples = session.scalar(resolved_mature_statement) or 0
     candidate_avg_data_quality = session.scalar(
         _apply_candidate_observation_filter(
             select(func.avg(ModelCandidate.data_quality))
@@ -809,9 +801,20 @@ def dashboard_summary_from_db(
         last_training_run=last_training.started_at if last_training else None,
         last_calibration_run=last_calibration.started_at if last_calibration else None,
         candidate_count=int(candidate_count),
-        resolved_mature_samples=int(resolved_mature_samples),
+        resolved_mature_samples=int(governance_summary["clean_resolved_mature_samples"]),
+        raw_resolved_mature_samples=int(governance_summary["raw_resolved_mature_samples"]),
+        clean_resolved_mature_samples=int(governance_summary["clean_resolved_mature_samples"]),
+        pre_clean_excluded_samples=int(governance_summary["pre_clean_excluded_samples"]),
         training_eligible_count=int(training_eligible_count),
+        clean_training_eligible_count=int(governance_summary["clean_training_eligible_count"]),
         last_governance_status=last_training.status if last_training else "not_run",
+        governance_training_policy=str(governance_summary["governance_training_policy"]),
+        clean_training_start_at=str(governance_summary["clean_training_start_at"]),
+        clean_training_start_at_et=str(governance_summary["clean_training_start_at_et"]),
+        clean_training_start_date_et=str(governance_summary["clean_training_start_date_et"]),
+        clean_filter_exclusion_counts=dict(governance_summary["clean_filter_exclusion_counts"]),
+        ignored_pre_clean_artifacts=dict(governance_summary["ignored_pre_clean_artifacts"]),
+        governance_parameter_registry=dict(governance_summary["governance_parameter_registry"]),
         governance_status=last_training.status if last_training else "not_run",
         trade_policy=last_prediction.trade_policy if last_prediction and last_prediction.trade_policy else {},
         trade_caps_used=(

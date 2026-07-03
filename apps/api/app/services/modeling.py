@@ -5,6 +5,7 @@ from datetime import datetime
 from decimal import Decimal
 from math import exp, factorial, log
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -39,6 +40,8 @@ MATURE_MODEL_TAG = "mature_mlb_run_distribution_v2"
 BASELINE_PARAMETER_VERSION_TAG = "mature_mlb_run_distribution_v2_baseline"
 MODEL_FAMILY = "mlb_all_supported_families"
 MAX_RUNS = 18
+GOVERNANCE_CLEAN_TRAINING_POLICY = "pr3p_clean_governance_training_v1"
+GOVERNANCE_CLEAN_TRAINING_ZONE = ZoneInfo("America/New_York")
 DEFAULT_MODEL_PARAMETERS: dict[str, object] = {
     "league_average_full_game_runs": 4.35,
     "home_field_runs": 0.18,
@@ -70,6 +73,71 @@ DEFAULT_MODEL_PARAMETERS: dict[str, object] = {
     "feature_module_weights_version": "family_weighted_v2",
     "spread_push_policy": "no_trade_when_push_possible",
     "total_push_policy": "no_trade_when_push_possible",
+}
+
+GOVERNANCE_PARAMETER_REGISTRY: dict[str, list[dict[str, object]]] = {
+    "governed_now": [
+        {
+            "name": "market_family_probability_offsets",
+            "storage": "model_parameter_versions.parameters",
+            "status": "autonomous_bounded_challenger",
+            "guardrails": [
+                "MODEL_MIN_SAMPLES_TRAIN",
+                "MODEL_MIN_SAMPLES_PROMOTE",
+                "MODEL_PROMOTION_MIN_LOGLOSS_IMPROVEMENT",
+                "MODEL_PROMOTION_MAX_ECE",
+            ],
+        },
+        {
+            "name": "active_parameter_version",
+            "storage": "model_parameter_versions.is_active",
+            "status": "autonomous_promotion_guarded",
+            "guardrails": ["chronological_holdout", "active_paper_epoch", "clean_training_cutoff"],
+        },
+    ],
+    "future_governable": [
+        {
+            "name": "run_expectation_coefficients",
+            "status": "static_until_enough_clean_samples",
+            "examples": [
+                "team_strength_coefficient",
+                "starter_era_coefficient",
+                "bullpen_era_coefficient",
+                "park_factor_coefficient",
+            ],
+        },
+        {
+            "name": "trade_threshold_policy",
+            "status": "recorded_for_simulation_only",
+            "examples": ["paper_min_net_ev", "paper_min_prob_edge", "paper_observation_min_data_quality"],
+        },
+        {
+            "name": "feature_module_weights",
+            "status": "diagnostic_static_until_validation",
+            "examples": ["family_weighted_v2"],
+        },
+    ],
+    "intentionally_static_safety": [
+        {
+            "name": "execution_safety_flags",
+            "status": "manual_only",
+            "examples": ["LIVE_TRADING_ENABLED", "EXECUTION_KILL_SWITCH", "KALSHI_ENV"],
+        },
+        {
+            "name": "paper_risk_caps",
+            "status": "manual_operator_policy",
+            "examples": [
+                "PAPER_MAX_DAILY_NEW_RISK_PCT",
+                "PAPER_MAX_OPEN_RISK_PCT",
+                "PAPER_MAX_SCOPE_RISK_PCT",
+            ],
+        },
+        {
+            "name": "spread_activation",
+            "status": "manual_only",
+            "examples": ["PAPER_SPREAD_TRADING_ENABLED"],
+        },
+    ],
 }
 
 
@@ -688,6 +756,41 @@ def _candidate_target_date_matches_game(candidate: ModelCandidate, game: MlbGame
     return candidate.target_date == game_day
 
 
+def _governance_clean_training_window(settings=None) -> dict[str, object]:
+    settings = settings or get_settings()
+    raw_value = str(settings.model_governance_clean_start_at or "").strip()
+    if not raw_value:
+        raw_value = "2026-07-02T00:00:00-04:00"
+    try:
+        parsed = datetime.fromisoformat(raw_value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(
+            "MODEL_GOVERNANCE_CLEAN_START_AT must be an ISO date/time, for example 2026-07-02T00:00:00-04:00"
+        ) from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=GOVERNANCE_CLEAN_TRAINING_ZONE)
+    start_utc = ensure_aware_utc(parsed)
+    start_et = start_utc.astimezone(GOVERNANCE_CLEAN_TRAINING_ZONE)
+    return {
+        "policy": GOVERNANCE_CLEAN_TRAINING_POLICY,
+        "start_at": start_utc,
+        "start_at_utc": start_utc.isoformat(),
+        "start_at_et": start_et.isoformat(),
+        "start_date_et": start_et.date(),
+        "start_date_et_iso": start_et.date().isoformat(),
+    }
+
+
+def governance_parameter_registry() -> dict[str, object]:
+    return {
+        "policy": "autonomous_parameter_coverage_v1",
+        "governed_now_count": len(GOVERNANCE_PARAMETER_REGISTRY["governed_now"]),
+        "future_governable_count": len(GOVERNANCE_PARAMETER_REGISTRY["future_governable"]),
+        "intentionally_static_safety_count": len(GOVERNANCE_PARAMETER_REGISTRY["intentionally_static_safety"]),
+        **GOVERNANCE_PARAMETER_REGISTRY,
+    }
+
+
 def _resolved_mature_candidates(session: Session, paper_trading_epoch_id: int | None = None) -> list[ModelCandidate]:
     stmt = (
         select(ModelCandidate, MlbGame)
@@ -709,6 +812,71 @@ def _resolved_mature_candidates(session: Session, paper_trading_epoch_id: int | 
         )
     )
     return [candidate for candidate, game in rows if _candidate_target_date_matches_game(candidate, game)]
+
+
+def _clean_candidate_exclusion_reason(candidate: ModelCandidate, clean_window: dict[str, object]) -> str | None:
+    clean_start = clean_window["start_at"]
+    clean_date = clean_window["start_date_et"]
+    if candidate.target_date is None:
+        return "missing_target_date"
+    if candidate.target_date < clean_date:
+        return "target_date_before_clean_start"
+    if candidate.evaluated_at is None:
+        return "missing_evaluated_at"
+    if ensure_aware_utc(candidate.evaluated_at) < clean_start:
+        return "evaluated_before_clean_start"
+    return None
+
+
+def _apply_clean_training_filter(
+    candidates: list[ModelCandidate],
+    clean_window: dict[str, object],
+) -> tuple[list[ModelCandidate], dict[str, int]]:
+    included: list[ModelCandidate] = []
+    excluded_counts: dict[str, int] = {}
+    for candidate in candidates:
+        reason = _clean_candidate_exclusion_reason(candidate, clean_window)
+        if reason is None:
+            included.append(candidate)
+        else:
+            excluded_counts[reason] = excluded_counts.get(reason, 0) + 1
+    return included, excluded_counts
+
+
+def _governance_training_policy_payload(
+    clean_window: dict[str, object],
+    *,
+    raw_sample_count: int,
+    clean_sample_count: int,
+    excluded_counts: dict[str, int],
+) -> dict[str, object]:
+    return {
+        "governance_training_policy": clean_window["policy"],
+        "clean_training_start_at": clean_window["start_at_utc"],
+        "clean_training_start_at_et": clean_window["start_at_et"],
+        "clean_training_start_date_et": clean_window["start_date_et_iso"],
+        "raw_resolved_mature_samples": raw_sample_count,
+        "clean_resolved_mature_samples": clean_sample_count,
+        "pre_clean_excluded_samples": raw_sample_count - clean_sample_count,
+        "clean_filter_exclusion_counts": excluded_counts,
+    }
+
+
+def governance_sample_summary(session: Session, paper_trading_epoch_id: int | None = None) -> dict[str, object]:
+    if paper_trading_epoch_id is None:
+        paper_trading_epoch_id = get_or_create_active_paper_epoch(session).id
+    clean_window = _governance_clean_training_window()
+    raw_candidates = _resolved_mature_candidates(session, paper_trading_epoch_id=paper_trading_epoch_id)
+    clean_candidates, excluded_counts = _apply_clean_training_filter(raw_candidates, clean_window)
+    return {
+        "paper_trading_epoch_id": paper_trading_epoch_id,
+        **_governance_training_policy_payload(
+            clean_window,
+            raw_sample_count=len(raw_candidates),
+            clean_sample_count=len(clean_candidates),
+            excluded_counts=excluded_counts,
+        ),
+    }
 
 
 def _candidate_probability(candidate: ModelCandidate, offsets: dict[str, Decimal] | None = None) -> Decimal | None:
@@ -840,33 +1008,117 @@ def _metadata_epoch_id(metadata: dict[str, object] | None) -> int | None:
         return None
 
 
-def _latest_row_by_metrics_epoch(session: Session, model, order_column, paper_trading_epoch_id: int):
+def _metrics_match_clean_training_policy(
+    metadata: dict[str, object] | None,
+    clean_window: dict[str, object] | None = None,
+) -> bool:
+    if not isinstance(metadata, dict):
+        return False
+    clean_window = clean_window or _governance_clean_training_window()
+    return (
+        metadata.get("governance_training_policy") == clean_window["policy"]
+        and metadata.get("clean_training_start_at") == clean_window["start_at_utc"]
+    )
+
+
+def _latest_row_by_metrics_epoch(
+    session: Session,
+    model,
+    order_column,
+    paper_trading_epoch_id: int,
+    clean_window: dict[str, object] | None = None,
+):
     for row in session.scalars(select(model).order_by(order_column.desc(), model.id.desc())):
-        if _metadata_epoch_id(getattr(row, "metrics", None)) == paper_trading_epoch_id:
+        metrics = getattr(row, "metrics", None)
+        if _metadata_epoch_id(metrics) == paper_trading_epoch_id and _metrics_match_clean_training_policy(
+            metrics, clean_window
+        ):
             return row
     return None
 
 
-def _threshold_matches_epoch(
+def _threshold_matches_governance_policy(
     session: Session,
     threshold: ModelThresholdVersion,
     paper_trading_epoch_id: int,
+    clean_window: dict[str, object] | None = None,
 ) -> bool:
-    if _metadata_epoch_id(threshold.metrics) == paper_trading_epoch_id:
+    if _metadata_epoch_id(threshold.metrics) == paper_trading_epoch_id and _metrics_match_clean_training_policy(
+        threshold.metrics, clean_window
+    ):
         return True
     if threshold.source_training_run_id is None:
         return False
     training = session.get(TrainingRun, threshold.source_training_run_id)
-    return training is not None and _metadata_epoch_id(training.metrics) == paper_trading_epoch_id
+    return (
+        training is not None
+        and _metadata_epoch_id(training.metrics) == paper_trading_epoch_id
+        and _metrics_match_clean_training_policy(training.metrics, clean_window)
+    )
+
+
+def _governance_ignored_artifacts(
+    session: Session,
+    paper_trading_epoch_id: int,
+    clean_window: dict[str, object] | None = None,
+) -> dict[str, object]:
+    clean_window = clean_window or _governance_clean_training_window()
+
+    def summarize_rows(model, order_column) -> dict[str, object]:
+        rows = [
+            row
+            for row in session.scalars(select(model).order_by(order_column.desc(), model.id.desc()))
+            if _metadata_epoch_id(getattr(row, "metrics", None)) == paper_trading_epoch_id
+            and not _metrics_match_clean_training_policy(getattr(row, "metrics", None), clean_window)
+        ]
+        latest = rows[0] if rows else None
+        return {
+            "ignored_count": len(rows),
+            "latest_ignored_status": getattr(latest, "status", None) if latest else None,
+            "latest_ignored_at": getattr(latest, "started_at", None).isoformat() if latest else None,
+            "reason": "pre_clean_or_legacy_governance_policy",
+        }
+
+    threshold_rows = [
+        threshold
+        for threshold in session.scalars(
+            select(ModelThresholdVersion).order_by(
+                ModelThresholdVersion.created_at.desc(), ModelThresholdVersion.id.desc()
+            )
+        )
+        if (
+            _metadata_epoch_id(threshold.metrics) == paper_trading_epoch_id
+            or (
+                threshold.source_training_run_id is not None
+                and (training := session.get(TrainingRun, threshold.source_training_run_id)) is not None
+                and _metadata_epoch_id(training.metrics) == paper_trading_epoch_id
+            )
+        )
+        and not _threshold_matches_governance_policy(session, threshold, paper_trading_epoch_id, clean_window)
+    ]
+    latest_threshold = threshold_rows[0] if threshold_rows else None
+    return {
+        "training": summarize_rows(TrainingRun, TrainingRun.started_at),
+        "calibration": summarize_rows(CalibrationRun, CalibrationRun.started_at),
+        "thresholds": {
+            "ignored_count": len(threshold_rows),
+            "latest_ignored_status": latest_threshold.status if latest_threshold else None,
+            "latest_ignored_at": latest_threshold.created_at_snapshot.isoformat() if latest_threshold else None,
+            "reason": "pre_clean_or_legacy_governance_policy",
+        },
+    }
 
 
 def latest_governance_artifacts(
     session: Session,
     paper_trading_epoch_id: int,
 ) -> tuple[TrainingRun | None, CalibrationRun | None, ModelThresholdVersion | None]:
-    last_training = _latest_row_by_metrics_epoch(session, TrainingRun, TrainingRun.started_at, paper_trading_epoch_id)
+    clean_window = _governance_clean_training_window()
+    last_training = _latest_row_by_metrics_epoch(
+        session, TrainingRun, TrainingRun.started_at, paper_trading_epoch_id, clean_window
+    )
     last_calibration = _latest_row_by_metrics_epoch(
-        session, CalibrationRun, CalibrationRun.started_at, paper_trading_epoch_id
+        session, CalibrationRun, CalibrationRun.started_at, paper_trading_epoch_id, clean_window
     )
     last_threshold = next(
         (
@@ -874,7 +1126,7 @@ def latest_governance_artifacts(
             for threshold in session.scalars(
                 select(ModelThresholdVersion).order_by(ModelThresholdVersion.created_at.desc(), ModelThresholdVersion.id.desc())
             )
-            if _threshold_matches_epoch(session, threshold, paper_trading_epoch_id)
+            if _threshold_matches_governance_policy(session, threshold, paper_trading_epoch_id, clean_window)
         ),
         None,
     )
@@ -893,7 +1145,10 @@ def run_model_governance(
     active_parameters = get_or_create_active_parameter_version(session)
     if paper_trading_epoch_id is None:
         paper_trading_epoch_id = get_or_create_active_paper_epoch(session).id
-    candidates = _resolved_mature_candidates(session, paper_trading_epoch_id=paper_trading_epoch_id)
+    clean_window = _governance_clean_training_window(settings)
+    raw_candidates = _resolved_mature_candidates(session, paper_trading_epoch_id=paper_trading_epoch_id)
+    candidates, clean_exclusion_counts = _apply_clean_training_filter(raw_candidates, clean_window)
+    raw_sample_count = len(raw_candidates)
     sample_count = len(candidates)
     train_min = settings.model_min_samples_train
     calibrate_min = settings.model_min_samples_calibrate
@@ -901,6 +1156,12 @@ def run_model_governance(
     train_rows, holdout_rows = _chronological_split(candidates)
     metrics = _metrics(candidates)
     holdout_metrics = _metrics(holdout_rows) if holdout_rows else metrics
+    clean_policy_metrics = _governance_training_policy_payload(
+        clean_window,
+        raw_sample_count=raw_sample_count,
+        clean_sample_count=sample_count,
+        excluded_counts=clean_exclusion_counts,
+    )
 
     training = TrainingRun(
         model_version_id=active.id,
@@ -913,6 +1174,7 @@ def run_model_governance(
             "feature_version": FEATURE_VERSION,
             "active_parameter_version": active_parameters.version_tag,
             "paper_trading_epoch_id": paper_trading_epoch_id,
+            **clean_policy_metrics,
             "minimum_samples_train": train_min,
             "minimum_samples_promote": promote_min,
             "split_policy": "chronological_holdout",
@@ -939,6 +1201,7 @@ def run_model_governance(
             "void_push": "excluded",
             "unsupported_mapping": "excluded",
             "paper_trading_epoch_id": paper_trading_epoch_id,
+            **clean_policy_metrics,
         },
         candidate_ids=[candidate.id for candidate in candidates if candidate.id is not None],
     )
@@ -953,6 +1216,7 @@ def run_model_governance(
             "minimum_samples_calibrate": calibrate_min,
             "minimum_samples_for_isotonic": settings.model_min_samples_for_isotonic,
             "paper_trading_epoch_id": paper_trading_epoch_id,
+            **clean_policy_metrics,
             "calibration_policy": "bounded family/global offsets; isotonic requires higher sample threshold",
         },
     )
@@ -961,7 +1225,10 @@ def run_model_governance(
     threshold_version: ModelThresholdVersion | None = None
     if sample_count < train_min:
         status = "skipped_insufficient_samples"
-        reason = f"INSUFFICIENT_MATURE_RESOLVED_SAMPLES:{sample_count}/{train_min}"
+        reason = (
+            f"INSUFFICIENT_MATURE_RESOLVED_SAMPLES_CLEAN_WINDOW:{sample_count}/{train_min};"
+            f"RAW_RESOLVED_MATURE_SAMPLES:{raw_sample_count}"
+        )
         promoted = False
     else:
         offsets = _fit_probability_offsets(train_rows)
@@ -991,6 +1258,8 @@ def run_model_governance(
                 "challenger_holdout": challenger_metrics,
                 "residual_offsets": _offsets_to_json(offsets),
                 "combined_offsets": _offsets_to_json(combined_offsets),
+                "paper_trading_epoch_id": paper_trading_epoch_id,
+                **clean_policy_metrics,
             },
         )
         session.add(challenger)
@@ -1009,6 +1278,7 @@ def run_model_governance(
             metrics={
                 "sample_count": sample_count,
                 "paper_trading_epoch_id": paper_trading_epoch_id,
+                **clean_policy_metrics,
                 "note": "Threshold tuning is evaluated separately from probability training.",
             },
         )
@@ -1067,6 +1337,7 @@ def run_model_governance(
             "promoted": promoted,
             "metrics": metrics,
             "holdout_metrics": holdout_metrics,
+            **clean_policy_metrics,
         },
     )
     session.add_all([training, calibration, event])
@@ -1076,6 +1347,14 @@ def run_model_governance(
         "reason": reason,
         "resolved_samples": sample_count,
         "resolved_mature_samples": sample_count,
+        "raw_resolved_mature_samples": raw_sample_count,
+        "clean_resolved_mature_samples": sample_count,
+        "pre_clean_excluded_samples": raw_sample_count - sample_count,
+        "clean_filter_exclusion_counts": clean_exclusion_counts,
+        "governance_training_policy": clean_window["policy"],
+        "clean_training_start_at": clean_window["start_at_utc"],
+        "clean_training_start_at_et": clean_window["start_at_et"],
+        "clean_training_start_date_et": clean_window["start_date_et_iso"],
         "minimum_samples_train": train_min,
         "minimum_samples_calibrate": calibrate_min,
         "minimum_samples_promote": promote_min,
@@ -1093,38 +1372,52 @@ def run_model_governance(
         "promoted": promoted,
         "metrics": metrics,
         "holdout_metrics": holdout_metrics,
+        "governance_parameter_registry": governance_parameter_registry(),
     }
 
 
 def governance_status(session: Session, paper_trading_epoch_id: int | None = None) -> dict[str, object]:
     if paper_trading_epoch_id is None:
         paper_trading_epoch_id = get_or_create_active_paper_epoch(session).id
+    clean_window = _governance_clean_training_window()
     active = session.scalar(select(ModelVersion).where(ModelVersion.is_active.is_(True)))
     active_parameters = session.scalar(
         select(ModelParameterVersion).where(ModelParameterVersion.is_active.is_(True))
     )
     last_training, last_calibration, last_threshold = latest_governance_artifacts(session, paper_trading_epoch_id)
+    sample_summary = governance_sample_summary(session, paper_trading_epoch_id)
+    ignored_artifacts = _governance_ignored_artifacts(session, paper_trading_epoch_id, clean_window)
     mature_count = session.scalar(
         select(func.count(ModelCandidate.id))
         .where(ModelCandidate.paper_trading_epoch_id == paper_trading_epoch_id)
         .where(ModelCandidate.feature_version == FEATURE_VERSION)
         .where(ModelCandidate.training_eligible.is_(True))
     ) or 0
-    resolved_count = len(_resolved_mature_candidates(session, paper_trading_epoch_id=paper_trading_epoch_id))
     return {
         "active_model_version": active.version_tag if active else None,
         "active_parameter_version": active_parameters.version_tag if active_parameters else None,
         "active_calibration_version": active_parameters.version_tag if active_parameters else None,
         "paper_trading_epoch_id": paper_trading_epoch_id,
         "feature_version": FEATURE_VERSION,
+        "governance_training_policy": clean_window["policy"],
+        "clean_training_start_at": clean_window["start_at_utc"],
+        "clean_training_start_at_et": clean_window["start_at_et"],
+        "clean_training_start_date_et": clean_window["start_date_et_iso"],
         "calibration_status": last_calibration.status if last_calibration else "not_run",
         "last_training_run": last_training.started_at.isoformat() if last_training else None,
         "last_calibration_run": last_calibration.started_at.isoformat() if last_calibration else None,
-        "resolved_mature_samples": resolved_count,
+        "resolved_mature_samples": int(sample_summary["clean_resolved_mature_samples"]),
+        "raw_resolved_mature_samples": int(sample_summary["raw_resolved_mature_samples"]),
+        "clean_resolved_mature_samples": int(sample_summary["clean_resolved_mature_samples"]),
+        "pre_clean_excluded_samples": int(sample_summary["pre_clean_excluded_samples"]),
+        "clean_filter_exclusion_counts": sample_summary["clean_filter_exclusion_counts"],
         "training_eligible_count": int(mature_count),
+        "clean_training_eligible_count": int(sample_summary["clean_resolved_mature_samples"]),
         "last_governance_status": last_training.status if last_training else "not_run",
         "trade_threshold_policy": last_threshold.thresholds if last_threshold else {},
-        "notes": "PR3c fix2 v2 model is active; parameter training promotes only after sample guardrails.",
+        "ignored_pre_clean_artifacts": ignored_artifacts,
+        "governance_parameter_registry": governance_parameter_registry(),
+        "notes": "PR3p clean governance trains and promotes only from active-epoch samples after the clean cutoff.",
     }
 
 
