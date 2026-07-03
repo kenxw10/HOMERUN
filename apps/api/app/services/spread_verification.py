@@ -381,7 +381,7 @@ def _supporting_spread_conflicts(
 ) -> list[str]:
     conflicts: list[str] = []
     selected = (selection_code or "").upper()
-    for field in ("yes_sub_title", "yes_subtitle", "yes_title", "subtitle"):
+    for field in ("title", "yes_sub_title", "yes_subtitle", "yes_title", "subtitle"):
         value = payload.get(field)
         if not value:
             continue

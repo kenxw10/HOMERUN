@@ -17191,6 +17191,36 @@ def test_full_game_spread_explicit_contradictory_no_text_remains_unsafe() -> Non
     assert "no_contract_text_conflicts_with_expected_complement" in verification.reason_codes
 
 
+def test_full_game_spread_title_line_conflict_blocks_trusted_audit() -> None:
+    game = MlbGame(
+        external_game_id="rules-spread-conflicting-title",
+        home_team="Pittsburgh Pirates",
+        away_team="Seattle Mariners",
+        home_abbreviation="PIT",
+        away_abbreviation="SEA",
+        scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+        status="scheduled",
+    )
+
+    verification = verify_spread_market(
+        game=game,
+        family_key="full_game_spread",
+        raw={
+            "ticker": "KXMLBSPREAD-26JUL011900SEAPIT-PIT2",
+            "title": "Pittsburgh Pirates +1.5 run line",
+            "yes_sub_title": "If Pittsburgh wins by more than 1.5 runs, this market resolves to Yes.",
+            "no_sub_title": "If Pittsburgh wins by more than 1.5 runs, this market resolves to Yes.",
+            "rules_primary": "If Pittsburgh wins by more than 1.5 runs, this market resolves to Yes.",
+        },
+    )
+
+    assert verification.verified is False
+    assert verification.line_value == Decimal("-1.5000")
+    assert verification.audit_status == "ambiguous_line_direction"
+    assert "subtitle_rules_line_conflict" in verification.reason_codes
+    assert verification.actual_contract_display == "YES ON PITTSBURGH PIRATES -1.5 FULL GAME"
+
+
 def test_full_game_spread_integer_line_requires_verified_push_behavior() -> None:
     game = MlbGame(
         external_game_id="rules-spread-integer",
