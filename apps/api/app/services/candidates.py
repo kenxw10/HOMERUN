@@ -843,7 +843,12 @@ def _diagnostics_payload(
     game_not_started = minutes_to_start > 0 and _eastern_date(game.scheduled_start) == target_date
     market_open = market.status.strip().lower() in TRADABLE_MARKET_STATUSES
     price_ok = price_context.status == "fresh_executable"
-    spread_trading_ok = settings.paper_spread_trading_enabled or market_type not in {FULL_GAME_SPREAD, FIRST_FIVE_SPREAD}
+    full_game_spread_audit_only = market_type == FULL_GAME_SPREAD
+    spread_trading_ok = (
+        False
+        if full_game_spread_audit_only
+        else settings.paper_spread_trading_enabled or market_type != FIRST_FIVE_SPREAD
+    )
     spread_parser_ok = _spread_parser_verified(mapping, game, market, market_type)
     data_quality_ok = data_quality is not None and data_quality >= _paper_quality_threshold()
     push_ok = not (push_probability is not None and push_probability > Decimal("0") and market_type.endswith(("spread", "total")))
@@ -908,6 +913,10 @@ def _diagnostics_payload(
         "gate_f5_tie_enabled": f5_tie_enabled,
         "gate_selection_trusted_ok": selection_trusted_ok,
         "gate_spread_trading_enabled": spread_trading_ok,
+        "paper_spread_trading_enabled": settings.paper_spread_trading_enabled,
+        "paper_first_five_spread_trading_enabled": settings.paper_spread_trading_enabled,
+        "paper_full_game_spread_trading_enabled": False,
+        "full_game_spread_audit_only": full_game_spread_audit_only,
         "gate_spread_parser_verified": spread_parser_ok,
         "gate_price_fresh_executable": price_ok,
         "gate_price_floor_ok": price_floor_ok,
@@ -1100,7 +1109,9 @@ def _base_decision(
         if mapping.line_value is None and market.line_value is None and market_type.endswith(("spread", "total")):
             return "no_trade_missing_line"
         return "no_trade_parse_uncertain"
-    if market_type in {FULL_GAME_SPREAD, FIRST_FIVE_SPREAD} and not settings.paper_spread_trading_enabled:
+    if market_type == FULL_GAME_SPREAD:
+        return "no_trade_full_game_spread_audit_only"
+    if market_type == FIRST_FIVE_SPREAD and not settings.paper_spread_trading_enabled:
         return "no_trade_spread_trading_disabled"
     if market_type in SPREAD_FAMILIES and not _spread_parser_verified(mapping, game, market, market_type):
         return "no_trade_spread_parser_unverified"
@@ -2320,6 +2331,9 @@ def generate_candidates(
             "paper_allow_multiple_lines_per_game_family": settings.paper_allow_multiple_lines_per_game_family,
             "paper_allow_multiple_f5_winner_outcomes": settings.paper_allow_multiple_f5_winner_outcomes,
             "paper_spread_trading_enabled": settings.paper_spread_trading_enabled,
+            "paper_first_five_spread_trading_enabled": settings.paper_spread_trading_enabled,
+            "paper_full_game_spread_trading_enabled": False,
+            "full_game_spread_audit_only": True,
             "paper_f5_tie_trading_enabled": False,
             "paper_min_trade_price": float(settings.paper_min_trade_price),
             "paper_low_price_threshold": float(settings.paper_low_price_threshold),
@@ -2638,6 +2652,9 @@ def generate_candidates(
             elif decision == "no_trade_mapping_uncertain":
                 candidate.training_eligible = False
                 candidate.training_exclusion_reason = "mapping_uncertain"
+            elif decision == "no_trade_full_game_spread_audit_only":
+                candidate.training_eligible = False
+                candidate.training_exclusion_reason = "full_game_spread_audit_only"
             elif decision == "no_trade_spread_trading_disabled":
                 candidate.training_eligible = False
                 candidate.training_exclusion_reason = "spread_trading_disabled"
@@ -3122,6 +3139,10 @@ def generate_candidates(
         "low_price_controls": low_price_controls,
         "game_scope_correlation": game_scope_summary,
         "spread_trading_enabled": settings.paper_spread_trading_enabled,
+        "paper_spread_trading_enabled": settings.paper_spread_trading_enabled,
+        "paper_first_five_spread_trading_enabled": settings.paper_spread_trading_enabled,
+        "paper_full_game_spread_trading_enabled": False,
+        "full_game_spread_audit_only": True,
         "side_aware_candidates_enabled": True,
         "risk_caps_enabled": True,
         "candidates_yes": len([candidate for candidate in evaluated_candidates if candidate.contract_side == "yes"]),
@@ -3195,6 +3216,10 @@ def generate_candidates(
         "low_price_controls": low_price_controls,
         "game_scope_correlation": game_scope_summary,
         "spread_trading_enabled": settings.paper_spread_trading_enabled,
+        "paper_spread_trading_enabled": settings.paper_spread_trading_enabled,
+        "paper_first_five_spread_trading_enabled": settings.paper_spread_trading_enabled,
+        "paper_full_game_spread_trading_enabled": False,
+        "full_game_spread_audit_only": True,
         "side_aware_candidates_enabled": True,
         "risk_caps_enabled": True,
         "candidates_yes": len([candidate for candidate in evaluated_candidates if candidate.contract_side == "yes"]),
