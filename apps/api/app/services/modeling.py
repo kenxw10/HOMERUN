@@ -9,7 +9,7 @@ import time
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import func, select
+from sqlalchemy import Date, cast, func, select
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
@@ -837,21 +837,34 @@ def _resolved_mature_candidate_filters(paper_trading_epoch_id: int | None = None
         ModelCandidate.price_status == "fresh_executable",
         ModelCandidate.time_to_start_minutes.is_not(None),
         ModelCandidate.time_to_start_minutes > 0,
-        ModelCandidate.target_date.is_not(None),
-        ModelCandidate.mlb_game_id.is_not(None),
     ]
     if paper_trading_epoch_id is not None:
         filters.append(ModelCandidate.paper_trading_epoch_id == paper_trading_epoch_id)
     return filters
 
 
+def _candidate_game_target_date_expression(session: Session):
+    bind = session.get_bind()
+    if bind is not None and bind.dialect.name == "postgresql":
+        return cast(func.timezone(str(get_dashboard_zone()), MlbGame.scheduled_start), Date)
+    return func.date(MlbGame.scheduled_start)
+
+
+def _resolved_mature_candidate_count_statement(session: Session, paper_trading_epoch_id: int | None = None):
+    return (
+        select(func.count(ModelCandidate.id))
+        .select_from(ModelCandidate)
+        .join(MlbGame, ModelCandidate.mlb_game_id == MlbGame.id)
+        .where(
+            *_resolved_mature_candidate_filters(paper_trading_epoch_id),
+            ModelCandidate.target_date == _candidate_game_target_date_expression(session),
+        )
+    )
+
+
 def count_raw_resolved_mature_candidates(session: Session, paper_trading_epoch_id: int | None = None) -> int:
     return int(
-        session.scalar(
-            select(func.count(ModelCandidate.id)).where(
-                *_resolved_mature_candidate_filters(paper_trading_epoch_id)
-            )
-        )
+        session.scalar(_resolved_mature_candidate_count_statement(session, paper_trading_epoch_id))
         or 0
     )
 
@@ -861,14 +874,12 @@ def count_clean_filter_exclusions_by_reason(
     paper_trading_epoch_id: int | None,
     clean_window: dict[str, object],
 ) -> dict[str, int]:
-    base_filters = _resolved_mature_candidate_filters(paper_trading_epoch_id)
     clean_start = clean_window["start_at"]
     clean_date = clean_window["start_date_et"]
     counts = {
         "target_date_before_clean_start": int(
             session.scalar(
-                select(func.count(ModelCandidate.id)).where(
-                    *base_filters,
+                _resolved_mature_candidate_count_statement(session, paper_trading_epoch_id).where(
                     ModelCandidate.target_date < clean_date,
                 )
             )
@@ -876,8 +887,7 @@ def count_clean_filter_exclusions_by_reason(
         ),
         "missing_evaluated_at": int(
             session.scalar(
-                select(func.count(ModelCandidate.id)).where(
-                    *base_filters,
+                _resolved_mature_candidate_count_statement(session, paper_trading_epoch_id).where(
                     ModelCandidate.target_date >= clean_date,
                     ModelCandidate.evaluated_at.is_(None),
                 )
@@ -886,8 +896,7 @@ def count_clean_filter_exclusions_by_reason(
         ),
         "evaluated_before_clean_start": int(
             session.scalar(
-                select(func.count(ModelCandidate.id)).where(
-                    *base_filters,
+                _resolved_mature_candidate_count_statement(session, paper_trading_epoch_id).where(
                     ModelCandidate.target_date >= clean_date,
                     ModelCandidate.evaluated_at.is_not(None),
                     ModelCandidate.evaluated_at < clean_start,
@@ -906,8 +915,7 @@ def count_clean_resolved_mature_candidates(
 ) -> int:
     return int(
         session.scalar(
-            select(func.count(ModelCandidate.id)).where(
-                *_resolved_mature_candidate_filters(paper_trading_epoch_id),
+            _resolved_mature_candidate_count_statement(session, paper_trading_epoch_id).where(
                 ModelCandidate.target_date >= clean_window["start_date_et"],
                 ModelCandidate.evaluated_at >= clean_window["start_at"],
             )

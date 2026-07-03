@@ -30,6 +30,7 @@ def upgrade() -> None:
         "model_candidates",
         [
             "paper_trading_epoch_id",
+            "mlb_game_id",
             "training_eligible",
             "feature_version",
             "outcome",

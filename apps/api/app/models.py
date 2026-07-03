@@ -162,6 +162,7 @@ class ModelCandidate(TimestampMixin, Base):
         Index(
             "ix_model_candidates_epoch_governance_counts",
             "paper_trading_epoch_id",
+            "mlb_game_id",
             "training_eligible",
             "feature_version",
             "outcome",

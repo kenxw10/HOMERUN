@@ -8304,7 +8304,16 @@ def test_governance_status_uses_aggregate_counts_without_candidate_loader(monkey
             scheduled_start=datetime(2026, 7, 2, 23, 0, tzinfo=UTC),
             status="Final",
         )
-        session.add(game)
+        mismatched_game = MlbGame(
+            external_game_id="governance-status-aggregate-mismatched-date",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 4, 23, 0, tzinfo=UTC),
+            status="Final",
+        )
+        session.add_all([game, mismatched_game])
         session.flush()
         _add_governance_candidate(
             session,
@@ -8313,6 +8322,15 @@ def test_governance_status_uses_aggregate_counts_without_candidate_loader(monkey
             target_date=date(2026, 7, 2),
             evaluated_at=datetime(2026, 7, 2, 16, 0, tzinfo=UTC),
             resolved_at=datetime(2026, 7, 3, 4, 0, tzinfo=UTC),
+        )
+        _add_governance_candidate(
+            session,
+            epoch_id=epoch_id,
+            game_id=mismatched_game.id,
+            target_date=date(2026, 7, 2),
+            evaluated_at=datetime(2026, 7, 2, 16, 5, tzinfo=UTC),
+            resolved_at=datetime(2026, 7, 3, 4, 5, tzinfo=UTC),
+            outcome="loss",
         )
         session.commit()
 
