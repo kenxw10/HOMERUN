@@ -996,6 +996,23 @@ def _combine_probability_offsets(
     }
 
 
+def _clean_challenger_parameter_seed(
+    active_parameters: ModelParameterVersion,
+    clean_window: dict[str, object],
+) -> tuple[dict[str, object], dict[str, object]]:
+    if _metrics_match_clean_training_policy(active_parameters.metrics, clean_window):
+        return dict(active_parameters.parameters or DEFAULT_MODEL_PARAMETERS), {
+            "parameter_seed_version": active_parameters.version_tag,
+            "parameter_seed_policy": "inherit_clean_active_parameter_version",
+            "parameter_seed_clean_policy_matched": True,
+        }
+    return dict(DEFAULT_MODEL_PARAMETERS), {
+        "parameter_seed_version": active_parameters.version_tag,
+        "parameter_seed_policy": "reset_to_default_parameters_pre_clean_active_ignored",
+        "parameter_seed_clean_policy_matched": False,
+    }
+
+
 def _metadata_epoch_id(metadata: dict[str, object] | None) -> int | None:
     if not isinstance(metadata, dict):
         return None
@@ -1232,9 +1249,10 @@ def run_model_governance(
         promoted = False
     else:
         offsets = _fit_probability_offsets(train_rows)
-        combined_offsets = _combine_probability_offsets(active_parameters.parameters, offsets)
+        parameter_seed, parameter_seed_metrics = _clean_challenger_parameter_seed(active_parameters, clean_window)
+        combined_offsets = _combine_probability_offsets(parameter_seed, offsets)
         challenger_parameters = {
-            **(active_parameters.parameters or DEFAULT_MODEL_PARAMETERS),
+            **parameter_seed,
             "market_family_probability_offsets": _offsets_to_json(combined_offsets),
             "trained_from_samples": True,
             "training_sample_count": len(train_rows),
@@ -1259,6 +1277,7 @@ def run_model_governance(
                 "residual_offsets": _offsets_to_json(offsets),
                 "combined_offsets": _offsets_to_json(combined_offsets),
                 "paper_trading_epoch_id": paper_trading_epoch_id,
+                **parameter_seed_metrics,
                 **clean_policy_metrics,
             },
         )

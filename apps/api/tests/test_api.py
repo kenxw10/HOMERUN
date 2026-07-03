@@ -14127,6 +14127,74 @@ def test_governance_trains_challenger_when_sample_threshold_met(monkeypatch) -> 
     assert challenger.parameters["trained_from_samples"] is True
 
 
+def test_clean_governance_challenger_does_not_inherit_pre_clean_offsets(monkeypatch) -> None:
+    monkeypatch.setenv("MODEL_MIN_SAMPLES_TRAIN", "3")
+    monkeypatch.setenv("MODEL_MIN_SAMPLES_CALIBRATE", "3")
+    monkeypatch.setenv("MODEL_MIN_SAMPLES_PROMOTE", "99")
+    monkeypatch.setenv("MODEL_GOVERNANCE_CLEAN_START_AT", "2026-07-02T00:00:00-04:00")
+    get_settings.cache_clear()
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    target_date = date(2026, 7, 2)
+
+    with Session(engine) as session:
+        epoch_id = _active_epoch_id(session)
+        session.add(
+            ModelParameterVersion(
+                version_tag="pre_clean_active_offsets",
+                model_family=modeling.MODEL_FAMILY,
+                role="champion",
+                status="promoted",
+                is_active=True,
+                promoted_at=datetime(2026, 7, 1, 12, 0, tzinfo=UTC),
+                parameters={
+                    **modeling.DEFAULT_MODEL_PARAMETERS,
+                    "market_family_probability_offsets": {"__global__": 0.02},
+                    "trained_from_samples": True,
+                },
+                metrics={"paper_trading_epoch_id": epoch_id},
+            )
+        )
+        game = MlbGame(
+            external_game_id="governance-clean-offset-reset",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 2, 23, 0, tzinfo=UTC),
+            status="Final",
+        )
+        session.add(game)
+        session.flush()
+        for index, outcome in enumerate(["win", "win", "loss", "win", "loss"], start=1):
+            _add_governance_candidate(
+                session,
+                epoch_id=epoch_id,
+                game_id=game.id,
+                target_date=target_date,
+                evaluated_at=datetime(2026, 7, 2, 16, index, tzinfo=UTC),
+                resolved_at=datetime(2026, 7, 3, 4, index, tzinfo=UTC),
+                outcome=outcome,
+            )
+        session.commit()
+
+        result = run_model_governance(session, now=datetime(2026, 7, 3, 12, 0, tzinfo=UTC))
+        challenger = session.scalar(
+            select(ModelParameterVersion).where(
+                ModelParameterVersion.version_tag == result["challenger_parameter_version"]
+            )
+        )
+
+    assert result["status"] == "trained_not_promoted"
+    assert challenger is not None
+    combined_global = Decimal(str(challenger.metrics["combined_offsets"]["__global__"]))
+    challenger_global = Decimal(str(challenger.parameters["market_family_probability_offsets"]["__global__"]))
+    assert combined_global == Decimal("0.075")
+    assert challenger_global == Decimal("0.075")
+    assert challenger.metrics["parameter_seed_policy"] == "reset_to_default_parameters_pre_clean_active_ignored"
+    assert challenger.metrics["parameter_seed_clean_policy_matched"] is False
+
+
 @pytest.mark.parametrize(
     ("market_family", "selection_code", "line_value", "over_under_side"),
     [
