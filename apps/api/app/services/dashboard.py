@@ -793,6 +793,39 @@ def _latest_job_status(
         .where(JobRun.paper_trading_epoch_id == epoch.id)
         .subquery()
     )
+    if not include_job_results:
+        rows = list(
+            session.execute(
+                select(
+                    JobRun.job_name,
+                    JobRun.status,
+                    JobRun.started_at,
+                    JobRun.completed_at,
+                    JobRun.duration_seconds,
+                    JobRun.target_date,
+                )
+                .join(ranked, JobRun.id == ranked.c.job_run_id)
+                .where(ranked.c.job_rank == 1)
+                .order_by(JobRun.job_name.asc())
+            )
+        )
+        return {
+            row.job_name: JobRunSummary(
+                job_name=row.job_name,
+                status=row.status,
+                started_at=to_eastern_iso(row.started_at),
+                completed_at=to_eastern_iso(row.completed_at),
+                duration_seconds=row.duration_seconds,
+                target_date=row.target_date.isoformat() if row.target_date else None,
+                result_is_compact=True,
+                step_count=None,
+                warning_count=None,
+                error_count=None,
+                result={},
+            )
+            for row in rows
+        }
+
     rows = list(
         session.scalars(
             select(JobRun)
@@ -812,11 +845,11 @@ def _latest_job_status(
             completed_at=to_eastern_iso(row.completed_at),
             duration_seconds=row.duration_seconds,
             target_date=row.target_date.isoformat() if row.target_date else None,
-            result_is_compact=not include_job_results,
+            result_is_compact=False,
             step_count=len(row.steps or []),
             warning_count=len(row.warnings or []),
             error_count=len(row.errors or []),
-            result=_compact_job_result(row.result, include_details=include_job_results),
+            result=_compact_job_result(row.result, include_details=True),
         )
     return latest
 

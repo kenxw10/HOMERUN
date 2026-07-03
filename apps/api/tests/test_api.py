@@ -854,7 +854,7 @@ def test_dashboard_job_status_is_scoped_to_active_epoch() -> None:
         summary = dashboard.dashboard_summary_from_db(session)
 
     assert summary.job_status["candidate-sweep"].status == "succeeded"
-    assert summary.job_status["candidate-sweep"].result == {"epoch": "active"}
+    assert summary.job_status["candidate-sweep"].result == {}
 
 
 def test_dashboard_job_status_fetches_latest_per_job_without_global_truncation() -> None:
@@ -903,10 +903,14 @@ def test_dashboard_job_status_fetches_latest_per_job_without_global_truncation()
         session.commit()
 
         summary = dashboard.dashboard_summary_from_db(session)
+        debug_summary = dashboard.dashboard_summary_from_db(session, include_job_results=True)
 
-    assert summary.job_status["price-refresh"].result == {"refresh_index": 54}
-    assert summary.job_status["governance"].result == {"governance": "present"}
-    assert summary.job_status["full-paper-cycle"].result == {"cycle": "present"}
+    assert summary.job_status["price-refresh"].result == {}
+    assert summary.job_status["governance"].result == {}
+    assert summary.job_status["full-paper-cycle"].result == {}
+    assert debug_summary.job_status["price-refresh"].result == {"refresh_index": 54}
+    assert debug_summary.job_status["governance"].result == {"governance": "present"}
+    assert debug_summary.job_status["full-paper-cycle"].result == {"cycle": "present"}
 
 
 def test_dashboard_summary_compacts_heavy_job_payloads_by_default() -> None:
@@ -950,11 +954,10 @@ def test_dashboard_summary_compacts_heavy_job_payloads_by_default() -> None:
 
     compact = summary.job_status["spread-audit"]
     assert compact.result_is_compact is True
-    assert compact.step_count == 1
-    assert compact.warning_count == 1
-    assert compact.result["checked"] == 8
-    assert compact.result["items_count"] == 8
-    assert compact.result["items_omitted"] is True
+    assert compact.step_count is None
+    assert compact.warning_count is None
+    assert compact.error_count is None
+    assert compact.result == {}
     assert "raw_payload" not in json.dumps(compact.result)
     assert "features" not in json.dumps(compact.result)
 
@@ -963,6 +966,39 @@ def test_dashboard_summary_compacts_heavy_job_payloads_by_default() -> None:
     assert debug_result["items"]["truncated"] is False
     assert "raw_payload" not in json.dumps(debug_result)
     assert "features" not in json.dumps(debug_result)
+
+
+def test_compact_dashboard_job_status_does_not_deserialize_job_json() -> None:
+    def reject_json_deserialization(_value: object) -> object:
+        raise AssertionError("compact job status must not deserialize JSON columns")
+
+    engine = create_engine("sqlite+pysqlite:///:memory:", json_deserializer=reject_json_deserialization)
+    Base.metadata.create_all(engine)
+    now = datetime(2026, 7, 3, 16, 0, tzinfo=UTC)
+
+    with Session(engine) as session:
+        active = get_or_create_active_paper_epoch(session, starting_balance=Decimal("500.00"))
+        active_id = active.id
+        session.add(
+            JobRun(
+                job_name="candidate-sweep",
+                job_type="paper_ops",
+                paper_trading_epoch_id=active_id,
+                status="succeeded",
+                started_at=now,
+                completed_at=now + timedelta(seconds=10),
+                result={"large": ["x" * 1000]},
+                warnings=[{"message": "sample warning"}],
+                errors=[],
+                steps=[{"name": "paper_candidate_engine", "status": "succeeded"}],
+            )
+        )
+        session.commit()
+
+        latest = dashboard._latest_job_status(session, SimpleNamespace(id=active_id))
+
+    assert latest["candidate-sweep"].status == "succeeded"
+    assert latest["candidate-sweep"].result == {}
 
 
 def test_dashboard_candidate_diagnostics_omit_candidate_level_lists_by_default() -> None:
