@@ -200,7 +200,7 @@ After deployment, validate:
 5. Run a dry candidate sweep and confirm `feature_sync_mode=cache_only`, `feature_sync_skipped=true`, and `heavy_feature_sync_skipped=true`.
 6. Confirm candidate diagnostics include `defense_catcher` in quality contribution/penalty output.
 7. Confirm PR3k selection controls, PR3m pregame context refresh, and PR3m.1 observation cutoff behavior still hold.
-8. Keep PR3o spread audit and PR3p spread enablement separate.
+8. Keep PR3o spread audit and any future spread-activation work separate.
 
 ## PR3n.1 First-Five Lifecycle Settlement
 
@@ -263,10 +263,10 @@ Per-market rows should include ticker, event ticker, title/subtitle/rules/YES/NO
 
 Interpretation:
 
-- `trusted_audit_only_count` is evidence for manual PR3p review only.
+- `trusted_audit_only_count` is evidence for manual future spread-activation review only.
 - Any `needs_review`, ambiguous, missing, or push-uncertain status must remain blocked.
-- Candidate sweeps should still show full-game spread candidates as no-trade with `no_trade_full_game_spread_audit_only`. The broad spread flag still controls first-five spread diagnostics, but full-game spread paper trading remains disabled until a future PR3p.
-- PR3p is the only future PR allowed to enable full-game spread paper trading, and only for rows that PR3o evidence proves safe.
+- Candidate sweeps should still show full-game spread candidates as no-trade with `no_trade_full_game_spread_audit_only`. The broad spread flag still controls first-five spread diagnostics, but full-game spread paper trading remains disabled until a future dedicated spread-activation PR.
+- A future dedicated spread-activation PR is the only work that should enable full-game spread paper trading, and only for rows that PR3o evidence proves safe.
 
 After deployment, validate:
 
@@ -274,10 +274,32 @@ After deployment, validate:
 2. Confirm default `/v1/dashboard/summary` still has the PR3m.1 observation cutoff active.
 3. Run `POST /v1/jobs/run/spread-audit?target_date=today_et&min_time_to_start_minutes=45&max_time_to_start_minutes=180`.
 4. Confirm the result includes `audit_scope=full_game_spread`, `read_only=true`, `mapping_mutations=0`, `settlement_rows_created=0`, `paper_trades_created=0`, `status_counts`, and `examples_by_reason`.
-5. Inspect trusted and review examples manually against Kalshi UI text before considering PR3p.
+5. Inspect trusted and review examples manually against Kalshi UI text before considering spread activation.
 6. Run a dry candidate sweep and confirm `feature_sync_mode=cache_only`, pregame context is present, full-game spread trades are not created, and PR3k controls remain active.
 7. Run settlement and confirm PR3n.1 first-five lifecycle behavior and full-game final-only behavior remain unchanged.
 8. Confirm no live execution, WebSocket, cron schedule, model/EV/risk-cap, source-sync, defense, sportsbook/team-total/umpire, or full-game spread activation behavior changed.
+
+## PR3p Clean Governance Training Autonomy
+
+Governance training has an explicit clean cutoff. The default is `MODEL_GOVERNANCE_CLEAN_START_AT=2026-07-02T00:00:00-04:00`, which is midnight ET at the PR3m.1 observation cutover.
+
+Operational meaning:
+
+- Governance still runs from the protected governance job or `/v1/run/model-governance`.
+- Training, calibration, challenger creation, threshold records, and promotion decisions use active-epoch mature resolved candidates only after the clean cutoff.
+- A candidate must have both `target_date` and `evaluated_at` at or after the cutoff to be clean.
+- Pre-clean candidates and legacy governance artifacts remain stored for audit/history but are not treated as current governance-ready artifacts.
+- `/v1/model/governance/status` and `/v1/dashboard/summary` model status report raw resolved samples, clean resolved samples, pre-clean exclusion counts, ignored pre-clean artifacts, and the autonomous parameter registry.
+- The registry is diagnostic. Currently governed items are bounded market-family/global probability offsets and active parameter-version promotion; safety flags, risk caps, and spread activation remain manual.
+
+After deployment, validate:
+
+1. Confirm `/v1/system/status` still reports paper mode, demo Kalshi environment, live trading disabled, and execution kill switch enabled.
+2. Confirm `GET /v1/model/governance/status` includes `clean_training_start_at`, `raw_resolved_mature_samples`, `clean_resolved_mature_samples`, `pre_clean_excluded_samples`, `ignored_pre_clean_artifacts`, and `governance_parameter_registry`.
+3. If raw samples exist but clean samples are below `MODEL_MIN_SAMPLES_TRAIN`, governance should return `skipped_insufficient_samples` with a clean-window reason and should not create a challenger.
+4. If clean samples later meet thresholds, challenger training/promotion should still require the existing sample, logloss, and ECE guardrails.
+5. Confirm dashboard model status shows the same clean sample counts as `/v1/model/governance/status`.
+6. Confirm no live execution, WebSocket, cron schedule, model formula, EV threshold, risk-cap, source-sync, settlement, market discovery, sportsbook/team-total/umpire, or full-game spread activation behavior changed.
 
 After deployment, validate:
 

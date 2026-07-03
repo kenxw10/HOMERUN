@@ -125,8 +125,19 @@ class ModelStatus(BaseModel):
     last_calibration_run: datetime | None
     candidate_count: int
     resolved_mature_samples: int = 0
+    raw_resolved_mature_samples: int = 0
+    clean_resolved_mature_samples: int = 0
+    pre_clean_excluded_samples: int = 0
     training_eligible_count: int = 0
+    clean_training_eligible_count: int = 0
     last_governance_status: str | None = None
+    governance_training_policy: str | None = None
+    clean_training_start_at: str | None = None
+    clean_training_start_at_et: str | None = None
+    clean_training_start_date_et: str | None = None
+    clean_filter_exclusion_counts: dict[str, int] = Field(default_factory=dict)
+    ignored_pre_clean_artifacts: dict[str, object] = Field(default_factory=dict)
+    governance_parameter_registry: dict[str, object] = Field(default_factory=dict)
     trade_policy: dict[str, object] = Field(default_factory=dict)
     trade_caps_used: dict[str, object] = Field(default_factory=dict)
     trade_threshold_policy: dict[str, object] = Field(default_factory=dict)

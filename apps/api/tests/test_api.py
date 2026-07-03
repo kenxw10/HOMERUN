@@ -38,6 +38,7 @@ from app.models import (
     ModelPredictionOutput,
     ModelPredictionRun,
     ModelThresholdVersion,
+    ModelTrainingDataset,
     ModelVersion,
     MarketDataWorkerStatus,
     PaperTrade,
@@ -2589,7 +2590,7 @@ def test_governance_job_scopes_resolved_samples_to_active_epoch() -> None:
             away_team="Seattle Mariners",
             home_abbreviation="PIT",
             away_abbreviation="SEA",
-            scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+            scheduled_start=datetime(2026, 7, 2, 23, 0, tzinfo=UTC),
             status="Final",
         )
         session.add_all([archived, game])
@@ -2602,12 +2603,12 @@ def test_governance_job_scopes_resolved_samples_to_active_epoch() -> None:
                 ModelCandidate(
                     paper_trading_epoch_id=epoch_id,
                     mlb_game_id=game.id,
-                    evaluated_at=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
+                    evaluated_at=datetime(2026, 7, 2, 16, 0, tzinfo=UTC),
                     features={},
                     probability=Decimal("0.600000"),
                     model_probability=Decimal("0.600000"),
                     probability_calibrated=Decimal("0.600000"),
-                    target_date=date(2026, 7, 1),
+                    target_date=target,
                     fee_estimate=Decimal("0.010000"),
                     price_status="fresh_executable",
                     market_type="full_game_winner",
@@ -7729,6 +7730,39 @@ def test_candidate_diagnostics_include_defense_module_status(monkeypatch) -> Non
     assert "defense_catcher" in paper_quality["quality_penalty_by_module"]
 
 
+def _add_governance_candidate(
+    session: Session,
+    *,
+    epoch_id: int,
+    game_id: int,
+    target_date: date,
+    evaluated_at: datetime,
+    resolved_at: datetime,
+    outcome: str = "win",
+) -> ModelCandidate:
+    candidate = ModelCandidate(
+        paper_trading_epoch_id=epoch_id,
+        mlb_game_id=game_id,
+        evaluated_at=evaluated_at,
+        features={},
+        probability=Decimal("0.550000"),
+        probability_calibrated=Decimal("0.550000"),
+        target_date=target_date,
+        fee_estimate=Decimal("0.010000"),
+        price_status="fresh_executable",
+        time_to_start_minutes=420,
+        decision="candidate_only",
+        outcome=outcome,
+        resolved_at=resolved_at,
+        model_version_tag=modeling.MATURE_MODEL_TAG,
+        feature_version=features.FEATURE_VERSION,
+        training_eligible=True,
+        market_family="full_game_winner",
+    )
+    session.add(candidate)
+    return candidate
+
+
 def test_model_governance_skips_training_and_records_runs_when_samples_are_too_small() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
@@ -7748,6 +7782,83 @@ def test_model_governance_skips_training_and_records_runs_when_samples_are_too_s
     assert calibration.metrics["paper_trading_epoch_id"] == result["paper_trading_epoch_id"]
     assert status["calibration_status"] == "skipped_insufficient_samples"
     assert "INSUFFICIENT_MATURE_RESOLVED_SAMPLES" in training.metrics["reason"]
+
+
+def test_model_governance_clean_cutoff_excludes_pre_cutoff_samples(monkeypatch) -> None:
+    monkeypatch.setenv("MODEL_MIN_SAMPLES_TRAIN", "3")
+    monkeypatch.setenv("MODEL_MIN_SAMPLES_CALIBRATE", "3")
+    monkeypatch.setenv("MODEL_MIN_SAMPLES_PROMOTE", "99")
+    monkeypatch.setenv("MODEL_GOVERNANCE_CLEAN_START_AT", "2026-07-02T00:00:00-04:00")
+    get_settings.cache_clear()
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        epoch_id = _active_epoch_id(session)
+        pre_clean_game = MlbGame(
+            external_game_id="governance-clean-pre-cutoff",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+            status="Final",
+        )
+        clean_game = MlbGame(
+            external_game_id="governance-clean-post-cutoff",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 2, 23, 0, tzinfo=UTC),
+            status="Final",
+        )
+        session.add_all([pre_clean_game, clean_game])
+        session.flush()
+        pre_clean_candidate = _add_governance_candidate(
+            session,
+            epoch_id=epoch_id,
+            game_id=pre_clean_game.id,
+            target_date=date(2026, 7, 1),
+            evaluated_at=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
+            resolved_at=datetime(2026, 7, 2, 4, 0, tzinfo=UTC),
+            outcome="win",
+        )
+        clean_candidates = [
+            _add_governance_candidate(
+                session,
+                epoch_id=epoch_id,
+                game_id=clean_game.id,
+                target_date=date(2026, 7, 2),
+                evaluated_at=datetime(2026, 7, 2, 16, index, tzinfo=UTC),
+                resolved_at=datetime(2026, 7, 3, 4, index, tzinfo=UTC),
+                outcome=outcome,
+            )
+            for index, outcome in enumerate(["win", "loss"], start=1)
+        ]
+        session.commit()
+
+        result = run_model_governance(session, now=datetime(2026, 7, 3, 12, 0, tzinfo=UTC))
+        dataset = session.get(ModelTrainingDataset, result["training_dataset_id"])
+        challenger = session.scalar(select(ModelParameterVersion).where(ModelParameterVersion.role == "challenger"))
+        status = modeling.governance_status(session)
+        clean_candidate_ids = [candidate.id for candidate in clean_candidates]
+        pre_clean_candidate_id = pre_clean_candidate.id
+
+    assert result["status"] == "skipped_insufficient_samples"
+    assert result["raw_resolved_mature_samples"] == 3
+    assert result["clean_resolved_mature_samples"] == 2
+    assert result["pre_clean_excluded_samples"] == 1
+    assert result["clean_filter_exclusion_counts"] == {"target_date_before_clean_start": 1}
+    assert challenger is None
+    assert dataset is not None
+    assert dataset.sample_count == 2
+    assert dataset.candidate_ids == clean_candidate_ids
+    assert pre_clean_candidate_id not in dataset.candidate_ids
+    assert status["raw_resolved_mature_samples"] == 3
+    assert status["clean_resolved_mature_samples"] == 2
+    assert status["governance_training_policy"] == modeling.GOVERNANCE_CLEAN_TRAINING_POLICY
+    assert status["governance_parameter_registry"]["governed_now_count"] >= 1
 
 
 def test_model_governance_keeps_only_one_active_champion() -> None:
@@ -7867,7 +7978,9 @@ def test_model_governance_counts_samples_after_settlement_labels_candidates() ->
     assert governance_result["resolved_samples"] == 0
 
 
-def test_model_governance_defaults_to_active_epoch_when_scope_omitted() -> None:
+def test_model_governance_defaults_to_active_epoch_when_scope_omitted(monkeypatch) -> None:
+    monkeypatch.setenv("MODEL_GOVERNANCE_CLEAN_START_AT", "2026-07-01T00:00:00-04:00")
+    get_settings.cache_clear()
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
 
@@ -7928,7 +8041,9 @@ def test_model_governance_defaults_to_active_epoch_when_scope_omitted() -> None:
     assert training.candidate_count == 1
 
 
-def test_model_governance_status_counts_active_epoch_only() -> None:
+def test_model_governance_status_counts_active_epoch_only(monkeypatch) -> None:
+    monkeypatch.setenv("MODEL_GOVERNANCE_CLEAN_START_AT", "2026-07-01T00:00:00-04:00")
+    get_settings.cache_clear()
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
 
@@ -7956,6 +8071,17 @@ def test_model_governance_status_counts_active_epoch_only() -> None:
         session.flush()
         active_id = active.id
         archived_id = archived.id
+        clean_window = modeling._governance_clean_training_window()
+        active_clean_metrics = {
+            "paper_trading_epoch_id": active_id,
+            "governance_training_policy": clean_window["policy"],
+            "clean_training_start_at": clean_window["start_at_utc"],
+        }
+        archived_clean_metrics = {
+            "paper_trading_epoch_id": archived_id,
+            "governance_training_policy": clean_window["policy"],
+            "clean_training_start_at": clean_window["start_at_utc"],
+        }
         for epoch_id, outcome in ((active_id, "win"), (archived_id, "loss")):
             session.add(
                 ModelCandidate(
@@ -7983,30 +8109,39 @@ def test_model_governance_status_counts_active_epoch_only() -> None:
             completed_at=datetime(2026, 7, 2, 12, 1, tzinfo=UTC),
             status="active_epoch_training",
             candidate_count=1,
-            metrics={"paper_trading_epoch_id": active_id},
+            metrics=active_clean_metrics,
         )
         archived_training = TrainingRun(
             started_at=datetime(2026, 7, 3, 12, 0, tzinfo=UTC),
             completed_at=datetime(2026, 7, 3, 12, 1, tzinfo=UTC),
             status="archived_epoch_training",
             candidate_count=1,
-            metrics={"paper_trading_epoch_id": archived_id},
+            metrics=archived_clean_metrics,
+        )
+        legacy_active_training = TrainingRun(
+            started_at=datetime(2026, 7, 4, 12, 0, tzinfo=UTC),
+            completed_at=datetime(2026, 7, 4, 12, 1, tzinfo=UTC),
+            status="legacy_active_training_without_clean_policy",
+            candidate_count=9,
+            metrics={"paper_trading_epoch_id": active_id},
         )
         active_calibration = CalibrationRun(
             started_at=datetime(2026, 7, 2, 12, 0, tzinfo=UTC),
             completed_at=datetime(2026, 7, 2, 12, 1, tzinfo=UTC),
             status="active_epoch_calibration",
             method="test",
-            metrics={"paper_trading_epoch_id": active_id},
+            metrics=active_clean_metrics,
         )
         archived_calibration = CalibrationRun(
             started_at=datetime(2026, 7, 3, 12, 0, tzinfo=UTC),
             completed_at=datetime(2026, 7, 3, 12, 1, tzinfo=UTC),
             status="archived_epoch_calibration",
             method="test",
-            metrics={"paper_trading_epoch_id": archived_id},
+            metrics=archived_clean_metrics,
         )
-        session.add_all([active_training, archived_training, active_calibration, archived_calibration])
+        session.add_all(
+            [active_training, archived_training, legacy_active_training, active_calibration, archived_calibration]
+        )
         session.flush()
         session.add_all(
             [
@@ -8018,7 +8153,7 @@ def test_model_governance_status_counts_active_epoch_only() -> None:
                     created_at_snapshot=datetime(2026, 7, 2, 12, 0, tzinfo=UTC),
                     source_training_run_id=active_training.id,
                     thresholds={"policy": "active_epoch_threshold"},
-                    metrics={"paper_trading_epoch_id": active_id},
+                    metrics=active_clean_metrics,
                 ),
                 ModelThresholdVersion(
                     version_tag="archived_epoch_threshold",
@@ -8028,7 +8163,7 @@ def test_model_governance_status_counts_active_epoch_only() -> None:
                     created_at_snapshot=datetime(2026, 7, 3, 12, 0, tzinfo=UTC),
                     source_training_run_id=archived_training.id,
                     thresholds={"policy": "archived_epoch_threshold"},
-                    metrics={"paper_trading_epoch_id": archived_id},
+                    metrics=archived_clean_metrics,
                 ),
             ]
         )
@@ -8043,9 +8178,13 @@ def test_model_governance_status_counts_active_epoch_only() -> None:
     assert result["last_governance_status"] == "active_epoch_training"
     assert result["calibration_status"] == "active_epoch_calibration"
     assert result["trade_threshold_policy"] == {"policy": "active_epoch_threshold"}
+    assert result["ignored_pre_clean_artifacts"]["training"]["ignored_count"] == 1
     assert summary.model_status.last_governance_status == "active_epoch_training"
     assert summary.model_status.calibration_status == "active_epoch_calibration"
     assert summary.model_status.trade_threshold_policy == {"policy": "active_epoch_threshold"}
+    assert summary.model_status.raw_resolved_mature_samples == 1
+    assert summary.model_status.clean_resolved_mature_samples == 1
+    assert summary.model_status.ignored_pre_clean_artifacts["training"]["ignored_count"] == 1
 
 
 def test_pr3c_feature_sync_records_source_statuses_and_no_umpire_fields(monkeypatch) -> None:
@@ -13936,7 +14075,7 @@ def test_governance_trains_challenger_when_sample_threshold_met(monkeypatch) -> 
     get_settings.cache_clear()
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
-    target_date = date(2026, 7, 1)
+    target_date = date(2026, 7, 2)
 
     with Session(engine) as session:
         epoch_id = _active_epoch_id(session)
@@ -13946,7 +14085,7 @@ def test_governance_trains_challenger_when_sample_threshold_met(monkeypatch) -> 
             away_team="Seattle Mariners",
             home_abbreviation="PIT",
             away_abbreviation="SEA",
-            scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+            scheduled_start=datetime(2026, 7, 2, 23, 0, tzinfo=UTC),
             status="Final",
             home_score=5,
             away_score=3,
@@ -13958,7 +14097,7 @@ def test_governance_trains_challenger_when_sample_threshold_met(monkeypatch) -> 
                 ModelCandidate(
                     paper_trading_epoch_id=epoch_id,
                     mlb_game_id=game.id,
-                    evaluated_at=datetime(2026, 7, 1, 16, index, tzinfo=UTC),
+                    evaluated_at=datetime(2026, 7, 2, 16, index, tzinfo=UTC),
                     features={},
                     probability=Decimal("0.550000"),
                     probability_calibrated=Decimal("0.550000"),
@@ -13968,7 +14107,7 @@ def test_governance_trains_challenger_when_sample_threshold_met(monkeypatch) -> 
                     time_to_start_minutes=400,
                     decision="candidate_only",
                     outcome=outcome,
-                    resolved_at=datetime(2026, 7, 2, 4, index, tzinfo=UTC),
+                    resolved_at=datetime(2026, 7, 3, 4, index, tzinfo=UTC),
                     model_version_tag=modeling.MATURE_MODEL_TAG,
                     feature_version=features.FEATURE_VERSION,
                     training_eligible=True,
@@ -13986,6 +14125,74 @@ def test_governance_trains_challenger_when_sample_threshold_met(monkeypatch) -> 
     assert result["challenger_parameter_version"] is not None
     assert challenger is not None
     assert challenger.parameters["trained_from_samples"] is True
+
+
+def test_clean_governance_challenger_does_not_inherit_pre_clean_offsets(monkeypatch) -> None:
+    monkeypatch.setenv("MODEL_MIN_SAMPLES_TRAIN", "3")
+    monkeypatch.setenv("MODEL_MIN_SAMPLES_CALIBRATE", "3")
+    monkeypatch.setenv("MODEL_MIN_SAMPLES_PROMOTE", "99")
+    monkeypatch.setenv("MODEL_GOVERNANCE_CLEAN_START_AT", "2026-07-02T00:00:00-04:00")
+    get_settings.cache_clear()
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    target_date = date(2026, 7, 2)
+
+    with Session(engine) as session:
+        epoch_id = _active_epoch_id(session)
+        session.add(
+            ModelParameterVersion(
+                version_tag="pre_clean_active_offsets",
+                model_family=modeling.MODEL_FAMILY,
+                role="champion",
+                status="promoted",
+                is_active=True,
+                promoted_at=datetime(2026, 7, 1, 12, 0, tzinfo=UTC),
+                parameters={
+                    **modeling.DEFAULT_MODEL_PARAMETERS,
+                    "market_family_probability_offsets": {"__global__": 0.02},
+                    "trained_from_samples": True,
+                },
+                metrics={"paper_trading_epoch_id": epoch_id},
+            )
+        )
+        game = MlbGame(
+            external_game_id="governance-clean-offset-reset",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 2, 23, 0, tzinfo=UTC),
+            status="Final",
+        )
+        session.add(game)
+        session.flush()
+        for index, outcome in enumerate(["win", "win", "loss", "win", "loss"], start=1):
+            _add_governance_candidate(
+                session,
+                epoch_id=epoch_id,
+                game_id=game.id,
+                target_date=target_date,
+                evaluated_at=datetime(2026, 7, 2, 16, index, tzinfo=UTC),
+                resolved_at=datetime(2026, 7, 3, 4, index, tzinfo=UTC),
+                outcome=outcome,
+            )
+        session.commit()
+
+        result = run_model_governance(session, now=datetime(2026, 7, 3, 12, 0, tzinfo=UTC))
+        challenger = session.scalar(
+            select(ModelParameterVersion).where(
+                ModelParameterVersion.version_tag == result["challenger_parameter_version"]
+            )
+        )
+
+    assert result["status"] == "trained_not_promoted"
+    assert challenger is not None
+    combined_global = Decimal(str(challenger.metrics["combined_offsets"]["__global__"]))
+    challenger_global = Decimal(str(challenger.parameters["market_family_probability_offsets"]["__global__"]))
+    assert combined_global == Decimal("0.075")
+    assert challenger_global == Decimal("0.075")
+    assert challenger.metrics["parameter_seed_policy"] == "reset_to_default_parameters_pre_clean_active_ignored"
+    assert challenger.metrics["parameter_seed_clean_policy_matched"] is False
 
 
 @pytest.mark.parametrize(

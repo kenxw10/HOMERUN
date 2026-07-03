@@ -617,7 +617,7 @@ Every future PR must update this section with:
 
 - Added a spread verification service and protected spread-audit job that parse spread side, line, inning scope, settlement rule status, actual contract display, normalized equivalent display, and raw contract text from Kalshi raw fields. Ticker-only spread parsing is not enough to mark a row verified.
 - Added `POST /v1/jobs/run/spread-audit?target_date=YYYY-MM-DD&min_time_to_start_minutes=45&max_time_to_start_minutes=180` and `python -m app.jobs.runner --job spread-audit ...`. The job updates mapping/market audit metadata only and does not create paper trades.
-- First-five spread candidates can only trade when the parser is verified, settlement metadata is verified, all normal candidate gates pass, and `PAPER_SPREAD_TRADING_ENABLED=true`. Full-game spread candidates remain diagnostics-only with `no_trade_full_game_spread_audit_only` until a future PR3p explicitly enables them.
+- First-five spread candidates can only trade when the parser is verified, settlement metadata is verified, all normal candidate gates pass, and `PAPER_SPREAD_TRADING_ENABLED=true`. Full-game spread candidates remain diagnostics-only with `no_trade_full_game_spread_audit_only` until a future dedicated spread-activation PR explicitly enables them.
 - Improved position/candidate display so the dashboard shows matchup first, actual Kalshi contract display, normalized equivalent display, display title/subtitle, raw ticker, and selected-position rationale. Totals NO displays under/over equivalents such as `UNDER 8 FULL GAME EQUIVALENT` rather than fake spread-style signed lines.
 - Added same-game same-scope correlation selection with `PAPER_MAX_TRADES_PER_GAME_SCOPE=1` by default. First-five total plus first-five winner/tie on the same game is blocked by default; one first-five and one full-game exposure remain separate scopes.
 - Candidate sweep summaries and dashboard risk panels now report the active epoch portfolio value used as the risk-limit basis and the max risk-at-sweep values.
@@ -727,10 +727,10 @@ Every future PR must update this section with:
 - The protected `spread-audit` job is now a full-game spread audit-only diagnostic. It no longer runs market-family mapping sync as part of the job and the audit service itself does not write paper trades, settlements, candidates, market rows, or mapping metadata.
 - Audit output classifies full-game spread rows with stable statuses and reason codes, including `trusted_audit_only`, `needs_review`, `missing_line`, `ambiguous_team_selection`, `ambiguous_yes_no_semantics`, `ambiguous_line_direction`, `settlement_text_unverified`, and `push_behavior_uncertain`.
 - Per-market audit rows expose raw Kalshi title/subtitle/rules/YES/NO text, mapped MLB game, selected team, line sign/direction, YES interpretation, NO complement/equivalent interpretation, push possibility, push condition, and read-only settlement preview for final games.
-- `trusted_audit_only` means the parsed team, line, YES/NO complement, and push/settlement evidence are coherent enough for manual review. It does not enable paper trading. Rows with missing or ambiguous evidence remain `needs_review`/unsafe-style statuses and must not be trusted for PR3p.
+- `trusted_audit_only` means the parsed team, line, YES/NO complement, and push/settlement evidence are coherent enough for manual review. It does not enable paper trading. Rows with missing or ambiguous evidence remain `needs_review`/unsafe-style statuses and must not be trusted for a future spread-activation PR.
 - Full-game spread candidate generation remains blocked by `PAPER_SPREAD_TRADING_ENABLED=false` and spread parser verification. PR3o does not enable full-game spread paper trades.
 - No live execution, credential, WebSocket, cron cadence, model probability, EV, risk-cap, source-sync, dashboard observation cutoff, defense, first-five lifecycle settlement, sportsbook/team-total/umpire, schema, or frontend change was added.
-- PR3p remains the separate future PR for any full-game spread paper enablement, and only if PR3o audit evidence passes manual validation.
+- Full-game spread paper enablement remains a separate future PR, and only if PR3o audit evidence passes manual validation.
 
 ### PR3o.1 - Full-Game Spread Audit Normalization
 
@@ -740,3 +740,12 @@ Every future PR must update this section with:
 - Half-run spreads are treated as no-push markets. Integer spreads remain untrusted unless push/void/refund behavior is verified from rules text.
 - Candidate generation still blocks all full-game spread rows with `no_trade_full_game_spread_audit_only`; the broad spread flag continues to apply only to first-five spread diagnostics. PR3o.1 does not enable full-game spread paper trades.
 - No live execution, credential, WebSocket, cron cadence, model probability, EV, risk-cap, source-sync, dashboard observation cutoff, defense, first-five lifecycle settlement, sportsbook/team-total/umpire, schema, migration, or frontend change was added.
+
+### PR3p - Clean Governance Training Autonomy
+
+- Governance now has an explicit clean training cutoff, `MODEL_GOVERNANCE_CLEAN_START_AT`, defaulting to `2026-07-02T00:00:00-04:00`.
+- `run_model_governance` still scopes to the active paper epoch, but it trains, calibrates, creates challengers, records threshold versions, and promotes parameters only from clean mature resolved candidates whose target date and evaluated timestamp are at or after the cutoff.
+- `/v1/model/governance/status` and dashboard model status distinguish raw resolved mature samples from clean resolved mature samples, report pre-clean exclusion counts, and surface ignored legacy/pre-clean training, calibration, and threshold artifacts.
+- Existing pre-clean artifacts remain in the database for audit/history, but artifacts without current clean-policy metadata are not treated as current governance-ready state.
+- A governance parameter registry reports currently governed autonomous offsets/version promotion, future-governable coefficients/threshold policy, and intentionally manual safety controls. It is diagnostic metadata only.
+- No live execution, credential, WebSocket, cron cadence, model formula, EV threshold, risk-cap, source-sync, dashboard observation cutoff, settlement, market discovery, spread activation, sportsbook/team-total/umpire, schema, migration, or frontend change was added.
