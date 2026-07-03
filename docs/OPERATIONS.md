@@ -373,6 +373,21 @@ After deployment, validate:
 
 Full-game spread paper trading is paper-only and separately disabled by default.
 
+## PR3r Governance Memory And Portfolio Time-Series Fidelity
+
+PR3r keeps PR3p/PR3p.2 compact status behavior and makes the explicit governance job itself memory-light. The governance job trains from scalar clean sample rows instead of materializing full `ModelCandidate` ORM rows and JSON payloads. It preserves the clean cutoff, 70/30 chronological split, bounded calibration offsets, threshold records, and promotion guardrails. Governance results include compact `governance_phase_metrics` with phase durations and RSS values when the runtime can report RSS.
+
+PR3r also improves portfolio chart fidelity. Balance snapshot creation skips duplicate rows when cash and portfolio value did not change, but still creates a new row when a trade entry, mark refresh, settlement, or manual refresh changes cash or portfolio value. `/v1/dashboard/summary` now sends a bounded 500-point active-epoch portfolio series from actual balance snapshots, preserving first/latest points and intraday high/low extrema instead of returning only the newest snapshots. The response exposes `portfolio_series_source`, `portfolio_series_point_count`, `portfolio_series_truncated`, and `portfolio_series_preserves_intraday_fluctuations=true`.
+
+After deployment, validate:
+
+1. Run protected `POST /v1/jobs/run/governance`.
+2. Confirm the job result includes `governance_phase_metrics` and does not log raw candidate payloads, features, rationale blobs, secrets, or market payloads.
+3. Confirm `/v1/model/governance/status` and default `/v1/dashboard/summary` still return compactly.
+4. Trigger a price refresh or settlement when open paper positions exist, then confirm balance snapshots are created only when portfolio values changed.
+5. Confirm `/v1/dashboard/summary` includes the portfolio series metadata fields and the chart preserves intraday rises/falls.
+6. Confirm no live execution, cron schedule, candidate generation, model math, EV threshold, risk cap, settlement logic, market discovery, WebSocket behavior, source ingestion, credentials, or environment variables changed.
+
 Default:
 
 - `PAPER_FULL_GAME_SPREAD_TRADING_ENABLED=false`

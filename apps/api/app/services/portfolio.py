@@ -25,6 +25,21 @@ def _money(value: Decimal) -> Decimal:
     return value.quantize(Decimal("0.01"))
 
 
+def _latest_balance_snapshot(session: Session, epoch: PaperTradingEpoch) -> BalanceSnapshot | None:
+    return session.scalar(
+        select(BalanceSnapshot)
+        .where(BalanceSnapshot.paper_trading_epoch_id == epoch.id)
+        .order_by(BalanceSnapshot.captured_at.desc(), BalanceSnapshot.id.desc())
+        .limit(1)
+    )
+
+
+def _snapshot_values_changed(snapshot: BalanceSnapshot | None, totals: PortfolioTotals) -> bool:
+    if snapshot is None:
+        return True
+    return snapshot.cash_balance != totals.cash_balance or snapshot.portfolio_value != totals.portfolio_value
+
+
 def paper_trade_fee(trade: PaperTrade) -> Decimal:
     value = trade.fee_paid if trade.fee_paid is not None else trade.total_fee_estimate
     return _money(Decimal(value or "0"))
@@ -75,6 +90,12 @@ def create_balance_snapshot(
 ) -> BalanceSnapshot:
     active_epoch = epoch or get_or_create_active_paper_epoch(session)
     totals = calculate_paper_portfolio(session, epoch=active_epoch, include_archived=include_archived)
+    latest = _latest_balance_snapshot(session, active_epoch)
+    if latest is not None and not _snapshot_values_changed(latest, totals):
+        active_epoch.current_balance_snapshot_id = latest.id
+        session.add(active_epoch)
+        session.flush()
+        return latest
     snapshot = BalanceSnapshot(
         paper_trading_epoch_id=active_epoch.id,
         captured_at=utc_now(),
