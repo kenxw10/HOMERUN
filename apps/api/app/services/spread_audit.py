@@ -96,9 +96,18 @@ def _settlement_preview(game: MlbGame, verification: SpreadVerification) -> dict
     ):
         threshold = verification.selected_team_margin_required_gt
         adjusted_margin = Decimal(margin) - threshold
-        yes_outcome = "win" if Decimal(margin) > threshold else "loss"
-        no_outcome = "loss" if yes_outcome == "win" else "win"
-        push = False
+        if Decimal(margin) > threshold:
+            yes_outcome = "win"
+            no_outcome = "loss"
+            push = False
+        elif Decimal(margin) == threshold and verification.push_possible and verification.push_rule_verified:
+            yes_outcome = "push"
+            no_outcome = "push"
+            push = True
+        else:
+            yes_outcome = "loss"
+            no_outcome = "win"
+            push = False
     else:
         adjusted_margin = Decimal(margin) + line_value
         yes_outcome = _spread_result(adjusted_margin)

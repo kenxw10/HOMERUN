@@ -18408,6 +18408,22 @@ def test_spread_audit_settlement_preview_handles_win_loss_push_and_pending(monke
         )
         _add_spread_audit_case(
             session,
+            external_game_id="spread-preview-rules-threshold-push",
+            ticker="KXMLBSPREAD-PREVIEW-RULES-THRESHOLD-PUSH",
+            scheduled_start=datetime(2026, 7, 1, 19, 20, tzinfo=UTC),
+            status="Final",
+            home_score=4,
+            away_score=3,
+            yes_subtitle="Pittsburgh wins by more than 1 run",
+            no_subtitle="Pittsburgh wins by more than 1 run",
+            rules=(
+                "If Pittsburgh wins by more than 1 run, this market resolves to Yes. "
+                "If Pittsburgh wins by exactly 1 run, the market pushes and contracts are void."
+            ),
+            line_value=Decimal("-1.0000"),
+        )
+        _add_spread_audit_case(
+            session,
             external_game_id="spread-preview-pending",
             ticker="KXMLBSPREAD-PREVIEW-PENDING",
             scheduled_start=datetime(2026, 7, 1, 19, 30, tzinfo=UTC),
@@ -18439,6 +18455,13 @@ def test_spread_audit_settlement_preview_handles_win_loss_push_and_pending(monke
     assert previews["KXMLBSPREAD-PREVIEW-RULES-THRESHOLD"]["yes_outcome"] == "loss"
     assert previews["KXMLBSPREAD-PREVIEW-RULES-THRESHOLD"]["no_outcome"] == "win"
     assert previews["KXMLBSPREAD-PREVIEW-RULES-THRESHOLD"]["push"] is False
+    assert previews["KXMLBSPREAD-PREVIEW-RULES-THRESHOLD-PUSH"]["yes_condition"] == (
+        "selected_team_runs - opponent_runs > 1"
+    )
+    assert previews["KXMLBSPREAD-PREVIEW-RULES-THRESHOLD-PUSH"]["line_adjusted_margin"] == "0.0000"
+    assert previews["KXMLBSPREAD-PREVIEW-RULES-THRESHOLD-PUSH"]["yes_outcome"] == "push"
+    assert previews["KXMLBSPREAD-PREVIEW-RULES-THRESHOLD-PUSH"]["no_outcome"] == "push"
+    assert previews["KXMLBSPREAD-PREVIEW-RULES-THRESHOLD-PUSH"]["push"] is True
     assert previews["KXMLBSPREAD-PREVIEW-PENDING"]["preview_status"] == "pending_final"
     assert result["settlement_rows_created"] == 0
     assert result["paper_trades_created"] == 0
