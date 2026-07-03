@@ -1301,6 +1301,55 @@ def test_system_status_redacts_secrets_and_allows_missing_database() -> None:
     assert "KALSHI_API_KEY" not in str(payload)
 
 
+def test_system_status_preserves_source_config_when_database_ready(monkeypatch) -> None:
+    engine = create_engine(
+        "sqlite+pysqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    SessionLocal = sessionmaker(bind=engine)
+
+    def fake_source_status_report(_session):
+        return {
+            "feature_sync_enable_network_sources": True,
+            "public_sources_enabled": True,
+            "mlb_stats_base_url": "https://statsapi.mlb.com/api/v1",
+            "open_meteo_base_url": "https://api.open-meteo.com/v1",
+            "optional_injury_provider_configured": False,
+            "optional_lineup_provider_configured": False,
+            "optional_weather_provider_configured": True,
+            "validation_status": "ok",
+            "last_attempted_sync": "2026-07-03T12:00:00+00:00",
+            "last_feature_sync_status": {
+                "validation_status": "ok",
+                "raw_payload": {"large": "x" * 1000},
+            },
+            "latest_errors": [],
+            "source_health": [
+                {"source_name": "mlb_stats_api", "status": "available", "criticality": "critical"},
+            ],
+        }
+
+    monkeypatch.setattr(
+        main_module,
+        "database_status",
+        lambda: {"ready": True, "configured": True, "dialect": "sqlite", "message": "ok"},
+    )
+    monkeypatch.setattr(main_module, "get_session_factory", lambda: SessionLocal)
+    monkeypatch.setattr(main_module, "source_status_report", fake_source_status_report)
+
+    response = client.get("/v1/system/status")
+
+    assert response.status_code == 200
+    source_status = response.json()["config"]["source_status"]
+    assert source_status["mlb_stats_base_url"] == "https://statsapi.mlb.com/api/v1"
+    assert source_status["open_meteo_base_url"] == "https://api.open-meteo.com/v1"
+    assert source_status["optional_weather_provider_configured"] is True
+    assert source_status["source_health_status_counts"] == {"available": 1}
+    assert "raw_payload" not in json.dumps(source_status)
+
+
 def test_model_sources_status_endpoint_reports_public_sources(monkeypatch) -> None:
     engine = create_engine(
         "sqlite+pysqlite://",

@@ -232,7 +232,22 @@ def system_status() -> SystemStatus:
         try:
             session_factory = get_session_factory()
             with session_factory() as session:
-                source_status = compact_source_status_payload(source_status_report(session))
+                full_source_status = source_status_report(session)
+                compact_source_status = compact_source_status_payload(full_source_status)
+                config_fields = {
+                    key: full_source_status[key]
+                    for key in (
+                        "feature_sync_enable_network_sources",
+                        "public_sources_enabled",
+                        "mlb_stats_base_url",
+                        "open_meteo_base_url",
+                        "optional_injury_provider_configured",
+                        "optional_lineup_provider_configured",
+                        "optional_weather_provider_configured",
+                    )
+                    if key in full_source_status
+                }
+                source_status = {**compact_source_status, **config_fields}
         except Exception:
             source_status["last_error"] = "source status unavailable"
 
