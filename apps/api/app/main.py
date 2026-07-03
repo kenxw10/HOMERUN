@@ -4,7 +4,7 @@ import logging
 import os
 import time
 
-from fastapi import Depends, FastAPI, HTTPException, Query, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import select
 
@@ -162,6 +162,7 @@ def dashboard_summary(
     include_governance_details: bool = Query(default=False),
     include_spread_audit_details: bool = Query(default=False),
     include_candidate_diagnostics: bool = Query(default=False),
+    x_api_key: str | None = Header(default=None),
 ) -> DashboardSummary:
     started_at = time.perf_counter()
     rss_before = _process_rss_bytes()
@@ -175,6 +176,17 @@ def dashboard_summary(
         "include_spread_audit_details": include_spread_audit_details,
         "include_candidate_diagnostics": include_candidate_diagnostics,
     }
+    if any(
+        (
+            include_diagnostics,
+            include_job_results,
+            include_source_details,
+            include_governance_details,
+            include_spread_audit_details,
+            include_candidate_diagnostics,
+        )
+    ):
+        require_internal_api_key(x_api_key=x_api_key)
     if not database_status()["ready"]:
         result = empty_dashboard_summary(closed_date)
         _log_endpoint_metrics("/v1/dashboard/summary", started_at, result, flags=flags, rss_before=rss_before)

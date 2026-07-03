@@ -391,6 +391,49 @@ def test_dashboard_summary_shape_is_empty_and_safe() -> None:
     assert payload["observation_filter"]["active"] is True
 
 
+@pytest.mark.parametrize(
+    "flag",
+    [
+        "include_diagnostics",
+        "include_job_results",
+        "include_source_details",
+        "include_governance_details",
+        "include_spread_audit_details",
+        "include_candidate_diagnostics",
+    ],
+)
+def test_dashboard_summary_diagnostic_flags_require_internal_auth(monkeypatch, flag: str) -> None:
+    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.delenv("BACKEND_API_KEY", raising=False)
+    get_settings.cache_clear()
+
+    try:
+        public_response = client.get("/v1/dashboard/summary")
+        diagnostic_response = client.get(f"/v1/dashboard/summary?{flag}=true")
+    finally:
+        get_settings.cache_clear()
+
+    assert public_response.status_code == 200
+    assert diagnostic_response.status_code == 401
+    assert "BACKEND_API_KEY" in diagnostic_response.json()["detail"]
+
+
+def test_dashboard_summary_diagnostic_flags_accept_internal_auth(monkeypatch) -> None:
+    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.setenv("BACKEND_API_KEY", "test-dashboard-key")
+    get_settings.cache_clear()
+
+    try:
+        response = client.get(
+            "/v1/dashboard/summary?include_source_details=true",
+            headers={"X-API-Key": "test-dashboard-key"},
+        )
+    finally:
+        get_settings.cache_clear()
+
+    assert response.status_code == 200
+
+
 def test_paper_epoch_reset_archives_old_rows_and_starts_at_500() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
