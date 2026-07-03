@@ -769,6 +769,7 @@ def _latest_job_status(
     epoch: PaperTradingEpoch,
     *,
     include_job_results: bool = False,
+    detailed_job_names: set[str] | None = None,
 ) -> dict[str, JobRunSummary]:
     job_names = [
         "daily-setup",
@@ -793,51 +794,50 @@ def _latest_job_status(
         .where(JobRun.paper_trading_epoch_id == epoch.id)
         .subquery()
     )
-    if not include_job_results:
-        rows = list(
-            session.execute(
-                select(
-                    JobRun.job_name,
-                    JobRun.status,
-                    JobRun.started_at,
-                    JobRun.completed_at,
-                    JobRun.duration_seconds,
-                    JobRun.target_date,
-                )
-                .join(ranked, JobRun.id == ranked.c.job_run_id)
-                .where(ranked.c.job_rank == 1)
-                .order_by(JobRun.job_name.asc())
+    compact_rows = list(
+        session.execute(
+            select(
+                JobRun.id,
+                JobRun.job_name,
+                JobRun.status,
+                JobRun.started_at,
+                JobRun.completed_at,
+                JobRun.duration_seconds,
+                JobRun.target_date,
             )
-        )
-        return {
-            row.job_name: JobRunSummary(
-                job_name=row.job_name,
-                status=row.status,
-                started_at=to_eastern_iso(row.started_at),
-                completed_at=to_eastern_iso(row.completed_at),
-                duration_seconds=row.duration_seconds,
-                target_date=row.target_date.isoformat() if row.target_date else None,
-                result_is_compact=True,
-                step_count=None,
-                warning_count=None,
-                error_count=None,
-                result={},
-            )
-            for row in rows
-        }
-
-    rows = list(
-        session.scalars(
-            select(JobRun)
             .join(ranked, JobRun.id == ranked.c.job_run_id)
             .where(ranked.c.job_rank == 1)
             .order_by(JobRun.job_name.asc())
         )
     )
-    latest: dict[str, JobRunSummary] = {}
+    latest = {
+        row.job_name: JobRunSummary(
+            job_name=row.job_name,
+            status=row.status,
+            started_at=to_eastern_iso(row.started_at),
+            completed_at=to_eastern_iso(row.completed_at),
+            duration_seconds=row.duration_seconds,
+            target_date=row.target_date.isoformat() if row.target_date else None,
+            result_is_compact=True,
+            step_count=None,
+            warning_count=None,
+            error_count=None,
+            result={},
+        )
+        for row in compact_rows
+    }
+
+    detailed_names = {row.job_name for row in compact_rows} if include_job_results else (detailed_job_names or set())
+    detailed_ids = [row.id for row in compact_rows if row.job_name in detailed_names]
+    if not detailed_ids:
+        return latest
+
+    rows = list(
+        session.scalars(
+            select(JobRun).where(JobRun.id.in_(detailed_ids)).order_by(JobRun.job_name.asc())
+        )
+    )
     for row in rows:
-        if row.job_name in latest:
-            continue
         latest[row.job_name] = JobRunSummary(
             job_name=row.job_name,
             status=row.status,
@@ -1126,7 +1126,8 @@ def dashboard_summary_from_db(
     summary.job_status = _latest_job_status(
         session,
         active_epoch,
-        include_job_results=include_diagnostics or include_job_results or include_spread_audit_details,
+        include_job_results=include_diagnostics or include_job_results,
+        detailed_job_names={"spread-audit"} if include_spread_audit_details else None,
     )
     summary.websocket_status = _websocket_status(session)
     feature_avg_data_quality = (

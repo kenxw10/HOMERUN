@@ -1001,6 +1001,62 @@ def test_compact_dashboard_job_status_does_not_deserialize_job_json() -> None:
     assert latest["candidate-sweep"].result == {}
 
 
+def test_spread_audit_details_only_deserializes_spread_job_json() -> None:
+    def reject_candidate_sweep_json(value: object) -> object:
+        raw = str(value)
+        if "candidate-large" in raw:
+            raise AssertionError("spread-audit details must not deserialize candidate-sweep JSON")
+        return json.loads(raw)
+
+    engine = create_engine("sqlite+pysqlite:///:memory:", json_deserializer=reject_candidate_sweep_json)
+    Base.metadata.create_all(engine)
+    now = datetime(2026, 7, 3, 16, 0, tzinfo=UTC)
+
+    with Session(engine) as session:
+        active = get_or_create_active_paper_epoch(session, starting_balance=Decimal("500.00"))
+        active_id = active.id
+        session.add_all(
+            [
+                JobRun(
+                    job_name="candidate-sweep",
+                    job_type="paper_ops",
+                    paper_trading_epoch_id=active_id,
+                    status="succeeded",
+                    started_at=now,
+                    completed_at=now + timedelta(seconds=10),
+                    result={"large": "candidate-large"},
+                    warnings=[],
+                    errors=[],
+                    steps=[],
+                ),
+                JobRun(
+                    job_name="spread-audit",
+                    job_type="paper_ops",
+                    paper_trading_epoch_id=active_id,
+                    status="succeeded",
+                    started_at=now,
+                    completed_at=now + timedelta(seconds=10),
+                    result={"status": "completed", "checked": 4},
+                    warnings=[],
+                    errors=[],
+                    steps=[],
+                ),
+            ]
+        )
+        session.commit()
+
+        latest = dashboard._latest_job_status(
+            session,
+            SimpleNamespace(id=active_id),
+            detailed_job_names={"spread-audit"},
+        )
+
+    assert latest["candidate-sweep"].result == {}
+    assert latest["candidate-sweep"].result_is_compact is True
+    assert latest["spread-audit"].result == {"status": "completed", "checked": 4}
+    assert latest["spread-audit"].result_is_compact is False
+
+
 def test_dashboard_candidate_diagnostics_omit_candidate_level_lists_by_default() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
