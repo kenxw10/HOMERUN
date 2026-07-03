@@ -149,6 +149,46 @@ def _game_status_display(game: MlbGame | None) -> str:
     return "UNKNOWN"
 
 
+def _compact_position_spread_audit(candidate: ModelCandidate | None) -> dict[str, object] | None:
+    scoring_rationale = candidate.__dict__.get("scoring_rationale") if candidate is not None else None
+    spread = scoring_rationale.get("spread_verification") if isinstance(scoring_rationale, dict) else None
+    if not isinstance(spread, dict):
+        return None
+    keys = (
+        "audit_status",
+        "verified",
+        "selection_code",
+        "line_value",
+        "inning_scope",
+        "settlement_formula",
+        "no_is_true_complement",
+        "complement_safe_for_paper_settlement",
+        "push_possible",
+        "push_rule_verified",
+    )
+    compact = {key: spread.get(key) for key in keys if key in spread}
+    return compact or None
+
+
+def _position_rationale(candidate: ModelCandidate, trade: PaperTrade) -> dict[str, object]:
+    scoring_rationale = candidate.__dict__.get("scoring_rationale")
+    risk_limit_basis = scoring_rationale.get("risk_limit_basis") if isinstance(scoring_rationale, dict) else None
+    rationale: dict[str, object] = {
+        "decision": candidate.decision,
+        "probability_edge": _float(candidate.probability_edge),
+        "net_expected_value": _float(candidate.net_expected_value),
+        "data_quality": _float(candidate.data_quality),
+        "risk_limit_basis": risk_limit_basis,
+        "contracts": trade.quantity,
+        "estimated_total_cost": _float(trade.estimated_total_cost),
+        "total_fee_estimate": _float(trade.total_fee_estimate),
+    }
+    spread_audit = _compact_position_spread_audit(candidate)
+    if spread_audit is not None:
+        rationale["spread_audit"] = spread_audit
+    return rationale
+
+
 def _position_from_trade(
     trade: PaperTrade,
     game: MlbGame | None = None,
@@ -177,8 +217,6 @@ def _position_from_trade(
         contract_side=trade.contract_side,
     )
     display = trade.contract_display or trade.market_display or fallback_labels.contract_display
-    scoring_rationale = candidate.__dict__.get("scoring_rationale") if candidate is not None else None
-    risk_limit_basis = scoring_rationale.get("risk_limit_basis") if isinstance(scoring_rationale, dict) else None
     return PositionSummary(
         time_entered=to_eastern_iso(trade.entry_time),
         time_entered_display=eastern_display(trade.entry_time),
@@ -194,20 +232,7 @@ def _position_from_trade(
         display_title=fallback_labels.display_title,
         display_subtitle=fallback_labels.display_subtitle,
         raw_ticker_display=fallback_labels.raw_ticker_display,
-        selected_position_rationale=(
-            {
-                "decision": candidate.decision,
-                "probability_edge": _float(candidate.probability_edge),
-                "net_expected_value": _float(candidate.net_expected_value),
-                "data_quality": _float(candidate.data_quality),
-                "risk_limit_basis": risk_limit_basis,
-                "contracts": trade.quantity,
-                "estimated_total_cost": _float(trade.estimated_total_cost),
-                "total_fee_estimate": _float(trade.total_fee_estimate),
-            }
-            if candidate is not None
-            else {}
-        ),
+        selected_position_rationale=_position_rationale(candidate, trade) if candidate is not None else {},
         side=trade.contract_side,
         entry_price=float(trade.entry_price),
         exit_price=float(trade.exit_price) if trade.exit_price is not None else None,
@@ -558,6 +583,25 @@ def _json_scalar(value: object) -> object:
     if isinstance(value, (date, datetime)):
         return value.isoformat()
     return str(value)
+
+
+def _int_json_scalar(value: object) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, Decimal):
+        return int(value)
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(Decimal(value.strip('"')))
+        except Exception:
+            return None
+    return None
 
 
 def _payload_count(value: object) -> int | None:
@@ -1000,6 +1044,61 @@ def _latest_job_status(
     return latest
 
 
+def _latest_spread_audit_counts(session: Session, epoch: PaperTradingEpoch) -> dict[str, object]:
+    row = session.execute(
+        select(
+            JobRun.status.label("job_status"),
+            JobRun.started_at,
+            JobRun.completed_at,
+            JobRun.target_date,
+            JobRun.result["checked"].label("checked"),
+            JobRun.result["verified"].label("verified"),
+            JobRun.result["trusted_audit_only_count"].label("trusted_audit_only_count"),
+            JobRun.result["needs_review"].label("needs_review"),
+            JobRun.result["unsafe_count"].label("unsafe_count"),
+            JobRun.result["parse_error_count"].label("parse_error_count"),
+            JobRun.result["settlement_text_unverified_count"].label("settlement_text_unverified_count"),
+            JobRun.result["push_behavior_uncertain_count"].label("push_behavior_uncertain_count"),
+            JobRun.result["paper_trades_created"].label("paper_trades_created"),
+            JobRun.result["read_only"].label("read_only"),
+        )
+        .where(JobRun.job_name == "spread-audit")
+        .where(JobRun.paper_trading_epoch_id == epoch.id)
+        .order_by(JobRun.started_at.desc(), JobRun.id.desc())
+        .limit(1)
+    ).mappings().first()
+    if not row:
+        return {}
+    compact: dict[str, object] = {
+        "job_status": row["job_status"],
+        "started_at": to_eastern_iso(row["started_at"]),
+        "completed_at": to_eastern_iso(row["completed_at"]),
+        "target_date": row["target_date"].isoformat() if row["target_date"] else None,
+    }
+    for key in (
+        "checked",
+        "verified",
+        "trusted_audit_only_count",
+        "needs_review",
+        "unsafe_count",
+        "parse_error_count",
+        "settlement_text_unverified_count",
+        "push_behavior_uncertain_count",
+        "paper_trades_created",
+    ):
+        value = _int_json_scalar(row[key])
+        if value is not None:
+            compact[key] = value
+    read_only = row["read_only"]
+    if isinstance(read_only, bool):
+        compact["read_only"] = read_only
+    elif isinstance(read_only, int):
+        compact["read_only"] = bool(read_only)
+    elif isinstance(read_only, str):
+        compact["read_only"] = read_only.strip('"').lower() == "true"
+    return compact
+
+
 def _websocket_status(session: Session) -> WebSocketStatusSummary:
     settings = get_settings()
     row = session.scalar(
@@ -1361,6 +1460,16 @@ def dashboard_summary_from_db(
         include_details=include_diagnostics or include_source_details,
     )
     starter_report = starter_status_report(session, today_eastern())
+    settings = get_settings()
+    trade_policy = dict(last_prediction["trade_policy"] if last_prediction and last_prediction["trade_policy"] else {})
+    trade_policy.update(
+        {
+            "paper_full_game_spread_trading_enabled": settings.paper_full_game_spread_trading_enabled,
+            "full_game_spread_audit_gate_enabled": True,
+            "full_game_spread_requires_trusted_audit": True,
+            "full_game_spread_latest_audit": _latest_spread_audit_counts(session, active_epoch),
+        }
+    )
     summary.model_status = ModelStatus(
         active_model_version=active_version.version_tag if active_version else None,
         active_parameter_version=active_parameter_version.version_tag if active_parameter_version else None,
@@ -1388,7 +1497,7 @@ def dashboard_summary_from_db(
             include_details=include_governance_registry_details,
         ),
         governance_status=str(governance_summary.get("last_governance_status") or "not_run"),
-        trade_policy=last_prediction["trade_policy"] if last_prediction and last_prediction["trade_policy"] else {},
+        trade_policy=trade_policy,
         trade_caps_used=trade_caps_used,
         trade_threshold_policy=dict(governance_summary.get("trade_threshold_policy") or {}),
         data_quality_summary={
