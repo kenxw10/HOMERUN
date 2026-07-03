@@ -6516,10 +6516,17 @@ def test_list_today_markets_uses_occurrence_or_mapped_game_time(monkeypatch) -> 
     assert mapped_row[1].mapping_status == "candidate"
 
 
-def test_dashboard_compacts_portfolio_snapshots_without_dropping_epoch_start() -> None:
+def test_dashboard_compacts_portfolio_snapshots_without_dropping_epoch_start(monkeypatch) -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
     captured_at = datetime(2026, 7, 2, 12, 0, tzinfo=UTC)
+    original_compactor = dashboard._compact_portfolio_snapshot_rows
+
+    def assert_streamed_rows(rows, first_row, latest_row):
+        assert not isinstance(rows, list)
+        return original_compactor(rows, first_row, latest_row)
+
+    monkeypatch.setattr(dashboard, "_compact_portfolio_snapshot_rows", assert_streamed_rows)
 
     with Session(engine) as session:
         epoch_id = _active_epoch_id(session)
@@ -6538,9 +6545,9 @@ def test_dashboard_compacts_portfolio_snapshots_without_dropping_epoch_start() -
 
         summary = dashboard.dashboard_summary_from_db(session)
 
-    assert len(summary.portfolio_series) == 500
+    assert len(summary.portfolio_series) <= 500
     assert summary.portfolio_series_source == "balance_snapshots"
-    assert summary.portfolio_series_point_count == 500
+    assert summary.portfolio_series_point_count == len(summary.portfolio_series)
     assert summary.portfolio_series_truncated is True
     assert summary.portfolio_series_preserves_intraday_fluctuations is True
     assert summary.portfolio_series[0].value == 0.0
@@ -6932,6 +6939,8 @@ def test_dashboard_default_excludes_pre_observation_rows_with_history_opt_in() -
     assert default_july2.portfolio_value == 499.78
     assert default_july2.portfolio_series[0].value == 500.0
     assert default_july2.portfolio_series[-1].value == 499.78
+    assert default_july2.portfolio_series_source == "observation_filtered_portfolio_totals"
+    assert default_july2.portfolio_series_preserves_intraday_fluctuations is False
 
     assert default_july1.closed_positions_count == 0
     assert default_july1.observation_filter is not None

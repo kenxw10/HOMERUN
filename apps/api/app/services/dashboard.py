@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 import logging
@@ -367,23 +368,59 @@ def _portfolio_point_from_snapshot_row(row) -> PortfolioPoint:
     return PortfolioPoint(timestamp=row.captured_at, value=float(row.portfolio_value))
 
 
-def _compact_portfolio_snapshot_rows(rows: list[object]) -> tuple[list[PortfolioPoint], bool]:
-    if len(rows) <= PORTFOLIO_SERIES_MAX_POINTS:
-        return [_portfolio_point_from_snapshot_row(row) for row in rows], False
-    keep_indexes = {0, len(rows) - 1}
-    middle_count = len(rows) - 2
+def _portfolio_snapshot_sort_key(row) -> tuple[datetime, int]:
+    return row.captured_at, int(row.id)
+
+
+def _portfolio_snapshot_bucket_index(row, first_row, latest_row, bucket_count: int) -> int:
+    elapsed_seconds = (latest_row.captured_at - first_row.captured_at).total_seconds()
+    if elapsed_seconds <= 0:
+        return 0
+    row_elapsed = (row.captured_at - first_row.captured_at).total_seconds()
+    return min(max(int((row_elapsed / elapsed_seconds) * bucket_count), 0), bucket_count - 1)
+
+
+def _compact_portfolio_snapshot_rows(
+    rows: Iterable[object],
+    first_row,
+    latest_row,
+) -> tuple[list[PortfolioPoint], bool]:
+    if first_row is None or latest_row is None:
+        return [], False
+    exact_rows: list[object] = []
+    keep_by_id = {int(first_row.id): first_row, int(latest_row.id): latest_row}
     bucket_count = max(1, (PORTFOLIO_SERIES_MAX_POINTS - 2) // 2)
-    for bucket_index in range(bucket_count):
-        start = 1 + (middle_count * bucket_index) // bucket_count
-        end = 1 + (middle_count * (bucket_index + 1)) // bucket_count
-        if start >= end:
-            continue
-        bucket_indexes = range(start, end)
-        low_index = min(bucket_indexes, key=lambda index: (rows[index].portfolio_value, rows[index].captured_at))
-        high_index = max(bucket_indexes, key=lambda index: (rows[index].portfolio_value, rows[index].captured_at))
-        keep_indexes.update({low_index, high_index})
-    points = [_portfolio_point_from_snapshot_row(rows[index]) for index in sorted(keep_indexes)]
-    return points[:PORTFOLIO_SERIES_MAX_POINTS], True
+    buckets: dict[int, dict[str, object]] = {}
+    row_count = 0
+    for row in rows:
+        row_count += 1
+        if row_count <= PORTFOLIO_SERIES_MAX_POINTS:
+            exact_rows.append(row)
+        bucket_index = _portfolio_snapshot_bucket_index(row, first_row, latest_row, bucket_count)
+        bucket = buckets.setdefault(bucket_index, {})
+        low = bucket.get("low")
+        high = bucket.get("high")
+        if low is None or (row.portfolio_value, row.captured_at, row.id) < (
+            low.portfolio_value,
+            low.captured_at,
+            low.id,
+        ):
+            bucket["low"] = row
+        if high is None or (row.portfolio_value, row.captured_at, row.id) > (
+            high.portfolio_value,
+            high.captured_at,
+            high.id,
+        ):
+            bucket["high"] = row
+
+    if row_count <= PORTFOLIO_SERIES_MAX_POINTS:
+        return [_portfolio_point_from_snapshot_row(row) for row in exact_rows], False
+
+    for bucket in buckets.values():
+        for row in bucket.values():
+            keep_by_id[int(row.id)] = row
+    compact_rows = sorted(keep_by_id.values(), key=_portfolio_snapshot_sort_key)
+    return [_portfolio_point_from_snapshot_row(row) for row in compact_rows[:PORTFOLIO_SERIES_MAX_POINTS]], True
 
 
 def _observation_filter_summary(
@@ -1187,19 +1224,34 @@ def dashboard_summary_from_db(
         started_at=to_eastern_iso(active_epoch.started_at),
     )
     summary.paper_starting_balance = float(active_epoch.starting_balance)
+    snapshot_columns = (
+        BalanceSnapshot.id.label("id"),
+        BalanceSnapshot.captured_at.label("captured_at"),
+        BalanceSnapshot.cash_balance.label("cash_balance"),
+        BalanceSnapshot.portfolio_value.label("portfolio_value"),
+    )
     snapshot_query = (
-        select(
-            BalanceSnapshot.captured_at.label("captured_at"),
-            BalanceSnapshot.cash_balance.label("cash_balance"),
-            BalanceSnapshot.portfolio_value.label("portfolio_value"),
-        )
+        select(*snapshot_columns)
         .where(BalanceSnapshot.paper_trading_epoch_id == active_epoch.id)
         .order_by(BalanceSnapshot.captured_at.asc(), BalanceSnapshot.id.asc())
     )
     if not include_pre_observation:
         snapshot_query = snapshot_query.where(BalanceSnapshot.captured_at >= observation_cutoff)
-    snapshot_rows = list(session.execute(snapshot_query))
-    snapshots, portfolio_series_truncated = _compact_portfolio_snapshot_rows(snapshot_rows)
+    latest_snapshot_query = select(*snapshot_columns).where(BalanceSnapshot.paper_trading_epoch_id == active_epoch.id)
+    if not include_pre_observation:
+        latest_snapshot_query = latest_snapshot_query.where(BalanceSnapshot.captured_at >= observation_cutoff)
+    first_snapshot = session.execute(
+        latest_snapshot_query.order_by(BalanceSnapshot.captured_at.asc(), BalanceSnapshot.id.asc()).limit(1)
+    ).first()
+    latest_snapshot = session.execute(
+        latest_snapshot_query.order_by(BalanceSnapshot.captured_at.desc(), BalanceSnapshot.id.desc()).limit(1)
+    ).first()
+    snapshot_rows = session.execute(snapshot_query.execution_options(yield_per=250, stream_results=True))
+    snapshots, portfolio_series_truncated = _compact_portfolio_snapshot_rows(
+        snapshot_rows,
+        first_snapshot,
+        latest_snapshot,
+    )
     summary.portfolio_series_source = "balance_snapshots"
     summary.portfolio_series_truncated = portfolio_series_truncated
     summary.portfolio_series_preserves_intraday_fluctuations = True
@@ -1226,15 +1278,14 @@ def dashboard_summary_from_db(
         ]
         summary.portfolio_series_source = "observation_filtered_portfolio_totals"
         summary.portfolio_series_truncated = False
+        summary.portfolio_series_preserves_intraday_fluctuations = False
     else:
         summary.portfolio_series = snapshots
     summary.portfolio_series_point_count = len(summary.portfolio_series)
-    if snapshot_rows and include_pre_observation:
-        latest_snapshot = snapshot_rows[-1]
+    if latest_snapshot and include_pre_observation:
         summary.cash_balance = float(latest_snapshot.cash_balance)
         summary.portfolio_value = float(latest_snapshot.portfolio_value)
-    elif snapshot_rows and not summary.observation_filter.excluded_pre_observation_count:
-        latest_snapshot = snapshot_rows[-1]
+    elif latest_snapshot and not summary.observation_filter.excluded_pre_observation_count:
         summary.cash_balance = float(latest_snapshot.cash_balance)
         summary.portfolio_value = float(latest_snapshot.portfolio_value)
     else:
