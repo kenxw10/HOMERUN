@@ -1100,7 +1100,7 @@ def test_spread_audit_details_only_deserializes_spread_job_json() -> None:
     assert latest["spread-audit"].result_is_compact is False
 
 
-def test_dashboard_candidate_diagnostics_are_debug_only() -> None:
+def test_dashboard_candidate_diagnostics_keep_compact_counts_by_default() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
     now = datetime(2026, 7, 3, 16, 0, tzinfo=UTC)
@@ -1139,7 +1139,15 @@ def test_dashboard_candidate_diagnostics_are_debug_only() -> None:
         summary = dashboard.dashboard_summary_from_db(session)
         debug_summary = dashboard.dashboard_summary_from_db(session, include_candidate_diagnostics=True)
 
-    assert summary.latest_candidate_diagnostics == {}
+    compact = summary.latest_candidate_diagnostics
+    assert compact["candidate_diagnostics"]["candidates_total"] == 6
+    assert compact["candidate_diagnostics"]["top_quality_blockers_count"] == 6
+    assert "top_quality_blockers" not in compact["candidate_diagnostics"]
+    assert (
+        compact["quality_ev_diagnostics"]["top_counterfactual_candidates_blocked_by_quality_count"]
+        == 6
+    )
+    assert "candidate_id" not in json.dumps(compact)
     debug_payload = debug_summary.latest_candidate_diagnostics
     assert debug_payload["quality_ev_diagnostics"]["top_counterfactual_candidates_blocked_by_quality"]["item_count"] == 6
 
@@ -1167,14 +1175,37 @@ def test_compact_dashboard_does_not_deserialize_prediction_summary() -> None:
                 candidates_evaluated=1,
                 trades_created=2,
                 trade_policy={"mode": "paper"},
-                summary={"candidate_diagnostics": {"large": "candidate-large"}},
+                summary={
+                    "candidate_diagnostics": {
+                        "candidates_total": 1,
+                        "quality_threshold": "0.55",
+                        "quality_block_reason_counts": {"low_quality_missing_cached_features": 1},
+                        "top_quality_blockers": [{"candidate_id": "candidate-large"}],
+                    },
+                    "quality_ev_diagnostics": {
+                        "candidates_total": 1,
+                        "quality_blocked_count": 1,
+                        "top_counterfactual_candidates_blocked_by_quality": [
+                            {"candidate_id": "candidate-large"}
+                        ],
+                    },
+                },
             )
         )
         session.commit()
 
         summary = dashboard.dashboard_summary_from_db(session)
 
-    assert summary.latest_candidate_diagnostics == {}
+    assert summary.latest_candidate_diagnostics["candidate_diagnostics"]["candidates_total"] == 1
+    assert summary.latest_candidate_diagnostics["candidate_diagnostics"]["top_quality_blockers_count"] == 1
+    assert summary.latest_candidate_diagnostics["quality_ev_diagnostics"]["quality_blocked_count"] == 1
+    assert (
+        summary.latest_candidate_diagnostics["quality_ev_diagnostics"][
+            "top_counterfactual_candidates_blocked_by_quality_count"
+        ]
+        == 1
+    )
+    assert summary.model_status.data_quality_summary["quality_threshold"] == "0.55"
     assert summary.model_status.trade_policy == {"mode": "paper"}
     assert summary.model_status.trade_caps_used == {"paper_trades": 2}
 

@@ -660,6 +660,123 @@ def compact_source_status_payload(source_status: dict[str, object], *, include_d
     }
 
 
+CANDIDATE_DATA_QUALITY_COMPACT_KEYS = (
+    "raw_feature_snapshot_data_quality_avg",
+    "raw_feature_snapshot_data_quality_max",
+    "paper_observation_data_quality_avg",
+    "paper_observation_data_quality_max",
+    "quality_threshold",
+    "candidate_stage_market_context_status_counts",
+    "quality_block_reason_counts",
+)
+
+CANDIDATE_DIAGNOSTIC_COMPACT_KEYS = (
+    "candidates_total",
+    "trade_eligible_before_quality",
+    "trade_eligible_after_quality",
+    "blocked_by_quality_only",
+    "would_pass_ev_if_quality_allowed",
+    "would_pass_edge_if_quality_allowed",
+    "ev_edge_pass_but_quality_fail",
+    "blocked_by_ev",
+    "blocked_by_edge",
+    "blocked_by_price",
+    "blocked_by_mapping",
+    "blocked_by_caps",
+    "average_data_quality",
+    "paper_observation_data_quality_avg",
+    "quality_threshold",
+    "quality_block_reason_counts",
+    "candidate_stage_market_context_status_counts",
+)
+
+QUALITY_EV_DIAGNOSTIC_COMPACT_KEYS = (
+    "candidates_total",
+    "ev_pass_count",
+    "edge_pass_count",
+    "ev_and_edge_pass_count",
+    "pre_quality_trade_eligible_count",
+    "post_quality_trade_eligible_count",
+    "quality_blocked_count",
+    "unique_game_scope_family_count",
+    "deduped_ev_edge_pass_count_by_game_scope_family",
+    "deduped_pre_quality_trade_eligible_count_by_game_scope_family",
+    "counts_by_quality_bucket",
+)
+
+
+def _prediction_summary_json_value(section: str, key: str):
+    return ModelPredictionRun.summary[section][key]
+
+
+def _prediction_summary_compact_columns() -> list[object]:
+    columns: list[object] = [
+        _prediction_summary_json_value("candidate_diagnostics", key).label(f"candidate_{key}")
+        for key in sorted(set(CANDIDATE_DATA_QUALITY_COMPACT_KEYS + CANDIDATE_DIAGNOSTIC_COMPACT_KEYS))
+    ]
+    columns.extend(
+        _prediction_summary_json_value("quality_ev_diagnostics", key).label(f"quality_ev_{key}")
+        for key in QUALITY_EV_DIAGNOSTIC_COMPACT_KEYS
+    )
+    columns.extend(
+        [
+            func.json_array_length(
+                _prediction_summary_json_value("candidate_diagnostics", "top_quality_blockers")
+            ).label("candidate_top_quality_blockers_count"),
+            func.json_array_length(
+                _prediction_summary_json_value(
+                    "quality_ev_diagnostics",
+                    "top_counterfactual_candidates_blocked_by_quality",
+                )
+            ).label("quality_ev_top_counterfactual_candidates_blocked_by_quality_count"),
+            func.json_array_length(
+                _prediction_summary_json_value(
+                    "quality_ev_diagnostics",
+                    "top_deduped_counterfactual_opinions_by_game_scope_family",
+                )
+            ).label("quality_ev_top_deduped_counterfactual_opinions_by_game_scope_family_count"),
+        ]
+    )
+    return columns
+
+
+def _compact_prediction_summary_from_row(row) -> dict[str, object] | None:
+    if not row:
+        return None
+    candidate = {
+        key: row[f"candidate_{key}"]
+        for key in sorted(set(CANDIDATE_DATA_QUALITY_COMPACT_KEYS + CANDIDATE_DIAGNOSTIC_COMPACT_KEYS))
+        if row.get(f"candidate_{key}") is not None
+    }
+    top_blockers_count = row.get("candidate_top_quality_blockers_count")
+    if isinstance(top_blockers_count, int):
+        candidate["top_quality_blockers_count"] = top_blockers_count
+    quality_ev = {
+        key: row[f"quality_ev_{key}"]
+        for key in QUALITY_EV_DIAGNOSTIC_COMPACT_KEYS
+        if row.get(f"quality_ev_{key}") is not None
+    }
+    for row_key, target_key in (
+        (
+            "quality_ev_top_counterfactual_candidates_blocked_by_quality_count",
+            "top_counterfactual_candidates_blocked_by_quality_count",
+        ),
+        (
+            "quality_ev_top_deduped_counterfactual_opinions_by_game_scope_family_count",
+            "top_deduped_counterfactual_opinions_by_game_scope_family_count",
+        ),
+    ):
+        value = row.get(row_key)
+        if isinstance(value, int):
+            quality_ev[target_key] = value
+    if not candidate and not quality_ev:
+        return None
+    return {
+        "candidate_diagnostics": candidate,
+        "quality_ev_diagnostics": quality_ev,
+    }
+
+
 def _compact_candidate_data_quality(
     run_summary: dict[str, object] | None,
     *,
@@ -668,16 +785,11 @@ def _compact_candidate_data_quality(
     diagnostics = (run_summary or {}).get("candidate_diagnostics") if run_summary else None
     if not isinstance(diagnostics, dict):
         return {}
-    keys = (
-        "raw_feature_snapshot_data_quality_avg",
-        "raw_feature_snapshot_data_quality_max",
-        "paper_observation_data_quality_avg",
-        "paper_observation_data_quality_max",
-        "quality_threshold",
-        "candidate_stage_market_context_status_counts",
-        "quality_block_reason_counts",
-    )
-    result = {key: diagnostics.get(key) for key in keys if key in diagnostics}
+    result = {
+        key: diagnostics.get(key)
+        for key in CANDIDATE_DATA_QUALITY_COMPACT_KEYS
+        if key in diagnostics
+    }
     blockers = diagnostics.get("top_quality_blockers")
     if isinstance(blockers, list):
         result["top_quality_blockers_count"] = len(blockers)
@@ -689,6 +801,8 @@ def _compact_candidate_data_quality(
                 max_dict_items=20,
                 include_heavy=False,
             )
+    elif isinstance(diagnostics.get("top_quality_blockers_count"), int):
+        result["top_quality_blockers_count"] = diagnostics["top_quality_blockers_count"]
     return result
 
 
@@ -714,46 +828,24 @@ def _compact_candidate_diagnostics(
                 include_heavy=True,
             )
         )
-    candidate_keys = (
-        "candidates_total",
-        "trade_eligible_before_quality",
-        "trade_eligible_after_quality",
-        "blocked_by_quality_only",
-        "would_pass_ev_if_quality_allowed",
-        "would_pass_edge_if_quality_allowed",
-        "ev_edge_pass_but_quality_fail",
-        "blocked_by_ev",
-        "blocked_by_edge",
-        "blocked_by_price",
-        "blocked_by_mapping",
-        "blocked_by_caps",
-        "average_data_quality",
-        "paper_observation_data_quality_avg",
-        "quality_threshold",
-        "quality_block_reason_counts",
-        "candidate_stage_market_context_status_counts",
-    )
-    quality_keys = (
-        "candidates_total",
-        "ev_pass_count",
-        "edge_pass_count",
-        "ev_and_edge_pass_count",
-        "pre_quality_trade_eligible_count",
-        "post_quality_trade_eligible_count",
-        "quality_blocked_count",
-        "unique_game_scope_family_count",
-        "deduped_ev_edge_pass_count_by_game_scope_family",
-        "deduped_pre_quality_trade_eligible_count_by_game_scope_family",
-        "counts_by_quality_bucket",
-    )
     result: dict[str, object] = {}
     if isinstance(candidate, dict):
-        result["candidate_diagnostics"] = {key: candidate.get(key) for key in candidate_keys if key in candidate}
+        result["candidate_diagnostics"] = {
+            key: candidate.get(key)
+            for key in CANDIDATE_DIAGNOSTIC_COMPACT_KEYS
+            if key in candidate
+        }
         blockers = candidate.get("top_quality_blockers")
         if isinstance(blockers, list):
             result["candidate_diagnostics"]["top_quality_blockers_count"] = len(blockers)
+        elif isinstance(candidate.get("top_quality_blockers_count"), int):
+            result["candidate_diagnostics"]["top_quality_blockers_count"] = candidate["top_quality_blockers_count"]
     if isinstance(quality_ev, dict):
-        result["quality_ev_diagnostics"] = {key: quality_ev.get(key) for key in quality_keys if key in quality_ev}
+        result["quality_ev_diagnostics"] = {
+            key: quality_ev.get(key)
+            for key in QUALITY_EV_DIAGNOSTIC_COMPACT_KEYS
+            if key in quality_ev
+        }
         for key in (
             "top_counterfactual_candidates_blocked_by_quality",
             "top_deduped_counterfactual_opinions_by_game_scope_family",
@@ -761,6 +853,8 @@ def _compact_candidate_diagnostics(
             value = quality_ev.get(key)
             if isinstance(value, list):
                 result["quality_ev_diagnostics"][f"{key}_count"] = len(value)
+            elif isinstance(quality_ev.get(f"{key}_count"), int):
+                result["quality_ev_diagnostics"][f"{key}_count"] = quality_ev[f"{key}_count"]
     return result
 
 
@@ -1072,6 +1166,7 @@ def dashboard_summary_from_db(
             ModelPredictionRun.summary["candidates_no"].label("summary_candidates_no"),
             ModelPredictionRun.summary["paper_trades_yes"].label("summary_paper_trades_yes"),
             ModelPredictionRun.summary["paper_trades_no"].label("summary_paper_trades_no"),
+            *_prediction_summary_compact_columns(),
         )
         .where(ModelPredictionRun.paper_trading_epoch_id == active_epoch.id)
         .where(ModelPredictionRun.target_date == today_eastern())
@@ -1080,7 +1175,7 @@ def dashboard_summary_from_db(
     last_prediction_summary = (
         session.scalar(select(ModelPredictionRun.summary).where(ModelPredictionRun.id == last_prediction["id"]))
         if last_prediction and include_candidate_details
-        else None
+        else _compact_prediction_summary_from_row(last_prediction)
     )
     today_feature_rows = list(
         session.scalars(
