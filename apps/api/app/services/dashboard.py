@@ -52,6 +52,10 @@ OBSERVATION_START_DATE = date(2026, 7, 2)
 OBSERVATION_TIME_ZONE = ZoneInfo("America/New_York")
 OBSERVATION_FILTER_REASON = "default_dashboard_excludes_pre_2026_07_02_validation_rows"
 PORTFOLIO_SERIES_MAX_POINTS = 500
+PORTFOLIO_SERIES_SOURCE_SNAPSHOTS = "active_epoch_balance_snapshots"
+PORTFOLIO_SERIES_SOURCE_FILTERED_TOTALS = "observation_filtered_portfolio_totals"
+PORTFOLIO_SERIES_FALLBACK_NO_SNAPSHOTS = "no_usable_active_epoch_balance_snapshots"
+PORTFOLIO_SERIES_FALLBACK_UNSAFE_PRE_OBSERVATION_TRADES = "pre_observation_trades_can_affect_snapshot_series"
 logger = logging.getLogger(__name__)
 
 
@@ -364,8 +368,80 @@ def _filtered_portfolio_totals(
     return cash, portfolio
 
 
+def _excluded_pre_observation_trades_can_affect_snapshot_series(
+    session: Session,
+    *,
+    active_epoch: PaperTradingEpoch,
+    cutoff: datetime,
+) -> bool:
+    return bool(
+        session.scalar(
+            select(func.count(PaperTrade.id))
+            .where(PaperTrade.paper_trading_epoch_id == active_epoch.id)
+            .where(PaperTrade.entry_time < cutoff)
+            .where(
+                or_(
+                    PaperTrade.status == "open",
+                    PaperTrade.exit_time >= cutoff,
+                    PaperTrade.settled_at >= cutoff,
+                    PaperTrade.current_price_updated_at >= cutoff,
+                )
+            )
+        )
+    )
+
+
 def _portfolio_point_from_snapshot_row(row) -> PortfolioPoint:
-    return PortfolioPoint(timestamp=row.captured_at, value=float(row.portfolio_value))
+    return PortfolioPoint(
+        timestamp=row.captured_at,
+        value=float(row.portfolio_value),
+        cash_balance=_float(getattr(row, "cash_balance", None)),
+        snapshot_id=int(row.id),
+        source=getattr(row, "source", None),
+        snapshot_type=getattr(row, "snapshot_type", None),
+    )
+
+
+def _same_portfolio_snapshot_values(left, right) -> bool:
+    return left.portfolio_value == right.portfolio_value and left.cash_balance == right.cash_balance
+
+
+def _coalesce_no_change_portfolio_rows(rows: list[object]) -> list[object]:
+    if len(rows) <= 2:
+        return rows
+    coalesced = [rows[0]]
+    for row in rows[1:-1]:
+        if _same_portfolio_snapshot_values(coalesced[-1], row):
+            continue
+        coalesced.append(row)
+    if int(rows[-1].id) != int(coalesced[-1].id):
+        coalesced.append(rows[-1])
+    return coalesced
+
+
+def _offset_money(value: float, offset: Decimal) -> float:
+    return float((Decimal(str(value)) + offset).quantize(Decimal("0.01")))
+
+
+def _offset_portfolio_series(
+    points: list[PortfolioPoint],
+    *,
+    portfolio_offset: Decimal,
+    cash_offset: Decimal,
+) -> list[PortfolioPoint]:
+    if not points or (portfolio_offset == 0 and cash_offset == 0):
+        return points
+    return [
+        PortfolioPoint(
+            timestamp=point.timestamp,
+            value=_offset_money(point.value, portfolio_offset),
+            cash_balance=_offset_money(point.cash_balance, cash_offset) if point.cash_balance is not None else None,
+            snapshot_id=point.snapshot_id,
+            source=point.source,
+            snapshot_type=point.snapshot_type,
+        )
+        for point in points
+    ]
 
 
 def _portfolio_snapshot_sort_key(row) -> tuple[datetime, int]:
@@ -414,13 +490,14 @@ def _compact_portfolio_snapshot_rows(
             bucket["high"] = row
 
     if row_count <= PORTFOLIO_SERIES_MAX_POINTS:
-        return [_portfolio_point_from_snapshot_row(row) for row in exact_rows], False
+        return [_portfolio_point_from_snapshot_row(row) for row in _coalesce_no_change_portfolio_rows(exact_rows)], False
 
     for bucket in buckets.values():
         for row in bucket.values():
             keep_by_id[int(row.id)] = row
     compact_rows = sorted(keep_by_id.values(), key=_portfolio_snapshot_sort_key)
-    return [_portfolio_point_from_snapshot_row(row) for row in compact_rows[:PORTFOLIO_SERIES_MAX_POINTS]], True
+    compact_rows = _coalesce_no_change_portfolio_rows(compact_rows[:PORTFOLIO_SERIES_MAX_POINTS])
+    return [_portfolio_point_from_snapshot_row(row) for row in compact_rows], True
 
 
 def _observation_filter_summary(
@@ -1229,6 +1306,8 @@ def dashboard_summary_from_db(
         BalanceSnapshot.captured_at.label("captured_at"),
         BalanceSnapshot.cash_balance.label("cash_balance"),
         BalanceSnapshot.portfolio_value.label("portfolio_value"),
+        BalanceSnapshot.source.label("source"),
+        BalanceSnapshot.snapshot_type.label("snapshot_type"),
     )
     snapshot_query = (
         select(*snapshot_columns)
@@ -1252,9 +1331,6 @@ def dashboard_summary_from_db(
         first_snapshot,
         latest_snapshot,
     )
-    summary.portfolio_series_source = "balance_snapshots"
-    summary.portfolio_series_truncated = portfolio_series_truncated
-    summary.portfolio_series_preserves_intraday_fluctuations = True
     filtered_trades = list(
         session.scalars(
             _apply_trade_observation_filter(
@@ -1264,24 +1340,67 @@ def dashboard_summary_from_db(
             )
         )
     )
-    if include_pre_observation:
-        summary.portfolio_series = snapshots
-    elif summary.observation_filter.excluded_pre_observation_count:
-        now = utc_now()
-        _, clean_portfolio_value = _filtered_portfolio_totals(
+    filtered_cash_balance: Decimal | None = None
+    filtered_portfolio_value: Decimal | None = None
+    if not include_pre_observation:
+        filtered_cash_balance, filtered_portfolio_value = _filtered_portfolio_totals(
             starting_balance=active_epoch.starting_balance,
             trades=filtered_trades,
         )
+    snapshot_series_fallback_reason = (
+        PORTFOLIO_SERIES_FALLBACK_UNSAFE_PRE_OBSERVATION_TRADES
+        if (
+            snapshots
+            and not include_pre_observation
+            and summary.observation_filter.excluded_pre_observation_count
+            and _excluded_pre_observation_trades_can_affect_snapshot_series(
+                session,
+                active_epoch=active_epoch,
+                cutoff=observation_cutoff,
+            )
+        )
+        else None
+    )
+    summary.portfolio_series_active_epoch_id = active_epoch.id
+    if snapshots and snapshot_series_fallback_reason is None:
+        if (
+            not include_pre_observation
+            and summary.observation_filter.excluded_pre_observation_count
+            and latest_snapshot is not None
+            and filtered_cash_balance is not None
+            and filtered_portfolio_value is not None
+        ):
+            snapshots = _offset_portfolio_series(
+                snapshots,
+                portfolio_offset=filtered_portfolio_value - latest_snapshot.portfolio_value,
+                cash_offset=filtered_cash_balance - latest_snapshot.cash_balance,
+            )
+        summary.portfolio_series = snapshots
+        summary.portfolio_series_source = PORTFOLIO_SERIES_SOURCE_SNAPSHOTS
+        summary.portfolio_series_truncated = portfolio_series_truncated
+        summary.portfolio_series_preserves_intraday_fluctuations = len(snapshots) >= 3
+    else:
+        now = utc_now()
+        fallback_start = ensure_aware_utc(active_epoch.started_at)
+        if not include_pre_observation and fallback_start < observation_cutoff:
+            fallback_start = observation_cutoff
+        if include_pre_observation:
+            fallback_totals = calculate_paper_portfolio(session, epoch=active_epoch)
+            fallback_value = fallback_totals.portfolio_value
+        else:
+            fallback_value = filtered_portfolio_value if filtered_portfolio_value is not None else active_epoch.starting_balance
         summary.portfolio_series = [
-            PortfolioPoint(timestamp=observation_cutoff, value=float(active_epoch.starting_balance)),
-            PortfolioPoint(timestamp=now, value=float(clean_portfolio_value)),
+            PortfolioPoint(timestamp=fallback_start, value=float(active_epoch.starting_balance)),
+            PortfolioPoint(timestamp=now, value=float(fallback_value)),
         ]
-        summary.portfolio_series_source = "observation_filtered_portfolio_totals"
+        summary.portfolio_series_source = PORTFOLIO_SERIES_SOURCE_FILTERED_TOTALS
         summary.portfolio_series_truncated = False
         summary.portfolio_series_preserves_intraday_fluctuations = False
-    else:
-        summary.portfolio_series = snapshots
+        summary.portfolio_series_fallback_reason = snapshot_series_fallback_reason or PORTFOLIO_SERIES_FALLBACK_NO_SNAPSHOTS
     summary.portfolio_series_point_count = len(summary.portfolio_series)
+    if summary.portfolio_series:
+        summary.portfolio_series_started_at = to_eastern_iso(summary.portfolio_series[0].timestamp)
+        summary.portfolio_series_ended_at = to_eastern_iso(summary.portfolio_series[-1].timestamp)
     if latest_snapshot and include_pre_observation:
         summary.cash_balance = float(latest_snapshot.cash_balance)
         summary.portfolio_value = float(latest_snapshot.portfolio_value)
@@ -1294,10 +1413,8 @@ def dashboard_summary_from_db(
             summary.cash_balance = float(totals.cash_balance)
             summary.portfolio_value = float(totals.portfolio_value)
         else:
-            cash_balance, portfolio_value = _filtered_portfolio_totals(
-                starting_balance=active_epoch.starting_balance,
-                trades=filtered_trades,
-            )
+            cash_balance = filtered_cash_balance if filtered_cash_balance is not None else active_epoch.starting_balance
+            portfolio_value = filtered_portfolio_value if filtered_portfolio_value is not None else active_epoch.starting_balance
             summary.cash_balance = float(cash_balance)
             summary.portfolio_value = float(portfolio_value)
 
