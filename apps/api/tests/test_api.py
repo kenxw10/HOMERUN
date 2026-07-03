@@ -988,15 +988,17 @@ def test_dashboard_summary_compacts_heavy_job_payloads_by_default() -> None:
                 started_at=now,
                 completed_at=now + timedelta(seconds=10),
                 result={
-                    "status": "completed",
-                    "checked": 8,
-                    "verified": 3,
-                    "trusted_audit_only_count": 3,
-                    "needs_review": 2,
-                    "paper_trades_created": 0,
-                    "read_only": True,
-                    "items": heavy_items,
-                    "examples_by_reason": {"needs_review": heavy_items},
+                    "spread_audit": {
+                        "status": "completed",
+                        "checked": 8,
+                        "verified": 3,
+                        "trusted_audit_only_count": 3,
+                        "needs_review_count": 2,
+                        "paper_trades_created": 0,
+                        "read_only": True,
+                        "items": heavy_items,
+                        "examples_by_reason": {"needs_review": heavy_items},
+                    }
                 },
                 warnings=[{"message": "sample warning"}],
                 errors=[],
@@ -1020,10 +1022,11 @@ def test_dashboard_summary_compacts_heavy_job_payloads_by_default() -> None:
     assert latest_audit["checked"] == 8
     assert latest_audit["verified"] == 3
     assert latest_audit["trusted_audit_only_count"] == 3
+    assert latest_audit["needs_review_count"] == 2
     assert latest_audit["paper_trades_created"] == 0
     assert latest_audit["read_only"] is True
 
-    debug_result = debug_summary.job_status["spread-audit"].result
+    debug_result = debug_summary.job_status["spread-audit"].result["spread_audit"]
     assert debug_result["items"]["item_count"] == 8
     assert debug_result["items"]["truncated"] is False
     assert "raw_payload" not in json.dumps(debug_result)

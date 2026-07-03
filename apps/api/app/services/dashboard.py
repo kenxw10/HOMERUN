@@ -1045,22 +1045,23 @@ def _latest_job_status(
 
 
 def _latest_spread_audit_counts(session: Session, epoch: PaperTradingEpoch) -> dict[str, object]:
+    spread_audit_result = JobRun.result["spread_audit"]
     row = session.execute(
         select(
             JobRun.status.label("job_status"),
             JobRun.started_at,
             JobRun.completed_at,
             JobRun.target_date,
-            JobRun.result["checked"].label("checked"),
-            JobRun.result["verified"].label("verified"),
-            JobRun.result["trusted_audit_only_count"].label("trusted_audit_only_count"),
-            JobRun.result["needs_review"].label("needs_review"),
-            JobRun.result["unsafe_count"].label("unsafe_count"),
-            JobRun.result["parse_error_count"].label("parse_error_count"),
-            JobRun.result["settlement_text_unverified_count"].label("settlement_text_unverified_count"),
-            JobRun.result["push_behavior_uncertain_count"].label("push_behavior_uncertain_count"),
-            JobRun.result["paper_trades_created"].label("paper_trades_created"),
-            JobRun.result["read_only"].label("read_only"),
+            spread_audit_result["checked"].label("checked"),
+            spread_audit_result["verified"].label("verified"),
+            spread_audit_result["trusted_audit_only_count"].label("trusted_audit_only_count"),
+            spread_audit_result["needs_review_count"].label("needs_review_count"),
+            spread_audit_result["unsafe_count"].label("unsafe_count"),
+            spread_audit_result["parse_error_count"].label("parse_error_count"),
+            spread_audit_result["settlement_text_unverified_count"].label("settlement_text_unverified_count"),
+            spread_audit_result["push_behavior_uncertain_count"].label("push_behavior_uncertain_count"),
+            spread_audit_result["paper_trades_created"].label("paper_trades_created"),
+            spread_audit_result["read_only"].label("read_only"),
         )
         .where(JobRun.job_name == "spread-audit")
         .where(JobRun.paper_trading_epoch_id == epoch.id)
@@ -1079,7 +1080,7 @@ def _latest_spread_audit_counts(session: Session, epoch: PaperTradingEpoch) -> d
         "checked",
         "verified",
         "trusted_audit_only_count",
-        "needs_review",
+        "needs_review_count",
         "unsafe_count",
         "parse_error_count",
         "settlement_text_unverified_count",
