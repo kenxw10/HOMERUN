@@ -17161,6 +17161,41 @@ def test_full_game_spread_rules_wins_by_more_than_normalizes_to_lay_line(
     assert "half_run_no_push_verified" in verification.reason_codes
 
 
+def test_full_game_spread_parses_secondary_rules_when_primary_is_generic() -> None:
+    game = MlbGame(
+        external_game_id="rules-spread-secondary",
+        home_team="Pittsburgh Pirates",
+        away_team="Seattle Mariners",
+        home_abbreviation="PIT",
+        away_abbreviation="SEA",
+        scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+        status="scheduled",
+    )
+
+    verification = verify_spread_market(
+        game=game,
+        family_key="full_game_spread",
+        raw={
+            "ticker": "KXMLBSPREAD-26JUL011900SEAPIT-PIT2",
+            "title": "Seattle Mariners vs Pittsburgh Pirates run line",
+            "yes_sub_title": "Pittsburgh -1.5",
+            "no_sub_title": "Seattle +1.5",
+            "rules_primary": "This market is based on the final score of the listed game.",
+            "rules_secondary": "If Pittsburgh wins by more than 1.5 runs, this market resolves to Yes.",
+        },
+    )
+
+    assert verification.verified is True
+    assert verification.audit_status == "trusted_audit_only"
+    assert verification.parse_source == "rules_text"
+    assert verification.line_value == Decimal("-1.5000")
+    assert verification.selection_code == "PIT"
+    assert "rules_text_unparseable" not in verification.reason_codes
+    assert "rules_text_spread_condition_verified" in verification.reason_codes
+    assert "This market is based on the final score" in str(verification.raw_contract_text["rules"])
+    assert "Pittsburgh wins by more than 1.5 runs" in str(verification.raw_contract_text["rules"])
+
+
 def test_full_game_spread_explicit_contradictory_no_text_remains_unsafe() -> None:
     game = MlbGame(
         external_game_id="rules-spread-conflicting-no",

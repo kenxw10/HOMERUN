@@ -445,6 +445,16 @@ def _first_text(payload: dict[str, Any], fields: tuple[str, ...]) -> tuple[str |
     return None, None
 
 
+def _all_text(payload: dict[str, Any], fields: tuple[str, ...]) -> list[tuple[str, str]]:
+    return [(field, str(payload[field])) for field in fields if payload.get(field)]
+
+
+def _combined_text(entries: list[tuple[str, str]]) -> str | None:
+    if not entries:
+        return None
+    return "\n".join(text for _field, text in entries)
+
+
 def _scope(family_key: str) -> str:
     return "first_five" if family_key == FIRST_FIVE_SPREAD else "full_game"
 
@@ -468,12 +478,14 @@ def verify_spread_market(
     if yes_text is None:
         yes_text, _yes_source = _first_text(payload, ("title", "subtitle"))
     no_text, _no_source = _first_text(payload, NO_SPREAD_TEXT_FIELDS)
-    rules_text, rules_source = _first_text(payload, SPREAD_RULE_TEXT_FIELDS)
-    rules_condition = _parse_rules_spread_condition(
-        rules_text if family_key == FULL_GAME_SPREAD else None,
-        game,
-        rules_source,
-    )
+    rule_entries = _all_text(payload, SPREAD_RULE_TEXT_FIELDS)
+    rules_text = _combined_text(rule_entries)
+    rules_condition = None
+    if family_key == FULL_GAME_SPREAD:
+        for rules_source, candidate_rules_text in rule_entries:
+            rules_condition = _parse_rules_spread_condition(candidate_rules_text, game, rules_source)
+            if rules_condition is not None:
+                break
     warnings: list[str] = []
 
     parsed_selection = (selection_code or "").upper() or None
