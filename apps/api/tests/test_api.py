@@ -6546,14 +6546,147 @@ def test_dashboard_compacts_portfolio_snapshots_without_dropping_epoch_start(mon
         summary = dashboard.dashboard_summary_from_db(session)
 
     assert len(summary.portfolio_series) <= 500
-    assert summary.portfolio_series_source == "balance_snapshots"
+    assert summary.portfolio_series_source == "active_epoch_balance_snapshots"
     assert summary.portfolio_series_point_count == len(summary.portfolio_series)
     assert summary.portfolio_series_truncated is True
     assert summary.portfolio_series_preserves_intraday_fluctuations is True
+    assert summary.portfolio_series_active_epoch_id == epoch_id
+    assert summary.portfolio_series_started_at is not None
+    assert summary.portfolio_series_ended_at is not None
+    assert summary.portfolio_series_fallback_reason is None
     assert summary.portfolio_series[0].value == 0.0
     assert summary.portfolio_series[-1].value == 500.0
     assert summary.cash_balance == 500.0
     assert summary.portfolio_value == 500.0
+
+
+def test_dashboard_portfolio_series_falls_back_only_without_usable_snapshots() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        epoch_id = _active_epoch_id(session)
+        summary = dashboard.dashboard_summary_from_db(session)
+
+    assert summary.portfolio_series_source == "observation_filtered_portfolio_totals"
+    assert summary.portfolio_series_fallback_reason == "no_usable_active_epoch_balance_snapshots"
+    assert summary.portfolio_series_active_epoch_id == epoch_id
+    assert summary.portfolio_series_point_count == 2
+    assert summary.portfolio_series_truncated is False
+    assert summary.portfolio_series_preserves_intraday_fluctuations is False
+
+
+def test_dashboard_portfolio_series_uses_snapshot_intraday_rise_and_fall() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    captured_at = datetime(2026, 7, 2, 12, 0, tzinfo=UTC)
+
+    with Session(engine) as session:
+        epoch_id = _active_epoch_id(session)
+        for index, value in enumerate((Decimal("500.00"), Decimal("520.00"), Decimal("505.00"), Decimal("512.00"))):
+            session.add(
+                BalanceSnapshot(
+                    paper_trading_epoch_id=epoch_id,
+                    captured_at=captured_at + timedelta(minutes=index),
+                    cash_balance=value,
+                    portfolio_value=value,
+                    source="paper",
+                    snapshot_type="test_intraday",
+                )
+            )
+        session.commit()
+
+        summary = dashboard.dashboard_summary_from_db(session)
+
+    assert summary.portfolio_series_source == "active_epoch_balance_snapshots"
+    assert summary.portfolio_series_point_count == 4
+    assert summary.portfolio_series_preserves_intraday_fluctuations is True
+    assert [point.value for point in summary.portfolio_series] == [500.0, 520.0, 505.0, 512.0]
+    assert {point.snapshot_type for point in summary.portfolio_series} == {"test_intraday"}
+    compact_payload = json.dumps([point.model_dump(mode="json") for point in summary.portfolio_series])
+    assert "raw_payload" not in compact_payload
+    assert "candidate_id" not in compact_payload
+
+
+def test_dashboard_portfolio_series_uses_snapshots_when_excluded_rows_are_constant_history() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    captured_at = datetime(2026, 7, 2, 12, 0, tzinfo=UTC)
+
+    with Session(engine) as session:
+        epoch_id = _active_epoch_id(session)
+        session.add(
+            PaperTrade(
+                paper_trading_epoch_id=epoch_id,
+                market_ticker="KXMLBGAME-PRE-CONSTANT-PIT",
+                contract_side="yes",
+                entry_price=Decimal("0.4000"),
+                current_price=Decimal("1.0000"),
+                exit_price=Decimal("1.0000"),
+                quantity=1,
+                entry_time=datetime(2026, 7, 1, 12, 0, tzinfo=UTC),
+                exit_time=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
+                status="settled",
+                outcome="win",
+                resolution="WIN",
+                realized_pnl=Decimal("0.60"),
+            )
+        )
+        for index, value in enumerate((Decimal("500.60"), Decimal("520.60"), Decimal("505.60"))):
+            session.add(
+                BalanceSnapshot(
+                    paper_trading_epoch_id=epoch_id,
+                    captured_at=captured_at + timedelta(minutes=index),
+                    cash_balance=value,
+                    portfolio_value=value,
+                    source="paper",
+                )
+            )
+        session.commit()
+
+        summary = dashboard.dashboard_summary_from_db(session)
+
+    assert summary.portfolio_series_source == "active_epoch_balance_snapshots"
+    assert summary.portfolio_series_active_epoch_id == epoch_id
+    assert summary.portfolio_series_fallback_reason is None
+    assert [point.value for point in summary.portfolio_series] == [495.0, 515.0, 500.0]
+    assert summary.portfolio_series[-1].value == summary.portfolio_value
+
+
+def test_dashboard_portfolio_series_coalesces_duplicate_no_change_points_without_removing_extrema() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    captured_at = datetime(2026, 7, 2, 12, 0, tzinfo=UTC)
+
+    with Session(engine) as session:
+        epoch_id = _active_epoch_id(session)
+        values = (
+            Decimal("500.00"),
+            Decimal("500.00"),
+            Decimal("520.00"),
+            Decimal("520.00"),
+            Decimal("505.00"),
+            Decimal("505.00"),
+            Decimal("512.00"),
+        )
+        for index, value in enumerate(values):
+            session.add(
+                BalanceSnapshot(
+                    paper_trading_epoch_id=epoch_id,
+                    captured_at=captured_at + timedelta(minutes=index),
+                    cash_balance=value,
+                    portfolio_value=value,
+                    source="paper",
+                )
+            )
+        session.commit()
+
+        summary = dashboard.dashboard_summary_from_db(session)
+
+    assert [point.value for point in summary.portfolio_series] == [500.0, 520.0, 505.0, 512.0]
+    assert summary.portfolio_series_point_count == 4
+    assert 520.0 in {point.value for point in summary.portfolio_series}
+    assert 505.0 in {point.value for point in summary.portfolio_series}
 
 
 def test_dashboard_portfolio_series_preserves_intraday_fluctuation_extrema() -> None:
@@ -6584,6 +6717,7 @@ def test_dashboard_portfolio_series_preserves_intraday_fluctuation_extrema() -> 
 
     values = {point.value for point in summary.portfolio_series}
     assert summary.portfolio_series_truncated is True
+    assert summary.portfolio_series_preserves_intraday_fluctuations is True
     assert 470.0 in values
     assert 535.0 in values
 
@@ -6906,6 +7040,13 @@ def test_dashboard_default_excludes_pre_observation_rows_with_history_opt_in() -
                 ),
                 BalanceSnapshot(
                     paper_trading_epoch_id=epoch_id,
+                    captured_at=datetime(2026, 7, 1, 20, 0, tzinfo=UTC),
+                    cash_balance=Decimal("123.00"),
+                    portfolio_value=Decimal("123.00"),
+                    source="paper",
+                ),
+                BalanceSnapshot(
+                    paper_trading_epoch_id=epoch_id,
                     captured_at=datetime(2026, 7, 2, 20, 0, tzinfo=UTC),
                     cash_balance=Decimal("999.00"),
                     portfolio_value=Decimal("999.00"),
@@ -6938,8 +7079,10 @@ def test_dashboard_default_excludes_pre_observation_rows_with_history_opt_in() -
     assert default_july2.cash_balance == 498.58
     assert default_july2.portfolio_value == 499.78
     assert default_july2.portfolio_series[0].value == 500.0
-    assert default_july2.portfolio_series[-1].value == 499.78
+    assert default_july2.portfolio_series[-1].value == default_july2.portfolio_value
     assert default_july2.portfolio_series_source == "observation_filtered_portfolio_totals"
+    assert default_july2.portfolio_series_active_epoch_id == epoch_id
+    assert default_july2.portfolio_series_fallback_reason == "pre_observation_trades_can_affect_snapshot_series"
     assert default_july2.portfolio_series_preserves_intraday_fluctuations is False
 
     assert default_july1.closed_positions_count == 0

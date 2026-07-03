@@ -379,14 +379,17 @@ PR3r keeps PR3p/PR3p.2 compact status behavior and makes the explicit governance
 
 PR3r also improves portfolio chart fidelity. Balance snapshot creation skips duplicate rows when cash and portfolio value did not change, but still creates a new row when a trade entry, mark refresh, settlement, or manual refresh changes cash or portfolio value. `/v1/dashboard/summary` now sends a bounded 500-point active-epoch portfolio series from actual balance snapshots, preserving first/latest points and intraday high/low extrema instead of returning only the newest snapshots. The response exposes `portfolio_series_source`, `portfolio_series_point_count`, `portfolio_series_truncated`, and `portfolio_series_preserves_intraday_fluctuations=true`.
 
+PR3r.1 tightens the dashboard source priority. If usable active-epoch balance snapshots exist after the observation cutoff on the same clean basis as current dashboard totals, the default summary must report `portfolio_series_source=active_epoch_balance_snapshots` and include `portfolio_series_active_epoch_id`, `portfolio_series_started_at`, and `portfolio_series_ended_at`. If filtered-out pre-observation trades can still affect whole-epoch snapshots, the summary falls back to `observation_filtered_portfolio_totals` with `portfolio_series_fallback_reason=pre_observation_trades_can_affect_snapshot_series`; if no usable snapshots exist, the fallback reason is `no_usable_active_epoch_balance_snapshots`. Snapshot points remain compact and must not include raw payloads, candidate ids, full positions, audit rows, or training data.
+
 After deployment, validate:
 
 1. Run protected `POST /v1/jobs/run/governance`.
 2. Confirm the job result includes `governance_phase_metrics` and does not log raw candidate payloads, features, rationale blobs, secrets, or market payloads.
 3. Confirm `/v1/model/governance/status` and default `/v1/dashboard/summary` still return compactly.
 4. Trigger a price refresh or settlement when open paper positions exist, then confirm balance snapshots are created only when portfolio values changed.
-5. Confirm `/v1/dashboard/summary` includes the portfolio series metadata fields and the chart preserves intraday rises/falls.
-6. Confirm no live execution, cron schedule, candidate generation, model math, EV threshold, risk cap, settlement logic, market discovery, WebSocket behavior, source ingestion, credentials, or environment variables changed.
+5. Confirm `/v1/dashboard/summary` includes the portfolio series metadata fields, uses `active_epoch_balance_snapshots` when clean-basis snapshot rows exist, and preserves intraday rises/falls.
+6. If no balance snapshots exist, confirm the summary falls back to `observation_filtered_portfolio_totals` with `portfolio_series_fallback_reason=no_usable_active_epoch_balance_snapshots`; if excluded pre-observation trades can still affect snapshots, confirm the fallback reason is `pre_observation_trades_can_affect_snapshot_series`.
+7. Confirm no live execution, cron schedule, candidate generation, model math, EV threshold, risk cap, settlement logic, market discovery, WebSocket behavior, source ingestion, credentials, or environment variables changed.
 
 Default:
 

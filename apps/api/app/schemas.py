@@ -16,6 +16,10 @@ class HealthResponse(BaseModel):
 class PortfolioPoint(BaseModel):
     timestamp: datetime
     value: float
+    cash_balance: float | None = None
+    snapshot_id: int | None = None
+    source: str | None = None
+    snapshot_type: str | None = None
 
 
 class PerformanceMetrics(BaseModel):
@@ -167,6 +171,10 @@ class DashboardSummary(BaseModel):
     portfolio_series_point_count: int = 0
     portfolio_series_truncated: bool = False
     portfolio_series_preserves_intraday_fluctuations: bool = True
+    portfolio_series_active_epoch_id: int | None = None
+    portfolio_series_started_at: str | None = None
+    portfolio_series_ended_at: str | None = None
+    portfolio_series_fallback_reason: str | None = None
     performance: PerformanceMetrics
     positions: list[PositionSummary]
     closed_positions: list[PositionSummary] = Field(default_factory=list)
