@@ -249,7 +249,7 @@ Invoke-RestMethod -Method Post -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-
 
 Audit taxonomy:
 
-- `trusted_audit_only`: team, line, YES/NO complement, and push/settlement evidence are coherent enough for manual review. This is not trade enablement.
+- `trusted_audit_only`: team, line, YES/NO complement, and push/settlement evidence are coherent enough for the PR3q paper gate when `PAPER_FULL_GAME_SPREAD_TRADING_ENABLED=true`.
 - `needs_review`: generic review bucket when evidence exists but is incomplete.
 - `missing_line`: line value cannot be verified.
 - `ambiguous_team_selection`: selected team cannot be uniquely verified against the mapped MLB game.
@@ -263,10 +263,10 @@ Per-market rows should include ticker, event ticker, title/subtitle/rules/YES/NO
 
 Interpretation:
 
-- `trusted_audit_only_count` is evidence for manual future spread-activation review only.
+- `trusted_audit_only_count` is the only full-game spread audit bucket eligible for PR3q paper trading when the separate full-game spread flag is enabled.
 - Any `needs_review`, ambiguous, missing, or push-uncertain status must remain blocked.
-- Candidate sweeps should still show full-game spread candidates as no-trade with `no_trade_full_game_spread_audit_only`. The broad spread flag still controls first-five spread diagnostics, but full-game spread paper trading remains disabled until a future dedicated spread-activation PR.
-- A future dedicated spread-activation PR is the only work that should enable full-game spread paper trading, and only for rows that PR3o evidence proves safe.
+- Candidate sweeps should show full-game spread candidates as `no_trade_full_game_spread_trading_disabled` while `PAPER_FULL_GAME_SPREAD_TRADING_ENABLED=false`. When that flag is true, only cached `trusted_audit_only` rows can pass; untrusted rows must return explicit full-game spread audit rejection reasons.
+- The broad `PAPER_SPREAD_TRADING_ENABLED` flag still controls first-five spread diagnostics. It does not enable full-game spread paper trading.
 
 After deployment, validate:
 
@@ -275,9 +275,10 @@ After deployment, validate:
 3. Run `POST /v1/jobs/run/spread-audit?target_date=today_et&min_time_to_start_minutes=45&max_time_to_start_minutes=180`.
 4. Confirm the result includes `audit_scope=full_game_spread`, `read_only=true`, `mapping_mutations=0`, `settlement_rows_created=0`, `paper_trades_created=0`, `status_counts`, and `examples_by_reason`.
 5. Inspect trusted and review examples manually against Kalshi UI text before considering spread activation.
-6. Run a dry candidate sweep and confirm `feature_sync_mode=cache_only`, pregame context is present, full-game spread trades are not created, and PR3k controls remain active.
-7. Run settlement and confirm PR3n.1 first-five lifecycle behavior and full-game final-only behavior remain unchanged.
-8. Confirm no live execution, WebSocket, cron schedule, model/EV/risk-cap, source-sync, defense, sportsbook/team-total/umpire, or full-game spread activation behavior changed.
+6. Run a dry candidate sweep with `PAPER_FULL_GAME_SPREAD_TRADING_ENABLED=false` and confirm `feature_sync_mode=cache_only`, pregame context is present, full-game spread trades are not created, and PR3k controls remain active.
+7. If enabling full-game spread paper observation, set only `PAPER_FULL_GAME_SPREAD_TRADING_ENABLED=true`, rerun candidate sweep, and confirm only `trusted_audit_only` full-game spread rows can create paper trades.
+8. Run settlement and confirm trusted full-game spread rows settle only after final game status, while untrusted/missing audit rows stay open with spread audit skip reasons.
+9. Confirm no live execution, WebSocket, cron schedule, model/EV/risk-cap, source-sync, defense, sportsbook/team-total/umpire, or market-discovery behavior changed.
 
 ## PR3p Clean Governance Training Autonomy
 
@@ -367,6 +368,34 @@ After deployment, validate:
 9. Confirm Railway memory does not staircase upward and there are no 502 responses or OOM warnings.
 10. Open one Vercel dashboard tab and watch Railway memory for about 5 minutes.
 11. Confirm no live execution, cron schedule, candidate generation, model math, EV threshold, risk cap, source sync behavior, settlement, market discovery, WebSocket, sportsbook/team-total/umpire, spread activation, secrets, or environment variables changed.
+
+## PR3q Full-Game Spread Paper Gate
+
+Full-game spread paper trading is paper-only and separately disabled by default.
+
+Default:
+
+- `PAPER_FULL_GAME_SPREAD_TRADING_ENABLED=false`
+- Full-game spread candidates return `no_trade_full_game_spread_trading_disabled`.
+- First-five spread behavior remains controlled by `PAPER_SPREAD_TRADING_ENABLED`.
+
+Enablement rule:
+
+- Set `PAPER_FULL_GAME_SPREAD_TRADING_ENABLED=true` only after validating PR3o.1 audit output.
+- Candidate sweep must use cached mapping audit metadata. It must not run `spread-audit`, full feature sync, pybaseball, FanGraphs, Statcast/Savant, Open-Meteo, sportsbook APIs, team totals, or umpire logic.
+- A full-game spread row may paper trade only when audit metadata is `trusted_audit_only` with full-game scope, verified selected team, verified line direction, true YES/NO complement, safe push/no-push handling, threshold, and settlement formula.
+- Missing, parse-error, unsafe, needs-review, ambiguous, settlement-text-unverified, push-uncertain, or otherwise untrusted audit rows must remain no-trade with explicit full-game spread audit reasons.
+- Full-game spread settlement revalidates the trusted audit before resolving. Missing/untrusted audit metadata leaves the trade open with a spread audit skip reason.
+
+After deployment, validate:
+
+1. Confirm `/v1/system/status` still reports paper mode, demo Kalshi environment, live trading disabled, and execution kill switch enabled.
+2. Confirm `/v1/dashboard/summary` model status exposes `paper_full_game_spread_trading_enabled`, `full_game_spread_audit_gate_enabled`, and compact latest spread-audit counts.
+3. With the new flag false, run candidate sweep and confirm full-game spread rows do not create trades.
+4. With the new flag true in a controlled paper environment, confirm only `trusted_audit_only` rows can create full-game spread paper trades.
+5. Confirm untrusted rows stay blocked with explicit full-game spread audit reasons and are not training eligible.
+6. Run settlement after final scores and confirm trusted spread trades settle from the audited formula while untrusted rows are skipped.
+7. Confirm no live execution, cron schedule, model math, EV threshold, risk cap, market discovery, source sync, WebSocket, sportsbook/team-total/umpire, credential, or frontend polling behavior changed.
 
 After deployment, validate:
 
@@ -487,7 +516,7 @@ Expected behavior:
 - `feature_sync_mode=cache_only` is still present for candidate-sweep.
 - Missing optional/structural modules remain visible as missing/partial and are not marked available.
 - Candidate-stage market context can be `available` only when mapping, settlement support, trusted selection, market status, side, and fresh executable price checks pass.
-- Full-game spread still returns blocked diagnostics while `PAPER_SPREAD_TRADING_ENABLED=false`.
+- Full-game spread returns blocked diagnostics while `PAPER_FULL_GAME_SPREAD_TRADING_ENABLED=false`; when enabled, it still requires cached `trusted_audit_only` metadata.
 - If no trades are created, the dominant reason should be explicit in `decision_counts`, `candidate_diagnostics`, and `quality_ev_diagnostics`.
 
 ## PR3d Hotfix 3 Spread Audit And Correlation Validation
@@ -504,7 +533,7 @@ Expected audit behavior:
 - The job is read-only; it does not create paper trades, settlement rows, candidates, or mapping/market metadata mutations.
 - Verified full-game spread rows include rules-primary parsed selection, normalized lay line, threshold, formula, inning scope, settlement rule status, actual contract display, normalized equivalent display, NO complement provenance, push metadata, and raw Kalshi contract text.
 - Ticker-only spread rows remain `needs_review` / parser-unverified.
-- Full-game spread candidates still return `no_trade_full_game_spread_audit_only`; first-five spread candidates remain controlled by `PAPER_SPREAD_TRADING_ENABLED`.
+- Full-game spread candidates return `no_trade_full_game_spread_trading_disabled` while `PAPER_FULL_GAME_SPREAD_TRADING_ENABLED=false`; when enabled, first-five spread candidates remain controlled by `PAPER_SPREAD_TRADING_ENABLED` and full-game spread candidates still require trusted audit metadata.
 
 Display checks:
 
@@ -525,7 +554,7 @@ Risk-basis checks:
 - The dashboard model panel should show the active risk basis amount and game-scope cap.
 - Selected positions should include a short rationale with edge, net EV, quality, and risk-basis context.
 
-This hotfix does not enable live trading, new production cron services, or spread paper trading. Keep cron and spread trading blocked until the audit output is manually compared with the Kalshi UI for multiple spread markets.
+This hotfix does not enable live trading or new production cron services. Keep full-game spread paper disabled unless the PR3q flag is deliberately enabled after the audit output is manually compared with the Kalshi UI for multiple spread markets.
 
 ## PR3d WebSocket Market Data Worker
 

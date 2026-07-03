@@ -72,6 +72,10 @@ class Settings(BaseSettings):
     )
     paper_max_open_positions: int = Field(default=12, alias="PAPER_MAX_OPEN_POSITIONS")
     paper_spread_trading_enabled: bool = Field(default=False, alias="PAPER_SPREAD_TRADING_ENABLED")
+    paper_full_game_spread_trading_enabled: bool = Field(
+        default=False,
+        alias="PAPER_FULL_GAME_SPREAD_TRADING_ENABLED",
+    )
     paper_min_trade_price: Decimal = Field(default=Decimal("0.10"), alias="PAPER_MIN_TRADE_PRICE")
     paper_low_price_threshold: Decimal = Field(default=Decimal("0.20"), alias="PAPER_LOW_PRICE_THRESHOLD")
     paper_low_price_max_trades_per_slate: int = Field(default=2, alias="PAPER_LOW_PRICE_MAX_TRADES_PER_SLATE")

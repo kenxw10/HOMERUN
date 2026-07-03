@@ -715,87 +715,101 @@ def spread_verification_from_mapping(
     market: KalshiMarket,
 ) -> SpreadVerification:
     family_key = mapping.market_family or market.market_family or market.market_type or ""
-    metadata = mapping.mapping_metadata or {}
-    existing = metadata.get("spread_verification")
-    if (
-        isinstance(existing, dict)
-        and existing.get("verified") is True
-        and CURRENT_AUDIT_METADATA_KEYS.issubset(existing.keys())
-        and existing.get("audit_status") in FULL_GAME_SPREAD_AUDIT_STATUSES
-    ):
-        line = existing.get("line_value")
-        return SpreadVerification(
-            family_key=family_key,
-            parser_status=str(existing.get("parser_status") or VERIFIED_STATUS),
-            settlement_rule_status=str(existing.get("settlement_rule_status") or VERIFIED_STATUS),
-            verified=True,
-            selection_code=str(existing.get("selection_code") or mapping.selection_code or market.selection_code or ""),
-            line_value=Decimal(str(line)).quantize(Decimal("0.0001")) if line is not None else mapping.line_value or market.line_value,
-            inning_scope=str(existing.get("inning_scope") or mapping.inning_scope or market.inning_scope or _scope(family_key)),
-            actual_contract_display=existing.get("actual_contract_display") if isinstance(existing.get("actual_contract_display"), str) else None,
-            no_contract_display=existing.get("no_contract_display") if isinstance(existing.get("no_contract_display"), str) else None,
-            normalized_no_equivalent_display=(
-                existing.get("normalized_no_equivalent_display")
-                if isinstance(existing.get("normalized_no_equivalent_display"), str)
-                else None
-            ),
-            parse_source=str(existing.get("parse_source") or "metadata"),
-            raw_contract_text=existing.get("raw_contract_text") if isinstance(existing.get("raw_contract_text"), dict) else {},
-            warnings=list(existing.get("warnings") or []) if isinstance(existing.get("warnings"), list) else [],
-            audit_status=str(existing.get("audit_status") or "trusted_audit_only"),
-            reason_codes=list(existing.get("reason_codes") or []) if isinstance(existing.get("reason_codes"), list) else [],
-            yes_interpretation=existing.get("yes_interpretation") if isinstance(existing.get("yes_interpretation"), str) else None,
-            no_interpretation=existing.get("no_interpretation") if isinstance(existing.get("no_interpretation"), str) else None,
-            no_is_true_complement=bool(existing.get("no_is_true_complement", True)),
-            complement_safe_for_paper_settlement=bool(existing.get("complement_safe_for_paper_settlement", True)),
-            line_sign=existing.get("line_sign") if isinstance(existing.get("line_sign"), str) else None,
-            line_direction=existing.get("line_direction") if isinstance(existing.get("line_direction"), str) else None,
-            push_possible=bool(existing.get("push_possible", False)),
-            push_condition=existing.get("push_condition") if isinstance(existing.get("push_condition"), str) else None,
-            push_rule_verified=bool(existing.get("push_rule_verified", False)),
-            condition_type=existing.get("condition_type") if isinstance(existing.get("condition_type"), str) else None,
-            threshold_runs=(
-                Decimal(str(existing.get("threshold_runs"))).quantize(Decimal("0.0001"))
-                if existing.get("threshold_runs") is not None
-                else None
-            ),
-            raw_threshold_runs=(
-                Decimal(str(existing.get("raw_threshold_runs"))).quantize(Decimal("0.0001"))
-                if existing.get("raw_threshold_runs") is not None
-                else None
-            ),
-            selected_team_margin_required_gt=(
-                Decimal(str(existing.get("selected_team_margin_required_gt"))).quantize(Decimal("0.0001"))
-                if existing.get("selected_team_margin_required_gt") is not None
-                else None
-            ),
-            display_spread_line=(
-                Decimal(str(existing.get("display_spread_line"))).quantize(Decimal("0.0001"))
-                if existing.get("display_spread_line") is not None
-                else None
-            ),
-            settlement_formula=(
-                existing.get("settlement_formula") if isinstance(existing.get("settlement_formula"), str) else None
-            ),
-            no_text_source=existing.get("no_text_source") if isinstance(existing.get("no_text_source"), str) else None,
-            no_complement_source=(
-                existing.get("no_complement_source") if isinstance(existing.get("no_complement_source"), str) else None
-            ),
-            no_complement_confidence=(
-                existing.get("no_complement_confidence")
-                if isinstance(existing.get("no_complement_confidence"), str)
-                else None
-            ),
-            ticker_suffix_line_raw=(
-                existing.get("ticker_suffix_line_raw")
-                if isinstance(existing.get("ticker_suffix_line_raw"), str)
-                else None
-            ),
-        )
+    cached = spread_verification_from_cached_metadata(mapping=mapping, market=market)
+    if cached is not None and cached.verified:
+        return cached
     return verify_spread_market(
         game=game,
         family_key=family_key,
         market=market,
         line_value=mapping.line_value or market.line_value,
         selection_code=mapping.selection_code or market.selection_code,
+    )
+
+
+def spread_verification_from_cached_metadata(
+    *,
+    mapping: MarketMapping,
+    market: KalshiMarket | None = None,
+) -> SpreadVerification | None:
+    family_key = mapping.market_family or (market.market_family if market is not None else None) or (
+        market.market_type if market is not None else None
+    ) or ""
+    metadata = mapping.mapping_metadata or {}
+    existing = metadata.get("spread_verification")
+    if not (
+        isinstance(existing, dict)
+        and CURRENT_AUDIT_METADATA_KEYS.issubset(existing.keys())
+        and existing.get("audit_status") in FULL_GAME_SPREAD_AUDIT_STATUSES
+    ):
+        return None
+    line = existing.get("line_value")
+    market_line = market.line_value if market is not None else None
+    market_selection = market.selection_code if market is not None else None
+    market_scope = market.inning_scope if market is not None else None
+    return SpreadVerification(
+        family_key=family_key,
+        parser_status=str(existing.get("parser_status") or VERIFIED_STATUS),
+        settlement_rule_status=str(existing.get("settlement_rule_status") or VERIFIED_STATUS),
+        verified=bool(existing.get("verified")),
+        selection_code=str(existing.get("selection_code") or mapping.selection_code or market_selection or "") or None,
+        line_value=Decimal(str(line)).quantize(Decimal("0.0001")) if line is not None else mapping.line_value or market_line,
+        inning_scope=str(existing.get("inning_scope") or mapping.inning_scope or market_scope or _scope(family_key)),
+        actual_contract_display=existing.get("actual_contract_display") if isinstance(existing.get("actual_contract_display"), str) else None,
+        no_contract_display=existing.get("no_contract_display") if isinstance(existing.get("no_contract_display"), str) else None,
+        normalized_no_equivalent_display=(
+            existing.get("normalized_no_equivalent_display")
+            if isinstance(existing.get("normalized_no_equivalent_display"), str)
+            else None
+        ),
+        parse_source=str(existing.get("parse_source") or "metadata"),
+        raw_contract_text=existing.get("raw_contract_text") if isinstance(existing.get("raw_contract_text"), dict) else {},
+        warnings=list(existing.get("warnings") or []) if isinstance(existing.get("warnings"), list) else [],
+        audit_status=str(existing.get("audit_status") or "trusted_audit_only"),
+        reason_codes=list(existing.get("reason_codes") or []) if isinstance(existing.get("reason_codes"), list) else [],
+        yes_interpretation=existing.get("yes_interpretation") if isinstance(existing.get("yes_interpretation"), str) else None,
+        no_interpretation=existing.get("no_interpretation") if isinstance(existing.get("no_interpretation"), str) else None,
+        no_is_true_complement=bool(existing.get("no_is_true_complement", True)),
+        complement_safe_for_paper_settlement=bool(existing.get("complement_safe_for_paper_settlement", True)),
+        line_sign=existing.get("line_sign") if isinstance(existing.get("line_sign"), str) else None,
+        line_direction=existing.get("line_direction") if isinstance(existing.get("line_direction"), str) else None,
+        push_possible=bool(existing.get("push_possible", False)),
+        push_condition=existing.get("push_condition") if isinstance(existing.get("push_condition"), str) else None,
+        push_rule_verified=bool(existing.get("push_rule_verified", False)),
+        condition_type=existing.get("condition_type") if isinstance(existing.get("condition_type"), str) else None,
+        threshold_runs=(
+            Decimal(str(existing.get("threshold_runs"))).quantize(Decimal("0.0001"))
+            if existing.get("threshold_runs") is not None
+            else None
+        ),
+        raw_threshold_runs=(
+            Decimal(str(existing.get("raw_threshold_runs"))).quantize(Decimal("0.0001"))
+            if existing.get("raw_threshold_runs") is not None
+            else None
+        ),
+        selected_team_margin_required_gt=(
+            Decimal(str(existing.get("selected_team_margin_required_gt"))).quantize(Decimal("0.0001"))
+            if existing.get("selected_team_margin_required_gt") is not None
+            else None
+        ),
+        display_spread_line=(
+            Decimal(str(existing.get("display_spread_line"))).quantize(Decimal("0.0001"))
+            if existing.get("display_spread_line") is not None
+            else None
+        ),
+        settlement_formula=existing.get("settlement_formula") if isinstance(existing.get("settlement_formula"), str) else None,
+        no_text_source=existing.get("no_text_source") if isinstance(existing.get("no_text_source"), str) else None,
+        no_complement_source=(
+            existing.get("no_complement_source") if isinstance(existing.get("no_complement_source"), str) else None
+        ),
+        no_complement_confidence=(
+            existing.get("no_complement_confidence")
+            if isinstance(existing.get("no_complement_confidence"), str)
+            else None
+        ),
+        ticker_suffix_line_raw=(
+            existing.get("ticker_suffix_line_raw")
+            if isinstance(existing.get("ticker_suffix_line_raw"), str)
+            else None
+        ),
     )
