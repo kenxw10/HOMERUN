@@ -241,8 +241,10 @@ def _parse_rules_spread_condition(
 def _line_text(value: Decimal | None) -> str:
     if value is None:
         return ""
-    normalized = value.normalize()
-    return f"{normalized:f}".rstrip("0").rstrip(".")
+    text = f"{value.normalize():f}"
+    if "." not in text:
+        return text
+    return text.rstrip("0").rstrip(".")
 
 
 def _line_text_variants(value: Decimal | None) -> set[str]:
