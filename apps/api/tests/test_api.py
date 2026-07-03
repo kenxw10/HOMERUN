@@ -1057,7 +1057,7 @@ def test_spread_audit_details_only_deserializes_spread_job_json() -> None:
     assert latest["spread-audit"].result_is_compact is False
 
 
-def test_dashboard_candidate_diagnostics_omit_candidate_level_lists_by_default() -> None:
+def test_dashboard_candidate_diagnostics_are_debug_only() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
     now = datetime(2026, 7, 3, 16, 0, tzinfo=UTC)
@@ -1096,18 +1096,44 @@ def test_dashboard_candidate_diagnostics_omit_candidate_level_lists_by_default()
         summary = dashboard.dashboard_summary_from_db(session)
         debug_summary = dashboard.dashboard_summary_from_db(session, include_candidate_diagnostics=True)
 
-    compact = summary.latest_candidate_diagnostics
-    assert compact["candidate_diagnostics"]["candidates_total"] == 6
-    assert compact["candidate_diagnostics"]["top_quality_blockers_count"] == 6
-    assert "top_quality_blockers" not in compact["candidate_diagnostics"]
-    assert (
-        compact["quality_ev_diagnostics"]["top_counterfactual_candidates_blocked_by_quality_count"]
-        == 6
-    )
-    assert "candidate_id" not in json.dumps(compact)
-
+    assert summary.latest_candidate_diagnostics == {}
     debug_payload = debug_summary.latest_candidate_diagnostics
     assert debug_payload["quality_ev_diagnostics"]["top_counterfactual_candidates_blocked_by_quality"]["item_count"] == 6
+
+
+def test_compact_dashboard_does_not_deserialize_prediction_summary() -> None:
+    def reject_prediction_summary_json(value: object) -> object:
+        raw = str(value)
+        if "candidate-large" in raw:
+            raise AssertionError("compact dashboard must not deserialize prediction summary JSON")
+        return json.loads(raw)
+
+    engine = create_engine("sqlite+pysqlite:///:memory:", json_deserializer=reject_prediction_summary_json)
+    Base.metadata.create_all(engine)
+    now = datetime(2026, 7, 3, 16, 0, tzinfo=UTC)
+
+    with Session(engine) as session:
+        active = get_or_create_active_paper_epoch(session, starting_balance=Decimal("500.00"))
+        session.add(
+            ModelPredictionRun(
+                paper_trading_epoch_id=active.id,
+                started_at=now,
+                completed_at=now,
+                target_date=today_eastern(),
+                status="completed",
+                candidates_evaluated=1,
+                trades_created=2,
+                trade_policy={"mode": "paper"},
+                summary={"candidate_diagnostics": {"large": "candidate-large"}},
+            )
+        )
+        session.commit()
+
+        summary = dashboard.dashboard_summary_from_db(session)
+
+    assert summary.latest_candidate_diagnostics == {}
+    assert summary.model_status.trade_policy == {"mode": "paper"}
+    assert summary.model_status.trade_caps_used == {"paper_trades": 2}
 
 
 def test_governance_status_defaults_to_compact_registry_and_allows_debug_details() -> None:

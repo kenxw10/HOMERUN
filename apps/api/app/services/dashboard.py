@@ -1059,11 +1059,28 @@ def dashboard_summary_from_db(
         active_epoch.id,
         include_details=include_governance_registry_details,
     )
-    last_prediction = session.scalar(
-        select(ModelPredictionRun)
+    include_candidate_details = include_diagnostics or include_candidate_diagnostics
+    last_prediction = session.execute(
+        select(
+            ModelPredictionRun.id,
+            ModelPredictionRun.trades_created,
+            ModelPredictionRun.trade_policy,
+            ModelPredictionRun.summary["cap_counts"].label("summary_cap_counts"),
+            ModelPredictionRun.summary["risk_caps"].label("summary_risk_caps"),
+            ModelPredictionRun.summary["candidate_sweep_window"].label("summary_candidate_sweep_window"),
+            ModelPredictionRun.summary["candidates_yes"].label("summary_candidates_yes"),
+            ModelPredictionRun.summary["candidates_no"].label("summary_candidates_no"),
+            ModelPredictionRun.summary["paper_trades_yes"].label("summary_paper_trades_yes"),
+            ModelPredictionRun.summary["paper_trades_no"].label("summary_paper_trades_no"),
+        )
         .where(ModelPredictionRun.paper_trading_epoch_id == active_epoch.id)
         .where(ModelPredictionRun.target_date == today_eastern())
         .order_by(ModelPredictionRun.started_at.desc())
+    ).mappings().first()
+    last_prediction_summary = (
+        session.scalar(select(ModelPredictionRun.summary).where(ModelPredictionRun.id == last_prediction["id"]))
+        if last_prediction and include_candidate_details
+        else None
     )
     today_feature_rows = list(
         session.scalars(
@@ -1117,11 +1134,38 @@ def dashboard_summary_from_db(
         settled,
         lambda trade: _family_scope(trade.market_family, trade.inning_scope),
     )
-    include_candidate_details = include_diagnostics or include_candidate_diagnostics
-    if last_prediction and last_prediction.summary:
+    if last_prediction_summary:
         summary.latest_candidate_diagnostics = _compact_candidate_diagnostics(
-            last_prediction.summary,
+            last_prediction_summary,
             include_details=include_candidate_details,
+        )
+    trade_caps_used: dict[str, object] = {
+        "paper_trades": int(last_prediction["trades_created"]) if last_prediction else 0,
+    }
+    if last_prediction:
+        for key in ("summary_cap_counts", "summary_risk_caps", "summary_candidate_sweep_window"):
+            value = last_prediction[key]
+            if isinstance(value, dict):
+                trade_caps_used.update(value)
+        for source_key, target_key in (
+            ("summary_candidates_yes", "candidates_yes"),
+            ("summary_candidates_no", "candidates_no"),
+            ("summary_paper_trades_yes", "paper_trades_yes"),
+            ("summary_paper_trades_no", "paper_trades_no"),
+        ):
+            value = last_prediction[source_key]
+            if value is not None:
+                trade_caps_used[target_key] = value
+    if last_prediction_summary:
+        trade_caps_used.update(last_prediction_summary.get("cap_counts", {}))
+        trade_caps_used.update(last_prediction_summary.get("risk_caps", {}))
+        trade_caps_used.update(last_prediction_summary.get("candidate_sweep_window", {}))
+        trade_caps_used.update(
+            {
+                key: last_prediction_summary.get(key)
+                for key in ("candidates_yes", "candidates_no", "paper_trades_yes", "paper_trades_no")
+                if key in last_prediction_summary
+            }
         )
     summary.job_status = _latest_job_status(
         session,
@@ -1169,27 +1213,15 @@ def dashboard_summary_from_db(
             include_details=include_governance_registry_details,
         ),
         governance_status=last_training.status if last_training else "not_run",
-        trade_policy=last_prediction.trade_policy if last_prediction and last_prediction.trade_policy else {},
-        trade_caps_used=(
-            {
-                **((last_prediction.summary or {}).get("cap_counts", {}) if last_prediction else {}),
-                **((last_prediction.summary or {}).get("risk_caps", {}) if last_prediction else {}),
-                **((last_prediction.summary or {}).get("candidate_sweep_window", {}) if last_prediction else {}),
-                **{
-                    key: (last_prediction.summary or {}).get(key)
-                    for key in ("candidates_yes", "candidates_no", "paper_trades_yes", "paper_trades_no")
-                    if last_prediction and key in (last_prediction.summary or {})
-                },
-                "paper_trades": last_prediction.trades_created if last_prediction else 0,
-            }
-        ),
+        trade_policy=last_prediction["trade_policy"] if last_prediction and last_prediction["trade_policy"] else {},
+        trade_caps_used=trade_caps_used,
         trade_threshold_policy=last_threshold.thresholds if last_threshold else {},
         data_quality_summary={
             "avg": float(avg_data_quality) if avg_data_quality is not None else None,
             "feature_version": active_version.feature_version if active_version else None,
             "starter_hydration": starter_report["summary"],
             **_compact_candidate_data_quality(
-                last_prediction.summary if last_prediction and last_prediction.summary else None,
+                last_prediction_summary,
                 include_details=include_candidate_details,
             ),
         },
