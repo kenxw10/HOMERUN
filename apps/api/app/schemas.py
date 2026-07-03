@@ -163,6 +163,10 @@ class ModelStatus(BaseModel):
 class DashboardSummary(BaseModel):
     active_epoch: ActiveEpochSummary | None = None
     portfolio_series: list[PortfolioPoint]
+    portfolio_series_source: str | None = None
+    portfolio_series_point_count: int = 0
+    portfolio_series_truncated: bool = False
+    portfolio_series_preserves_intraday_fluctuations: bool = True
     performance: PerformanceMetrics
     positions: list[PositionSummary]
     closed_positions: list[PositionSummary] = Field(default_factory=list)

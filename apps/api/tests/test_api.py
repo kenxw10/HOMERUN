@@ -91,7 +91,7 @@ from app.services.paper_epoch import (
     get_or_create_active_paper_epoch,
     reset_paper_trading_epoch,
 )
-from app.services.portfolio import calculate_paper_portfolio
+from app.services.portfolio import calculate_paper_portfolio, create_balance_snapshot
 from app.services.settlement import settle_paper_trades
 from app.services.spread_audit import run_spread_audit
 from app.services.spread_verification import verify_spread_market
@@ -6516,7 +6516,7 @@ def test_list_today_markets_uses_occurrence_or_mapped_game_time(monkeypatch) -> 
     assert mapped_row[1].mapping_status == "candidate"
 
 
-def test_dashboard_uses_newest_portfolio_snapshots() -> None:
+def test_dashboard_compacts_portfolio_snapshots_without_dropping_epoch_start() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
     captured_at = datetime(2026, 7, 2, 12, 0, tzinfo=UTC)
@@ -6539,10 +6539,75 @@ def test_dashboard_uses_newest_portfolio_snapshots() -> None:
         summary = dashboard.dashboard_summary_from_db(session)
 
     assert len(summary.portfolio_series) == 500
-    assert summary.portfolio_series[0].value == 1.0
+    assert summary.portfolio_series_source == "balance_snapshots"
+    assert summary.portfolio_series_point_count == 500
+    assert summary.portfolio_series_truncated is True
+    assert summary.portfolio_series_preserves_intraday_fluctuations is True
+    assert summary.portfolio_series[0].value == 0.0
     assert summary.portfolio_series[-1].value == 500.0
     assert summary.cash_balance == 500.0
     assert summary.portfolio_value == 500.0
+
+
+def test_dashboard_portfolio_series_preserves_intraday_fluctuation_extrema() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    captured_at = datetime(2026, 7, 2, 12, 0, tzinfo=UTC)
+
+    with Session(engine) as session:
+        epoch_id = _active_epoch_id(session)
+        for index in range(620):
+            value = Decimal("500.00")
+            if index == 280:
+                value = Decimal("470.00")
+            elif index == 281:
+                value = Decimal("535.00")
+            session.add(
+                BalanceSnapshot(
+                    paper_trading_epoch_id=epoch_id,
+                    captured_at=captured_at + timedelta(minutes=index),
+                    cash_balance=value,
+                    portfolio_value=value,
+                    source="paper",
+                )
+            )
+        session.commit()
+
+        summary = dashboard.dashboard_summary_from_db(session)
+
+    values = {point.value for point in summary.portfolio_series}
+    assert summary.portfolio_series_truncated is True
+    assert 470.0 in values
+    assert 535.0 in values
+
+
+def test_create_balance_snapshot_skips_no_change_duplicates_and_keeps_changes() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        epoch = get_or_create_active_paper_epoch(session)
+        first = create_balance_snapshot(session, source="test_initial", epoch=epoch)
+        duplicate = create_balance_snapshot(session, source="test_no_change", epoch=epoch)
+        session.add(
+            PaperTrade(
+                paper_trading_epoch_id=epoch.id,
+                market_ticker="KXMLB-SNAPSHOT-CHANGE",
+                contract_side="yes",
+                entry_price=Decimal("0.4000"),
+                current_price=Decimal("0.4000"),
+                quantity=1,
+                entry_time=datetime(2026, 7, 2, 12, 0, tzinfo=UTC),
+                status="open",
+            )
+        )
+        changed = create_balance_snapshot(session, source="trade_entry", epoch=epoch)
+        snapshots = list(session.scalars(select(BalanceSnapshot).order_by(BalanceSnapshot.id.asc())))
+
+    assert duplicate.id == first.id
+    assert changed.id != first.id
+    assert len(snapshots) == 2
+    assert snapshots[-1].snapshot_type == "trade_entry"
 
 
 def test_dashboard_preserves_zero_current_prices() -> None:
@@ -7080,7 +7145,8 @@ def test_paper_settlement_sync_settles_wins_losses_and_is_idempotent() -> None:
     assert result["settled"] == 2
     assert second_result["settled"] == 0
     assert len(settlements) == 2
-    assert len(snapshots) == 2
+    assert len(snapshots) == 1
+    assert second_result["snapshot_id"] == result["snapshot_id"]
     assert [trade.outcome for trade in trades] == ["win", "loss"]
     assert [trade.realized_pnl for trade in trades] == [Decimal("1.20"), Decimal("-0.90")]
     assert no_trade is not None
@@ -8559,6 +8625,52 @@ def test_governance_status_uses_aggregate_counts_without_candidate_loader(monkey
     assert status["raw_resolved_mature_samples"] == 1
     assert status["clean_resolved_mature_samples"] == 1
     assert status["pre_clean_excluded_samples"] == 0
+
+
+def test_model_governance_uses_scalar_samples_and_records_phase_metrics(monkeypatch) -> None:
+    monkeypatch.setenv("MODEL_GOVERNANCE_CLEAN_START_AT", "2026-07-02T00:00:00-04:00")
+    get_settings.cache_clear()
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        epoch_id = _active_epoch_id(session)
+        game = MlbGame(
+            external_game_id="governance-memory-light",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 2, 23, 0, tzinfo=UTC),
+            status="Final",
+        )
+        session.add(game)
+        session.flush()
+        _add_governance_candidate(
+            session,
+            epoch_id=epoch_id,
+            game_id=game.id,
+            target_date=date(2026, 7, 2),
+            evaluated_at=datetime(2026, 7, 2, 16, 0, tzinfo=UTC),
+            resolved_at=datetime(2026, 7, 3, 4, 0, tzinfo=UTC),
+        )
+        session.commit()
+
+        def fail_full_loader(*_args, **_kwargs):
+            raise AssertionError("governance job must not materialize full ModelCandidate rows")
+
+        monkeypatch.setattr(modeling, "_resolved_mature_candidates", fail_full_loader)
+        result = run_model_governance(session, now=datetime(2026, 7, 3, 12, 0, tzinfo=UTC))
+        training = session.get(TrainingRun, result["training_run_id"])
+
+    assert result["raw_resolved_mature_samples"] == 1
+    assert result["clean_resolved_mature_samples"] == 1
+    phase_names = {phase["phase"] for phase in result["governance_phase_metrics"]}
+    assert "load_clean_training_samples" in phase_names
+    assert "commit_governance_artifacts" in phase_names
+    assert training is not None
+    persisted_phase_names = {phase["phase"] for phase in training.metrics["governance_phase_metrics"]}
+    assert "load_clean_training_samples" in persisted_phase_names
 
 
 def test_dashboard_summary_does_not_deserialize_candidate_json_for_compact_counts(monkeypatch) -> None:

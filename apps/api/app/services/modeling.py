@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 import logging
 from math import exp, factorial, log
@@ -165,6 +165,23 @@ class RunExpectations:
     away_first_five_runs_mean: Decimal
     home_first_five_runs_mean: Decimal
     effects: list[dict[str, object]]
+
+
+@dataclass(frozen=True)
+class GovernanceCandidateSample:
+    id: int
+    evaluated_at: datetime
+    resolved_at: datetime | None
+    target_date: date | None
+    probability: Decimal | None
+    model_probability: Decimal | None
+    probability_calibrated: Decimal | None
+    market_family: str | None
+    time_bucket: str | None
+    outcome: str | None
+
+
+CandidateSampleLike = ModelCandidate | GovernanceCandidateSample
 
 
 def _deactivate_other_active_versions(session: Session, active_id: int | None) -> None:
@@ -744,7 +761,7 @@ def score_candidate_probability(features: dict[str, object], contract_side: str 
     return score
 
 
-def _candidate_outcome_value(candidate: ModelCandidate) -> int | None:
+def _candidate_outcome_value(candidate: CandidateSampleLike) -> int | None:
     if candidate.outcome == "win":
         return 1
     if candidate.outcome == "loss":
@@ -831,6 +848,53 @@ def _resolved_mature_candidates(session: Session, paper_trading_epoch_id: int | 
         )
     )
     return [candidate for candidate, game in rows if _candidate_target_date_matches_game(candidate, game)]
+
+
+def _resolved_mature_candidate_sample_statement(paper_trading_epoch_id: int | None = None):
+    return (
+        select(
+            ModelCandidate.id,
+            ModelCandidate.evaluated_at,
+            ModelCandidate.resolved_at,
+            ModelCandidate.target_date,
+            ModelCandidate.probability,
+            ModelCandidate.model_probability,
+            ModelCandidate.probability_calibrated,
+            ModelCandidate.market_family,
+            ModelCandidate.time_bucket,
+            ModelCandidate.outcome,
+            MlbGame.scheduled_start,
+        )
+        .select_from(ModelCandidate)
+        .join(MlbGame, ModelCandidate.mlb_game_id == MlbGame.id)
+        .where(*_resolved_mature_candidate_filters(paper_trading_epoch_id))
+        .order_by(ModelCandidate.resolved_at.asc().nullslast(), ModelCandidate.evaluated_at.asc(), ModelCandidate.id.asc())
+    )
+
+
+def _resolved_mature_candidate_samples(
+    session: Session,
+    paper_trading_epoch_id: int | None = None,
+) -> list[GovernanceCandidateSample]:
+    samples: list[GovernanceCandidateSample] = []
+    for row in session.execute(_resolved_mature_candidate_sample_statement(paper_trading_epoch_id)):
+        if not _target_date_matches_scheduled_start(row.target_date, row.scheduled_start):
+            continue
+        samples.append(
+            GovernanceCandidateSample(
+                id=int(row.id),
+                evaluated_at=row.evaluated_at,
+                resolved_at=row.resolved_at,
+                target_date=row.target_date,
+                probability=row.probability,
+                model_probability=row.model_probability,
+                probability_calibrated=row.probability_calibrated,
+                market_family=row.market_family,
+                time_bucket=row.time_bucket,
+                outcome=row.outcome,
+            )
+        )
+    return samples
 
 
 def _resolved_mature_candidate_filters(paper_trading_epoch_id: int | None = None) -> list[object]:
@@ -972,7 +1036,7 @@ def count_pre_clean_excluded_candidates(
     return sum(count_clean_filter_exclusions_by_reason(session, paper_trading_epoch_id, clean_window).values())
 
 
-def _clean_candidate_exclusion_reason(candidate: ModelCandidate, clean_window: dict[str, object]) -> str | None:
+def _clean_candidate_exclusion_reason(candidate: CandidateSampleLike, clean_window: dict[str, object]) -> str | None:
     clean_start = clean_window["start_at"]
     clean_date = clean_window["start_date_et"]
     if candidate.target_date is None:
@@ -987,10 +1051,10 @@ def _clean_candidate_exclusion_reason(candidate: ModelCandidate, clean_window: d
 
 
 def _apply_clean_training_filter(
-    candidates: list[ModelCandidate],
+    candidates: list[GovernanceCandidateSample],
     clean_window: dict[str, object],
-) -> tuple[list[ModelCandidate], dict[str, int]]:
-    included: list[ModelCandidate] = []
+) -> tuple[list[GovernanceCandidateSample], dict[str, int]]:
+    included: list[GovernanceCandidateSample] = []
     excluded_counts: dict[str, int] = {}
     for candidate in candidates:
         reason = _clean_candidate_exclusion_reason(candidate, clean_window)
@@ -1020,6 +1084,57 @@ def _governance_training_policy_payload(
     }
 
 
+def _governance_rss_mb() -> float | None:
+    try:
+        import psutil  # type: ignore[import-not-found]
+
+        return round(psutil.Process().memory_info().rss / (1024 * 1024), 2)
+    except Exception:
+        pass
+    try:
+        import resource  # type: ignore[import-not-found]
+
+        rss = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    except Exception:
+        return None
+    if rss <= 0:
+        return None
+    if rss > 10_000_000:
+        return round(rss / (1024 * 1024), 2)
+    return round(rss / 1024, 2)
+
+
+def _governance_phase_start() -> tuple[float, float | None]:
+    return time.perf_counter(), _governance_rss_mb()
+
+
+def _record_governance_phase(
+    phases: list[dict[str, object]],
+    phase: str,
+    started_at: float,
+    rss_before_mb: float | None,
+    **extra: object,
+) -> None:
+    rss_after_mb = _governance_rss_mb()
+    entry: dict[str, object] = {
+        "phase": phase,
+        "duration_ms": int((time.perf_counter() - started_at) * 1000),
+    }
+    if rss_after_mb is not None:
+        entry["rss_mb"] = rss_after_mb
+    if rss_before_mb is not None and rss_after_mb is not None:
+        entry["rss_delta_mb"] = round(rss_after_mb - rss_before_mb, 2)
+    entry.update(extra)
+    phases.append(entry)
+    logger.info(
+        "model_governance_phase phase=%s duration_ms=%s rss_mb=%s counts=%s",
+        phase,
+        entry["duration_ms"],
+        entry.get("rss_mb"),
+        {key: value for key, value in extra.items() if key.endswith("_count") or key.endswith("_samples")},
+    )
+
+
 def governance_sample_summary(session: Session, paper_trading_epoch_id: int | None = None) -> dict[str, object]:
     if paper_trading_epoch_id is None:
         paper_trading_epoch_id = get_or_create_active_paper_epoch(session).id
@@ -1047,7 +1162,7 @@ def governance_sample_summary(session: Session, paper_trading_epoch_id: int | No
     }
 
 
-def _candidate_probability(candidate: ModelCandidate, offsets: dict[str, Decimal] | None = None) -> Decimal | None:
+def _candidate_probability(candidate: CandidateSampleLike, offsets: dict[str, Decimal] | None = None) -> Decimal | None:
     probability = candidate.probability_calibrated or candidate.model_probability or candidate.probability
     if probability is None:
         return None
@@ -1059,7 +1174,7 @@ def _candidate_probability(candidate: ModelCandidate, offsets: dict[str, Decimal
 
 
 def _metrics(
-    candidates: list[ModelCandidate],
+    candidates: list[GovernanceCandidateSample],
     offsets: dict[str, Decimal] | None = None,
 ) -> dict[str, object]:
     rows: list[tuple[float, int, str | None, str | None]] = []
@@ -1103,14 +1218,16 @@ def _metrics(
     }
 
 
-def _chronological_split(candidates: list[ModelCandidate]) -> tuple[list[ModelCandidate], list[ModelCandidate]]:
+def _chronological_split(
+    candidates: list[GovernanceCandidateSample],
+) -> tuple[list[GovernanceCandidateSample], list[GovernanceCandidateSample]]:
     if len(candidates) < 2:
         return candidates, []
     split_index = max(1, int(len(candidates) * 0.7))
     return candidates[:split_index], candidates[split_index:]
 
 
-def _fit_probability_offsets(candidates: list[ModelCandidate]) -> dict[str, Decimal]:
+def _fit_probability_offsets(candidates: list[GovernanceCandidateSample]) -> dict[str, Decimal]:
     rows: list[tuple[Decimal, Decimal, str]] = []
     for candidate in candidates:
         outcome = _candidate_outcome_value(candidate)
@@ -1324,6 +1441,8 @@ def run_model_governance(
     *,
     paper_trading_epoch_id: int | None = None,
 ) -> dict[str, object]:
+    phase_metrics: list[dict[str, object]] = []
+    phase_started, phase_rss = _governance_phase_start()
     settings = get_settings()
     started = now or utc_now()
     active = get_or_create_mature_model_version(session)
@@ -1331,13 +1450,41 @@ def run_model_governance(
     if paper_trading_epoch_id is None:
         paper_trading_epoch_id = get_or_create_active_paper_epoch(session).id
     clean_window = _governance_clean_training_window(settings)
-    raw_candidates = _resolved_mature_candidates(session, paper_trading_epoch_id=paper_trading_epoch_id)
+    _record_governance_phase(
+        phase_metrics,
+        "initialize",
+        phase_started,
+        phase_rss,
+        paper_trading_epoch_id=paper_trading_epoch_id,
+    )
+
+    phase_started, phase_rss = _governance_phase_start()
+    raw_candidates = _resolved_mature_candidate_samples(session, paper_trading_epoch_id=paper_trading_epoch_id)
+    _record_governance_phase(
+        phase_metrics,
+        "load_clean_training_samples",
+        phase_started,
+        phase_rss,
+        raw_sample_count=len(raw_candidates),
+    )
+
+    phase_started, phase_rss = _governance_phase_start()
     candidates, clean_exclusion_counts = _apply_clean_training_filter(raw_candidates, clean_window)
     raw_sample_count = len(raw_candidates)
     sample_count = len(candidates)
     train_min = settings.model_min_samples_train
     calibrate_min = settings.model_min_samples_calibrate
     promote_min = settings.model_min_samples_promote
+    _record_governance_phase(
+        phase_metrics,
+        "apply_clean_training_filter",
+        phase_started,
+        phase_rss,
+        clean_sample_count=sample_count,
+        pre_clean_excluded_samples=raw_sample_count - sample_count,
+    )
+
+    phase_started, phase_rss = _governance_phase_start()
     train_rows, holdout_rows = _chronological_split(candidates)
     metrics = _metrics(candidates)
     holdout_metrics = _metrics(holdout_rows) if holdout_rows else metrics
@@ -1347,7 +1494,16 @@ def run_model_governance(
         clean_sample_count=sample_count,
         excluded_counts=clean_exclusion_counts,
     )
+    _record_governance_phase(
+        phase_metrics,
+        "split_and_score",
+        phase_started,
+        phase_rss,
+        train_sample_count=len(train_rows),
+        holdout_sample_count=len(holdout_rows),
+    )
 
+    phase_started, phase_rss = _governance_phase_start()
     training = TrainingRun(
         model_version_id=active.id,
         started_at=started,
@@ -1493,6 +1649,17 @@ def run_model_governance(
             reason = "CHALLENGER_DID_NOT_CLEAR_PROMOTION_GUARDRAILS"
             promoted = False
 
+    _record_governance_phase(
+        phase_metrics,
+        "fit_and_stage_governance_artifacts",
+        phase_started,
+        phase_rss,
+        training_run_id=training.id,
+        calibration_staged_count=1,
+        challenger_staged_count=1 if challenger else 0,
+        threshold_staged_count=1 if threshold_version else 0,
+    )
+
     training.status = status
     calibration.status = "skipped_insufficient_samples" if sample_count < calibrate_min else status
     training.metrics = {
@@ -1500,6 +1667,7 @@ def run_model_governance(
         "reason": reason,
         "holdout_metrics": holdout_metrics,
         "challenger_parameter_version": challenger.version_tag if challenger else None,
+        "governance_phase_metrics": list(phase_metrics),
     }
     calibration.metrics = {
         **(calibration.metrics or {}),
@@ -1507,6 +1675,7 @@ def run_model_governance(
         "method_selected": "platt_sigmoid" if sample_count >= calibrate_min else "none",
         "isotonic_allowed": sample_count >= settings.model_min_samples_for_isotonic,
         "paper_trading_epoch_id": paper_trading_epoch_id,
+        "governance_phase_metrics": list(phase_metrics),
     }
     event = ModelGovernanceEvent(
         occurred_at=started,
@@ -1525,10 +1694,20 @@ def run_model_governance(
             "metrics": metrics,
             "holdout_metrics": holdout_metrics,
             **clean_policy_metrics,
+            "governance_phase_metrics": list(phase_metrics),
         },
     )
     session.add_all([training, calibration, event])
+    phase_started, phase_rss = _governance_phase_start()
     session.commit()
+    _record_governance_phase(
+        phase_metrics,
+        "commit_governance_artifacts",
+        phase_started,
+        phase_rss,
+        training_run_id=training.id,
+        calibration_run_id=calibration.id,
+    )
     return {
         "status": status,
         "reason": reason,
@@ -1559,6 +1738,7 @@ def run_model_governance(
         "promoted": promoted,
         "metrics": metrics,
         "holdout_metrics": holdout_metrics,
+        "governance_phase_metrics": phase_metrics,
         "governance_parameter_registry": governance_parameter_registry(),
     }
 

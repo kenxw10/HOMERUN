@@ -103,6 +103,10 @@ type PositionSummary = {
 type DashboardSummary = {
   active_epoch: ActiveEpochSummary | null;
   portfolio_series: PortfolioPoint[];
+  portfolio_series_source?: string | null;
+  portfolio_series_point_count?: number;
+  portfolio_series_truncated?: boolean;
+  portfolio_series_preserves_intraday_fluctuations?: boolean;
   performance: PerformanceMetrics;
   positions: PositionSummary[];
   closed_positions: PositionSummary[];
