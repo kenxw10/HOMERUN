@@ -477,7 +477,394 @@ def _decision_breakdown(candidates: list[ModelCandidate]) -> tuple[dict[str, dic
     return by_family, by_scope
 
 
-def _latest_job_status(session: Session, epoch: PaperTradingEpoch) -> dict[str, JobRunSummary]:
+ALWAYS_OMIT_PAYLOAD_KEYS = {
+    "features",
+    "raw_contract_text",
+    "raw_output",
+    "raw_payload",
+    "rationale",
+}
+
+HEAVY_PAYLOAD_KEYS = {
+    "candidate_ids",
+    "counterfactuals",
+    "items",
+    "rows",
+    "source_health",
+    "source_inventory",
+    "tables",
+    "top_counterfactual_candidates_blocked_by_quality",
+    "top_deduped_counterfactual_opinions_by_game_scope_family",
+}
+
+
+def _json_scalar(value: object) -> object:
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
+    return str(value)
+
+
+def _payload_count(value: object) -> int | None:
+    if isinstance(value, (list, tuple, set, dict)):
+        return len(value)
+    return None
+
+
+def _compact_payload(
+    value: object,
+    *,
+    max_depth: int = 3,
+    max_list_items: int = 5,
+    max_dict_items: int = 40,
+    include_heavy: bool = False,
+) -> object:
+    if value is None or isinstance(value, (bool, int, float, str, Decimal, date, datetime)):
+        return _json_scalar(value)
+    if max_depth <= 0:
+        count = _payload_count(value)
+        return {"truncated": True, "item_count": count} if count is not None else _json_scalar(value)
+    if isinstance(value, (list, tuple, set)):
+        rows = list(value)
+        return {
+            "item_count": len(rows),
+            "items": [
+                _compact_payload(
+                    item,
+                    max_depth=max_depth - 1,
+                    max_list_items=max_list_items,
+                    max_dict_items=max_dict_items,
+                    include_heavy=include_heavy,
+                )
+                for item in rows[:max_list_items]
+            ],
+            "truncated": len(rows) > max_list_items,
+        }
+    if isinstance(value, dict):
+        compact: dict[str, object] = {}
+        for index, (raw_key, raw_item) in enumerate(value.items()):
+            if index >= max_dict_items:
+                compact["truncated"] = True
+                compact["omitted_key_count"] = len(value) - max_dict_items
+                break
+            key = str(raw_key)
+            if key in ALWAYS_OMIT_PAYLOAD_KEYS:
+                compact["omitted_blob_field_count"] = int(compact.get("omitted_blob_field_count", 0)) + 1
+                continue
+            if not include_heavy and key in HEAVY_PAYLOAD_KEYS:
+                count = _payload_count(raw_item)
+                if count is not None:
+                    compact[f"{key}_count"] = count
+                compact[f"{key}_omitted"] = True
+                continue
+            compact[key] = _compact_payload(
+                raw_item,
+                max_depth=max_depth - 1,
+                max_list_items=max_list_items,
+                max_dict_items=max_dict_items,
+                include_heavy=include_heavy,
+            )
+        return compact
+    return _json_scalar(value)
+
+
+def _compact_job_result(result: dict[str, object] | None, *, include_details: bool = False) -> dict[str, object]:
+    if not result:
+        return {}
+    return dict(
+        _compact_payload(
+            result,
+            max_depth=5 if include_details else 3,
+            max_list_items=25 if include_details else 5,
+            max_dict_items=80 if include_details else 40,
+            include_heavy=include_details,
+        )
+    )
+
+
+def _compact_governance_registry(registry: object, *, include_details: bool = False) -> dict[str, object]:
+    if not isinstance(registry, dict):
+        return {}
+    if include_details:
+        return dict(_compact_payload(registry, max_depth=5, max_list_items=25, max_dict_items=80, include_heavy=True))
+    return {
+        key: _json_scalar(value)
+        for key, value in registry.items()
+        if key.endswith("_count") or key in {"policy"}
+    }
+
+
+def _compact_latest_errors(errors: object, *, limit: int = 3) -> tuple[int, list[object]]:
+    if not isinstance(errors, list):
+        return 0, []
+    return len(errors), [
+        _compact_payload(error, max_depth=2, max_list_items=3, max_dict_items=12, include_heavy=False)
+        for error in errors[:limit]
+    ]
+
+
+def compact_source_status_payload(source_status: dict[str, object], *, include_details: bool = False) -> dict[str, object]:
+    if include_details:
+        return dict(
+            _compact_payload(
+                source_status,
+                max_depth=5,
+                max_list_items=25,
+                max_dict_items=120,
+                include_heavy=True,
+            )
+        )
+    health = source_status.get("source_health")
+    health_rows = health if isinstance(health, list) else []
+    health_status_counts: dict[str, int] = {}
+    health_criticality_counts: dict[str, int] = {}
+    for row in health_rows:
+        if not isinstance(row, dict):
+            continue
+        status = str(row.get("status") or "unknown")
+        criticality = str(row.get("criticality") or "unknown")
+        health_status_counts[status] = health_status_counts.get(status, 0) + 1
+        health_criticality_counts[criticality] = health_criticality_counts.get(criticality, 0) + 1
+    latest_error_count, latest_error_sample = _compact_latest_errors(source_status.get("latest_errors"))
+    completeness = source_status.get("latest_feature_completeness")
+    completeness_summary = (
+        (completeness or {}).get("summary") if isinstance(completeness, dict) else None
+    )
+    return {
+        "feature_sync_enable_network_sources": bool(source_status.get("feature_sync_enable_network_sources")),
+        "public_sources_enabled": bool(source_status.get("public_sources_enabled")),
+        "validation_status": source_status.get("validation_status"),
+        "last_attempted_sync": source_status.get("last_attempted_sync"),
+        "source_count": len(health_rows),
+        "source_health_status_counts": health_status_counts,
+        "source_health_criticality_counts": health_criticality_counts,
+        "latest_error_count": latest_error_count,
+        "latest_errors_sample": latest_error_sample,
+        "pybaseball_fangraphs_status": source_status.get("pybaseball_fangraphs_status"),
+        "advanced_public_stats_status": source_status.get("advanced_public_stats_status"),
+        "statcast_savant_status": source_status.get("statcast_savant_status"),
+        "last_feature_sync_status": _compact_payload(
+            source_status.get("last_feature_sync_status") or {},
+            max_depth=2,
+            max_list_items=3,
+            max_dict_items=20,
+            include_heavy=False,
+        ),
+        "latest_feature_completeness": {
+            "date": completeness.get("date") if isinstance(completeness, dict) else None,
+            "summary": completeness_summary if isinstance(completeness_summary, dict) else {},
+        },
+    }
+
+
+CANDIDATE_DATA_QUALITY_COMPACT_KEYS = (
+    "raw_feature_snapshot_data_quality_avg",
+    "raw_feature_snapshot_data_quality_max",
+    "paper_observation_data_quality_avg",
+    "paper_observation_data_quality_max",
+    "quality_threshold",
+    "candidate_stage_market_context_status_counts",
+    "quality_block_reason_counts",
+)
+
+CANDIDATE_DIAGNOSTIC_COMPACT_KEYS = (
+    "candidates_total",
+    "trade_eligible_before_quality",
+    "trade_eligible_after_quality",
+    "blocked_by_quality_only",
+    "would_pass_ev_if_quality_allowed",
+    "would_pass_edge_if_quality_allowed",
+    "ev_edge_pass_but_quality_fail",
+    "blocked_by_ev",
+    "blocked_by_edge",
+    "blocked_by_price",
+    "blocked_by_mapping",
+    "blocked_by_caps",
+    "average_data_quality",
+    "paper_observation_data_quality_avg",
+    "quality_threshold",
+    "quality_block_reason_counts",
+    "candidate_stage_market_context_status_counts",
+)
+
+QUALITY_EV_DIAGNOSTIC_COMPACT_KEYS = (
+    "candidates_total",
+    "ev_pass_count",
+    "edge_pass_count",
+    "ev_and_edge_pass_count",
+    "pre_quality_trade_eligible_count",
+    "post_quality_trade_eligible_count",
+    "quality_blocked_count",
+    "unique_game_scope_family_count",
+    "deduped_ev_edge_pass_count_by_game_scope_family",
+    "deduped_pre_quality_trade_eligible_count_by_game_scope_family",
+    "counts_by_quality_bucket",
+)
+
+
+def _prediction_summary_json_value(section: str, key: str):
+    return ModelPredictionRun.summary[section][key]
+
+
+def _prediction_summary_compact_columns() -> list[object]:
+    columns: list[object] = [
+        _prediction_summary_json_value("candidate_diagnostics", key).label(f"candidate_{key}")
+        for key in sorted(set(CANDIDATE_DATA_QUALITY_COMPACT_KEYS + CANDIDATE_DIAGNOSTIC_COMPACT_KEYS))
+    ]
+    columns.extend(
+        _prediction_summary_json_value("quality_ev_diagnostics", key).label(f"quality_ev_{key}")
+        for key in QUALITY_EV_DIAGNOSTIC_COMPACT_KEYS
+    )
+    columns.extend(
+        [
+            func.json_array_length(
+                _prediction_summary_json_value("candidate_diagnostics", "top_quality_blockers")
+            ).label("candidate_top_quality_blockers_count"),
+            func.json_array_length(
+                _prediction_summary_json_value(
+                    "quality_ev_diagnostics",
+                    "top_counterfactual_candidates_blocked_by_quality",
+                )
+            ).label("quality_ev_top_counterfactual_candidates_blocked_by_quality_count"),
+            func.json_array_length(
+                _prediction_summary_json_value(
+                    "quality_ev_diagnostics",
+                    "top_deduped_counterfactual_opinions_by_game_scope_family",
+                )
+            ).label("quality_ev_top_deduped_counterfactual_opinions_by_game_scope_family_count"),
+        ]
+    )
+    return columns
+
+
+def _compact_prediction_summary_from_row(row) -> dict[str, object] | None:
+    if not row:
+        return None
+    candidate = {
+        key: row[f"candidate_{key}"]
+        for key in sorted(set(CANDIDATE_DATA_QUALITY_COMPACT_KEYS + CANDIDATE_DIAGNOSTIC_COMPACT_KEYS))
+        if row.get(f"candidate_{key}") is not None
+    }
+    top_blockers_count = row.get("candidate_top_quality_blockers_count")
+    if isinstance(top_blockers_count, int):
+        candidate["top_quality_blockers_count"] = top_blockers_count
+    quality_ev = {
+        key: row[f"quality_ev_{key}"]
+        for key in QUALITY_EV_DIAGNOSTIC_COMPACT_KEYS
+        if row.get(f"quality_ev_{key}") is not None
+    }
+    for row_key, target_key in (
+        (
+            "quality_ev_top_counterfactual_candidates_blocked_by_quality_count",
+            "top_counterfactual_candidates_blocked_by_quality_count",
+        ),
+        (
+            "quality_ev_top_deduped_counterfactual_opinions_by_game_scope_family_count",
+            "top_deduped_counterfactual_opinions_by_game_scope_family_count",
+        ),
+    ):
+        value = row.get(row_key)
+        if isinstance(value, int):
+            quality_ev[target_key] = value
+    if not candidate and not quality_ev:
+        return None
+    return {
+        "candidate_diagnostics": candidate,
+        "quality_ev_diagnostics": quality_ev,
+    }
+
+
+def _compact_candidate_data_quality(
+    run_summary: dict[str, object] | None,
+    *,
+    include_details: bool = False,
+) -> dict[str, object]:
+    diagnostics = (run_summary or {}).get("candidate_diagnostics") if run_summary else None
+    if not isinstance(diagnostics, dict):
+        return {}
+    result = {
+        key: diagnostics.get(key)
+        for key in CANDIDATE_DATA_QUALITY_COMPACT_KEYS
+        if key in diagnostics
+    }
+    blockers = diagnostics.get("top_quality_blockers")
+    if isinstance(blockers, list):
+        result["top_quality_blockers_count"] = len(blockers)
+        if include_details:
+            result["top_quality_blockers"] = _compact_payload(
+                blockers,
+                max_depth=3,
+                max_list_items=10,
+                max_dict_items=20,
+                include_heavy=False,
+            )
+    elif isinstance(diagnostics.get("top_quality_blockers_count"), int):
+        result["top_quality_blockers_count"] = diagnostics["top_quality_blockers_count"]
+    return result
+
+
+def _compact_candidate_diagnostics(
+    run_summary: dict[str, object] | None,
+    *,
+    include_details: bool = False,
+) -> dict[str, object]:
+    if not run_summary:
+        return {}
+    candidate = run_summary.get("candidate_diagnostics")
+    quality_ev = run_summary.get("quality_ev_diagnostics")
+    if include_details:
+        return dict(
+            _compact_payload(
+                {
+                    "candidate_diagnostics": candidate or {},
+                    "quality_ev_diagnostics": quality_ev or {},
+                },
+                max_depth=5,
+                max_list_items=25,
+                max_dict_items=100,
+                include_heavy=True,
+            )
+        )
+    result: dict[str, object] = {}
+    if isinstance(candidate, dict):
+        result["candidate_diagnostics"] = {
+            key: candidate.get(key)
+            for key in CANDIDATE_DIAGNOSTIC_COMPACT_KEYS
+            if key in candidate
+        }
+        blockers = candidate.get("top_quality_blockers")
+        if isinstance(blockers, list):
+            result["candidate_diagnostics"]["top_quality_blockers_count"] = len(blockers)
+        elif isinstance(candidate.get("top_quality_blockers_count"), int):
+            result["candidate_diagnostics"]["top_quality_blockers_count"] = candidate["top_quality_blockers_count"]
+    if isinstance(quality_ev, dict):
+        result["quality_ev_diagnostics"] = {
+            key: quality_ev.get(key)
+            for key in QUALITY_EV_DIAGNOSTIC_COMPACT_KEYS
+            if key in quality_ev
+        }
+        for key in (
+            "top_counterfactual_candidates_blocked_by_quality",
+            "top_deduped_counterfactual_opinions_by_game_scope_family",
+        ):
+            value = quality_ev.get(key)
+            if isinstance(value, list):
+                result["quality_ev_diagnostics"][f"{key}_count"] = len(value)
+            elif isinstance(quality_ev.get(f"{key}_count"), int):
+                result["quality_ev_diagnostics"][f"{key}_count"] = quality_ev[f"{key}_count"]
+    return result
+
+
+def _latest_job_status(
+    session: Session,
+    epoch: PaperTradingEpoch,
+    *,
+    include_job_results: bool = False,
+    detailed_job_names: set[str] | None = None,
+) -> dict[str, JobRunSummary]:
     job_names = [
         "daily-setup",
         "candidate-sweep",
@@ -501,18 +888,50 @@ def _latest_job_status(session: Session, epoch: PaperTradingEpoch) -> dict[str, 
         .where(JobRun.paper_trading_epoch_id == epoch.id)
         .subquery()
     )
-    rows = list(
-        session.scalars(
-            select(JobRun)
+    compact_rows = list(
+        session.execute(
+            select(
+                JobRun.id,
+                JobRun.job_name,
+                JobRun.status,
+                JobRun.started_at,
+                JobRun.completed_at,
+                JobRun.duration_seconds,
+                JobRun.target_date,
+            )
             .join(ranked, JobRun.id == ranked.c.job_run_id)
             .where(ranked.c.job_rank == 1)
             .order_by(JobRun.job_name.asc())
         )
     )
-    latest: dict[str, JobRunSummary] = {}
+    latest = {
+        row.job_name: JobRunSummary(
+            job_name=row.job_name,
+            status=row.status,
+            started_at=to_eastern_iso(row.started_at),
+            completed_at=to_eastern_iso(row.completed_at),
+            duration_seconds=row.duration_seconds,
+            target_date=row.target_date.isoformat() if row.target_date else None,
+            result_is_compact=True,
+            step_count=None,
+            warning_count=None,
+            error_count=None,
+            result={},
+        )
+        for row in compact_rows
+    }
+
+    detailed_names = {row.job_name for row in compact_rows} if include_job_results else (detailed_job_names or set())
+    detailed_ids = [row.id for row in compact_rows if row.job_name in detailed_names]
+    if not detailed_ids:
+        return latest
+
+    rows = list(
+        session.scalars(
+            select(JobRun).where(JobRun.id.in_(detailed_ids)).order_by(JobRun.job_name.asc())
+        )
+    )
     for row in rows:
-        if row.job_name in latest:
-            continue
         latest[row.job_name] = JobRunSummary(
             job_name=row.job_name,
             status=row.status,
@@ -520,7 +939,11 @@ def _latest_job_status(session: Session, epoch: PaperTradingEpoch) -> dict[str, 
             completed_at=to_eastern_iso(row.completed_at),
             duration_seconds=row.duration_seconds,
             target_date=row.target_date.isoformat() if row.target_date else None,
-            result=row.result or {},
+            result_is_compact=False,
+            step_count=len(row.steps or []),
+            warning_count=len(row.warnings or []),
+            error_count=len(row.errors or []),
+            result=_compact_job_result(row.result, include_details=True),
         )
     return latest
 
@@ -560,6 +983,12 @@ def dashboard_summary_from_db(
     epoch_key: str | None = None,
     include_archived: bool = False,
     include_pre_observation: bool = False,
+    include_diagnostics: bool = False,
+    include_job_results: bool = False,
+    include_source_details: bool = False,
+    include_governance_details: bool = False,
+    include_candidate_diagnostics: bool = False,
+    include_spread_audit_details: bool = False,
 ) -> DashboardSummary:
     selected_closed_date = closed_date or today_eastern()
     summary = empty_dashboard_summary(selected_closed_date)
@@ -718,12 +1147,35 @@ def dashboard_summary_from_db(
         select(ModelParameterVersion).where(ModelParameterVersion.is_active.is_(True))
     )
     last_training, last_calibration, last_threshold = latest_governance_artifacts(session, active_epoch.id)
-    governance_summary = model_governance_status(session, active_epoch.id)
-    last_prediction = session.scalar(
-        select(ModelPredictionRun)
+    include_governance_registry_details = include_diagnostics or include_governance_details
+    governance_summary = model_governance_status(
+        session,
+        active_epoch.id,
+        include_details=include_governance_registry_details,
+    )
+    include_candidate_details = include_diagnostics or include_candidate_diagnostics
+    last_prediction = session.execute(
+        select(
+            ModelPredictionRun.id,
+            ModelPredictionRun.trades_created,
+            ModelPredictionRun.trade_policy,
+            ModelPredictionRun.summary["cap_counts"].label("summary_cap_counts"),
+            ModelPredictionRun.summary["risk_caps"].label("summary_risk_caps"),
+            ModelPredictionRun.summary["candidate_sweep_window"].label("summary_candidate_sweep_window"),
+            ModelPredictionRun.summary["candidates_yes"].label("summary_candidates_yes"),
+            ModelPredictionRun.summary["candidates_no"].label("summary_candidates_no"),
+            ModelPredictionRun.summary["paper_trades_yes"].label("summary_paper_trades_yes"),
+            ModelPredictionRun.summary["paper_trades_no"].label("summary_paper_trades_no"),
+            *_prediction_summary_compact_columns(),
+        )
         .where(ModelPredictionRun.paper_trading_epoch_id == active_epoch.id)
         .where(ModelPredictionRun.target_date == today_eastern())
         .order_by(ModelPredictionRun.started_at.desc())
+    ).mappings().first()
+    last_prediction_summary = (
+        session.scalar(select(ModelPredictionRun.summary).where(ModelPredictionRun.id == last_prediction["id"]))
+        if last_prediction and include_candidate_details
+        else _compact_prediction_summary_from_row(last_prediction)
     )
     today_feature_rows = list(
         session.scalars(
@@ -777,12 +1229,45 @@ def dashboard_summary_from_db(
         settled,
         lambda trade: _family_scope(trade.market_family, trade.inning_scope),
     )
-    if last_prediction and last_prediction.summary:
-        summary.latest_candidate_diagnostics = {
-            **dict(last_prediction.summary.get("candidate_diagnostics") or {}),
-            "quality_ev_diagnostics": dict(last_prediction.summary.get("quality_ev_diagnostics") or {}),
-        }
-    summary.job_status = _latest_job_status(session, active_epoch)
+    if last_prediction_summary:
+        summary.latest_candidate_diagnostics = _compact_candidate_diagnostics(
+            last_prediction_summary,
+            include_details=include_candidate_details,
+        )
+    trade_caps_used: dict[str, object] = {
+        "paper_trades": int(last_prediction["trades_created"]) if last_prediction else 0,
+    }
+    if last_prediction:
+        for key in ("summary_cap_counts", "summary_risk_caps", "summary_candidate_sweep_window"):
+            value = last_prediction[key]
+            if isinstance(value, dict):
+                trade_caps_used.update(value)
+        for source_key, target_key in (
+            ("summary_candidates_yes", "candidates_yes"),
+            ("summary_candidates_no", "candidates_no"),
+            ("summary_paper_trades_yes", "paper_trades_yes"),
+            ("summary_paper_trades_no", "paper_trades_no"),
+        ):
+            value = last_prediction[source_key]
+            if value is not None:
+                trade_caps_used[target_key] = value
+    if last_prediction_summary:
+        trade_caps_used.update(last_prediction_summary.get("cap_counts", {}))
+        trade_caps_used.update(last_prediction_summary.get("risk_caps", {}))
+        trade_caps_used.update(last_prediction_summary.get("candidate_sweep_window", {}))
+        trade_caps_used.update(
+            {
+                key: last_prediction_summary.get(key)
+                for key in ("candidates_yes", "candidates_no", "paper_trades_yes", "paper_trades_no")
+                if key in last_prediction_summary
+            }
+        )
+    summary.job_status = _latest_job_status(
+        session,
+        active_epoch,
+        include_job_results=include_diagnostics or include_job_results,
+        detailed_job_names={"spread-audit"} if include_spread_audit_details else None,
+    )
     summary.websocket_status = _websocket_status(session)
     feature_avg_data_quality = (
         sum((row.data_quality or Decimal("0")) for row in today_feature_rows) / Decimal(len(today_feature_rows))
@@ -791,6 +1276,10 @@ def dashboard_summary_from_db(
     )
     avg_data_quality = candidate_avg_data_quality if candidate_avg_data_quality is not None else feature_avg_data_quality
     source_status = source_status_report(session)
+    compact_source_status = compact_source_status_payload(
+        source_status,
+        include_details=include_diagnostics or include_source_details,
+    )
     starter_report = starter_status_report(session, today_eastern())
     summary.model_status = ModelStatus(
         active_model_version=active_version.version_tag if active_version else None,
@@ -814,42 +1303,21 @@ def dashboard_summary_from_db(
         clean_training_start_date_et=str(governance_summary["clean_training_start_date_et"]),
         clean_filter_exclusion_counts=dict(governance_summary["clean_filter_exclusion_counts"]),
         ignored_pre_clean_artifacts=dict(governance_summary["ignored_pre_clean_artifacts"]),
-        governance_parameter_registry=dict(governance_summary["governance_parameter_registry"]),
-        governance_status=last_training.status if last_training else "not_run",
-        trade_policy=last_prediction.trade_policy if last_prediction and last_prediction.trade_policy else {},
-        trade_caps_used=(
-            {
-                **((last_prediction.summary or {}).get("cap_counts", {}) if last_prediction else {}),
-                **((last_prediction.summary or {}).get("risk_caps", {}) if last_prediction else {}),
-                **((last_prediction.summary or {}).get("candidate_sweep_window", {}) if last_prediction else {}),
-                **{
-                    key: (last_prediction.summary or {}).get(key)
-                    for key in ("candidates_yes", "candidates_no", "paper_trades_yes", "paper_trades_no")
-                    if last_prediction and key in (last_prediction.summary or {})
-                },
-                "paper_trades": last_prediction.trades_created if last_prediction else 0,
-            }
+        governance_parameter_registry=_compact_governance_registry(
+            governance_summary.get("governance_parameter_registry"),
+            include_details=include_governance_registry_details,
         ),
+        governance_status=last_training.status if last_training else "not_run",
+        trade_policy=last_prediction["trade_policy"] if last_prediction and last_prediction["trade_policy"] else {},
+        trade_caps_used=trade_caps_used,
         trade_threshold_policy=last_threshold.thresholds if last_threshold else {},
         data_quality_summary={
             "avg": float(avg_data_quality) if avg_data_quality is not None else None,
             "feature_version": active_version.feature_version if active_version else None,
             "starter_hydration": starter_report["summary"],
-            **(
-                {
-                    key: (last_prediction.summary or {}).get("candidate_diagnostics", {}).get(key)
-                    for key in (
-                        "raw_feature_snapshot_data_quality_avg",
-                        "raw_feature_snapshot_data_quality_max",
-                        "paper_observation_data_quality_avg",
-                        "paper_observation_data_quality_max",
-                        "quality_threshold",
-                        "candidate_stage_market_context_status_counts",
-                        "top_quality_blockers",
-                    )
-                }
-                if last_prediction and last_prediction.summary
-                else {}
+            **_compact_candidate_data_quality(
+                last_prediction_summary,
+                include_details=include_candidate_details,
             ),
         },
         feature_completeness=feature_completeness,
@@ -860,7 +1328,12 @@ def dashboard_summary_from_db(
         weather_status=_module_status(source_statuses, "park_weather"),
         network_sources_enabled=bool(source_status["feature_sync_enable_network_sources"]),
         public_sources_enabled=bool(source_status["public_sources_enabled"]),
-        last_feature_sync_status=dict(source_status["last_feature_sync_status"]),
+        last_feature_sync_status=dict(compact_source_status.get("last_feature_sync_status") or {}),
+        source_details=(
+            compact_source_status
+            if include_diagnostics or include_source_details
+            else {}
+        ),
         notes=[
             "PR3c fix2 run-distribution model is paper-only.",
             "Parameter promotion remains gated by resolved mature sample thresholds.",

@@ -41,6 +41,10 @@ class JobRunSummary(BaseModel):
     completed_at: str | None = None
     duration_seconds: int | None = None
     target_date: str | None = None
+    result_is_compact: bool = True
+    step_count: int | None = None
+    warning_count: int | None = None
+    error_count: int | None = None
     result: dict[str, object] = Field(default_factory=dict)
 
 
@@ -151,6 +155,7 @@ class ModelStatus(BaseModel):
     network_sources_enabled: bool = False
     public_sources_enabled: bool = False
     last_feature_sync_status: dict[str, object] = Field(default_factory=dict)
+    source_details: dict[str, object] = Field(default_factory=dict)
     governance_status: str | None = None
     notes: str | list[str]
 

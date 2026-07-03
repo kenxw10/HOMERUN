@@ -749,3 +749,12 @@ Every future PR must update this section with:
 - Existing pre-clean artifacts remain in the database for audit/history, but artifacts without current clean-policy metadata are not treated as current governance-ready state.
 - A governance parameter registry reports currently governed autonomous offsets/version promotion, future-governable coefficients/threshold policy, and intentionally manual safety controls. It is diagnostic metadata only.
 - No live execution, credential, WebSocket, cron cadence, model formula, EV threshold, risk-cap, source-sync, dashboard observation cutoff, settlement, market discovery, spread activation, sportsbook/team-total/umpire, schema, migration, or frontend change was added.
+
+### PR3p.1 - Dashboard Payload Memory Hygiene
+
+- Root cause hypothesis: `/v1/dashboard/summary` was serializing full stored job results, source-health details, governance registry lists, and candidate-level diagnostic arrays into the default dashboard payload. After PR3p diagnostics grew, that made the production summary endpoint slow and memory-heavy even though the frontend only needs compact operator status.
+- Dashboard summaries are compact by default. Job status now returns scalar status/count summaries instead of full `JobRun.result` blobs; candidate diagnostics return aggregate counts without candidate IDs/counterfactual lists; source status is reduced to source-health counts and latest sync summary; and governance registry defaults to counts instead of full registry lists.
+- Opt-in debug query flags are available on `/v1/dashboard/summary`: `include_diagnostics`, `include_job_results`, `include_source_details`, `include_governance_details`, `include_spread_audit_details`, and `include_candidate_diagnostics`. Even debug mode caps samples and omits raw payload/features/rationale blobs from the dashboard response.
+- `/v1/model/governance/status` now defaults to the compact registry and accepts `include_details=true` for the full protected diagnostic registry.
+- Lightweight endpoint metrics were added for dashboard summary and protected model diagnostics: duration, approximate response size, RSS before/after when available, and non-secret flag values.
+- No candidate generation, cron schedule, model math, settlement, risk-cap, WebSocket, market-discovery, live execution, credentials, environment-variable, schema, or trading behavior changed.
