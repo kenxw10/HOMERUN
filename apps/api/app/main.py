@@ -694,10 +694,14 @@ def model_sources_status(_: None = Depends(require_internal_api_key)) -> RunResp
 
 @app.get("/v1/model/parameters/active", response_model=RunResponse)
 def model_active_parameters(_: None = Depends(require_internal_api_key)) -> RunResponse:
+    started_at = time.perf_counter()
+    rss_before = _process_rss_bytes()
     with _db_session_or_503() as session:
         result = active_parameter_payload(session)
         session.commit()
-    return RunResponse(ok=True, action="model_active_parameters", result=result)
+    response = RunResponse(ok=True, action="model_active_parameters", result=result)
+    _log_endpoint_metrics("/v1/model/parameters/active", started_at, response, rss_before=rss_before)
+    return response
 
 
 @app.get("/v1/model/training/latest", response_model=RunResponse)

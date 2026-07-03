@@ -3,7 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
+import logging
 from math import exp, factorial, log
+import time
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -42,6 +44,7 @@ MODEL_FAMILY = "mlb_all_supported_families"
 MAX_RUNS = 18
 GOVERNANCE_CLEAN_TRAINING_POLICY = "pr3p_clean_governance_training_v1"
 GOVERNANCE_CLEAN_TRAINING_ZONE = ZoneInfo("America/New_York")
+logger = logging.getLogger(__name__)
 DEFAULT_MODEL_PARAMETERS: dict[str, object] = {
     "league_average_full_game_runs": 4.35,
     "home_field_runs": 0.18,
@@ -824,6 +827,103 @@ def _resolved_mature_candidates(session: Session, paper_trading_epoch_id: int | 
     return [candidate for candidate, game in rows if _candidate_target_date_matches_game(candidate, game)]
 
 
+def _resolved_mature_candidate_filters(paper_trading_epoch_id: int | None = None) -> list[object]:
+    filters: list[object] = [
+        ModelCandidate.outcome.in_(["win", "loss"]),
+        ModelCandidate.training_eligible.is_(True),
+        ModelCandidate.feature_version == FEATURE_VERSION,
+        ModelCandidate.market_family.in_(PAPER_SUPPORTED_MARKET_FAMILIES),
+        ModelCandidate.fee_estimate.is_not(None),
+        ModelCandidate.price_status == "fresh_executable",
+        ModelCandidate.time_to_start_minutes.is_not(None),
+        ModelCandidate.time_to_start_minutes > 0,
+        ModelCandidate.target_date.is_not(None),
+        ModelCandidate.mlb_game_id.is_not(None),
+    ]
+    if paper_trading_epoch_id is not None:
+        filters.append(ModelCandidate.paper_trading_epoch_id == paper_trading_epoch_id)
+    return filters
+
+
+def count_raw_resolved_mature_candidates(session: Session, paper_trading_epoch_id: int | None = None) -> int:
+    return int(
+        session.scalar(
+            select(func.count(ModelCandidate.id)).where(
+                *_resolved_mature_candidate_filters(paper_trading_epoch_id)
+            )
+        )
+        or 0
+    )
+
+
+def count_clean_filter_exclusions_by_reason(
+    session: Session,
+    paper_trading_epoch_id: int | None,
+    clean_window: dict[str, object],
+) -> dict[str, int]:
+    base_filters = _resolved_mature_candidate_filters(paper_trading_epoch_id)
+    clean_start = clean_window["start_at"]
+    clean_date = clean_window["start_date_et"]
+    counts = {
+        "target_date_before_clean_start": int(
+            session.scalar(
+                select(func.count(ModelCandidate.id)).where(
+                    *base_filters,
+                    ModelCandidate.target_date < clean_date,
+                )
+            )
+            or 0
+        ),
+        "missing_evaluated_at": int(
+            session.scalar(
+                select(func.count(ModelCandidate.id)).where(
+                    *base_filters,
+                    ModelCandidate.target_date >= clean_date,
+                    ModelCandidate.evaluated_at.is_(None),
+                )
+            )
+            or 0
+        ),
+        "evaluated_before_clean_start": int(
+            session.scalar(
+                select(func.count(ModelCandidate.id)).where(
+                    *base_filters,
+                    ModelCandidate.target_date >= clean_date,
+                    ModelCandidate.evaluated_at.is_not(None),
+                    ModelCandidate.evaluated_at < clean_start,
+                )
+            )
+            or 0
+        ),
+    }
+    return {key: value for key, value in counts.items() if value}
+
+
+def count_clean_resolved_mature_candidates(
+    session: Session,
+    paper_trading_epoch_id: int | None,
+    clean_window: dict[str, object],
+) -> int:
+    return int(
+        session.scalar(
+            select(func.count(ModelCandidate.id)).where(
+                *_resolved_mature_candidate_filters(paper_trading_epoch_id),
+                ModelCandidate.target_date >= clean_window["start_date_et"],
+                ModelCandidate.evaluated_at >= clean_window["start_at"],
+            )
+        )
+        or 0
+    )
+
+
+def count_pre_clean_excluded_candidates(
+    session: Session,
+    paper_trading_epoch_id: int | None,
+    clean_window: dict[str, object],
+) -> int:
+    return sum(count_clean_filter_exclusions_by_reason(session, paper_trading_epoch_id, clean_window).values())
+
+
 def _clean_candidate_exclusion_reason(candidate: ModelCandidate, clean_window: dict[str, object]) -> str | None:
     clean_start = clean_window["start_at"]
     clean_date = clean_window["start_date_et"]
@@ -875,15 +975,25 @@ def _governance_training_policy_payload(
 def governance_sample_summary(session: Session, paper_trading_epoch_id: int | None = None) -> dict[str, object]:
     if paper_trading_epoch_id is None:
         paper_trading_epoch_id = get_or_create_active_paper_epoch(session).id
+    started_at = time.perf_counter()
     clean_window = _governance_clean_training_window()
-    raw_candidates = _resolved_mature_candidates(session, paper_trading_epoch_id=paper_trading_epoch_id)
-    clean_candidates, excluded_counts = _apply_clean_training_filter(raw_candidates, clean_window)
+    raw_sample_count = count_raw_resolved_mature_candidates(session, paper_trading_epoch_id)
+    clean_sample_count = count_clean_resolved_mature_candidates(session, paper_trading_epoch_id, clean_window)
+    excluded_counts = count_clean_filter_exclusions_by_reason(session, paper_trading_epoch_id, clean_window)
+    logger.info(
+        "governance_sample_summary_counts epoch_id=%s duration_ms=%s raw_samples=%s clean_samples=%s excluded_samples=%s",
+        paper_trading_epoch_id,
+        int((time.perf_counter() - started_at) * 1000),
+        raw_sample_count,
+        clean_sample_count,
+        raw_sample_count - clean_sample_count,
+    )
     return {
         "paper_trading_epoch_id": paper_trading_epoch_id,
         **_governance_training_policy_payload(
             clean_window,
-            raw_sample_count=len(raw_candidates),
-            clean_sample_count=len(clean_candidates),
+            raw_sample_count=raw_sample_count,
+            clean_sample_count=clean_sample_count,
             excluded_counts=excluded_counts,
         ),
     }

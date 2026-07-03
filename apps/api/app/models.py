@@ -49,6 +49,7 @@ class PaperTradingEpoch(TimestampMixin, Base):
 
 class BalanceSnapshot(TimestampMixin, Base):
     __tablename__ = "balance_snapshots"
+    __table_args__ = (Index("ix_balance_snapshots_epoch_captured", "paper_trading_epoch_id", "captured_at"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     paper_trading_epoch_id: Mapped[int | None] = mapped_column(ForeignKey("paper_trading_epochs.id"), index=True)
@@ -157,6 +158,28 @@ class ModelVersion(TimestampMixin, Base):
 
 class ModelCandidate(TimestampMixin, Base):
     __tablename__ = "model_candidates"
+    __table_args__ = (
+        Index(
+            "ix_model_candidates_epoch_governance_counts",
+            "paper_trading_epoch_id",
+            "training_eligible",
+            "feature_version",
+            "outcome",
+            "price_status",
+            "market_family",
+            "target_date",
+            "evaluated_at",
+        ),
+        Index(
+            "ix_model_candidates_epoch_decision_scope",
+            "paper_trading_epoch_id",
+            "evaluated_at",
+            "market_family",
+            "market_type",
+            "inning_scope",
+            "decision",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     paper_trading_epoch_id: Mapped[int | None] = mapped_column(ForeignKey("paper_trading_epochs.id"), index=True)
@@ -379,7 +402,10 @@ class FeatureSnapshot(TimestampMixin, Base):
 
 class MlbFeatureSnapshot(TimestampMixin, Base):
     __tablename__ = "mlb_feature_snapshots"
-    __table_args__ = (UniqueConstraint("mlb_game_id", "target_date", "source", name="uq_mlb_feature_game_date_source"),)
+    __table_args__ = (
+        UniqueConstraint("mlb_game_id", "target_date", "source", name="uq_mlb_feature_game_date_source"),
+        Index("ix_mlb_feature_snapshots_date_source_captured", "target_date", "source", "captured_at"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     mlb_game_id: Mapped[int | None] = mapped_column(ForeignKey("mlb_games.id"))
@@ -647,6 +673,7 @@ class JobRun(TimestampMixin, Base):
         Index("ix_job_runs_lock_status", "lock_key", "status"),
         Index("ix_job_runs_started_at", "started_at"),
         Index("ix_job_runs_epoch", "paper_trading_epoch_id"),
+        Index("ix_job_runs_epoch_name_started_id", "paper_trading_epoch_id", "job_name", "started_at", "id"),
         Index(
             "uq_job_runs_running_lock_key",
             "lock_key",

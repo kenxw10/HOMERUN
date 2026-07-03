@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
+import logging
+import time as perf_time
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, or_, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, load_only
 
 from app.config import get_settings
 from app.models import (
@@ -39,7 +41,6 @@ from app.schemas import (
 from app.services.contracts import contract_labels, market_type_from_ticker
 from app.services.features import FEATURE_VERSION, source_status_report, starter_status_report
 from app.services.modeling import governance_status as model_governance_status
-from app.services.modeling import latest_governance_artifacts
 from app.services.portfolio import calculate_paper_portfolio, paper_trade_fee
 from app.services.paper_epoch import resolve_epoch_filter
 from app.services.ws_market_data import ws_status_running_is_fresh
@@ -49,6 +50,7 @@ MAPPING_STATUS_PRIORITY = {"confirmed": 0, "candidate": 1, "needs_review": 2}
 OBSERVATION_START_DATE = date(2026, 7, 2)
 OBSERVATION_TIME_ZONE = ZoneInfo("America/New_York")
 OBSERVATION_FILTER_REASON = "default_dashboard_excludes_pre_2026_07_02_validation_rows"
+logger = logging.getLogger(__name__)
 
 
 def empty_dashboard_summary(closed_date: date | None = None) -> DashboardSummary:
@@ -175,6 +177,8 @@ def _position_from_trade(
         contract_side=trade.contract_side,
     )
     display = trade.contract_display or trade.market_display or fallback_labels.contract_display
+    scoring_rationale = candidate.__dict__.get("scoring_rationale") if candidate is not None else None
+    risk_limit_basis = scoring_rationale.get("risk_limit_basis") if isinstance(scoring_rationale, dict) else None
     return PositionSummary(
         time_entered=to_eastern_iso(trade.entry_time),
         time_entered_display=eastern_display(trade.entry_time),
@@ -196,9 +200,7 @@ def _position_from_trade(
                 "probability_edge": _float(candidate.probability_edge),
                 "net_expected_value": _float(candidate.net_expected_value),
                 "data_quality": _float(candidate.data_quality),
-                "risk_limit_basis": (candidate.scoring_rationale or {}).get("risk_limit_basis")
-                if isinstance(candidate.scoring_rationale, dict)
-                else None,
+                "risk_limit_basis": risk_limit_basis,
                 "contracts": trade.quantity,
                 "estimated_total_cost": _float(trade.estimated_total_cost),
                 "total_fee_estimate": _float(trade.total_fee_estimate),
@@ -474,6 +476,56 @@ def _decision_breakdown(candidates: list[ModelCandidate]) -> tuple[dict[str, dic
         decision = candidate.decision or "unknown"
         by_family.setdefault(family, {})[decision] = by_family.setdefault(family, {}).get(decision, 0) + 1
         by_scope.setdefault(scope, {})[decision] = by_scope.setdefault(scope, {}).get(decision, 0) + 1
+    return by_family, by_scope
+
+
+def _decision_breakdown_from_db(
+    session: Session,
+    *,
+    epoch_id: int,
+    include_pre_observation: bool,
+    cutoff: datetime,
+) -> tuple[dict[str, dict[str, int]], dict[str, dict[str, int]]]:
+    started_at = perf_time.perf_counter()
+    statement = _apply_candidate_observation_filter(
+        select(
+            ModelCandidate.market_family,
+            ModelCandidate.market_type,
+            ModelCandidate.inning_scope,
+            ModelCandidate.decision,
+            func.count(ModelCandidate.id).label("candidate_count"),
+        )
+        .where(ModelCandidate.paper_trading_epoch_id == epoch_id)
+        .group_by(
+            ModelCandidate.market_family,
+            ModelCandidate.market_type,
+            ModelCandidate.inning_scope,
+            ModelCandidate.decision,
+        ),
+        include_pre_observation,
+        cutoff,
+    )
+    by_family: dict[str, dict[str, int]] = {}
+    by_scope: dict[str, dict[str, int]] = {}
+    row_count = 0
+    candidate_total = 0
+    for row in session.execute(statement):
+        row_count += 1
+        family = row.market_family or row.market_type or "unknown"
+        scope = _family_scope(family, row.inning_scope)
+        decision = row.decision or "unknown"
+        count = int(row.candidate_count or 0)
+        candidate_total += count
+        by_family.setdefault(family, {})[decision] = by_family.setdefault(family, {}).get(decision, 0) + count
+        by_scope.setdefault(scope, {})[decision] = by_scope.setdefault(scope, {}).get(decision, 0) + count
+    logger.info(
+        "dashboard_decision_breakdown_counts epoch_id=%s duration_ms=%s grouped_rows=%s candidate_total=%s include_pre_observation=%s",
+        epoch_id,
+        int((perf_time.perf_counter() - started_at) * 1000),
+        row_count,
+        candidate_total,
+        include_pre_observation,
+    )
     return by_family, by_scope
 
 
@@ -1088,6 +1140,23 @@ def dashboard_summary_from_db(
         .outerjoin(ModelCandidate, PaperTrade.candidate_id == ModelCandidate.id)
         .outerjoin(MlbGame, ModelCandidate.mlb_game_id == MlbGame.id)
         .outerjoin(KalshiMarket, ModelCandidate.kalshi_market_id == KalshiMarket.id)
+        .options(
+            load_only(
+                ModelCandidate.id,
+                ModelCandidate.decision,
+                ModelCandidate.probability_edge,
+                ModelCandidate.net_expected_value,
+                ModelCandidate.data_quality,
+            ),
+            load_only(
+                MlbGame.id,
+                MlbGame.status,
+                MlbGame.home_team,
+                MlbGame.away_team,
+                MlbGame.home_abbreviation,
+                MlbGame.away_abbreviation,
+            ),
+        )
         .where(PaperTrade.paper_trading_epoch_id == active_epoch.id)
         .where(PaperTrade.status == "open")
     )
@@ -1114,6 +1183,23 @@ def dashboard_summary_from_db(
         .outerjoin(ModelCandidate, PaperTrade.candidate_id == ModelCandidate.id)
         .outerjoin(MlbGame, ModelCandidate.mlb_game_id == MlbGame.id)
         .outerjoin(KalshiMarket, ModelCandidate.kalshi_market_id == KalshiMarket.id)
+        .options(
+            load_only(
+                ModelCandidate.id,
+                ModelCandidate.decision,
+                ModelCandidate.probability_edge,
+                ModelCandidate.net_expected_value,
+                ModelCandidate.data_quality,
+            ),
+            load_only(
+                MlbGame.id,
+                MlbGame.status,
+                MlbGame.home_team,
+                MlbGame.away_team,
+                MlbGame.home_abbreviation,
+                MlbGame.away_abbreviation,
+            ),
+        )
         .where(PaperTrade.paper_trading_epoch_id == active_epoch.id)
         .where(PaperTrade.status.in_(["settled", "closed", "void"]))
         .where(
@@ -1146,7 +1232,6 @@ def dashboard_summary_from_db(
     active_parameter_version = session.scalar(
         select(ModelParameterVersion).where(ModelParameterVersion.is_active.is_(True))
     )
-    last_training, last_calibration, last_threshold = latest_governance_artifacts(session, active_epoch.id)
     include_governance_registry_details = include_diagnostics or include_governance_details
     governance_summary = model_governance_status(
         session,
@@ -1178,8 +1263,8 @@ def dashboard_summary_from_db(
         else _compact_prediction_summary_from_row(last_prediction)
     )
     today_feature_rows = list(
-        session.scalars(
-            select(MlbFeatureSnapshot)
+        session.execute(
+            select(MlbFeatureSnapshot.source_statuses, MlbFeatureSnapshot.data_quality)
             .where(MlbFeatureSnapshot.target_date == today_eastern())
             .where(MlbFeatureSnapshot.source == FEATURE_VERSION)
             .order_by(MlbFeatureSnapshot.captured_at.desc())
@@ -1210,17 +1295,12 @@ def dashboard_summary_from_db(
             observation_cutoff,
         )
     )
-    active_candidates_statement = _apply_candidate_observation_filter(
-        select(ModelCandidate).where(ModelCandidate.paper_trading_epoch_id == active_epoch.id),
-        include_pre_observation,
-        observation_cutoff,
+    summary.decision_breakdown_by_family, summary.decision_breakdown_by_scope = _decision_breakdown_from_db(
+        session,
+        epoch_id=active_epoch.id,
+        include_pre_observation=include_pre_observation,
+        cutoff=observation_cutoff,
     )
-    active_candidates = list(
-        session.scalars(
-            active_candidates_statement.order_by(ModelCandidate.evaluated_at.desc()).limit(1000)
-        )
-    )
-    summary.decision_breakdown_by_family, summary.decision_breakdown_by_scope = _decision_breakdown(active_candidates)
     summary.performance_by_family = _performance_bucket(
         settled,
         lambda trade: trade.market_family or "unknown",
@@ -1286,9 +1366,9 @@ def dashboard_summary_from_db(
         active_parameter_version=active_parameter_version.version_tag if active_parameter_version else None,
         active_calibration_version=active_parameter_version.version_tag if active_parameter_version else None,
         feature_version=active_version.feature_version if active_version else None,
-        calibration_status=last_calibration.status if last_calibration else "not_run",
-        last_training_run=last_training.started_at if last_training else None,
-        last_calibration_run=last_calibration.started_at if last_calibration else None,
+        calibration_status=str(governance_summary.get("calibration_status") or "not_run"),
+        last_training_run=governance_summary.get("last_training_run"),
+        last_calibration_run=governance_summary.get("last_calibration_run"),
         candidate_count=int(candidate_count),
         resolved_mature_samples=int(governance_summary["clean_resolved_mature_samples"]),
         raw_resolved_mature_samples=int(governance_summary["raw_resolved_mature_samples"]),
@@ -1296,7 +1376,7 @@ def dashboard_summary_from_db(
         pre_clean_excluded_samples=int(governance_summary["pre_clean_excluded_samples"]),
         training_eligible_count=int(training_eligible_count),
         clean_training_eligible_count=int(governance_summary["clean_training_eligible_count"]),
-        last_governance_status=last_training.status if last_training else "not_run",
+        last_governance_status=str(governance_summary.get("last_governance_status") or "not_run"),
         governance_training_policy=str(governance_summary["governance_training_policy"]),
         clean_training_start_at=str(governance_summary["clean_training_start_at"]),
         clean_training_start_at_et=str(governance_summary["clean_training_start_at_et"]),
@@ -1307,10 +1387,10 @@ def dashboard_summary_from_db(
             governance_summary.get("governance_parameter_registry"),
             include_details=include_governance_registry_details,
         ),
-        governance_status=last_training.status if last_training else "not_run",
+        governance_status=str(governance_summary.get("last_governance_status") or "not_run"),
         trade_policy=last_prediction["trade_policy"] if last_prediction and last_prediction["trade_policy"] else {},
         trade_caps_used=trade_caps_used,
-        trade_threshold_policy=last_threshold.thresholds if last_threshold else {},
+        trade_threshold_policy=dict(governance_summary.get("trade_threshold_policy") or {}),
         data_quality_summary={
             "avg": float(avg_data_quality) if avg_data_quality is not None else None,
             "feature_version": active_version.feature_version if active_version else None,
