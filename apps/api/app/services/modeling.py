@@ -753,10 +753,16 @@ def _candidate_outcome_value(candidate: ModelCandidate) -> int | None:
 
 
 def _candidate_target_date_matches_game(candidate: ModelCandidate, game: MlbGame | None) -> bool:
-    if candidate.target_date is None or game is None:
+    if game is None:
         return False
-    game_day = ensure_aware_utc(game.scheduled_start).astimezone(get_dashboard_zone()).date()
-    return candidate.target_date == game_day
+    return _target_date_matches_scheduled_start(candidate.target_date, game.scheduled_start)
+
+
+def _target_date_matches_scheduled_start(target_date: object, scheduled_start: datetime | None) -> bool:
+    if target_date is None or scheduled_start is None:
+        return False
+    game_day = ensure_aware_utc(scheduled_start).astimezone(get_dashboard_zone()).date()
+    return target_date == game_day
 
 
 def _governance_clean_training_window(settings=None) -> dict[str, object]:
@@ -843,30 +849,76 @@ def _resolved_mature_candidate_filters(paper_trading_epoch_id: int | None = None
     return filters
 
 
-def _candidate_game_target_date_expression(session: Session):
+def _can_count_candidate_game_date_in_sql(session: Session) -> bool:
     bind = session.get_bind()
-    if bind is not None and bind.dialect.name == "postgresql":
-        return cast(func.timezone(str(get_dashboard_zone()), MlbGame.scheduled_start), Date)
-    return func.date(MlbGame.scheduled_start)
+    return bind is not None and bind.dialect.name == "postgresql"
 
 
-def _resolved_mature_candidate_count_statement(session: Session, paper_trading_epoch_id: int | None = None):
+def _candidate_game_target_date_expression():
+    return cast(func.timezone(str(get_dashboard_zone()), MlbGame.scheduled_start), Date)
+
+
+def _resolved_mature_candidate_count_statement(
+    session: Session,
+    paper_trading_epoch_id: int | None = None,
+    extra_filters: tuple[object, ...] = (),
+):
     return (
         select(func.count(ModelCandidate.id))
         .select_from(ModelCandidate)
         .join(MlbGame, ModelCandidate.mlb_game_id == MlbGame.id)
         .where(
             *_resolved_mature_candidate_filters(paper_trading_epoch_id),
-            ModelCandidate.target_date == _candidate_game_target_date_expression(session),
+            ModelCandidate.target_date == _candidate_game_target_date_expression(),
+            *extra_filters,
         )
     )
 
 
-def count_raw_resolved_mature_candidates(session: Session, paper_trading_epoch_id: int | None = None) -> int:
-    return int(
-        session.scalar(_resolved_mature_candidate_count_statement(session, paper_trading_epoch_id))
-        or 0
+def _resolved_mature_candidate_scalar_statement(
+    paper_trading_epoch_id: int | None = None,
+    extra_filters: tuple[object, ...] = (),
+):
+    return (
+        select(ModelCandidate.target_date, MlbGame.scheduled_start)
+        .select_from(ModelCandidate)
+        .join(MlbGame, ModelCandidate.mlb_game_id == MlbGame.id)
+        .where(
+            *_resolved_mature_candidate_filters(paper_trading_epoch_id),
+            *extra_filters,
+        )
     )
+
+
+def _count_resolved_mature_candidates(
+    session: Session,
+    paper_trading_epoch_id: int | None = None,
+    *extra_filters: object,
+) -> int:
+    if _can_count_candidate_game_date_in_sql(session):
+        return int(
+            session.scalar(
+                _resolved_mature_candidate_count_statement(
+                    session,
+                    paper_trading_epoch_id,
+                    tuple(extra_filters),
+                )
+            )
+            or 0
+        )
+
+    rows = session.execute(
+        _resolved_mature_candidate_scalar_statement(paper_trading_epoch_id, tuple(extra_filters))
+    )
+    return sum(
+        1
+        for target_date, scheduled_start in rows
+        if _target_date_matches_scheduled_start(target_date, scheduled_start)
+    )
+
+
+def count_raw_resolved_mature_candidates(session: Session, paper_trading_epoch_id: int | None = None) -> int:
+    return _count_resolved_mature_candidates(session, paper_trading_epoch_id)
 
 
 def count_clean_filter_exclusions_by_reason(
@@ -877,32 +929,23 @@ def count_clean_filter_exclusions_by_reason(
     clean_start = clean_window["start_at"]
     clean_date = clean_window["start_date_et"]
     counts = {
-        "target_date_before_clean_start": int(
-            session.scalar(
-                _resolved_mature_candidate_count_statement(session, paper_trading_epoch_id).where(
-                    ModelCandidate.target_date < clean_date,
-                )
-            )
-            or 0
+        "target_date_before_clean_start": _count_resolved_mature_candidates(
+            session,
+            paper_trading_epoch_id,
+            ModelCandidate.target_date < clean_date,
         ),
-        "missing_evaluated_at": int(
-            session.scalar(
-                _resolved_mature_candidate_count_statement(session, paper_trading_epoch_id).where(
-                    ModelCandidate.target_date >= clean_date,
-                    ModelCandidate.evaluated_at.is_(None),
-                )
-            )
-            or 0
+        "missing_evaluated_at": _count_resolved_mature_candidates(
+            session,
+            paper_trading_epoch_id,
+            ModelCandidate.target_date >= clean_date,
+            ModelCandidate.evaluated_at.is_(None),
         ),
-        "evaluated_before_clean_start": int(
-            session.scalar(
-                _resolved_mature_candidate_count_statement(session, paper_trading_epoch_id).where(
-                    ModelCandidate.target_date >= clean_date,
-                    ModelCandidate.evaluated_at.is_not(None),
-                    ModelCandidate.evaluated_at < clean_start,
-                )
-            )
-            or 0
+        "evaluated_before_clean_start": _count_resolved_mature_candidates(
+            session,
+            paper_trading_epoch_id,
+            ModelCandidate.target_date >= clean_date,
+            ModelCandidate.evaluated_at.is_not(None),
+            ModelCandidate.evaluated_at < clean_start,
         ),
     }
     return {key: value for key, value in counts.items() if value}
@@ -913,14 +956,11 @@ def count_clean_resolved_mature_candidates(
     paper_trading_epoch_id: int | None,
     clean_window: dict[str, object],
 ) -> int:
-    return int(
-        session.scalar(
-            _resolved_mature_candidate_count_statement(session, paper_trading_epoch_id).where(
-                ModelCandidate.target_date >= clean_window["start_date_et"],
-                ModelCandidate.evaluated_at >= clean_window["start_at"],
-            )
-        )
-        or 0
+    return _count_resolved_mature_candidates(
+        session,
+        paper_trading_epoch_id,
+        ModelCandidate.target_date >= clean_window["start_date_et"],
+        ModelCandidate.evaluated_at >= clean_window["start_at"],
     )
 
 

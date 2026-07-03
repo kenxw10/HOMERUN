@@ -8288,7 +8288,7 @@ def test_model_governance_clean_cutoff_excludes_pre_cutoff_samples(monkeypatch) 
 
 
 def test_governance_status_uses_aggregate_counts_without_candidate_loader(monkeypatch) -> None:
-    monkeypatch.setenv("MODEL_GOVERNANCE_CLEAN_START_AT", "2026-07-02T00:00:00-04:00")
+    monkeypatch.setenv("MODEL_GOVERNANCE_CLEAN_START_AT", "2026-07-01T00:00:00-04:00")
     get_settings.cache_clear()
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
@@ -8301,7 +8301,7 @@ def test_governance_status_uses_aggregate_counts_without_candidate_loader(monkey
             away_team="Seattle Mariners",
             home_abbreviation="PIT",
             away_abbreviation="SEA",
-            scheduled_start=datetime(2026, 7, 2, 23, 0, tzinfo=UTC),
+            scheduled_start=datetime(2026, 7, 2, 3, 0, tzinfo=UTC),
             status="Final",
         )
         mismatched_game = MlbGame(
@@ -8319,16 +8319,16 @@ def test_governance_status_uses_aggregate_counts_without_candidate_loader(monkey
             session,
             epoch_id=epoch_id,
             game_id=game.id,
-            target_date=date(2026, 7, 2),
-            evaluated_at=datetime(2026, 7, 2, 16, 0, tzinfo=UTC),
+            target_date=date(2026, 7, 1),
+            evaluated_at=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
             resolved_at=datetime(2026, 7, 3, 4, 0, tzinfo=UTC),
         )
         _add_governance_candidate(
             session,
             epoch_id=epoch_id,
             game_id=mismatched_game.id,
-            target_date=date(2026, 7, 2),
-            evaluated_at=datetime(2026, 7, 2, 16, 5, tzinfo=UTC),
+            target_date=date(2026, 7, 1),
+            evaluated_at=datetime(2026, 7, 1, 16, 5, tzinfo=UTC),
             resolved_at=datetime(2026, 7, 3, 4, 5, tzinfo=UTC),
             outcome="loss",
         )
