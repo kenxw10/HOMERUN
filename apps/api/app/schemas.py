@@ -155,6 +155,7 @@ class ModelStatus(BaseModel):
     network_sources_enabled: bool = False
     public_sources_enabled: bool = False
     last_feature_sync_status: dict[str, object] = Field(default_factory=dict)
+    source_details: dict[str, object] = Field(default_factory=dict)
     governance_status: str | None = None
     notes: str | list[str]
 

@@ -1174,10 +1174,16 @@ def test_dashboard_source_status_is_summarized_for_model_status(monkeypatch) -> 
         get_or_create_active_paper_epoch(session, starting_balance=Decimal("500.00"))
         monkeypatch.setattr(dashboard, "source_status_report", fake_source_status_report)
         summary = dashboard.dashboard_summary_from_db(session)
+        detailed = dashboard.dashboard_summary_from_db(session, include_source_details=True)
 
     payload = summary.model_status.last_feature_sync_status
     assert payload["validation_status"] == "degraded_with_errors"
     assert "raw_payload" not in json.dumps(payload)
+    assert summary.model_status.source_details == {}
+    assert detailed.model_status.source_details["source_health"]["item_count"] == 2
+    assert detailed.model_status.source_details["source_inventory"]["item_count"] == 1
+    assert "tables" in detailed.model_status.source_details
+    assert "raw_payload" not in json.dumps(detailed.model_status.source_details)
 
 
 def test_system_status_redacts_secrets_and_allows_missing_database() -> None:

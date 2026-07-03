@@ -1202,6 +1202,11 @@ def dashboard_summary_from_db(
         network_sources_enabled=bool(source_status["feature_sync_enable_network_sources"]),
         public_sources_enabled=bool(source_status["public_sources_enabled"]),
         last_feature_sync_status=dict(compact_source_status.get("last_feature_sync_status") or {}),
+        source_details=(
+            compact_source_status
+            if include_diagnostics or include_source_details
+            else {}
+        ),
         notes=[
             "PR3c fix2 run-distribution model is paper-only.",
             "Parameter promotion remains gated by resolved mature sample thresholds.",
