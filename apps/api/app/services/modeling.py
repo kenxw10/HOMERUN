@@ -1883,8 +1883,6 @@ def _train_family_scope_challengers(
             and improvement >= float(settings.model_promotion_min_logloss_improvement)
             and isinstance(challenger_ece, float)
             and challenger_ece <= float(settings.model_promotion_max_ece)
-            and int(summary.get("adapter_error_count") or 0) == 0
-            and int(summary.get("adapter_missing_count") or 0) == 0
         )
         promotion_status = "promoted" if can_promote else "trained_not_promoted"
         promotion_reason = (

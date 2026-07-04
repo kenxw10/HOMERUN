@@ -9587,6 +9587,56 @@ def test_pr3v_adapter_errors_are_counted_and_excluded_from_training(monkeypatch)
     assert dataset.sample_count == 2
 
 
+def test_pr3v_adapter_errors_do_not_veto_family_promotion(monkeypatch) -> None:
+    monkeypatch.setenv("MODEL_MIN_SAMPLES_TRAIN", "2")
+    monkeypatch.setenv("MODEL_MIN_SAMPLES_CALIBRATE", "2")
+    monkeypatch.setenv("MODEL_MIN_SAMPLES_PROMOTE", "99")
+    monkeypatch.setenv("MODEL_GOVERNANCE_FAMILY_MIN_SAMPLES_TRAIN", "2")
+    monkeypatch.setenv("MODEL_GOVERNANCE_FAMILY_MIN_SAMPLES_CALIBRATE", "2")
+    monkeypatch.setenv("MODEL_GOVERNANCE_FAMILY_MIN_SAMPLES_PROMOTE", "3")
+    monkeypatch.setenv("MODEL_GOVERNANCE_CLEAN_START_AT", "2026-07-02T00:00:00-04:00")
+    get_settings.cache_clear()
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        epoch_id = _active_epoch_id(session)
+        game = MlbGame(
+            external_game_id="pr3v-adapter-error-promotion",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 2, 23, 0, tzinfo=UTC),
+            status="Final",
+        )
+        session.add(game)
+        session.flush()
+        for index, error in enumerate([None, None, "missing_total_direction_or_line", None], start=1):
+            _add_governance_candidate(
+                session,
+                epoch_id=epoch_id,
+                game_id=game.id,
+                target_date=date(2026, 7, 2),
+                evaluated_at=datetime(2026, 7, 2, 16, index, tzinfo=UTC),
+                resolved_at=datetime(2026, 7, 3, 4, index, tzinfo=UTC),
+                outcome="loss" if error else "win",
+                market_family="first_five_total",
+                probability=Decimal("0.930000"),
+                adapter_error=error,
+            )
+        session.commit()
+
+        result = run_model_governance(session, now=datetime(2026, 7, 3, 12, 0, tzinfo=UTC))
+
+    unit = result["family_scope_units"]["first_five_total"]
+    assert unit["adapter_error_count"] == 1
+    assert unit["trainable_clean_samples"] == 3
+    assert unit["promotion_status"] == "promoted"
+    assert unit["calibration_status"] == "family_scope_active"
+    assert result["family_scope_promoted_units"] == ["first_five_total"]
+
+
 def test_pr3v_missing_adapter_metadata_is_counted_and_excluded(monkeypatch) -> None:
     monkeypatch.setenv("MODEL_MIN_SAMPLES_TRAIN", "2")
     monkeypatch.setenv("MODEL_MIN_SAMPLES_CALIBRATE", "2")
