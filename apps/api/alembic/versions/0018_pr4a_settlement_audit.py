@@ -1,6 +1,6 @@
 """PR4a add paper trade settlement and model audit columns.
 
-Revision ID: 0018_pr4a_settlement_accounting_audit
+Revision ID: 0018_pr4a_settlement_audit
 Revises: 0017_pr3x_risk_governance
 Create Date: 2026-07-04
 """
@@ -10,7 +10,7 @@ from collections.abc import Sequence
 from alembic import op
 import sqlalchemy as sa
 
-revision: str = "0018_pr4a_settlement_accounting_audit"
+revision: str = "0018_pr4a_settlement_audit"
 down_revision: str | None = "0017_pr3x_risk_governance"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
