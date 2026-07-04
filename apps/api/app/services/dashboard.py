@@ -195,6 +195,28 @@ def _position_rationale(candidate: ModelCandidate, trade: PaperTrade) -> dict[st
     return rationale
 
 
+def _position_exposure_payload(trade: PaperTrade) -> dict[str, object] | None:
+    payload = {
+        "economic_exposure_label": trade.economic_exposure_label,
+        "economic_exposure_key": trade.economic_exposure_key,
+        "economic_exposure_family": trade.economic_exposure_family,
+        "economic_exposure_scope": trade.economic_exposure_scope,
+        "economic_exposure_direction": trade.economic_exposure_direction,
+        "economic_exposure_team": trade.economic_exposure_team,
+        "economic_exposure_line": _float(trade.economic_exposure_line),
+        "contract_mechanics_label": trade.contract_mechanics_label,
+        "concept_cluster_key": trade.concept_cluster_key,
+        "same_game_concept_cluster_key": trade.same_game_concept_cluster_key,
+        "line_class": trade.line_class,
+        "line_class_reason": trade.line_class_reason,
+        "line_ladder_rank": trade.line_ladder_rank,
+        "line_ladder_distance_from_central": trade.line_ladder_distance_from_central,
+        "line_ladder_size": trade.line_ladder_size,
+    }
+    compact = {key: value for key, value in payload.items() if value is not None}
+    return compact or None
+
+
 def _position_from_trade(
     trade: PaperTrade,
     game: MlbGame | None = None,
@@ -222,7 +244,13 @@ def _position_from_trade(
         selection_code=trade.selection_code or (market.selection_code if market else None),
         contract_side=trade.contract_side,
     )
-    display = trade.contract_display or trade.market_display or fallback_labels.contract_display
+    exposure_label = trade.economic_exposure_label
+    mechanics_label = trade.contract_mechanics_label or trade.contract_display
+    display = exposure_label or mechanics_label or trade.market_display or fallback_labels.contract_display
+    selected_rationale = _position_rationale(candidate, trade) if candidate is not None else {}
+    exposure_payload = _position_exposure_payload(trade)
+    if exposure_payload is not None:
+        selected_rationale["exposure_taxonomy"] = exposure_payload
     return PositionSummary(
         time_entered=to_eastern_iso(trade.entry_time),
         time_entered_display=eastern_display(trade.entry_time),
@@ -230,15 +258,30 @@ def _position_from_trade(
         time_closed_display=eastern_display(trade.exit_time or trade.settled_at),
         market=display,
         market_ticker=trade.market_ticker,
-        market_display=trade.market_display or fallback_labels.market_display,
+        market_display=exposure_label or trade.market_display or fallback_labels.market_display,
         selection_display=trade.selection_display or fallback_labels.selection_display,
         matchup_display=trade.matchup_display or fallback_labels.matchup_display,
         contract_display=display,
         normalized_equivalent_display=fallback_labels.normalized_equivalent_display,
+        economic_exposure_label=trade.economic_exposure_label,
+        economic_exposure_key=trade.economic_exposure_key,
+        economic_exposure_family=trade.economic_exposure_family,
+        economic_exposure_scope=trade.economic_exposure_scope,
+        economic_exposure_direction=trade.economic_exposure_direction,
+        economic_exposure_team=trade.economic_exposure_team,
+        economic_exposure_line=_float(trade.economic_exposure_line),
+        contract_mechanics_label=trade.contract_mechanics_label,
+        concept_cluster_key=trade.concept_cluster_key,
+        same_game_concept_cluster_key=trade.same_game_concept_cluster_key,
+        line_class=trade.line_class,
+        line_class_reason=trade.line_class_reason,
+        line_ladder_rank=trade.line_ladder_rank,
+        line_ladder_distance_from_central=trade.line_ladder_distance_from_central,
+        line_ladder_size=trade.line_ladder_size,
         display_title=fallback_labels.display_title,
         display_subtitle=fallback_labels.display_subtitle,
         raw_ticker_display=fallback_labels.raw_ticker_display,
-        selected_position_rationale=_position_rationale(candidate, trade) if candidate is not None else {},
+        selected_position_rationale=selected_rationale,
         side=trade.contract_side,
         entry_price=float(trade.entry_price),
         exit_price=float(trade.exit_price) if trade.exit_price is not None else None,

@@ -31,6 +31,15 @@ from app.services.contracts import (
     has_trusted_selection,
     market_type_from_ticker,
 )
+from app.services.exposure_taxonomy import (
+    EXPOSURE_TAXONOMY_VERSION,
+    ExposureTaxonomy,
+    LINE_CLASSIFICATION_POLICY_VERSION,
+    LineClassification,
+    candidate_line_ladder_key,
+    exposure_taxonomy_for_candidate,
+    line_classification_for_ladder,
+)
 from app.services.features import CORE_MODULES, FEATURE_VERSION, QUALITY_WEIGHTS, build_feature_snapshot
 from app.services.mapping import infer_market_type
 from app.services.modeling import (
@@ -153,6 +162,113 @@ class SizingContext:
             "total_fee_estimate": float(self.total_fee_estimate) if self.total_fee_estimate is not None else None,
             "status": self.status,
         }
+
+
+def _apply_exposure_taxonomy(candidate: ModelCandidate, taxonomy: ExposureTaxonomy) -> None:
+    candidate.economic_exposure_label = taxonomy.economic_exposure_label
+    candidate.economic_exposure_key = taxonomy.economic_exposure_key
+    candidate.economic_exposure_family = taxonomy.economic_exposure_family
+    candidate.economic_exposure_scope = taxonomy.economic_exposure_scope
+    candidate.economic_exposure_direction = taxonomy.economic_exposure_direction
+    candidate.economic_exposure_team = taxonomy.economic_exposure_team
+    candidate.economic_exposure_line = taxonomy.economic_exposure_line
+    candidate.contract_mechanics_label = taxonomy.contract_mechanics_label
+    candidate.concept_cluster_key = taxonomy.concept_cluster_key
+    candidate.same_game_concept_cluster_key = taxonomy.same_game_concept_cluster_key
+    candidate.exposure_taxonomy_version = taxonomy.exposure_taxonomy_version
+
+
+def _apply_line_classification(candidate: ModelCandidate, classification: LineClassification) -> None:
+    candidate.line_class = classification.line_class
+    candidate.line_class_reason = classification.line_class_reason
+    candidate.line_ladder_rank = classification.line_ladder_rank
+    candidate.line_ladder_distance_from_central = classification.line_ladder_distance_from_central
+    candidate.line_ladder_size = classification.line_ladder_size
+    candidate.line_classification_policy_version = classification.line_classification_policy_version
+
+
+def _copy_exposure_metadata_to_trade(trade: PaperTrade, candidate: ModelCandidate) -> None:
+    trade.economic_exposure_label = candidate.economic_exposure_label
+    trade.economic_exposure_key = candidate.economic_exposure_key
+    trade.economic_exposure_family = candidate.economic_exposure_family
+    trade.economic_exposure_scope = candidate.economic_exposure_scope
+    trade.economic_exposure_direction = candidate.economic_exposure_direction
+    trade.economic_exposure_team = candidate.economic_exposure_team
+    trade.economic_exposure_line = candidate.economic_exposure_line
+    trade.contract_mechanics_label = candidate.contract_mechanics_label
+    trade.concept_cluster_key = candidate.concept_cluster_key
+    trade.same_game_concept_cluster_key = candidate.same_game_concept_cluster_key
+    trade.line_class = candidate.line_class
+    trade.line_class_reason = candidate.line_class_reason
+    trade.line_ladder_rank = candidate.line_ladder_rank
+    trade.line_ladder_distance_from_central = candidate.line_ladder_distance_from_central
+    trade.line_ladder_size = candidate.line_ladder_size
+    trade.exposure_taxonomy_version = candidate.exposure_taxonomy_version
+    trade.line_classification_policy_version = candidate.line_classification_policy_version
+
+
+def _candidate_exposure_payload(candidate: ModelCandidate) -> dict[str, object]:
+    return {
+        "economic_exposure_label": candidate.economic_exposure_label,
+        "economic_exposure_key": candidate.economic_exposure_key,
+        "economic_exposure_family": candidate.economic_exposure_family,
+        "economic_exposure_scope": candidate.economic_exposure_scope,
+        "economic_exposure_direction": candidate.economic_exposure_direction,
+        "economic_exposure_team": candidate.economic_exposure_team,
+        "economic_exposure_line": (
+            str(candidate.economic_exposure_line) if candidate.economic_exposure_line is not None else None
+        ),
+        "contract_mechanics_label": candidate.contract_mechanics_label,
+        "concept_cluster_key": candidate.concept_cluster_key,
+        "same_game_concept_cluster_key": candidate.same_game_concept_cluster_key,
+        "line_class": candidate.line_class,
+        "line_class_reason": candidate.line_class_reason,
+        "line_ladder_rank": candidate.line_ladder_rank,
+        "line_ladder_distance_from_central": candidate.line_ladder_distance_from_central,
+        "line_ladder_size": candidate.line_ladder_size,
+        "exposure_taxonomy_version": candidate.exposure_taxonomy_version,
+        "line_classification_policy_version": candidate.line_classification_policy_version,
+    }
+
+
+def _apply_candidate_line_classifications(
+    candidates: list[ModelCandidate],
+    outputs_by_candidate_id: dict[int, ModelPredictionOutput],
+) -> dict[str, int]:
+    grouped_lines: dict[tuple[object, ...], list[Decimal | None]] = {}
+    for candidate in candidates:
+        key = candidate_line_ladder_key(candidate)
+        if key is not None:
+            grouped_lines.setdefault(key, []).append(candidate.line_value)
+
+    counts: dict[str, int] = {}
+    for candidate in candidates:
+        key = candidate_line_ladder_key(candidate)
+        classification = line_classification_for_ladder(
+            market_family=candidate.market_family or candidate.market_type,
+            line_value=candidate.line_value,
+            ladder_lines=grouped_lines.get(key, []),
+        )
+        _apply_line_classification(candidate, classification)
+        counts[classification.line_class] = counts.get(classification.line_class, 0) + 1
+
+        payload = _candidate_exposure_payload(candidate)
+        candidate.features = {**(candidate.features or {}), "exposure_taxonomy": payload}
+        candidate.scoring_rationale = {**(candidate.scoring_rationale or {}), "exposure_taxonomy": payload}
+        diagnostics = dict(candidate.gate_diagnostics or {})
+        diagnostics["exposure_taxonomy"] = payload
+        candidate.gate_diagnostics = diagnostics
+
+        if candidate.id is not None:
+            output = outputs_by_candidate_id.get(candidate.id)
+            if output is not None:
+                raw = dict(output.raw_output or {})
+                raw["exposure_taxonomy"] = payload
+                gate_diagnostics = dict(raw.get("gate_diagnostics") or {})
+                gate_diagnostics["exposure_taxonomy"] = payload
+                raw["gate_diagnostics"] = gate_diagnostics
+                output.raw_output = raw
+    return counts
 
 
 @dataclass(frozen=True)
@@ -2540,6 +2656,7 @@ def generate_candidates(
     trade_intents: list[TradeIntent] = []
     evaluated_candidates: list[ModelCandidate] = []
     outputs_by_candidate_id: dict[int, ModelPredictionOutput] = {}
+    open_trade_metadata_refreshes: list[tuple[ModelCandidate, PaperTrade]] = []
     stale_price_count = 0
     non_executable_price_count = 0
 
@@ -2654,6 +2771,18 @@ def generate_candidates(
                 contract_side=contract_side,
             )
             actual_display = labels.actual_contract_display or labels.contract_display
+            exposure_taxonomy = exposure_taxonomy_for_candidate(
+                game=game,
+                market_family=mapping.market_family or market.market_family or market_type,
+                selection_code=parsed_selection_code,
+                line_value=parsed_line_value,
+                over_under_side=mapping.over_under_side or market.over_under_side,
+                contract_side=contract_side,
+                contract_mechanics_label=actual_display,
+                spread_verification=spread_verification,
+            )
+            market_context["exposure_taxonomy"] = exposure_taxonomy.as_dict()
+            features["exposure_taxonomy"] = exposure_taxonomy.as_dict()
             gross_ev, fee, net_ev, probability_edge = _expected_values(probability, price, 1)
             market_context["fee_estimate"] = float(fee) if fee is not None else None
             if price_context.status == "stale":
@@ -2830,6 +2959,7 @@ def generate_candidates(
                 "display_subtitle": labels.display_subtitle,
                 "raw_ticker_display": labels.raw_ticker_display,
                 "spread_verification": spread_audit_metadata,
+                "exposure_taxonomy": exposure_taxonomy.as_dict(),
                 "sweep_label": normalized_sweep_label,
                 "sweep_window_enabled": sweep_window_enabled,
                 "dry_run_candidates_only": dry_run_candidates_only,
@@ -2844,6 +2974,10 @@ def generate_candidates(
             candidate.over_under_side = mapping.over_under_side or market.over_under_side
             candidate.inning_scope = mapping.inning_scope or market.inning_scope
             candidate.settlement_rule_status = mapping.settlement_rule_status or market.settlement_rule_status
+            _apply_exposure_taxonomy(candidate, exposure_taxonomy)
+            if open_trade_for_market is not None and not dry_run_candidates_only:
+                _copy_exposure_metadata_to_trade(open_trade_for_market, candidate)
+                open_trade_metadata_refreshes.append((candidate, open_trade_for_market))
             diagnostics = _diagnostics_payload(
                 mapping=mapping,
                 game=game,
@@ -2885,6 +3019,7 @@ def generate_candidates(
             diagnostics["display_title"] = labels.display_title
             diagnostics["display_subtitle"] = labels.display_subtitle
             diagnostics["raw_ticker_display"] = labels.raw_ticker_display
+            diagnostics["exposure_taxonomy"] = exposure_taxonomy.as_dict()
             if spread_audit_metadata is not None:
                 diagnostics["spread_verification"] = spread_audit_metadata
             diagnostics["sweep_label"] = normalized_sweep_label
@@ -2968,6 +3103,15 @@ def generate_candidates(
                         score=_trade_rank_score(candidate),
                     )
                 )
+
+    line_classification_counts = _apply_candidate_line_classifications(evaluated_candidates, outputs_by_candidate_id)
+    for candidate, open_trade in open_trade_metadata_refreshes:
+        _copy_exposure_metadata_to_trade(open_trade, candidate)
+        session.add(open_trade)
+    for candidate in evaluated_candidates:
+        session.add(candidate)
+    for output in outputs_by_candidate_id.values():
+        session.add(output)
 
     side_guarded_trades, side_conflict_counts = _apply_side_conflict_guard(trade_intents)
     line_selected_trades, line_selection_counts = _apply_line_selection(side_guarded_trades)
@@ -3176,6 +3320,7 @@ def generate_candidates(
             one_contract_fee_estimate=candidate.one_contract_fee_estimate,
             total_fee_estimate=candidate.total_fee_estimate,
         )
+        _copy_exposure_metadata_to_trade(trade, candidate)
         session.add(trade)
         output = outputs_by_candidate_id.get(candidate.id)
         if output is not None:
@@ -3296,6 +3441,9 @@ def generate_candidates(
         },
         "actual_contract_parse_failures": 0,
         "side_aware_verified_count": created_or_updated,
+        "exposure_taxonomy_version": EXPOSURE_TAXONOMY_VERSION,
+        "line_classification_policy_version": LINE_CLASSIFICATION_POLICY_VERSION,
+        "line_classification_counts": line_classification_counts,
         "line_selection": line_selection_counts,
         "warnings": warnings,
         "eligible_trade_intents": len(trade_intents),
@@ -3375,6 +3523,9 @@ def generate_candidates(
         },
         "actual_contract_parse_failures": 0,
         "side_aware_verified_count": created_or_updated,
+        "exposure_taxonomy_version": EXPOSURE_TAXONOMY_VERSION,
+        "line_classification_policy_version": LINE_CLASSIFICATION_POLICY_VERSION,
+        "line_classification_counts": line_classification_counts,
         "trade_eligible_before_quality": gate_summary["trade_eligible_before_quality"],
         "trade_eligible_after_quality": gate_summary["trade_eligible_after_quality"],
         "blocked_by_quality_only": gate_summary["blocked_by_quality_only"],

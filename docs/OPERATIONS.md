@@ -88,6 +88,7 @@ The jobs currently cover:
 - REST last-mark refresh for open paper positions.
 - Strict paper trade caps by slate, game, market family, open-position count, correlated game/family exposure, and aggregate bankroll risk. Defaults are 8 trades per slate, 4 per family, 12 open positions, 20% daily new risk, 25% open risk, 10% family risk, 15% scope risk, and 8% sub-20c low-price bucket risk.
 - PR3k adds stricter paper selection controls: first-five `TIE` is diagnostics-only, sub-10c prices are blocked, 10c-under-20c prices need stronger EV/edge and have low-price slate/sweep caps, each sweep opens at most 3 new trades by default, early sweeps reserve later slots, same-side exposure is capped by default, and risk-cap-reduced positions must still meet minimum size.
+- PR3s records compact exposure-taxonomy metadata on candidates and paper trades so operators can distinguish economic exposure from Kalshi YES/NO contract mechanics. These labels and line classes are display/diagnostic fields only and must not be used as a hidden replacement for existing paper trade caps, settlement, model math, or source-ingestion rules.
 - Spread markets are diagnostics-only unless `PAPER_SPREAD_TRADING_ENABLED=true`. Do not enable spread paper trading until side-aware spread parsing and settlement have been manually verified against the Kalshi UI.
 
 They do not cover scheduled automation or live execution.
@@ -178,6 +179,8 @@ The dashboard shows the last setup, candidate sweep, price refresh, settlement, 
 PR3m pregame context refresh uses only official MLB Stats API calls: target-date schedule with `probablePitcher(note)`, per-game live feed probable pitchers and lineups, boxscore starter/lineup data, and pitcher game-log stats for known starter IDs. Live feed/boxscore identities are preferred over stale schedule probables when both exist. It does not call pybaseball, FanGraphs, Statcast/Savant, Open-Meteo, full `sync_mlb_features`, sportsbook APIs, team totals, or umpire logic. If official MLB sources do not identify a starter or lineup, the status remains missing or partial with a reason; no neutral starter or fake lineup is inserted.
 
 PR3m.1 dashboard observation cutover is reporting-only. Default `/v1/dashboard/summary` excludes active-epoch paper trades and legacy positions entered before midnight ET on `2026-07-02`; those rows remain in the database and are visible only when `include_pre_observation=true` is supplied. The response includes `observation_filter` metadata with excluded counts and the history parameter. This cutover must not reset epochs, close open positions, delete rows, alter candidate generation, change settlement, change cron schedules, or enable live execution.
+
+PR3s exposure taxonomy is also reporting-only. Candidate sweeps may persist `economic_exposure_*`, `concept_cluster_key`, `same_game_concept_cluster_key`, and line-ladder fields such as `line_class` and `line_ladder_distance_from_central`; these values are derived from current Kalshi mappings/contracts and are bounded to the sweep's current candidate set. They do not call sportsbook APIs, do not infer consensus lines, do not scan historical ladders, and do not change any existing candidate decision, risk-cap, settlement, governance, cron, WebSocket, or live-execution behavior.
 
 ## PR3n Defense Feature Transparency
 
