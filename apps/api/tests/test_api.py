@@ -470,6 +470,33 @@ def test_probability_adapters_do_not_invent_ambiguous_spread_complements() -> No
     assert ambiguous_no.diagnostics["ambiguous_spread_complement"] is True
 
 
+def test_compact_dashboard_preserves_nested_probability_adapter_summary() -> None:
+    compact = dashboard._compact_candidate_diagnostics(
+        {
+            "probability_adapter": {
+                "probability_adapter_policy_version": probability_adapters.PROBABILITY_ADAPTER_POLICY_VERSION,
+                "probability_adapter_counts": {
+                    "full_game_total_probability_adapter:full_game_total_adapter_v1": 12,
+                },
+                "probability_adapter_calibration_hook_counts": {
+                    "calibration_hook_full_game_total": 12,
+                },
+                "probability_adapter_family_counts": {"full_game_total": 12},
+                "probability_adapter_missing_count": 0,
+                "probability_adapter_error_count": 0,
+            }
+        }
+    )
+
+    assert compact["probability_adapter"]["probability_adapter_policy_version"] == (
+        probability_adapters.PROBABILITY_ADAPTER_POLICY_VERSION
+    )
+    assert compact["probability_adapter"]["probability_adapter_counts"] == {
+        "full_game_total_probability_adapter:full_game_total_adapter_v1": 12
+    }
+    assert compact["probability_adapter"]["probability_adapter_error_count"] == 0
+
+
 def _cap_intent(
     session: Session,
     *,

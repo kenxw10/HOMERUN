@@ -1182,11 +1182,13 @@ def _compact_candidate_diagnostics(
     selector = run_summary.get("selector")
     if not isinstance(selector, dict):
         selector = {key: run_summary.get(key) for key in SELECTOR_DIAGNOSTIC_COMPACT_KEYS if key in run_summary}
-    probability_adapter = {
-        key: run_summary.get(key)
-        for key in PROBABILITY_ADAPTER_DIAGNOSTIC_COMPACT_KEYS
-        if key in run_summary
-    }
+    probability_adapter = run_summary.get("probability_adapter")
+    if not isinstance(probability_adapter, dict):
+        probability_adapter = {
+            key: run_summary.get(key)
+            for key in PROBABILITY_ADAPTER_DIAGNOSTIC_COMPACT_KEYS
+            if key in run_summary
+        }
     if include_details:
         return dict(
             _compact_payload(
