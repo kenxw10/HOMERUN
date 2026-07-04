@@ -16883,6 +16883,8 @@ def test_trade_caps_allow_configured_multiple_total_lines(monkeypatch) -> None:
     assert all(trade.line_class in {"central", "near_alternate"} for trade in trades)
     assert all(trade.exposure_taxonomy_version == EXPOSURE_TAXONOMY_VERSION for trade in trades)
     assert summary.positions[0].market == summary.positions[0].economic_exposure_label
+    assert summary.positions[0].contract_display == summary.positions[0].economic_exposure_label
+    assert summary.positions[0].contract_display != summary.positions[0].contract_mechanics_label
     assert summary.positions[0].contract_mechanics_label is not None
     assert summary.positions[0].selected_position_rationale["exposure_taxonomy"]["concept_cluster_key"] == "total_over"
 

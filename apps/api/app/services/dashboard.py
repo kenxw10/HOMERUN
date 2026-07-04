@@ -261,7 +261,7 @@ def _position_from_trade(
         market_display=exposure_label or trade.market_display or fallback_labels.market_display,
         selection_display=trade.selection_display or fallback_labels.selection_display,
         matchup_display=trade.matchup_display or fallback_labels.matchup_display,
-        contract_display=mechanics_label or display,
+        contract_display=display,
         normalized_equivalent_display=fallback_labels.normalized_equivalent_display,
         economic_exposure_label=trade.economic_exposure_label,
         economic_exposure_key=trade.economic_exposure_key,
