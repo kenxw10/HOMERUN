@@ -41,6 +41,11 @@ from app.services.exposure_taxonomy import (
     line_classification_for_ladder,
 )
 from app.services.features import CORE_MODULES, FEATURE_VERSION, QUALITY_WEIGHTS, build_feature_snapshot
+from app.services.live_like_selector import (
+    SELECTOR_POLICY_VERSION,
+    apply_live_like_selector,
+    selector_metadata_payload,
+)
 from app.services.mapping import infer_market_type
 from app.services.modeling import (
     MATURE_MODEL_TAG,
@@ -207,6 +212,27 @@ def _copy_exposure_metadata_to_trade(trade: PaperTrade, candidate: ModelCandidat
     trade.line_classification_policy_version = candidate.line_classification_policy_version
 
 
+def _copy_selector_metadata_to_trade(trade: PaperTrade, candidate: ModelCandidate) -> None:
+    trade.selector_policy_version = candidate.selector_policy_version
+    trade.selector_mode = candidate.selector_mode
+    trade.selector_status = candidate.selector_status
+    trade.selector_decision = candidate.selector_decision
+    trade.selector_rejection_reason = candidate.selector_rejection_reason
+    trade.selector_threshold_profile = candidate.selector_threshold_profile
+    trade.selector_min_net_ev = candidate.selector_min_net_ev
+    trade.selector_min_prob_edge = candidate.selector_min_prob_edge
+    trade.selector_min_data_quality = candidate.selector_min_data_quality
+    trade.selector_line_class_policy = candidate.selector_line_class_policy
+    trade.selector_concept_cluster_key = candidate.selector_concept_cluster_key
+    trade.selector_same_game_concept_cluster_key = candidate.selector_same_game_concept_cluster_key
+    trade.selector_cluster_rank = candidate.selector_cluster_rank
+    trade.selector_cluster_rank_score = candidate.selector_cluster_rank_score
+    trade.selector_selected_from_cluster = candidate.selector_selected_from_cluster
+    trade.selector_shadow_only = candidate.selector_shadow_only
+    trade.selector_live_like_eligible_before_cluster = candidate.selector_live_like_eligible_before_cluster
+    trade.selector_live_like_eligible_after_cluster = candidate.selector_live_like_eligible_after_cluster
+
+
 def _candidate_exposure_payload(candidate: ModelCandidate) -> dict[str, object]:
     return {
         "economic_exposure_label": candidate.economic_exposure_label,
@@ -253,6 +279,35 @@ def _candidate_exposure_field_counts(candidates: list[ModelCandidate]) -> dict[s
     }
     for candidate in candidates:
         payload = _candidate_exposure_payload(candidate)
+        for field, value in payload.items():
+            if value is not None:
+                counts[field] += 1
+    return counts
+
+
+def _candidate_selector_field_counts(candidates: list[ModelCandidate]) -> dict[str, int]:
+    counts = {
+        "selector_policy_version": 0,
+        "selector_mode": 0,
+        "selector_status": 0,
+        "selector_decision": 0,
+        "selector_rejection_reason": 0,
+        "selector_threshold_profile": 0,
+        "selector_min_net_ev": 0,
+        "selector_min_prob_edge": 0,
+        "selector_min_data_quality": 0,
+        "selector_line_class_policy": 0,
+        "selector_concept_cluster_key": 0,
+        "selector_same_game_concept_cluster_key": 0,
+        "selector_cluster_rank": 0,
+        "selector_cluster_rank_score": 0,
+        "selector_selected_from_cluster": 0,
+        "selector_shadow_only": 0,
+        "selector_live_like_eligible_before_cluster": 0,
+        "selector_live_like_eligible_after_cluster": 0,
+    }
+    for candidate in candidates:
+        payload = selector_metadata_payload(candidate)
         for field, value in payload.items():
             if value is not None:
                 counts[field] += 1
@@ -2605,6 +2660,8 @@ def generate_candidates(
             "paper_allow_last_price_fallback_for_trade": settings.paper_allow_last_price_fallback_for_trade,
             "paper_allow_multiple_lines_per_game_family": settings.paper_allow_multiple_lines_per_game_family,
             "paper_allow_multiple_f5_winner_outcomes": settings.paper_allow_multiple_f5_winner_outcomes,
+            "paper_selector_mode": settings.paper_selector_mode,
+            "selector_policy_version": SELECTOR_POLICY_VERSION,
             "paper_spread_trading_enabled": settings.paper_spread_trading_enabled,
             "paper_first_five_spread_trading_enabled": settings.paper_spread_trading_enabled,
             "paper_full_game_spread_trading_enabled": settings.paper_full_game_spread_trading_enabled,
@@ -2893,6 +2950,7 @@ def generate_candidates(
                     or market.settlement_rule_status
                 )
                 session.add(open_trade_for_market)
+            eligible_for_intent = decision == "eligible_for_paper_trade" and price is not None
             if decision == "eligible_for_paper_trade":
                 if dry_run_candidates_only:
                     decision = "candidate_only_dry_run"
@@ -3120,7 +3178,9 @@ def generate_candidates(
             session.add(output)
             outputs_by_candidate_id[candidate.id] = output
 
-            if decision == "eligible_for_paper_trade" and price is not None:
+            if price is not None and (
+                decision == "eligible_for_paper_trade" or (dry_run_candidates_only and eligible_for_intent)
+            ):
                 trade_intents.append(
                     TradeIntent(
                         candidate=candidate,
@@ -3142,26 +3202,69 @@ def generate_candidates(
     for output in outputs_by_candidate_id.values():
         session.add(output)
 
-    side_guarded_trades, side_conflict_counts = _apply_side_conflict_guard(trade_intents)
-    line_selected_trades, line_selection_counts = _apply_line_selection(side_guarded_trades)
-    scope_selected_trades, game_scope_counts, game_scope_summary = _apply_game_scope_correlation(
-        session,
-        line_selected_trades,
-        active_epoch.id,
+    if dry_run_candidates_only:
+        side_guarded_trades = trade_intents
+        line_selected_trades = side_guarded_trades
+        scope_selected_trades = line_selected_trades
+        side_conflict_counts = {"no_trade_conflicting_side_signals": 0}
+        line_selection_counts = {
+            "line_selection_groups_considered": 0,
+            "line_selection_candidates_kept": len(line_selected_trades),
+            "line_selection_candidates_rejected": 0,
+        }
+        game_scope_counts = {
+            "game_scope_correlation_groups_considered": 0,
+            "game_scope_correlation_candidates_kept": len(scope_selected_trades),
+            "game_scope_correlation_candidates_rejected": 0,
+            "no_trade_game_scope_correlation_cap": 0,
+            "no_trade_same_game_scope_correlation_not_best": 0,
+        }
+        game_scope_summary = {
+            "limit": max(settings.paper_max_trades_per_game_scope, 1),
+            "groups": {},
+            "dry_run_candidates_only": True,
+            "guard_skipped": True,
+        }
+    else:
+        side_guarded_trades, side_conflict_counts = _apply_side_conflict_guard(trade_intents)
+        line_selected_trades, line_selection_counts = _apply_line_selection(side_guarded_trades)
+        scope_selected_trades, game_scope_counts, game_scope_summary = _apply_game_scope_correlation(
+            session,
+            line_selected_trades,
+            active_epoch.id,
+        )
+    selector_selected_trades, selector_counts, selector_summary = apply_live_like_selector(
+        candidates=evaluated_candidates,
+        intents=scope_selected_trades,
+        settings=settings,
+        dry_run_candidates_only=dry_run_candidates_only,
     )
+    candidate_selector_field_counts = _candidate_selector_field_counts(evaluated_candidates)
+    for candidate in evaluated_candidates:
+        output = outputs_by_candidate_id.get(candidate.id)
+        if output is not None:
+            output.decision_reason = candidate.decision
+            raw = dict(output.raw_output or {})
+            raw["selector"] = selector_metadata_payload(candidate)
+            raw["gate_diagnostics"] = candidate.gate_diagnostics or {}
+            output.raw_output = raw
+            session.add(output)
+        session.add(candidate)
     for intent in trade_intents:
         output = outputs_by_candidate_id.get(intent.candidate.id)
         if output is not None:
             output.decision_reason = intent.candidate.decision
             raw = dict(output.raw_output or {})
+            raw["selector"] = selector_metadata_payload(intent.candidate)
             raw["gate_diagnostics"] = intent.candidate.gate_diagnostics or {}
             output.raw_output = raw
             session.add(output)
         session.add(intent.candidate)
 
+    cap_input_trades = [] if dry_run_candidates_only else selector_selected_trades
     selected_trades, cap_counts, trade_allocation_summary = _apply_trade_caps(
         session,
-        scope_selected_trades,
+        cap_input_trades,
         day,
         day_start,
         day_end,
@@ -3179,6 +3282,7 @@ def generate_candidates(
         if output is not None:
             output.decision_reason = intent.candidate.decision
             raw = dict(output.raw_output or {})
+            raw["selector"] = selector_metadata_payload(intent.candidate)
             raw["gate_diagnostics"] = intent.candidate.gate_diagnostics or {}
             output.raw_output = raw
             session.add(output)
@@ -3350,6 +3454,7 @@ def generate_candidates(
             total_fee_estimate=candidate.total_fee_estimate,
         )
         _copy_exposure_metadata_to_trade(trade, candidate)
+        _copy_selector_metadata_to_trade(trade, candidate)
         session.add(trade)
         output = outputs_by_candidate_id.get(candidate.id)
         if output is not None:
@@ -3401,6 +3506,8 @@ def generate_candidates(
     }
     trades_blocked_by_edge_or_fee = sum(decision_counts.get(reason, 0) for reason in edge_or_fee_reasons)
     all_cap_counts = {**cap_counts}
+    for key, value in selector_counts.items():
+        all_cap_counts[key] = all_cap_counts.get(key, 0) + value
     for key, value in side_conflict_counts.items():
         all_cap_counts[key] = all_cap_counts.get(key, 0) + value
     for key, value in game_scope_counts.items():
@@ -3473,16 +3580,21 @@ def generate_candidates(
         "exposure_taxonomy_version": EXPOSURE_TAXONOMY_VERSION,
         "line_classification_policy_version": LINE_CLASSIFICATION_POLICY_VERSION,
         "candidate_exposure_field_counts": candidate_exposure_field_counts,
+        "candidate_selector_field_counts": candidate_selector_field_counts,
         "line_classification_counts": line_classification_counts,
         "line_selection": line_selection_counts,
+        "selector": selector_summary,
+        **selector_summary,
         "warnings": warnings,
         "eligible_trade_intents": len(trade_intents),
         "trade_eligible_after_side_conflict_guard": len(side_guarded_trades),
         "trade_eligible_after_line_selection": len(line_selected_trades),
         "trade_eligible_after_game_scope_correlation": len(scope_selected_trades),
-        "trade_eligible_before_caps": len(scope_selected_trades),
+        "trade_eligible_after_live_like_selector": len(selector_selected_trades),
+        "trade_eligible_before_caps": len(selector_selected_trades),
         "trades_blocked_by_edge_or_fee": trades_blocked_by_edge_or_fee,
         "trades_blocked_by_line_selection": line_selection_counts["line_selection_candidates_rejected"],
+        "trades_blocked_by_live_like_selector": sum(selector_counts.values()),
         "trades_blocked_by_game_scope_correlation": game_scope_counts["game_scope_correlation_candidates_rejected"],
         "stale_price_count": stale_price_count,
         "paper_trades": paper_trades,
@@ -3556,7 +3668,10 @@ def generate_candidates(
         "exposure_taxonomy_version": EXPOSURE_TAXONOMY_VERSION,
         "line_classification_policy_version": LINE_CLASSIFICATION_POLICY_VERSION,
         "candidate_exposure_field_counts": candidate_exposure_field_counts,
+        "candidate_selector_field_counts": candidate_selector_field_counts,
         "line_classification_counts": line_classification_counts,
+        "selector": selector_summary,
+        **selector_summary,
         "trade_eligible_before_quality": gate_summary["trade_eligible_before_quality"],
         "trade_eligible_after_quality": gate_summary["trade_eligible_after_quality"],
         "blocked_by_quality_only": gate_summary["blocked_by_quality_only"],
@@ -3571,16 +3686,18 @@ def generate_candidates(
         "blocked_by_line_selection": gate_summary["blocked_by_line_selection"],
         "blocked_by_caps": gate_summary["blocked_by_caps"],
         "trade_eligible_after_side_conflict_guard": len(side_guarded_trades),
-        "trade_eligible_before_caps": len(scope_selected_trades),
+        "trade_eligible_before_caps": len(selector_selected_trades),
         "trade_eligible_after_ev_filters": len(trade_intents),
         "trade_eligible_after_line_selection": len(line_selected_trades),
         "trade_eligible_after_game_scope_correlation": len(scope_selected_trades),
+        "trade_eligible_after_live_like_selector": len(selector_selected_trades),
         "trades_blocked_by_caps": trades_blocked_by_caps,
         "trades_blocked_by_edge_or_fee": trades_blocked_by_edge_or_fee,
         "trades_blocked_by_line_selection": line_selection_counts["line_selection_candidates_rejected"],
         "trades_blocked_by_line_selection_or_correlation": line_selection_counts["line_selection_candidates_rejected"]
         + all_cap_counts.get("no_trade_correlated_market_cap", 0)
         + game_scope_counts["game_scope_correlation_candidates_rejected"],
+        "trades_blocked_by_live_like_selector": sum(selector_counts.values()),
         "trades_blocked_by_game_scope_correlation": game_scope_counts["game_scope_correlation_candidates_rejected"],
         "stale_price_count": stale_price_count,
         "non_executable_price_count": non_executable_price_count,

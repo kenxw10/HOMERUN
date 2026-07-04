@@ -62,6 +62,7 @@ from app.services import (
     dashboard,
     features,
     job_runs,
+    live_like_selector,
     market_family_discovery,
     market_family_mapping,
     market_sync,
@@ -122,9 +123,27 @@ PR3S_REQUIRED_CANDIDATE_FIELDS = (
     "line_classification_policy_version",
 )
 
+PR3T_REQUIRED_CANDIDATE_FIELDS = (
+    "selector_policy_version",
+    "selector_mode",
+    "selector_status",
+    "selector_decision",
+    "selector_threshold_profile",
+    "selector_min_net_ev",
+    "selector_min_prob_edge",
+    "selector_min_data_quality",
+    "selector_line_class_policy",
+    "selector_live_like_eligible_before_cluster",
+)
+
 
 def _assert_pr3s_required_fields_populated(row: object) -> None:
     for field in PR3S_REQUIRED_CANDIDATE_FIELDS:
+        assert getattr(row, field) is not None, field
+
+
+def _assert_pr3t_required_fields_populated(row: object) -> None:
+    for field in PR3T_REQUIRED_CANDIDATE_FIELDS:
         assert getattr(row, field) is not None, field
 
 
@@ -308,6 +327,186 @@ def _cap_intent(
         labels=SimpleNamespace(),
         score=Decimal(score),
     )
+
+
+def _selector_candidate(
+    candidate_id: int,
+    *,
+    family: str = "full_game_winner",
+    ev: str = "0.100000",
+    edge: str = "0.060000",
+    quality: str = "1.0000",
+    line_class: str = "not_applicable",
+    cluster: str | None = None,
+    game_id: int = 1,
+) -> ModelCandidate:
+    return ModelCandidate(
+        id=candidate_id,
+        mlb_game_id=game_id,
+        evaluated_at=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
+        features={},
+        target_date=date(2026, 7, 1),
+        decision="eligible_for_paper_trade",
+        market_family=family,
+        market_type=family,
+        contract_side="yes",
+        net_expected_value=Decimal(ev),
+        probability_edge=Decimal(edge),
+        data_quality=Decimal(quality),
+        line_class=line_class,
+        concept_cluster_key=cluster.split(":", 2)[-1] if cluster else f"candidate:{candidate_id}",
+        same_game_concept_cluster_key=cluster,
+    )
+
+
+def _selector_intent(candidate: ModelCandidate, *, price: str = "0.4000") -> candidates.TradeIntent:
+    return candidates.TradeIntent(
+        candidate=candidate,
+        game=SimpleNamespace(id=candidate.mlb_game_id),
+        market=KalshiMarket(
+            kalshi_market_id=f"KX-SELECTOR-{candidate.id}",
+            ticker=f"KX-SELECTOR-{candidate.id}",
+            title="Selector test market",
+            status="open",
+        ),
+        price=Decimal(price),
+        labels=SimpleNamespace(),
+        score=Decimal("1.0000"),
+    )
+
+
+def test_live_like_selector_enforces_family_scope_thresholds(monkeypatch) -> None:
+    monkeypatch.setenv("PAPER_MIN_NET_EV", "0.01")
+    monkeypatch.setenv("PAPER_MIN_PROB_EDGE", "0.01")
+    get_settings.cache_clear()
+    settings = get_settings()
+    total = _selector_candidate(1, family="full_game_total", ev="0.055000", edge="0.050000", line_class="central")
+    winner = _selector_candidate(2, family="full_game_winner", ev="0.055000", edge="0.031000")
+
+    selected, counts, summary = live_like_selector.apply_live_like_selector(
+        candidates=[total, winner],
+        intents=[_selector_intent(total), _selector_intent(winner)],
+        settings=settings,
+    )
+
+    assert len(selected) == 1
+    assert selected[0].candidate is winner
+    assert total.selector_decision == "no_trade_selector_family_scope_threshold"
+    assert winner.selector_decision == "selected_live_like"
+    assert winner.selector_selected_from_cluster is True
+    assert counts["no_trade_selector_family_scope_threshold"] == 1
+    assert summary["selector_selected_after_cluster"] == 1
+    assert summary["selector_rejected_by_family_scope_threshold"] == 1
+
+    monkeypatch.setenv("PAPER_MIN_NET_EV", "0.090000")
+    get_settings.cache_clear()
+    settings = get_settings()
+    stricter = _selector_candidate(3, family="full_game_winner", ev="0.080000", edge="0.050000")
+    live_like_selector.apply_live_like_selector(
+        candidates=[stricter],
+        intents=[_selector_intent(stricter)],
+        settings=settings,
+    )
+    assert stricter.selector_min_net_ev == Decimal("0.090000")
+    assert stricter.selector_decision == "no_trade_selector_family_scope_threshold"
+
+
+def test_live_like_selector_enforces_line_class_and_low_price_policy(monkeypatch) -> None:
+    monkeypatch.setenv("PAPER_MIN_NET_EV", "0.01")
+    monkeypatch.setenv("PAPER_MIN_PROB_EDGE", "0.01")
+    get_settings.cache_clear()
+    settings = get_settings()
+    central = _selector_candidate(10, family="full_game_total", ev="0.061000", edge="0.041000", line_class="central")
+    near = _selector_candidate(11, family="full_game_total", ev="0.070000", edge="0.049000", line_class="near_alternate")
+    deep = _selector_candidate(12, family="full_game_total", ev="0.090000", edge="0.059000", line_class="deep_alternate")
+    tail = _selector_candidate(13, family="full_game_total", ev="0.110000", edge="0.090000", line_class="tail")
+    exceptional_tail = _selector_candidate(14, family="full_game_total", ev="0.130000", edge="0.090000", line_class="tail")
+    unclassified = _selector_candidate(15, family="full_game_total", ev="0.200000", edge="0.200000", line_class="unclassified")
+    low_price_tail = _selector_candidate(16, family="full_game_total", ev="0.110000", edge="0.070000", line_class="tail")
+
+    selected, counts, summary = live_like_selector.apply_live_like_selector(
+        candidates=[central, near, deep, tail, exceptional_tail, unclassified, low_price_tail],
+        intents=[
+            _selector_intent(central),
+            _selector_intent(near),
+            _selector_intent(deep),
+            _selector_intent(tail),
+            _selector_intent(exceptional_tail),
+            _selector_intent(unclassified),
+            _selector_intent(low_price_tail, price="0.1500"),
+        ],
+        settings=settings,
+    )
+
+    assert [intent.candidate for intent in selected] == [central, exceptional_tail]
+    assert near.selector_decision == "no_trade_selector_line_class_threshold"
+    assert deep.selector_decision == "no_trade_selector_line_class_threshold"
+    assert tail.selector_decision == "no_trade_tail_shadow_only"
+    assert unclassified.selector_decision == "no_trade_unclassified_line_shadow_only"
+    assert low_price_tail.selector_decision == "no_trade_tail_shadow_only"
+    assert low_price_tail.selector_line_class_policy.endswith("+low_price_strict")
+    assert counts["no_trade_tail_shadow_only"] == 2
+    assert summary["selector_rejected_by_line_class"] == 5
+    assert summary["selector_shadow_only_count"] == 3
+
+
+def test_live_like_selector_selects_best_same_game_concept_cluster(monkeypatch) -> None:
+    monkeypatch.setenv("PAPER_MIN_NET_EV", "0.01")
+    monkeypatch.setenv("PAPER_MIN_PROB_EDGE", "0.01")
+    get_settings.cache_clear()
+    settings = get_settings()
+    full_under = _selector_candidate(
+        20,
+        family="full_game_total",
+        ev="0.090000",
+        edge="0.060000",
+        line_class="central",
+        cluster="mlb_game:1:total_under",
+    )
+    f5_under = _selector_candidate(
+        21,
+        family="first_five_total",
+        ev="0.100000",
+        edge="0.050000",
+        line_class="central",
+        cluster="mlb_game:1:total_under",
+    )
+    full_over = _selector_candidate(
+        22,
+        family="full_game_total",
+        ev="0.080000",
+        edge="0.050000",
+        line_class="central",
+        cluster="mlb_game:1:total_over",
+    )
+    other_game_under = _selector_candidate(
+        23,
+        family="full_game_total",
+        ev="0.080000",
+        edge="0.050000",
+        line_class="central",
+        cluster="mlb_game:2:total_under",
+        game_id=2,
+    )
+
+    selected, counts, summary = live_like_selector.apply_live_like_selector(
+        candidates=[full_under, f5_under, full_over, other_game_under],
+        intents=[
+            _selector_intent(full_under),
+            _selector_intent(f5_under),
+            _selector_intent(full_over),
+            _selector_intent(other_game_under),
+        ],
+        settings=settings,
+    )
+
+    assert [intent.candidate.id for intent in selected] == [21, 22, 23]
+    assert f5_under.selector_selected_from_cluster is True
+    assert f5_under.selector_cluster_rank == 1
+    assert full_under.selector_cluster_rank == 2
+    assert full_under.selector_decision == "no_trade_selector_concept_cluster_not_best"
+    assert counts["no_trade_selector_concept_cluster_not_best"] == 1
+    assert summary["selector_rejected_by_concept_cluster"] == 1
 
 
 _CANDIDATE_DECISION_PATTERN = re.compile(
@@ -1726,6 +1925,10 @@ def test_generate_candidates_time_window_filters_games(monkeypatch) -> None:
     assert len(all_candidates) == 1
     assert len(all_trades) == 1
     assert all_trades[0].market_ticker == "KXMLBGAME-WINDOW-IN-WINDOW-PIT"
+    assert all_candidates[0].selector_policy_version == live_like_selector.SELECTOR_POLICY_VERSION
+    assert all_candidates[0].selector_selected_from_cluster is True
+    assert all_trades[0].selector_policy_version == live_like_selector.SELECTOR_POLICY_VERSION
+    assert all_trades[0].selector_selected_from_cluster is True
 
 
 def test_generate_candidates_time_window_returns_skipped_when_empty(monkeypatch) -> None:
@@ -1849,14 +2052,94 @@ def test_generate_candidates_dry_run_scores_without_opening_no_trade(monkeypatch
     assert no_candidate.training_eligible is False
     assert no_candidate.training_exclusion_reason == "dry_run_candidates_only"
     _assert_pr3s_required_fields_populated(no_candidate)
+    _assert_pr3t_required_fields_populated(no_candidate)
     assert no_candidate.economic_exposure_label == "SEA FULL GAME WINNER"
+    assert no_candidate.selector_policy_version == live_like_selector.SELECTOR_POLICY_VERSION
+    assert no_candidate.selector_mode == "live_like"
+    assert no_candidate.selector_decision == "selected_live_like"
+    assert no_candidate.selector_selected_from_cluster is True
     assert no_candidate.line_class == "not_applicable"
     assert no_candidate.line_class_reason is not None
     assert yes_candidate is not None
     assert yes_candidate.decision == "no_trade_missing_price"
     _assert_pr3s_required_fields_populated(yes_candidate)
+    assert yes_candidate.selector_policy_version == live_like_selector.SELECTOR_POLICY_VERSION
+    assert yes_candidate.selector_status == "not_considered"
     assert result["candidate_exposure_field_counts"]["economic_exposure_label"] == 2
     assert result["candidate_exposure_field_counts"]["line_classification_policy_version"] == 2
+    assert result["candidate_selector_field_counts"]["selector_policy_version"] == 2
+    assert result["selector_policy_version"] == live_like_selector.SELECTOR_POLICY_VERSION
+    assert result["selector_mode"] == "live_like"
+    assert result["selector_selected_after_cluster"] == 1
+
+
+def test_generate_candidates_dry_run_does_not_mutate_candidates_with_trade_guards(monkeypatch) -> None:
+    _relax_data_quality_gate(monkeypatch)
+    now = datetime(2026, 7, 2, 16, 0, tzinfo=UTC)
+    monkeypatch.setattr(candidates, "utc_now", lambda: now)
+    monkeypatch.setattr(candidates, "score_mature_candidate", lambda *_args, **_kwargs: _fixed_model_score("0.200000"))
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        game = MlbGame(
+            external_game_id="window-dry-run-line-selection",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=now + timedelta(minutes=90),
+            status="scheduled",
+        )
+        session.add(game)
+        for index in range(2):
+            market = KalshiMarket(
+                kalshi_market_id=f"KX-WINDOW-DRY-LINE-{index}",
+                ticker=f"KXMLBGAME-WINDOW-DRY-LINE-{index}-PIT",
+                title="Will Pittsburgh win?",
+                status="open",
+                no_ask=Decimal("0.4000"),
+                market_price_updated_at=now,
+            )
+            session.add(market)
+            _add_candidate_mapping(
+                session,
+                game,
+                market,
+                mapping_status="confirmed",
+                market_family="full_game_winner",
+                market_type="full_game_winner",
+                selection_code="PIT",
+                settlement_rule_status="paper_supported",
+            )
+        session.commit()
+
+        result = candidates.generate_candidates(
+            session,
+            target_date=date(2026, 7, 2),
+            min_time_to_start_minutes=45,
+            max_time_to_start_minutes=180,
+            dry_run_candidates_only=True,
+        )
+        no_candidates = list(
+            session.scalars(
+                select(ModelCandidate)
+                .where(ModelCandidate.contract_side == "no")
+                .order_by(ModelCandidate.kalshi_market_id)
+            )
+        )
+        trades = list(session.scalars(select(PaperTrade)))
+
+    assert result["dry_run_candidates_only"] is True
+    assert result["paper_trades"] == 0
+    assert trades == []
+    assert len(no_candidates) == 2
+    assert {candidate.decision for candidate in no_candidates} == {"candidate_only_dry_run"}
+    assert result["trade_eligible_after_ev_filters"] == 2
+    assert result["selector_candidates_considered"] == 2
+    assert result["line_selection_candidates_rejected"] == 0
+    assert {candidate.selector_status for candidate in no_candidates} == {"selected", "rejected"}
 
 
 def test_generate_candidates_window_uses_global_daily_trade_caps(monkeypatch) -> None:
@@ -4785,6 +5068,17 @@ def test_generate_candidates_refreshes_existing_open_trade_price(monkeypatch) ->
         trade = session.scalar(select(PaperTrade).where(PaperTrade.market_ticker == "KXMLBGAME-REFRESH-NYY"))
         assert trade is not None
         assert trade.current_price == Decimal("0.4000")
+        _assert_pr3t_required_fields_populated(trade)
+        original_selector = {
+            field: getattr(trade, field)
+            for field in (
+                *PR3T_REQUIRED_CANDIDATE_FIELDS,
+                "selector_decision",
+                "selector_selected_from_cluster",
+                "selector_live_like_eligible_after_cluster",
+            )
+        }
+        assert original_selector["selector_status"] == "selected"
 
         current_time["now"] = datetime(2026, 7, 2, 16, 0, tzinfo=UTC)
         market.implied_yes_ask = Decimal("0.3200")
@@ -4803,6 +5097,8 @@ def test_generate_candidates_refreshes_existing_open_trade_price(monkeypatch) ->
     assert refreshed_trade is not None
     assert refreshed_trade.entry_price == Decimal("0.4000")
     assert refreshed_trade.current_price == Decimal("0.2800")
+    for field, expected in original_selector.items():
+        assert getattr(refreshed_trade, field) == expected, field
 
 
 def test_generate_candidates_refreshes_existing_no_trade_with_no_bid_mark(monkeypatch) -> None:
@@ -16821,6 +17117,7 @@ def test_line_selection_rejects_correlated_total_lines_before_caps(monkeypatch) 
 
 
 def test_trade_caps_allow_configured_multiple_total_lines(monkeypatch) -> None:
+    monkeypatch.setenv("PAPER_SELECTOR_MODE", "legacy")
     monkeypatch.setenv("PAPER_ALLOW_MULTIPLE_LINES_PER_GAME_FAMILY", "true")
     monkeypatch.setenv("PAPER_MAX_TRADES_PER_GAME_FAMILY", "2")
     monkeypatch.setenv("PAPER_MAX_TRADES_PER_GAME_SCOPE", "2")
@@ -16981,6 +17278,23 @@ def test_model_predictions_today_filters_by_prediction_run_target_date(monkeypat
             line_ladder_size=3,
             exposure_taxonomy_version=EXPOSURE_TAXONOMY_VERSION,
             line_classification_policy_version=LINE_CLASSIFICATION_POLICY_VERSION,
+            selector_policy_version=live_like_selector.SELECTOR_POLICY_VERSION,
+            selector_mode="live_like",
+            selector_status="selected",
+            selector_decision="selected_live_like",
+            selector_threshold_profile="full_game_total:central:standard",
+            selector_min_net_ev=Decimal("0.060000"),
+            selector_min_prob_edge=Decimal("0.040000"),
+            selector_min_data_quality=Decimal("0.5500"),
+            selector_line_class_policy="normal",
+            selector_concept_cluster_key="total_under",
+            selector_same_game_concept_cluster_key="mlb_game:99:total_under",
+            selector_cluster_rank=1,
+            selector_cluster_rank_score=Decimal("9.123456"),
+            selector_selected_from_cluster=True,
+            selector_shadow_only=False,
+            selector_live_like_eligible_before_cluster=True,
+            selector_live_like_eligible_after_cluster=True,
         )
         session.add(today_candidate)
         session.flush()
@@ -17068,6 +17382,23 @@ def test_model_predictions_today_filters_by_prediction_run_target_date(monkeypat
     assert item["line_ladder_size"] == 3
     assert item["exposure_taxonomy_version"] == EXPOSURE_TAXONOMY_VERSION
     assert item["line_classification_policy_version"] == LINE_CLASSIFICATION_POLICY_VERSION
+    assert item["selector_policy_version"] == live_like_selector.SELECTOR_POLICY_VERSION
+    assert item["selector_mode"] == "live_like"
+    assert item["selector_status"] == "selected"
+    assert item["selector_decision"] == "selected_live_like"
+    assert item["selector_threshold_profile"] == "full_game_total:central:standard"
+    assert item["selector_min_net_ev"] == 0.06
+    assert item["selector_min_prob_edge"] == 0.04
+    assert item["selector_min_data_quality"] == 0.55
+    assert item["selector_line_class_policy"] == "normal"
+    assert item["selector_concept_cluster_key"] == "total_under"
+    assert item["selector_same_game_concept_cluster_key"] == "mlb_game:99:total_under"
+    assert item["selector_cluster_rank"] == 1
+    assert item["selector_cluster_rank_score"] == 9.123456
+    assert item["selector_selected_from_cluster"] is True
+    assert item["selector_shadow_only"] is False
+    assert item["selector_live_like_eligible_before_cluster"] is True
+    assert item["selector_live_like_eligible_after_cluster"] is True
     assert "raw_output" not in item
     assert "features" not in item
     assert "scoring_rationale" not in item
@@ -18948,6 +19279,7 @@ def test_paper_supported_market_family_can_create_pre_model_paper_trade(monkeypa
 
 def test_trusted_full_game_spread_can_create_paper_trade_when_enabled(monkeypatch) -> None:
     _relax_data_quality_gate(monkeypatch)
+    monkeypatch.setenv("PAPER_SELECTOR_MODE", "legacy")
     monkeypatch.setenv("PAPER_FULL_GAME_SPREAD_TRADING_ENABLED", "true")
     get_settings.cache_clear()
     now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
@@ -20403,6 +20735,8 @@ def test_game_scope_correlation_rejection_persists_without_creating_trade(monkey
 
 def test_same_game_different_scopes_can_both_trade(monkeypatch) -> None:
     _relax_data_quality_gate(monkeypatch)
+    monkeypatch.setenv("PAPER_SELECTOR_MODE", "legacy")
+    get_settings.cache_clear()
     now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
     monkeypatch.setattr(candidates, "utc_now", lambda: now)
     monkeypatch.setattr(candidates, "score_mature_candidate", lambda *_args, **_kwargs: _fixed_model_score("0.800000"))

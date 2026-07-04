@@ -812,3 +812,13 @@ Every future PR must update this section with:
 - Persistence remains on the nullable PR3s candidate/trade columns added by PR3s. PaperTrade propagation continues to copy compact taxonomy fields from the selected candidate when paper trades are created.
 - Historical pre-PR3s rows can still have null taxonomy fields unless a future bounded backfill is explicitly added.
 - Safety posture and selector behavior are unchanged: no model probability math, EV threshold, data-quality threshold, risk-cap, settlement, governance, cron, WebSocket, market-discovery, source-ingestion, live-execution, credential, sportsbook/team-total/umpire, or portfolio-series change was added.
+
+### PR3t - Live-Like Paper Selector
+
+- Added `PAPER_SELECTOR_MODE=live_like` as the default paper selector mode, with `legacy` available for old paper-selection behavior in tests or controlled diagnostics.
+- Candidate generation still scores and persists every candidate for governance/backtesting, but actual paper trades now come only from the live-like selected set when selector mode is `live_like`.
+- The selector uses PR3s taxonomy fields plus Kalshi yes/no fee-adjusted economics to apply family/scope-specific thresholds, stricter alternate/tail line-class requirements, low-price threshold combination, and same-game concept-cluster best-of selection.
+- Full-game and first-five same-direction total exposures on the same MLB game share concept clusters and compete for one paper slot; opposite directions and different games do not block each other through that cluster.
+- Selector decisions are compact scalar metadata on candidates and paper trades: policy version, mode, status, decision/reason, threshold profile, min EV/edge/quality, line-class policy, cluster keys/rank/score, selected/shadow flags, and pre/post-cluster eligibility. `/v1/model/predictions`, candidate-sweep summaries, and dashboard position rationale expose those compact fields without raw payloads or unbounded arrays.
+- Existing base gates, full-game spread trusted-audit gate, candidate-sweep cache-only behavior, fixed-risk sizing, aggregate risk caps, settlement, governance, feature ingestion, cron schedules, portfolio series, WebSocket behavior, and live execution remain unchanged.
+- Safety posture remains paper-only: `PAPER_TRADING=true`, `LIVE_TRADING_ENABLED=false`, `EXECUTION_KILL_SWITCH=true`, `KALSHI_ENV=demo`, no production Kalshi credentials, no live orders, no sportsbook/Odds API behavior, no team totals, no umpire factors, and no MVE/multivariate markets.

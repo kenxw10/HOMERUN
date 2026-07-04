@@ -847,6 +847,72 @@ Invoke-RestMethod -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-RAILWAY-API/v
 
 7. Expected: full-game and first-five winner families may use direct market-ticker probes. Spread and total families should show `event_ticker` lookup activity and should not spend ticker batches on guessed spread/total market tickers. Cache hits, no-match responses, source errors, and 429s should be structured; repeated 429s should produce `partial_rate_limited` plus cooldown metadata.
 
+## PR3t Live-Like Paper Selector Validation
+
+PR3t keeps candidate sweeps feature-cache-only and paper-only, but changes which scored candidates can become paper trades when `PAPER_SELECTOR_MODE=live_like`.
+
+Use the known nonzero validation slate `2026-07-04`.
+
+1. Confirm safety baseline:
+
+```powershell
+$base = "https://homerun-production-2551.up.railway.app"
+$targetDate = "2026-07-04"
+$apiKeySecure = Read-Host -Prompt "Paste internal API key" -AsSecureString
+$apiKeyPtr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($apiKeySecure)
+try { $apiKey = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($apiKeyPtr).Trim() } finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($apiKeyPtr) }
+$headers = @{ "X-API-Key" = $apiKey }
+$status = Invoke-RestMethod -Headers $headers "$base/v1/system/status"
+$status.config | Select-Object paper_trading,live_trading_enabled,execution_kill_switch,kalshi_env,kalshi_credentials | Format-List
+```
+
+Expected: paper trading true, live trading false, kill switch true, Kalshi demo, credentials not set unless deliberately configured for safe demo reads.
+
+2. Prepare the known slate with normal component setup:
+
+```powershell
+Invoke-RestMethod -Method Post -Headers $headers "$base/v1/sync/mlb-features?target_date=$targetDate&include_modules=all&refresh_schedule=true"
+Invoke-RestMethod -Method Post -Headers $headers "$base/v1/run/market-family-discovery?target_date=$targetDate&force_refresh=false"
+Invoke-RestMethod -Method Post -Headers $headers "$base/v1/sync/market-family-mappings?target_date=$targetDate"
+```
+
+Feature sync may degrade for optional public sources such as FanGraphs/pybaseball, but it should return structured JSON and leave mature cached snapshots usable.
+
+3. Run the PR3t dry-run selector proof:
+
+```powershell
+$label = "pr3t_validation_dry_run_" + (Get-Date -Format "yyyyMMdd_HHmmss")
+$dry = Invoke-RestMethod -Method Post -Headers $headers "$base/v1/jobs/run/candidate-sweep?target_date=$targetDate&min_time_to_start_minutes=0&max_time_to_start_minutes=1800&sweep_label=$label&dry_run_candidates_only=true"
+$engine = $dry.result.result.paper_candidate_engine
+if (-not $engine) { $engine = $dry.result.result.candidate_engine }
+if (-not $engine) { $engine = $dry.result.result }
+$engine | Select-Object target_date,selector_policy_version,selector_mode,feature_sync_mode,feature_sync_skipped,heavy_feature_sync_skipped,candidates_evaluated,paper_trades_created,selector_pre_cluster_eligible,selector_selected_after_cluster | Format-List
+```
+
+Expected: nonzero candidates evaluated, `dry_run_candidates_only=true`, zero paper trades, `feature_sync_mode=cache_only`, `heavy_feature_sync_skipped=true`, `selector_policy_version=pr3t_live_like_selector_v1`, `selector_mode=live_like`, and nonzero selector diagnostics where qualifying candidates exist.
+
+4. Inspect predictions:
+
+```powershell
+$predictions = Invoke-RestMethod -Headers $headers "$base/v1/model/predictions?date=$targetDate"
+($predictions | ConvertTo-Json -Depth 100) -split "`n" |
+  Where-Object { $_ -match "economic_exposure|contract_mechanics|concept_cluster|line_class|selector_" } |
+  Select-Object -First 260
+```
+
+Expected: compact PR3s taxonomy fields and PR3t selector fields appear on candidate rows. Do not expect raw features, raw payloads, full scoring rationale, or orderbook blobs.
+
+5. Final dashboard compactness check:
+
+```powershell
+$final = Invoke-RestMethod -Headers $headers "$base/v1/dashboard/summary?closed_date=2026-07-02"
+($final | ConvertTo-Json -Depth 80) -split "`n" |
+  Where-Object { $_ -match "selector_|portfolio_series_source|raw_payload|features|scoring_rationale|orderbook_raw" } |
+  Select-Object -First 220
+```
+
+Expected: compact selector summary/rationale may appear, portfolio series metadata remains compact, and raw payload/features/scoring rationale/orderbook blobs do not appear in the default dashboard response.
+
 ## Required Context Updates
 
 Every PR must update `PROJECT_CONTEXT.md`.
