@@ -107,6 +107,27 @@ from app.workers import kalshi_ws_paper
 client = TestClient(app)
 
 
+PR3S_REQUIRED_CANDIDATE_FIELDS = (
+    "economic_exposure_label",
+    "economic_exposure_key",
+    "economic_exposure_family",
+    "economic_exposure_scope",
+    "economic_exposure_direction",
+    "contract_mechanics_label",
+    "concept_cluster_key",
+    "same_game_concept_cluster_key",
+    "line_class",
+    "line_class_reason",
+    "exposure_taxonomy_version",
+    "line_classification_policy_version",
+)
+
+
+def _assert_pr3s_required_fields_populated(row: object) -> None:
+    for field in PR3S_REQUIRED_CANDIDATE_FIELDS:
+        assert getattr(row, field) is not None, field
+
+
 @pytest.fixture(autouse=True)
 def _clear_settings_cache_between_tests():
     get_settings.cache_clear()
@@ -1827,8 +1848,15 @@ def test_generate_candidates_dry_run_scores_without_opening_no_trade(monkeypatch
     assert no_candidate.decision == "candidate_only_dry_run"
     assert no_candidate.training_eligible is False
     assert no_candidate.training_exclusion_reason == "dry_run_candidates_only"
+    _assert_pr3s_required_fields_populated(no_candidate)
+    assert no_candidate.economic_exposure_label == "SEA FULL GAME WINNER"
+    assert no_candidate.line_class == "not_applicable"
+    assert no_candidate.line_class_reason is not None
     assert yes_candidate is not None
     assert yes_candidate.decision == "no_trade_missing_price"
+    _assert_pr3s_required_fields_populated(yes_candidate)
+    assert result["candidate_exposure_field_counts"]["economic_exposure_label"] == 2
+    assert result["candidate_exposure_field_counts"]["line_classification_policy_version"] == 2
 
 
 def test_generate_candidates_window_uses_global_daily_trade_caps(monkeypatch) -> None:
@@ -16919,6 +16947,43 @@ def test_model_predictions_today_filters_by_prediction_run_target_date(monkeypat
         )
         session.add(archived_epoch)
         session.flush()
+        market = KalshiMarket(
+            kalshi_market_id="KX-PREDICTION-TAXONOMY",
+            ticker="KXMLBTOTAL-PREDICTION-TAXONOMY-OVER-8.5",
+            title="Game total over 8.5",
+            status="open",
+        )
+        session.add(market)
+        session.flush()
+        today_candidate = ModelCandidate(
+            paper_trading_epoch_id=active_epoch.id,
+            kalshi_market_id=market.id,
+            evaluated_at=datetime(2026, 7, 2, 16, 0, tzinfo=UTC),
+            target_date=date(2026, 7, 2),
+            decision="candidate_only_dry_run",
+            market_type="full_game_total",
+            market_family="full_game_total",
+            contract_side="no",
+            line_value=Decimal("8.5000"),
+            economic_exposure_label="UNDER 8.5 FULL GAME TOTAL",
+            economic_exposure_key="total:full_game:under:8_5",
+            economic_exposure_family="total",
+            economic_exposure_scope="full_game",
+            economic_exposure_direction="under",
+            economic_exposure_line=Decimal("8.5000"),
+            contract_mechanics_label="NO ON OVER 8.5 FULL GAME TOTAL",
+            concept_cluster_key="total_under",
+            same_game_concept_cluster_key="mlb_game:99:total_under",
+            line_class="central",
+            line_class_reason="current_kalshi_ladder_position",
+            line_ladder_rank=2,
+            line_ladder_distance_from_central=0,
+            line_ladder_size=3,
+            exposure_taxonomy_version=EXPOSURE_TAXONOMY_VERSION,
+            line_classification_policy_version=LINE_CLASSIFICATION_POLICY_VERSION,
+        )
+        session.add(today_candidate)
+        session.flush()
         old_run = ModelPredictionRun(
             paper_trading_epoch_id=active_epoch.id,
             started_at=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
@@ -16951,9 +17016,11 @@ def test_model_predictions_today_filters_by_prediction_run_target_date(monkeypat
                 ModelPredictionOutput(
                     paper_trading_epoch_id=active_epoch.id,
                     prediction_run_id=today_run.id,
+                    candidate_id=today_candidate.id,
                     market_family="full_game_total",
                     probability_calibrated=Decimal("0.550000"),
                     decision_reason="today",
+                    raw_output={"scoring_rationale": "must_not_serialize"},
                 ),
                 ModelPredictionOutput(
                     paper_trading_epoch_id=archived_epoch.id,
@@ -16964,6 +17031,7 @@ def test_model_predictions_today_filters_by_prediction_run_target_date(monkeypat
                 ),
             ]
         )
+        today_candidate_id = today_candidate.id
         session.commit()
 
     app.dependency_overrides[require_internal_api_key] = lambda: None
@@ -16977,7 +17045,32 @@ def test_model_predictions_today_filters_by_prediction_run_target_date(monkeypat
 
     assert response.status_code == 200
     assert payload["result"]["count"] == 1
-    assert payload["result"]["items"][0]["decision_reason"] == "today"
+    item = payload["result"]["items"][0]
+    assert item["decision_reason"] == "today"
+    assert item["candidate_id"] == today_candidate_id
+    assert item["market_ticker"] == "KXMLBTOTAL-PREDICTION-TAXONOMY-OVER-8.5"
+    assert item["market_type"] == "full_game_total"
+    assert item["contract_side"] == "no"
+    assert item["decision"] == "candidate_only_dry_run"
+    assert item["economic_exposure_label"] == "UNDER 8.5 FULL GAME TOTAL"
+    assert item["economic_exposure_key"] == "total:full_game:under:8_5"
+    assert item["economic_exposure_family"] == "total"
+    assert item["economic_exposure_scope"] == "full_game"
+    assert item["economic_exposure_direction"] == "under"
+    assert item["economic_exposure_line"] == 8.5
+    assert item["contract_mechanics_label"] == "NO ON OVER 8.5 FULL GAME TOTAL"
+    assert item["concept_cluster_key"] == "total_under"
+    assert item["same_game_concept_cluster_key"] == "mlb_game:99:total_under"
+    assert item["line_class"] == "central"
+    assert item["line_class_reason"] == "current_kalshi_ladder_position"
+    assert item["line_ladder_rank"] == 2
+    assert item["line_ladder_distance_from_central"] == 0
+    assert item["line_ladder_size"] == 3
+    assert item["exposure_taxonomy_version"] == EXPOSURE_TAXONOMY_VERSION
+    assert item["line_classification_policy_version"] == LINE_CLASSIFICATION_POLICY_VERSION
+    assert "raw_output" not in item
+    assert "features" not in item
+    assert "scoring_rationale" not in item
     assert dated_response.status_code == 200
     assert dated_payload["result"]["date"] == "2026-07-01"
     assert dated_payload["result"]["count"] == 1

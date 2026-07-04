@@ -231,6 +231,34 @@ def _candidate_exposure_payload(candidate: ModelCandidate) -> dict[str, object]:
     }
 
 
+def _candidate_exposure_field_counts(candidates: list[ModelCandidate]) -> dict[str, int]:
+    counts = {
+        "economic_exposure_label": 0,
+        "economic_exposure_key": 0,
+        "economic_exposure_family": 0,
+        "economic_exposure_scope": 0,
+        "economic_exposure_direction": 0,
+        "economic_exposure_team": 0,
+        "economic_exposure_line": 0,
+        "contract_mechanics_label": 0,
+        "concept_cluster_key": 0,
+        "same_game_concept_cluster_key": 0,
+        "line_class": 0,
+        "line_class_reason": 0,
+        "line_ladder_rank": 0,
+        "line_ladder_distance_from_central": 0,
+        "line_ladder_size": 0,
+        "exposure_taxonomy_version": 0,
+        "line_classification_policy_version": 0,
+    }
+    for candidate in candidates:
+        payload = _candidate_exposure_payload(candidate)
+        for field, value in payload.items():
+            if value is not None:
+                counts[field] += 1
+    return counts
+
+
 def _apply_candidate_line_classifications(
     candidates: list[ModelCandidate],
     outputs_by_candidate_id: dict[int, ModelPredictionOutput],
@@ -3105,6 +3133,7 @@ def generate_candidates(
                 )
 
     line_classification_counts = _apply_candidate_line_classifications(evaluated_candidates, outputs_by_candidate_id)
+    candidate_exposure_field_counts = _candidate_exposure_field_counts(evaluated_candidates)
     for candidate, open_trade in open_trade_metadata_refreshes:
         _copy_exposure_metadata_to_trade(open_trade, candidate)
         session.add(open_trade)
@@ -3443,6 +3472,7 @@ def generate_candidates(
         "side_aware_verified_count": created_or_updated,
         "exposure_taxonomy_version": EXPOSURE_TAXONOMY_VERSION,
         "line_classification_policy_version": LINE_CLASSIFICATION_POLICY_VERSION,
+        "candidate_exposure_field_counts": candidate_exposure_field_counts,
         "line_classification_counts": line_classification_counts,
         "line_selection": line_selection_counts,
         "warnings": warnings,
@@ -3525,6 +3555,7 @@ def generate_candidates(
         "side_aware_verified_count": created_or_updated,
         "exposure_taxonomy_version": EXPOSURE_TAXONOMY_VERSION,
         "line_classification_policy_version": LINE_CLASSIFICATION_POLICY_VERSION,
+        "candidate_exposure_field_counts": candidate_exposure_field_counts,
         "line_classification_counts": line_classification_counts,
         "trade_eligible_before_quality": gate_summary["trade_eligible_before_quality"],
         "trade_eligible_after_quality": gate_summary["trade_eligible_after_quality"],
