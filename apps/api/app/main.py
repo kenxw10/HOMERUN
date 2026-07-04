@@ -7,6 +7,7 @@ import time
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import select
+from sqlalchemy.orm import load_only
 
 from app.config import get_settings
 from app.database import database_status, get_session_factory
@@ -726,6 +727,55 @@ def _model_predictions_for_date(target_date: date) -> dict[str, object]:
                 .outerjoin(KalshiMarket, ModelCandidate.kalshi_market_id == KalshiMarket.id)
                 .where(ModelPredictionRun.target_date == target_date)
                 .where(ModelPredictionOutput.paper_trading_epoch_id == active_epoch.id)
+                .options(
+                    load_only(
+                        ModelPredictionOutput.id,
+                        ModelPredictionOutput.prediction_run_id,
+                        ModelPredictionOutput.market_family,
+                        ModelPredictionOutput.probability_raw,
+                        ModelPredictionOutput.probability_calibrated,
+                        ModelPredictionOutput.fair_value,
+                        ModelPredictionOutput.executable_price,
+                        ModelPredictionOutput.expected_value_gross,
+                        ModelPredictionOutput.fee_estimate,
+                        ModelPredictionOutput.expected_value_net,
+                        ModelPredictionOutput.probability_edge,
+                        ModelPredictionOutput.executable_price_source,
+                        ModelPredictionOutput.price_status,
+                        ModelPredictionOutput.data_quality,
+                        ModelPredictionOutput.calibration_status,
+                        ModelPredictionOutput.trade_rank,
+                        ModelPredictionOutput.decision_reason,
+                    ),
+                    load_only(
+                        ModelCandidate.id,
+                        ModelCandidate.kalshi_market_id,
+                        ModelCandidate.decision,
+                        ModelCandidate.market_type,
+                        ModelCandidate.market_family,
+                        ModelCandidate.contract_side,
+                        ModelCandidate.line_value,
+                        ModelCandidate.economic_exposure_label,
+                        ModelCandidate.economic_exposure_key,
+                        ModelCandidate.economic_exposure_family,
+                        ModelCandidate.economic_exposure_scope,
+                        ModelCandidate.economic_exposure_direction,
+                        ModelCandidate.economic_exposure_team,
+                        ModelCandidate.economic_exposure_line,
+                        ModelCandidate.contract_mechanics_label,
+                        ModelCandidate.concept_cluster_key,
+                        ModelCandidate.same_game_concept_cluster_key,
+                        ModelCandidate.line_class,
+                        ModelCandidate.line_class_reason,
+                        ModelCandidate.line_ladder_rank,
+                        ModelCandidate.line_ladder_distance_from_central,
+                        ModelCandidate.line_ladder_size,
+                        ModelCandidate.exposure_taxonomy_version,
+                        ModelCandidate.line_classification_policy_version,
+                    ),
+                    load_only(KalshiMarket.id, KalshiMarket.ticker),
+                    load_only(ModelPredictionRun.id, ModelPredictionRun.target_date),
+                )
                 .order_by(ModelPredictionOutput.id.desc())
                 .limit(500)
             )
@@ -737,6 +787,11 @@ def _model_predictions_for_date(target_date: date) -> dict[str, object]:
                 "candidate_id": candidate.id if candidate else None,
                 "market_ticker": market.ticker if market else None,
                 "market_family": output.market_family,
+                "market_type": candidate.market_type if candidate else None,
+                "contract_side": candidate.contract_side if candidate else None,
+                "decision": candidate.decision if candidate else output.decision_reason,
+                "line_value": _decimal_float(candidate.line_value) if candidate else None,
+                **_candidate_prediction_taxonomy(candidate),
                 "probability_raw": _decimal_float(output.probability_raw),
                 "probability_calibrated": _decimal_float(output.probability_calibrated),
                 "fair_value": _decimal_float(output.fair_value),
@@ -755,6 +810,48 @@ def _model_predictions_for_date(target_date: date) -> dict[str, object]:
             for output, candidate, market, run in rows
         ]
     return {"date": target_date.isoformat(), "items": items, "count": len(items)}
+
+
+def _candidate_prediction_taxonomy(candidate: ModelCandidate | None) -> dict[str, object]:
+    if candidate is None:
+        return {
+            "economic_exposure_label": None,
+            "economic_exposure_key": None,
+            "economic_exposure_family": None,
+            "economic_exposure_scope": None,
+            "economic_exposure_direction": None,
+            "economic_exposure_team": None,
+            "economic_exposure_line": None,
+            "contract_mechanics_label": None,
+            "concept_cluster_key": None,
+            "same_game_concept_cluster_key": None,
+            "line_class": None,
+            "line_class_reason": None,
+            "line_ladder_rank": None,
+            "line_ladder_distance_from_central": None,
+            "line_ladder_size": None,
+            "exposure_taxonomy_version": None,
+            "line_classification_policy_version": None,
+        }
+    return {
+        "economic_exposure_label": candidate.economic_exposure_label,
+        "economic_exposure_key": candidate.economic_exposure_key,
+        "economic_exposure_family": candidate.economic_exposure_family,
+        "economic_exposure_scope": candidate.economic_exposure_scope,
+        "economic_exposure_direction": candidate.economic_exposure_direction,
+        "economic_exposure_team": candidate.economic_exposure_team,
+        "economic_exposure_line": _decimal_float(candidate.economic_exposure_line),
+        "contract_mechanics_label": candidate.contract_mechanics_label,
+        "concept_cluster_key": candidate.concept_cluster_key,
+        "same_game_concept_cluster_key": candidate.same_game_concept_cluster_key,
+        "line_class": candidate.line_class,
+        "line_class_reason": candidate.line_class_reason,
+        "line_ladder_rank": candidate.line_ladder_rank,
+        "line_ladder_distance_from_central": candidate.line_ladder_distance_from_central,
+        "line_ladder_size": candidate.line_ladder_size,
+        "exposure_taxonomy_version": candidate.exposure_taxonomy_version,
+        "line_classification_policy_version": candidate.line_classification_policy_version,
+    }
 
 
 @app.get("/v1/model/predictions", response_model=RunResponse)
