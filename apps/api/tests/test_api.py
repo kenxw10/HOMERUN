@@ -9700,6 +9700,78 @@ def test_pr3v_governance_status_remains_compact(monkeypatch) -> None:
     assert '"raw_payload":' not in dumped
 
 
+def test_pr3v_governance_status_preserves_current_family_counts_after_training(monkeypatch) -> None:
+    monkeypatch.setenv("MODEL_MIN_SAMPLES_TRAIN", "99")
+    monkeypatch.setenv("MODEL_MIN_SAMPLES_CALIBRATE", "99")
+    monkeypatch.setenv("MODEL_MIN_SAMPLES_PROMOTE", "99")
+    monkeypatch.setenv("MODEL_GOVERNANCE_FAMILY_MIN_SAMPLES_TRAIN", "2")
+    monkeypatch.setenv("MODEL_GOVERNANCE_FAMILY_MIN_SAMPLES_CALIBRATE", "2")
+    monkeypatch.setenv("MODEL_GOVERNANCE_FAMILY_MIN_SAMPLES_PROMOTE", "99")
+    monkeypatch.setenv("MODEL_GOVERNANCE_CLEAN_START_AT", "2026-07-02T00:00:00-04:00")
+    get_settings.cache_clear()
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        epoch_id = _active_epoch_id(session)
+        game = MlbGame(
+            external_game_id="pr3v-status-current-counts",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 2, 23, 0, tzinfo=UTC),
+            status="Final",
+        )
+        session.add(game)
+        session.flush()
+        _add_governance_candidate(
+            session,
+            epoch_id=epoch_id,
+            game_id=game.id,
+            target_date=date(2026, 7, 2),
+            evaluated_at=datetime(2026, 7, 2, 16, 1, tzinfo=UTC),
+            resolved_at=datetime(2026, 7, 3, 4, 1, tzinfo=UTC),
+            outcome="win",
+            market_family="full_game_total",
+        )
+        session.commit()
+
+        run_model_governance(session, now=datetime(2026, 7, 3, 12, 0, tzinfo=UTC))
+
+        _add_governance_candidate(
+            session,
+            epoch_id=epoch_id,
+            game_id=game.id,
+            target_date=date(2026, 7, 2),
+            evaluated_at=datetime(2026, 7, 2, 16, 2, tzinfo=UTC),
+            resolved_at=datetime(2026, 7, 3, 4, 2, tzinfo=UTC),
+            outcome="win",
+            market_family="full_game_total",
+        )
+        _add_governance_candidate(
+            session,
+            epoch_id=epoch_id,
+            game_id=game.id,
+            target_date=date(2026, 7, 2),
+            evaluated_at=datetime(2026, 7, 2, 16, 3, tzinfo=UTC),
+            resolved_at=datetime(2026, 7, 3, 4, 3, tzinfo=UTC),
+            outcome="loss",
+            market_family="full_game_total",
+            adapter_error="missing_total_direction_or_line",
+        )
+        session.commit()
+
+        status = modeling.governance_status(session)
+
+    unit = status["family_scope_units"]["full_game_total"]
+    assert unit["status"] == "ready_for_training"
+    assert unit["clean_resolved_mature_samples"] == 3
+    assert unit["trainable_clean_samples"] == 2
+    assert unit["adapter_error_count"] == 1
+    assert unit["adapter_error_reason_counts"] == {"missing_total_direction_or_line": 1}
+
+
 def test_dashboard_summary_does_not_deserialize_candidate_json_for_compact_counts(monkeypatch) -> None:
     def reject_model_candidate_json(value: object) -> object:
         raw = value.decode("utf-8") if isinstance(value, bytes) else str(value)

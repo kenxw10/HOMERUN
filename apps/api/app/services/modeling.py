@@ -1216,18 +1216,34 @@ def _governance_family_scope_key(candidate: CandidateSampleLike) -> str | None:
 
 
 def _probability_adapter_error_reason(candidate: GovernanceCandidateSample) -> str | None:
-    metadata = candidate.probability_adapter_metadata if isinstance(candidate.probability_adapter_metadata, dict) else {}
-    diagnostics = metadata.get("diagnostics") if isinstance(metadata.get("diagnostics"), dict) else {}
-    reason = diagnostics.get("adapter_error")
-    if reason:
-        return str(reason)
-    if candidate.probability_adapter_key == "unsupported_probability_adapter":
-        return "unsupported_probability_adapter"
-    adapter_values = [
+    return _probability_adapter_error_reason_from_fields(
         candidate.probability_adapter_key,
         candidate.probability_adapter_version,
         candidate.probability_adapter_family,
         candidate.probability_adapter_calibration_hook,
+        candidate.probability_adapter_metadata,
+    )
+
+
+def _probability_adapter_error_reason_from_fields(
+    adapter_key: str | None,
+    adapter_version: str | None,
+    adapter_family: str | None,
+    calibration_hook: str | None,
+    adapter_metadata: dict[str, object] | None,
+) -> str | None:
+    metadata = adapter_metadata if isinstance(adapter_metadata, dict) else {}
+    diagnostics = metadata.get("diagnostics") if isinstance(metadata.get("diagnostics"), dict) else {}
+    reason = diagnostics.get("adapter_error")
+    if reason:
+        return str(reason)
+    if adapter_key == "unsupported_probability_adapter":
+        return "unsupported_probability_adapter"
+    adapter_values = [
+        adapter_key,
+        adapter_version,
+        adapter_family,
+        calibration_hook,
     ]
     if not any(adapter_values):
         return "missing_probability_adapter_metadata"
@@ -1398,6 +1414,62 @@ def _family_scope_unit_filter(unit: str):
     )
 
 
+def _current_family_scope_adapter_error_counts(
+    session: Session,
+    *,
+    unit: str,
+    paper_trading_epoch_id: int | None,
+    clean_window: dict[str, object],
+) -> tuple[dict[str, int], int]:
+    filters = (
+        _family_scope_unit_filter(unit),
+        ModelCandidate.target_date >= clean_window["start_date_et"],
+        ModelCandidate.evaluated_at >= clean_window["start_at"],
+    )
+    statement = (
+        select(
+            ModelCandidate.probability_adapter_key,
+            ModelCandidate.probability_adapter_version,
+            ModelCandidate.probability_adapter_family,
+            ModelCandidate.probability_adapter_calibration_hook,
+            ModelCandidate.probability_adapter_metadata,
+            ModelCandidate.target_date,
+            MlbGame.scheduled_start,
+        )
+        .select_from(ModelCandidate)
+        .join(MlbGame, ModelCandidate.mlb_game_id == MlbGame.id)
+        .where(*_resolved_mature_candidate_filters(paper_trading_epoch_id), *filters)
+    )
+    if _can_count_candidate_game_date_in_sql(session):
+        statement = statement.where(ModelCandidate.target_date == _candidate_game_target_date_expression())
+
+    reason_counts: dict[str, int] = {}
+    missing_count = 0
+    for row in session.execute(statement):
+        if not _can_count_candidate_game_date_in_sql(session) and not _target_date_matches_scheduled_start(
+            row.target_date,
+            row.scheduled_start,
+        ):
+            continue
+        if not (
+            row.probability_adapter_key
+            and row.probability_adapter_version
+            and row.probability_adapter_family
+            and row.probability_adapter_calibration_hook
+        ):
+            missing_count += 1
+        reason = _probability_adapter_error_reason_from_fields(
+            row.probability_adapter_key,
+            row.probability_adapter_version,
+            row.probability_adapter_family,
+            row.probability_adapter_calibration_hook,
+            row.probability_adapter_metadata if isinstance(row.probability_adapter_metadata, dict) else None,
+        )
+        if reason:
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+    return reason_counts, missing_count
+
+
 def _split_counts(sample_count: int) -> tuple[int, int]:
     if sample_count < 2:
         return sample_count, 0
@@ -1426,15 +1498,28 @@ def _family_scope_governance_units_from_counts(
             ModelCandidate.target_date >= clean_window["start_date_et"],
             ModelCandidate.evaluated_at >= clean_window["start_at"],
         )
-        train_count, holdout_count = _split_counts(clean_count)
+        adapter_error_reason_counts, adapter_missing_count = _current_family_scope_adapter_error_counts(
+            session,
+            unit=unit,
+            paper_trading_epoch_id=paper_trading_epoch_id,
+            clean_window=clean_window,
+        )
+        adapter_error_count = sum(adapter_error_reason_counts.values())
+        trainable_clean_count = max(0, clean_count - adapter_error_count)
+        train_count, holdout_count = _split_counts(trainable_clean_count)
+        status = (
+            "ready_for_training"
+            if trainable_clean_count >= minimums["minimum_samples_train"]
+            else "skipped_not_enough_family_samples"
+        )
         reason = (
-            f"INSUFFICIENT_FAMILY_SCOPE_SAMPLES:{clean_count}/{minimums['minimum_samples_train']}"
-            if clean_count < minimums["minimum_samples_train"]
+            f"INSUFFICIENT_FAMILY_SCOPE_SAMPLES:{trainable_clean_count}/{minimums['minimum_samples_train']}"
+            if trainable_clean_count < minimums["minimum_samples_train"]
             else "family_scope_ready_for_training"
         )
         units[unit] = {
             "governance_family_scope_key": unit,
-            "status": "skipped_not_enough_family_samples",
+            "status": status,
             "reason": reason,
             "calibration_hook": CALIBRATION_HOOK_BY_GOVERNANCE_UNIT[unit],
             "adapter_version": ADAPTER_VERSION_BY_GOVERNANCE_UNIT[unit],
@@ -1445,15 +1530,15 @@ def _family_scope_governance_units_from_counts(
             "raw_resolved_mature_samples": raw_count,
             "clean_resolved_mature_samples": clean_count,
             "pre_clean_excluded_samples": max(0, raw_count - clean_count),
-            "trainable_clean_samples": clean_count,
+            "trainable_clean_samples": trainable_clean_count,
             "train_sample_count": train_count,
             "holdout_sample_count": holdout_count,
             **minimums,
-            "adapter_error_count": 0,
-            "adapter_error_reason_counts": {},
-            "excluded_error_count": 0,
-            "adapter_missing_count": 0,
-            "errored_candidates_excluded_from_training": False,
+            "adapter_error_count": adapter_error_count,
+            "adapter_error_reason_counts": adapter_error_reason_counts,
+            "excluded_error_count": adapter_error_count,
+            "adapter_missing_count": adapter_missing_count,
+            "errored_candidates_excluded_from_training": adapter_error_count > 0,
             "promotion_status": "not_eligible",
             "promotion_reason": reason,
             "challenger_version": None,
@@ -1464,6 +1549,26 @@ def _family_scope_governance_units_from_counts(
             **_active_family_scope_calibration_summary(active_parameters, unit),
         }
     return units
+
+
+CURRENT_FAMILY_SCOPE_UNIT_FIELDS = {
+    "status",
+    "reason",
+    "raw_resolved_mature_samples",
+    "clean_resolved_mature_samples",
+    "pre_clean_excluded_samples",
+    "trainable_clean_samples",
+    "train_sample_count",
+    "holdout_sample_count",
+    "minimum_samples_train",
+    "minimum_samples_calibrate",
+    "minimum_samples_promote",
+    "adapter_error_count",
+    "adapter_error_reason_counts",
+    "excluded_error_count",
+    "adapter_missing_count",
+    "errored_candidates_excluded_from_training",
+}
 
 
 def _governance_rss_mb() -> float | None:
@@ -2414,13 +2519,23 @@ def governance_status(
         if isinstance(persisted_units, dict):
             for unit, persisted in persisted_units.items():
                 if unit in family_scope_units and isinstance(persisted, dict):
+                    current_unit = family_scope_units[unit]
+                    current_fields = {
+                        key: current_unit[key]
+                        for key in CURRENT_FAMILY_SCOPE_UNIT_FIELDS
+                        if key in current_unit
+                    }
+                    if persisted.get("challenger_version") or persisted.get("last_trained_at"):
+                        current_fields.pop("status", None)
+                        current_fields.pop("reason", None)
                     family_scope_units[unit] = {
-                        **family_scope_units[unit],
+                        **current_unit,
                         **persisted,
                         **_active_family_scope_calibration_summary(
                             active_parameters.parameters if active_parameters else None,
                             unit,
                         ),
+                        **current_fields,
                     }
     aggregate_adapter_error_reason_counts: dict[str, int] = {}
     for unit in family_scope_units.values():
