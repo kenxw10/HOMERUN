@@ -113,6 +113,20 @@ class Settings(BaseSettings):
         default="pr3w_tail_alternate_probability_hardening_v1",
         alias="PAPER_PROBABILITY_HARDENING_POLICY_VERSION",
     )
+    paper_risk_governance_enabled: bool = Field(default=True, alias="PAPER_RISK_GOVERNANCE_ENABLED")
+    paper_risk_governance_policy_version: str = Field(
+        default="pr3x_paper_risk_governance_v1",
+        alias="PAPER_RISK_GOVERNANCE_POLICY_VERSION",
+    )
+    paper_drawdown_halt_enabled: bool = Field(default=True, alias="PAPER_DRAWDOWN_HALT_ENABLED")
+    paper_drawdown_halt_threshold_abs: Decimal = Field(
+        default=Decimal("50.00"),
+        alias="PAPER_DRAWDOWN_HALT_THRESHOLD_ABS",
+    )
+    paper_drawdown_halt_threshold_pct: Decimal = Field(
+        default=Decimal("0.10"),
+        alias="PAPER_DRAWDOWN_HALT_THRESHOLD_PCT",
+    )
     paper_starting_balance: Decimal = Field(default=Decimal("1000.00"), alias="PAPER_STARTING_BALANCE")
     paper_bankroll_starting_balance: Decimal = Field(
         default=Decimal("500.00"), alias="PAPER_BANKROLL_STARTING_BALANCE"
@@ -281,6 +295,8 @@ class Settings(BaseSettings):
         "paper_max_market_family_risk_pct",
         "paper_max_scope_risk_pct",
         "paper_max_price_bucket_risk_pct_under_20c",
+        "paper_drawdown_halt_threshold_abs",
+        "paper_drawdown_halt_threshold_pct",
         "kalshi_trade_fee_rate",
         "model_promotion_min_logloss_improvement",
         "model_promotion_max_ece",

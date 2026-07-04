@@ -73,6 +73,7 @@ from app.services import (
     probability_adapters,
     probability_hardening,
     pybaseball_client,
+    risk_governance,
     ws_market_data,
 )
 from app.services.contracts import contract_labels, selected_team_from_ticker
@@ -193,6 +194,27 @@ PR3W_CORE_REQUIRED_CANDIDATE_FIELDS = (
     "probability_hardening_block_recommendation",
 )
 
+PR3X_REQUIRED_CANDIDATE_FIELDS = (
+    "risk_governance_policy_version",
+    "risk_governance_enabled",
+    "risk_governance_status",
+    "risk_governance_decision",
+    "risk_governance_rejection_reason",
+    "risk_governance_family_status",
+    "risk_governance_family_cap_status",
+    "risk_governance_concept_cluster_cap_status",
+    "risk_governance_same_game_cap_status",
+    "risk_governance_alternate_line_cap_status",
+    "risk_governance_low_price_tail_cap_status",
+    "risk_governance_drawdown_status",
+    "risk_governance_approved_before_caps",
+    "risk_governance_approved_after_caps",
+    "risk_governance_shadow_only",
+    "risk_governance_blocked",
+    "risk_governance_rank",
+    "risk_governance_rank_score",
+)
+
 
 def _assert_pr3s_required_fields_populated(row: object) -> None:
     for field in PR3S_REQUIRED_CANDIDATE_FIELDS:
@@ -211,6 +233,11 @@ def _assert_pr3u_required_fields_populated(row: object) -> None:
 
 def _assert_pr3w_required_fields_populated(row: object) -> None:
     for field in PR3W_CORE_REQUIRED_CANDIDATE_FIELDS:
+        assert getattr(row, field) is not None, field
+
+
+def _assert_pr3x_required_fields_populated(row: object) -> None:
+    for field in PR3X_REQUIRED_CANDIDATE_FIELDS:
         assert getattr(row, field) is not None, field
 
 
@@ -325,6 +352,37 @@ def _fixed_model_score(
         training_eligible=True,
         training_exclusion_reason=None,
         push_probability=Decimal(push_probability),
+    )
+
+
+def _risk_governance_test_candidate(
+    *,
+    epoch: PaperTradingEpoch,
+    game: MlbGame,
+    now: datetime,
+    family: str = "full_game_winner",
+    concept_key: str = "winner:PIT",
+    line_class: str = "not_applicable",
+    rank_score: str = "1.000000",
+) -> ModelCandidate:
+    return ModelCandidate(
+        paper_trading_epoch_id=epoch.id,
+        mlb_game_id=game.id,
+        evaluated_at=now,
+        features={},
+        target_date=game.scheduled_start.astimezone(UTC).date(),
+        market_family=family,
+        market_type=family,
+        inning_scope="first_five" if family.startswith("first_five") else "full_game",
+        contract_side="yes",
+        decision="selected_live_like",
+        net_expected_value=Decimal("0.100000"),
+        probability_edge=Decimal("0.050000"),
+        selector_cluster_rank_score=Decimal(rank_score),
+        concept_cluster_key=concept_key,
+        same_game_concept_cluster_key=concept_key,
+        line_class=line_class,
+        line_class_reason="test",
     )
 
 
@@ -566,6 +624,28 @@ def test_compact_dashboard_preserves_nested_probability_hardening_summary() -> N
     )
     assert compact["probability_hardening"]["probability_hardening_applied_count"] == 3
     assert compact["probability_hardening"]["probability_hardening_block_recommendation_count"] == 1
+
+
+def test_compact_dashboard_preserves_nested_risk_governance_summary() -> None:
+    compact = dashboard._compact_candidate_diagnostics(
+        {
+            "risk_governance": {
+                "risk_governance_policy_version": risk_governance.RISK_GOVERNANCE_POLICY_VERSION,
+                "risk_governance_enabled": True,
+                "risk_candidates_considered": 4,
+                "risk_approved_after_caps": 2,
+                "risk_rejected_by_family_cap": 1,
+                "risk_drawdown_summary": {"status": "clear"},
+            }
+        }
+    )
+
+    assert compact["risk_governance"]["risk_governance_policy_version"] == (
+        risk_governance.RISK_GOVERNANCE_POLICY_VERSION
+    )
+    assert compact["risk_governance"]["risk_candidates_considered"] == 4
+    assert compact["risk_governance"]["risk_approved_after_caps"] == 2
+    assert compact["risk_governance"]["risk_drawdown_summary"] == {"status": "clear"}
 
 
 def _cap_intent(
@@ -833,6 +913,162 @@ def test_probability_hardening_exceptional_tail_can_pass_existing_selector(monke
     assert selected[0].candidate is tail
     assert counts == {}
     assert summary["selector_selected_after_cluster"] == 1
+
+
+def test_risk_governance_family_shadow_and_new_caps(monkeypatch) -> None:
+    get_settings.cache_clear()
+    settings = get_settings()
+    now = datetime(2026, 7, 2, 16, 0, tzinfo=UTC)
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        epoch = get_or_create_active_paper_epoch(session)
+        games = [
+            MlbGame(
+                external_game_id=f"risk-family-{index}",
+                home_team="Pittsburgh Pirates",
+                away_team="Seattle Mariners",
+                home_abbreviation="PIT",
+                away_abbreviation="SEA",
+                scheduled_start=now + timedelta(minutes=90 + index),
+                status="scheduled",
+            )
+            for index in range(4)
+        ]
+        session.add_all(games)
+        session.flush()
+        approved_a = _risk_governance_test_candidate(
+            epoch=epoch,
+            game=games[0],
+            now=now,
+            family="full_game_total",
+            concept_key="total:full:over:8.5",
+            line_class="central",
+            rank_score="4",
+        )
+        approved_b = _risk_governance_test_candidate(
+            epoch=epoch,
+            game=games[1],
+            now=now,
+            family="full_game_total",
+            concept_key="total:full:over:9.5",
+            line_class="near_alternate",
+            rank_score="3",
+        )
+        capped = _risk_governance_test_candidate(
+            epoch=epoch,
+            game=games[2],
+            now=now,
+            family="full_game_total",
+            concept_key="total:full:over:10.5",
+            line_class="deep_alternate",
+            rank_score="2",
+        )
+        shadow = _risk_governance_test_candidate(
+            epoch=epoch,
+            game=games[3],
+            now=now,
+            family="first_five_spread",
+            concept_key="spread:f5:PIT:-0.5",
+            line_class="central",
+            rank_score="1",
+        )
+        candidates_for_risk = [approved_a, approved_b, capped, shadow]
+        session.add_all(candidates_for_risk)
+        session.flush()
+        intents = [
+            SimpleNamespace(
+                candidate=row,
+                game=games[index],
+                market=SimpleNamespace(ticker=f"RISK{index}"),
+                price=Decimal("0.5000"),
+                score=Decimal("1"),
+            )
+            for index, row in enumerate(candidates_for_risk)
+        ]
+
+        selected, counts, summary = risk_governance.apply_risk_governance(
+            session,
+            candidates=candidates_for_risk,
+            intents=intents,
+            settings=settings,
+            active_epoch=epoch,
+            target_date=date(2026, 7, 2),
+            day_start=now,
+            day_end=now + timedelta(days=1),
+        )
+
+    assert selected == intents[:2]
+    assert counts["no_trade_risk_family_new_cap"] == 1
+    assert counts["no_trade_risk_family_shadow_only"] == 1
+    assert summary["risk_candidates_considered"] == 4
+    assert summary["risk_approved_after_caps"] == 2
+    assert summary["risk_rejected_by_family_cap"] == 1
+    assert summary["risk_shadow_only_count"] == 1
+    assert capped.risk_governance_decision == "rejected_by_family_cap"
+    assert shadow.risk_governance_status == "shadow_only"
+    for row in candidates_for_risk:
+        _assert_pr3x_required_fields_populated(row)
+
+
+def test_risk_governance_drawdown_halt_blocks_new_paper_trades(monkeypatch) -> None:
+    get_settings.cache_clear()
+    settings = get_settings()
+    now = datetime(2026, 7, 2, 16, 0, tzinfo=UTC)
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        epoch = get_or_create_active_paper_epoch(session)
+        session.add(
+            BalanceSnapshot(
+                paper_trading_epoch_id=epoch.id,
+                captured_at=now - timedelta(minutes=30),
+                cash_balance=Decimal("600.00"),
+                portfolio_value=Decimal("600.00"),
+                source="test",
+            )
+        )
+        game = MlbGame(
+            external_game_id="risk-drawdown",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=now + timedelta(minutes=90),
+            status="scheduled",
+        )
+        session.add(game)
+        session.flush()
+        candidate = _risk_governance_test_candidate(epoch=epoch, game=game, now=now)
+        session.add(candidate)
+        session.flush()
+        intent = SimpleNamespace(
+            candidate=candidate,
+            game=game,
+            market=SimpleNamespace(ticker="RISK-DRAWDOWN"),
+            price=Decimal("0.5000"),
+            score=Decimal("1"),
+        )
+
+        selected, counts, summary = risk_governance.apply_risk_governance(
+            session,
+            candidates=[candidate],
+            intents=[intent],
+            settings=settings,
+            active_epoch=epoch,
+            target_date=date(2026, 7, 2),
+            day_start=now,
+            day_end=now + timedelta(days=1),
+        )
+
+    assert selected == []
+    assert counts["no_trade_risk_drawdown_halt"] == 1
+    assert summary["risk_drawdown_summary"]["status"] == "halted"
+    assert candidate.risk_governance_decision == "rejected_by_drawdown_halt"
+    assert candidate.risk_governance_drawdown_status == "halted"
+    _assert_pr3x_required_fields_populated(candidate)
 
 
 def test_live_like_selector_enforces_family_scope_thresholds(monkeypatch) -> None:
@@ -2515,6 +2751,7 @@ def test_generate_candidates_dry_run_scores_without_opening_no_trade(monkeypatch
     _assert_pr3t_required_fields_populated(no_candidate)
     _assert_pr3u_required_fields_populated(no_candidate)
     _assert_pr3w_required_fields_populated(no_candidate)
+    _assert_pr3x_required_fields_populated(no_candidate)
     assert no_candidate.economic_exposure_label == "SEA FULL GAME WINNER"
     assert no_candidate.probability_adapter_key == "full_game_winner_probability_adapter"
     assert no_candidate.probability_adapter_policy_version == probability_adapters.PROBABILITY_ADAPTER_POLICY_VERSION
@@ -2533,6 +2770,14 @@ def test_generate_candidates_dry_run_scores_without_opening_no_trade(monkeypatch
     assert no_candidate.selector_mode == "live_like"
     assert no_candidate.selector_decision == "selected_live_like"
     assert no_candidate.selector_selected_from_cluster is True
+    assert no_candidate.risk_governance_policy_version == risk_governance.RISK_GOVERNANCE_POLICY_VERSION
+    assert no_candidate.risk_governance_status == "approved"
+    assert no_candidate.risk_governance_decision == "approved_for_paper_trade"
+    assert no_candidate.risk_governance_approved_before_caps is True
+    assert no_candidate.risk_governance_approved_after_caps is True
+    assert no_candidate.scoring_rationale["risk_governance"]["risk_governance_policy_version"] == (
+        risk_governance.RISK_GOVERNANCE_POLICY_VERSION
+    )
     assert no_candidate.line_class == "not_applicable"
     assert no_candidate.line_class_reason is not None
     assert yes_candidate is not None
@@ -2540,14 +2785,22 @@ def test_generate_candidates_dry_run_scores_without_opening_no_trade(monkeypatch
     _assert_pr3s_required_fields_populated(yes_candidate)
     _assert_pr3u_required_fields_populated(yes_candidate)
     _assert_pr3w_required_fields_populated(yes_candidate)
+    _assert_pr3x_required_fields_populated(yes_candidate)
     assert yes_candidate.selector_policy_version == live_like_selector.SELECTOR_POLICY_VERSION
     assert yes_candidate.selector_status == "not_considered"
+    assert yes_candidate.risk_governance_status == "not_considered"
     assert result["candidate_exposure_field_counts"]["economic_exposure_label"] == 2
     assert result["candidate_exposure_field_counts"]["line_classification_policy_version"] == 2
     assert result["candidate_probability_adapter_field_counts"]["probability_adapter_key"] == 2
     assert result["candidate_probability_hardening_field_counts"]["probability_hardening_policy_version"] == 2
     assert result["candidate_probability_hardening_field_counts"]["probability_before_hardening"] == 2
     assert result["candidate_probability_hardening_field_counts"]["probability_after_hardening"] == 2
+    assert result["candidate_risk_governance_field_counts"]["risk_governance_policy_version"] == 2
+    assert result["candidate_risk_governance_field_counts"]["risk_governance_status"] == 2
+    assert result["risk_governance_policy_version"] == risk_governance.RISK_GOVERNANCE_POLICY_VERSION
+    assert result["risk_candidates_considered"] == 1
+    assert result["risk_approved_after_caps"] == 1
+    assert result["trade_eligible_after_risk_governance"] == 1
     assert result["probability_hardening_policy_version"] == probability_hardening.PROBABILITY_HARDENING_POLICY_VERSION
     assert result["probability_hardening_missing_count"] == 0
     assert result["probability_hardening_status_counts"] == {"not_applicable": 2}
@@ -14392,6 +14645,7 @@ def test_source_status_report_does_not_fail_unattempted_statcast(monkeypatch) ->
 
 
 def test_source_status_report_ignores_pybaseball_player_mapping_misses(monkeypatch) -> None:
+    monkeypatch.setenv("ADVANCED_PUBLIC_STATS_MAX_STALE_HOURS", "168")
     get_settings.cache_clear()
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
@@ -16805,6 +17059,7 @@ def test_full_game_winner_probabilities_allocate_tie_mass_to_no_tie_outcomes() -
 
 
 def test_pr3c_trade_policy_caps_slate_trades(monkeypatch) -> None:
+    monkeypatch.setenv("PAPER_RISK_GOVERNANCE_ENABLED", "false")
     monkeypatch.setenv("PAPER_MAX_TRADES_PER_SLATE", "2")
     monkeypatch.setenv("PAPER_MAX_TRADES_PER_MARKET_FAMILY", "10")
     monkeypatch.setenv("PAPER_MIN_DATA_QUALITY", "0")
@@ -17419,6 +17674,7 @@ def test_normal_non_low_price_candidate_can_still_open(monkeypatch) -> None:
 
 def test_sweep_cap_refills_after_sizing_and_post_cap_rejections(monkeypatch) -> None:
     _relax_data_quality_gate(monkeypatch)
+    monkeypatch.setenv("PAPER_RISK_GOVERNANCE_ENABLED", "false")
     monkeypatch.setenv("PAPER_MAX_NEW_TRADES_PER_SWEEP", "1")
     monkeypatch.setenv("PAPER_MAX_DAILY_NEW_RISK_PCT", "0.008")
     monkeypatch.setenv("PAPER_MAX_OPEN_RISK_PCT", "0.008")
@@ -17617,6 +17873,7 @@ def test_early_reserve_refills_after_sizing_and_post_cap_rejections(monkeypatch)
 
 def test_low_price_sweep_cap_refills_after_sizing_rejection(monkeypatch) -> None:
     _relax_data_quality_gate(monkeypatch)
+    monkeypatch.setenv("PAPER_RISK_GOVERNANCE_ENABLED", "false")
     monkeypatch.setenv("PAPER_MAX_NEW_TRADES_PER_SWEEP", "10")
     monkeypatch.setenv("PAPER_LOW_PRICE_MAX_TRADES_PER_SWEEP", "1")
     monkeypatch.setenv("PAPER_LOW_PRICE_MAX_TRADES_PER_SLATE", "2")
@@ -18247,6 +18504,7 @@ def test_line_selection_rejects_correlated_total_lines_before_caps(monkeypatch) 
 
 def test_trade_caps_allow_configured_multiple_total_lines(monkeypatch) -> None:
     monkeypatch.setenv("PAPER_SELECTOR_MODE", "legacy")
+    monkeypatch.setenv("PAPER_RISK_GOVERNANCE_ENABLED", "false")
     monkeypatch.setenv("PAPER_ALLOW_MULTIPLE_LINES_PER_GAME_FAMILY", "true")
     monkeypatch.setenv("PAPER_MAX_TRADES_PER_GAME_FAMILY", "2")
     monkeypatch.setenv("PAPER_MAX_TRADES_PER_GAME_SCOPE", "2")
@@ -18456,6 +18714,24 @@ def test_model_predictions_today_filters_by_prediction_run_target_date(monkeypat
             probability_hardening_dampening_factor=Decimal("1.0000"),
             probability_hardening_shadow_only=False,
             probability_hardening_block_recommendation=False,
+            risk_governance_policy_version=risk_governance.RISK_GOVERNANCE_POLICY_VERSION,
+            risk_governance_enabled=True,
+            risk_governance_status="approved",
+            risk_governance_decision="approved_for_paper_trade",
+            risk_governance_rejection_reason="none",
+            risk_governance_family_status="enabled",
+            risk_governance_family_cap_status="passed",
+            risk_governance_concept_cluster_cap_status="passed",
+            risk_governance_same_game_cap_status="passed",
+            risk_governance_alternate_line_cap_status="not_applicable",
+            risk_governance_low_price_tail_cap_status="not_applicable",
+            risk_governance_drawdown_status="clear",
+            risk_governance_approved_before_caps=True,
+            risk_governance_approved_after_caps=True,
+            risk_governance_shadow_only=False,
+            risk_governance_blocked=False,
+            risk_governance_rank=1,
+            risk_governance_rank_score=Decimal("9.123456"),
         )
         session.add(today_candidate)
         session.flush()
@@ -18584,6 +18860,24 @@ def test_model_predictions_today_filters_by_prediction_run_target_date(monkeypat
     assert item["probability_hardening_dampening_factor"] == 1.0
     assert item["probability_hardening_shadow_only"] is False
     assert item["probability_hardening_block_recommendation"] is False
+    assert item["risk_governance_policy_version"] == risk_governance.RISK_GOVERNANCE_POLICY_VERSION
+    assert item["risk_governance_enabled"] is True
+    assert item["risk_governance_status"] == "approved"
+    assert item["risk_governance_decision"] == "approved_for_paper_trade"
+    assert item["risk_governance_rejection_reason"] == "none"
+    assert item["risk_governance_family_status"] == "enabled"
+    assert item["risk_governance_family_cap_status"] == "passed"
+    assert item["risk_governance_concept_cluster_cap_status"] == "passed"
+    assert item["risk_governance_same_game_cap_status"] == "passed"
+    assert item["risk_governance_alternate_line_cap_status"] == "not_applicable"
+    assert item["risk_governance_low_price_tail_cap_status"] == "not_applicable"
+    assert item["risk_governance_drawdown_status"] == "clear"
+    assert item["risk_governance_approved_before_caps"] is True
+    assert item["risk_governance_approved_after_caps"] is True
+    assert item["risk_governance_shadow_only"] is False
+    assert item["risk_governance_blocked"] is False
+    assert item["risk_governance_rank"] == 1
+    assert item["risk_governance_rank_score"] == 9.123456
     assert "raw_output" not in item
     assert "features" not in item
     assert "scoring_rationale" not in item
@@ -21922,6 +22216,7 @@ def test_game_scope_correlation_rejection_persists_without_creating_trade(monkey
 def test_same_game_different_scopes_can_both_trade(monkeypatch) -> None:
     _relax_data_quality_gate(monkeypatch)
     monkeypatch.setenv("PAPER_SELECTOR_MODE", "legacy")
+    monkeypatch.setenv("PAPER_RISK_GOVERNANCE_ENABLED", "false")
     get_settings.cache_clear()
     now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
     monkeypatch.setattr(candidates, "utc_now", lambda: now)

@@ -57,6 +57,7 @@ from app.services.features import (
     sync_travel_schedule_features,
     sync_weather_features,
 )
+from app.services.risk_governance import RISK_GOVERNANCE_FIELD_NAMES
 from app.services.modeling import (
     active_parameter_payload,
     governance_status,
@@ -228,6 +229,11 @@ def system_status() -> SystemStatus:
         "public_sources_enabled": settings.feature_sync_enable_network_sources,
         "mlb_stats_base_url": settings.mlb_stats_base_url,
         "open_meteo_base_url": settings.open_meteo_base_url,
+        "paper_risk_governance_enabled": settings.paper_risk_governance_enabled,
+        "paper_risk_governance_policy_version": settings.paper_risk_governance_policy_version,
+        "paper_drawdown_halt_enabled": settings.paper_drawdown_halt_enabled,
+        "paper_drawdown_halt_threshold_abs": float(settings.paper_drawdown_halt_threshold_abs),
+        "paper_drawdown_halt_threshold_pct": float(settings.paper_drawdown_halt_threshold_pct),
     }
     if db_status["ready"]:
         try:
@@ -245,10 +251,22 @@ def system_status() -> SystemStatus:
                         "optional_injury_provider_configured",
                         "optional_lineup_provider_configured",
                         "optional_weather_provider_configured",
+                        "paper_risk_governance_enabled",
+                        "paper_risk_governance_policy_version",
+                        "paper_drawdown_halt_enabled",
+                        "paper_drawdown_halt_threshold_abs",
+                        "paper_drawdown_halt_threshold_pct",
                     )
                     if key in full_source_status
                 }
-                source_status = {**compact_source_status, **config_fields}
+                risk_config_fields = {
+                    "paper_risk_governance_enabled": settings.paper_risk_governance_enabled,
+                    "paper_risk_governance_policy_version": settings.paper_risk_governance_policy_version,
+                    "paper_drawdown_halt_enabled": settings.paper_drawdown_halt_enabled,
+                    "paper_drawdown_halt_threshold_abs": float(settings.paper_drawdown_halt_threshold_abs),
+                    "paper_drawdown_halt_threshold_pct": float(settings.paper_drawdown_halt_threshold_pct),
+                }
+                source_status = {**compact_source_status, **config_fields, **risk_config_fields}
         except Exception:
             source_status["last_error"] = "source status unavailable"
 
@@ -368,6 +386,7 @@ def _candidate_summary(candidate: ModelCandidate, game: MlbGame | None, market: 
         probability_adapter_calibration_version=candidate.probability_adapter_calibration_version,
         probability_adapter_feature_policy_version=candidate.probability_adapter_feature_policy_version,
         **_candidate_prediction_probability_hardening(candidate),
+        **_candidate_prediction_risk_governance(candidate),
         decision=candidate.decision,
     )
 
@@ -831,6 +850,24 @@ def _model_predictions_for_date(target_date: date) -> dict[str, object]:
                         ModelCandidate.probability_hardening_shadow_only,
                         ModelCandidate.probability_hardening_block_recommendation,
                         ModelCandidate.probability_hardening_error_reason,
+                        ModelCandidate.risk_governance_policy_version,
+                        ModelCandidate.risk_governance_enabled,
+                        ModelCandidate.risk_governance_status,
+                        ModelCandidate.risk_governance_decision,
+                        ModelCandidate.risk_governance_rejection_reason,
+                        ModelCandidate.risk_governance_family_status,
+                        ModelCandidate.risk_governance_family_cap_status,
+                        ModelCandidate.risk_governance_concept_cluster_cap_status,
+                        ModelCandidate.risk_governance_same_game_cap_status,
+                        ModelCandidate.risk_governance_alternate_line_cap_status,
+                        ModelCandidate.risk_governance_low_price_tail_cap_status,
+                        ModelCandidate.risk_governance_drawdown_status,
+                        ModelCandidate.risk_governance_approved_before_caps,
+                        ModelCandidate.risk_governance_approved_after_caps,
+                        ModelCandidate.risk_governance_shadow_only,
+                        ModelCandidate.risk_governance_blocked,
+                        ModelCandidate.risk_governance_rank,
+                        ModelCandidate.risk_governance_rank_score,
                     ),
                     load_only(KalshiMarket.id, KalshiMarket.ticker),
                     load_only(ModelPredictionRun.id, ModelPredictionRun.target_date),
@@ -854,6 +891,7 @@ def _model_predictions_for_date(target_date: date) -> dict[str, object]:
                 **_candidate_prediction_selector(candidate),
                 **_candidate_prediction_probability_adapter(candidate),
                 **_candidate_prediction_probability_hardening(candidate),
+                **_candidate_prediction_risk_governance(candidate),
                 "probability_raw": _decimal_float(output.probability_raw),
                 "probability_calibrated": _decimal_float(output.probability_calibrated),
                 "fair_value": _decimal_float(output.fair_value),
@@ -1042,6 +1080,14 @@ def _candidate_prediction_probability_hardening(candidate: ModelCandidate | None
         "probability_hardening_block_recommendation": candidate.probability_hardening_block_recommendation,
         "probability_hardening_error_reason": candidate.probability_hardening_error_reason,
     }
+
+
+def _candidate_prediction_risk_governance(candidate: ModelCandidate | None) -> dict[str, object]:
+    if candidate is None:
+        return {key: None for key in RISK_GOVERNANCE_FIELD_NAMES}
+    payload = {key: getattr(candidate, key, None) for key in RISK_GOVERNANCE_FIELD_NAMES}
+    payload["risk_governance_rank_score"] = _decimal_float(candidate.risk_governance_rank_score)
+    return payload
 
 
 @app.get("/v1/model/predictions", response_model=RunResponse)

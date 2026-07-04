@@ -122,6 +122,24 @@ class PositionSummary(BaseModel):
     selector_shadow_only: bool | None = None
     selector_live_like_eligible_before_cluster: bool | None = None
     selector_live_like_eligible_after_cluster: bool | None = None
+    risk_governance_policy_version: str | None = None
+    risk_governance_enabled: bool | None = None
+    risk_governance_status: str | None = None
+    risk_governance_decision: str | None = None
+    risk_governance_rejection_reason: str | None = None
+    risk_governance_family_status: str | None = None
+    risk_governance_family_cap_status: str | None = None
+    risk_governance_concept_cluster_cap_status: str | None = None
+    risk_governance_same_game_cap_status: str | None = None
+    risk_governance_alternate_line_cap_status: str | None = None
+    risk_governance_low_price_tail_cap_status: str | None = None
+    risk_governance_drawdown_status: str | None = None
+    risk_governance_approved_before_caps: bool | None = None
+    risk_governance_approved_after_caps: bool | None = None
+    risk_governance_shadow_only: bool | None = None
+    risk_governance_blocked: bool | None = None
+    risk_governance_rank: int | None = None
+    risk_governance_rank_score: float | None = None
     display_title: str | None = None
     display_subtitle: str | None = None
     raw_ticker_display: str | None = None
@@ -352,6 +370,24 @@ class CandidateSummary(BaseModel):
     probability_hardening_shadow_only: bool | None = None
     probability_hardening_block_recommendation: bool | None = None
     probability_hardening_error_reason: str | None = None
+    risk_governance_policy_version: str | None = None
+    risk_governance_enabled: bool | None = None
+    risk_governance_status: str | None = None
+    risk_governance_decision: str | None = None
+    risk_governance_rejection_reason: str | None = None
+    risk_governance_family_status: str | None = None
+    risk_governance_family_cap_status: str | None = None
+    risk_governance_concept_cluster_cap_status: str | None = None
+    risk_governance_same_game_cap_status: str | None = None
+    risk_governance_alternate_line_cap_status: str | None = None
+    risk_governance_low_price_tail_cap_status: str | None = None
+    risk_governance_drawdown_status: str | None = None
+    risk_governance_approved_before_caps: bool | None = None
+    risk_governance_approved_after_caps: bool | None = None
+    risk_governance_shadow_only: bool | None = None
+    risk_governance_blocked: bool | None = None
+    risk_governance_rank: int | None = None
+    risk_governance_rank_score: float | None = None
     decision: str
 
 

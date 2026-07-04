@@ -44,6 +44,7 @@ from app.services.features import FEATURE_VERSION, source_status_report, starter
 from app.services.modeling import governance_status as model_governance_status
 from app.services.portfolio import calculate_paper_portfolio, paper_trade_fee
 from app.services.paper_epoch import resolve_epoch_filter
+from app.services.risk_governance import RISK_GOVERNANCE_FIELD_NAMES
 from app.services.ws_market_data import ws_status_running_is_fresh
 from app.time_utils import eastern_display, ensure_aware_utc, get_dashboard_zone, to_eastern_iso, today_eastern, utc_now
 
@@ -242,6 +243,13 @@ def _position_selector_payload(trade: PaperTrade) -> dict[str, object] | None:
     return compact or None
 
 
+def _position_risk_governance_payload(trade: PaperTrade) -> dict[str, object] | None:
+    payload = {key: getattr(trade, key, None) for key in RISK_GOVERNANCE_FIELD_NAMES}
+    payload["risk_governance_rank_score"] = _float(trade.risk_governance_rank_score)
+    compact = {key: value for key, value in payload.items() if value is not None}
+    return compact or None
+
+
 def _position_from_trade(
     trade: PaperTrade,
     game: MlbGame | None = None,
@@ -279,6 +287,9 @@ def _position_from_trade(
     selector_payload = _position_selector_payload(trade)
     if selector_payload is not None:
         selected_rationale["selector"] = selector_payload
+    risk_governance_payload = _position_risk_governance_payload(trade)
+    if risk_governance_payload is not None:
+        selected_rationale["risk_governance"] = risk_governance_payload
     return PositionSummary(
         time_entered=to_eastern_iso(trade.entry_time),
         time_entered_display=eastern_display(trade.entry_time),
@@ -324,6 +335,24 @@ def _position_from_trade(
         selector_shadow_only=trade.selector_shadow_only,
         selector_live_like_eligible_before_cluster=trade.selector_live_like_eligible_before_cluster,
         selector_live_like_eligible_after_cluster=trade.selector_live_like_eligible_after_cluster,
+        risk_governance_policy_version=trade.risk_governance_policy_version,
+        risk_governance_enabled=trade.risk_governance_enabled,
+        risk_governance_status=trade.risk_governance_status,
+        risk_governance_decision=trade.risk_governance_decision,
+        risk_governance_rejection_reason=trade.risk_governance_rejection_reason,
+        risk_governance_family_status=trade.risk_governance_family_status,
+        risk_governance_family_cap_status=trade.risk_governance_family_cap_status,
+        risk_governance_concept_cluster_cap_status=trade.risk_governance_concept_cluster_cap_status,
+        risk_governance_same_game_cap_status=trade.risk_governance_same_game_cap_status,
+        risk_governance_alternate_line_cap_status=trade.risk_governance_alternate_line_cap_status,
+        risk_governance_low_price_tail_cap_status=trade.risk_governance_low_price_tail_cap_status,
+        risk_governance_drawdown_status=trade.risk_governance_drawdown_status,
+        risk_governance_approved_before_caps=trade.risk_governance_approved_before_caps,
+        risk_governance_approved_after_caps=trade.risk_governance_approved_after_caps,
+        risk_governance_shadow_only=trade.risk_governance_shadow_only,
+        risk_governance_blocked=trade.risk_governance_blocked,
+        risk_governance_rank=trade.risk_governance_rank,
+        risk_governance_rank_score=_float(trade.risk_governance_rank_score),
         display_title=fallback_labels.display_title,
         display_subtitle=fallback_labels.display_subtitle,
         raw_ticker_display=fallback_labels.raw_ticker_display,
@@ -1071,6 +1100,30 @@ PROBABILITY_HARDENING_DIAGNOSTIC_COMPACT_KEYS = (
     "probability_hardening_monotonicity_status_counts",
 )
 
+RISK_GOVERNANCE_DIAGNOSTIC_COMPACT_KEYS = (
+    "risk_governance_policy_version",
+    "risk_governance_enabled",
+    "risk_candidates_considered",
+    "risk_approved_before_caps",
+    "risk_approved_after_caps",
+    "risk_shadow_only_count",
+    "risk_blocked_count",
+    "risk_rejected_by_family_status",
+    "risk_rejected_by_family_cap",
+    "risk_rejected_by_concept_cluster_cap",
+    "risk_rejected_by_same_game_cap",
+    "risk_rejected_by_alternate_line_cap",
+    "risk_rejected_by_low_price_tail_cap",
+    "risk_rejected_by_drawdown_halt",
+    "risk_by_family_scope",
+    "risk_by_line_class",
+    "risk_by_same_game_sample",
+    "risk_drawdown_summary",
+    "candidate_risk_governance_field_counts",
+    "trade_eligible_after_risk_governance",
+    "trades_blocked_by_risk_governance",
+)
+
 
 def _prediction_summary_json_value(section: str, key: str):
     return ModelPredictionRun.summary[section][key]
@@ -1093,6 +1146,10 @@ def _prediction_summary_compact_columns() -> list[object]:
     columns.extend(
         ModelPredictionRun.summary[key].label(f"probability_hardening_{key}")
         for key in PROBABILITY_HARDENING_DIAGNOSTIC_COMPACT_KEYS
+    )
+    columns.extend(
+        ModelPredictionRun.summary[key].label(f"risk_governance_{key}")
+        for key in RISK_GOVERNANCE_DIAGNOSTIC_COMPACT_KEYS
     )
     columns.extend(
         [
@@ -1160,7 +1217,19 @@ def _compact_prediction_summary_from_row(row) -> dict[str, object] | None:
         for key in PROBABILITY_HARDENING_DIAGNOSTIC_COMPACT_KEYS
         if row.get(f"probability_hardening_{key}") is not None
     }
-    if not candidate and not quality_ev and not selector and not probability_adapter and not probability_hardening:
+    risk_governance = {
+        key: row[f"risk_governance_{key}"]
+        for key in RISK_GOVERNANCE_DIAGNOSTIC_COMPACT_KEYS
+        if row.get(f"risk_governance_{key}") is not None
+    }
+    if (
+        not candidate
+        and not quality_ev
+        and not selector
+        and not probability_adapter
+        and not probability_hardening
+        and not risk_governance
+    ):
         return None
     return {
         "candidate_diagnostics": candidate,
@@ -1168,6 +1237,7 @@ def _compact_prediction_summary_from_row(row) -> dict[str, object] | None:
         "selector": selector,
         "probability_adapter": probability_adapter,
         "probability_hardening": probability_hardening,
+        "risk_governance": risk_governance,
     }
 
 
@@ -1226,6 +1296,13 @@ def _compact_candidate_diagnostics(
             for key in PROBABILITY_HARDENING_DIAGNOSTIC_COMPACT_KEYS
             if key in run_summary
         }
+    risk_governance = run_summary.get("risk_governance")
+    if not isinstance(risk_governance, dict):
+        risk_governance = {
+            key: run_summary.get(key)
+            for key in RISK_GOVERNANCE_DIAGNOSTIC_COMPACT_KEYS
+            if key in run_summary
+        }
     if include_details:
         return dict(
             _compact_payload(
@@ -1235,6 +1312,7 @@ def _compact_candidate_diagnostics(
                     "selector": selector or {},
                     "probability_adapter": probability_adapter or {},
                     "probability_hardening": probability_hardening or {},
+                    "risk_governance": risk_governance or {},
                 },
                 max_depth=5,
                 max_list_items=25,
@@ -1279,6 +1357,8 @@ def _compact_candidate_diagnostics(
         result["probability_adapter"] = probability_adapter
     if probability_hardening:
         result["probability_hardening"] = probability_hardening
+    if risk_governance:
+        result["risk_governance"] = risk_governance
     return result
 
 
@@ -1827,6 +1907,15 @@ def dashboard_summary_from_db(
         trade_caps_used.update(last_prediction_summary.get("cap_counts", {}))
         trade_caps_used.update(last_prediction_summary.get("risk_caps", {}))
         trade_caps_used.update(last_prediction_summary.get("candidate_sweep_window", {}))
+        risk_governance = last_prediction_summary.get("risk_governance")
+        if isinstance(risk_governance, dict):
+            trade_caps_used.update(
+                {
+                    key: risk_governance.get(key)
+                    for key in RISK_GOVERNANCE_DIAGNOSTIC_COMPACT_KEYS
+                    if key in risk_governance
+                }
+            )
         trade_caps_used.update(
             {
                 key: last_prediction_summary.get(key)
@@ -1861,6 +1950,11 @@ def dashboard_summary_from_db(
             "full_game_spread_audit_gate_enabled": True,
             "full_game_spread_requires_trusted_audit": True,
             "full_game_spread_latest_audit": _latest_spread_audit_counts(session, active_epoch),
+            "paper_risk_governance_enabled": settings.paper_risk_governance_enabled,
+            "paper_risk_governance_policy_version": settings.paper_risk_governance_policy_version,
+            "paper_drawdown_halt_enabled": settings.paper_drawdown_halt_enabled,
+            "paper_drawdown_halt_threshold_abs": float(settings.paper_drawdown_halt_threshold_abs),
+            "paper_drawdown_halt_threshold_pct": float(settings.paper_drawdown_halt_threshold_pct),
         }
     )
     summary.model_status = ModelStatus(

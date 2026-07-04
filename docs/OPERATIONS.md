@@ -89,6 +89,7 @@ The jobs currently cover:
 - Strict paper trade caps by slate, game, market family, open-position count, correlated game/family exposure, and aggregate bankroll risk. Defaults are 8 trades per slate, 4 per family, 12 open positions, 20% daily new risk, 25% open risk, 10% family risk, 15% scope risk, and 8% sub-20c low-price bucket risk.
 - PR3k adds stricter paper selection controls: first-five `TIE` is diagnostics-only, sub-10c prices are blocked, 10c-under-20c prices need stronger EV/edge and have low-price slate/sweep caps, each sweep opens at most 3 new trades by default, early sweeps reserve later slots, same-side exposure is capped by default, and risk-cap-reduced positions must still meet minimum size.
 - PR3s records compact exposure-taxonomy metadata on candidates and paper trades so operators can distinguish economic exposure from Kalshi YES/NO contract mechanics. These labels and line classes are display/diagnostic fields only and must not be used as a hidden replacement for existing paper trade caps, settlement, model math, or source-ingestion rules.
+- PR3x adds a paper-only risk-governance pass after the live-like selector and before legacy caps/sizing. It enforces family, concept-cluster, same-game, alternate-line, low-price/tail, and drawdown-halt controls while preserving all scored candidates for diagnostics and governance. It blocks new paper trades only; it does not close positions or change settlement.
 - Spread markets are diagnostics-only unless `PAPER_SPREAD_TRADING_ENABLED=true`. Do not enable spread paper trading until side-aware spread parsing and settlement have been manually verified against the Kalshi UI.
 
 They do not cover scheduled automation or live execution.
@@ -1091,6 +1092,59 @@ $statusFinal.config | Select-Object paper_trading,live_trading_enabled,execution
 ```
 
 Expected: governance succeeds or cleanly skips by existing thresholds, and safety remains paper trading true, live trading false, kill switch true, Kalshi demo, and no production credential requirement. PR3w.1 does not add migrations, live execution, sportsbook data, team totals, umpire factors, MVE/multivariate markets, cron changes, source-ingestion changes, settlement changes, or raw payload/debug response bloat.
+
+## PR3x Paper Risk Governance Validation
+
+PR3x keeps the system paper-only and adds compact risk-governance controls after PR3t selection and PR3w hardening. Validate it against the fixed production backend and known replay slate `2026-07-04`. Prompt only for the internal API key.
+
+Expected safe config:
+
+- `PAPER_RISK_GOVERNANCE_ENABLED=true`
+- `PAPER_RISK_GOVERNANCE_POLICY_VERSION=pr3x_paper_risk_governance_v1`
+- `PAPER_DRAWDOWN_HALT_ENABLED=true`
+- `PAPER_DRAWDOWN_HALT_THRESHOLD_ABS=50.00`
+- `PAPER_DRAWDOWN_HALT_THRESHOLD_PCT=0.10`
+- `PAPER_TRADING=true`
+- `LIVE_TRADING_ENABLED=false`
+- `EXECUTION_KILL_SWITCH=true`
+- `KALSHI_ENV=demo`
+
+Run the same dry-run validation pattern:
+
+```powershell
+$base = "https://homerun-production-2551.up.railway.app"
+$headers = @{"X-API-Key"="YOUR_KEY"}
+$targetDate = "2026-07-04"
+$label = "pr3x_risk_governance_validation"
+$dry = Invoke-RestMethod -Method Post -Headers $headers "$base/v1/jobs/run/candidate-sweep?target_date=$targetDate&min_time_to_start_minutes=0&max_time_to_start_minutes=1800&sweep_label=$label&dry_run_candidates_only=true"
+$predictions = Invoke-RestMethod -Method Get -Headers $headers "$base/v1/model/predictions?date=$targetDate"
+$system = Invoke-RestMethod -Method Get "$base/v1/system/status"
+```
+
+Expected candidate-sweep result:
+
+- nonzero `candidates_evaluated`
+- `dry_run_candidates_only=true`
+- `paper_trades=0`
+- `feature_sync_mode=cache_only`
+- `heavy_feature_sync_skipped=true`
+- `risk_governance_policy_version=pr3x_paper_risk_governance_v1`
+- `risk_candidates_considered`, `risk_approved_before_caps`, `risk_approved_after_caps`, and risk rejection counts are present
+- `candidate_risk_governance_field_counts.risk_governance_policy_version` equals the evaluated candidate count
+- `risk_drawdown_summary.status` is present and is normally `clear` unless the active epoch has breached the configured drawdown halt
+
+Expected prediction rows:
+
+- Newly scored candidate rows expose compact non-null PR3x fields where candidate data exists: `risk_governance_policy_version`, `risk_governance_enabled`, `risk_governance_status`, `risk_governance_decision`, `risk_governance_rejection_reason`, family/cap statuses, drawdown status, approved-before/after flags, shadow/blocked flags, and risk rank/score.
+- Raw features, full scoring rationale blobs, and unbounded candidate arrays should not appear in `/v1/model/predictions`.
+
+Expected dashboard/system checks:
+
+- `/v1/dashboard/summary` compact diagnostics include a `risk_governance` block after a candidate sweep.
+- `/v1/system/status` reports the PR3x risk-governance config fields without secrets.
+- Open and closed position tables remain compact and only show PR3x rationale for selected paper trades.
+
+PR3x must not change live execution, cron schedules, source ingestion, model math, EV thresholds, settlement, WebSocket behavior, market discovery, production credentials, sportsbook/Odds API scope, team totals, umpire factors, or MVE/multivariate markets.
 
 ## Required Context Updates
 

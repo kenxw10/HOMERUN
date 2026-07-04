@@ -67,6 +67,13 @@ from app.services.probability_hardening import (
     probability_hardening_summary,
 )
 from app.services.portfolio import calculate_paper_portfolio, create_balance_snapshot, paper_trade_fee
+from app.services.risk_governance import (
+    apply_risk_governance,
+    copy_risk_governance_metadata_to_trade,
+    risk_governance_field_counts,
+    risk_governance_payload,
+    risk_governance_policy_version,
+)
 from app.services.paper_epoch import get_or_create_active_paper_epoch
 from app.services.spread_verification import (
     SPREAD_FAMILIES,
@@ -2800,6 +2807,11 @@ def generate_candidates(
             "probability_adapter_policy_version": PROBABILITY_ADAPTER_POLICY_VERSION,
             "paper_probability_hardening_enabled": settings.paper_probability_hardening_enabled,
             "paper_probability_hardening_policy_version": settings.paper_probability_hardening_policy_version,
+            "paper_risk_governance_enabled": settings.paper_risk_governance_enabled,
+            "paper_risk_governance_policy_version": risk_governance_policy_version(settings),
+            "paper_drawdown_halt_enabled": settings.paper_drawdown_halt_enabled,
+            "paper_drawdown_halt_threshold_abs": float(settings.paper_drawdown_halt_threshold_abs),
+            "paper_drawdown_halt_threshold_pct": float(settings.paper_drawdown_halt_threshold_pct),
             "paper_spread_trading_enabled": settings.paper_spread_trading_enabled,
             "paper_first_five_spread_trading_enabled": settings.paper_spread_trading_enabled,
             "paper_full_game_spread_trading_enabled": settings.paper_full_game_spread_trading_enabled,
@@ -3673,7 +3685,30 @@ def generate_candidates(
             session.add(output)
         session.add(intent.candidate)
 
-    cap_input_trades = [] if dry_run_candidates_only else selector_selected_trades
+    risk_governance_selected_trades, risk_governance_counts, risk_governance_summary = apply_risk_governance(
+        session,
+        candidates=evaluated_candidates,
+        intents=selector_selected_trades,
+        settings=settings,
+        active_epoch=active_epoch,
+        target_date=day,
+        day_start=day_start,
+        day_end=day_end,
+        dry_run_candidates_only=dry_run_candidates_only,
+    )
+    candidate_risk_governance_field_counts = risk_governance_field_counts(evaluated_candidates)
+    for candidate in evaluated_candidates:
+        output = outputs_by_candidate_id.get(candidate.id)
+        if output is not None:
+            output.decision_reason = candidate.decision
+            raw = dict(output.raw_output or {})
+            raw["risk_governance"] = risk_governance_payload(candidate)
+            raw["gate_diagnostics"] = candidate.gate_diagnostics or {}
+            output.raw_output = raw
+            session.add(output)
+        session.add(candidate)
+
+    cap_input_trades = [] if dry_run_candidates_only else risk_governance_selected_trades
     selected_trades, cap_counts, trade_allocation_summary = _apply_trade_caps(
         session,
         cap_input_trades,
@@ -3867,6 +3902,7 @@ def generate_candidates(
         )
         _copy_exposure_metadata_to_trade(trade, candidate)
         _copy_selector_metadata_to_trade(trade, candidate)
+        copy_risk_governance_metadata_to_trade(trade, candidate)
         session.add(trade)
         output = outputs_by_candidate_id.get(candidate.id)
         if output is not None:
@@ -3877,6 +3913,7 @@ def generate_candidates(
                 **(intent.sizing or {}),
                 "contracts": intent.quantity,
             }
+            raw["risk_governance"] = risk_governance_payload(candidate)
             raw["gate_diagnostics"] = candidate.gate_diagnostics or {}
             output.raw_output = raw
             session.add(output)
@@ -3923,6 +3960,8 @@ def generate_candidates(
     for key, value in side_conflict_counts.items():
         all_cap_counts[key] = all_cap_counts.get(key, 0) + value
     for key, value in game_scope_counts.items():
+        all_cap_counts[key] = all_cap_counts.get(key, 0) + value
+    for key, value in risk_governance_counts.items():
         all_cap_counts[key] = all_cap_counts.get(key, 0) + value
     for key, value in risk_cap_counts.items():
         all_cap_counts[key] = all_cap_counts.get(key, 0) + value
@@ -3994,11 +4033,16 @@ def generate_candidates(
         "probability_adapter_policy_version": PROBABILITY_ADAPTER_POLICY_VERSION,
         "probability_hardening_policy_version": settings.paper_probability_hardening_policy_version,
         "probability_hardening_enabled": settings.paper_probability_hardening_enabled,
+        "risk_governance_policy_version": risk_governance_policy_version(settings),
+        "risk_governance_enabled": settings.paper_risk_governance_enabled,
         "candidate_exposure_field_counts": candidate_exposure_field_counts,
         "candidate_probability_adapter_field_counts": candidate_probability_adapter_field_counts,
         "candidate_probability_hardening_field_counts": candidate_probability_hardening_field_counts,
+        "candidate_risk_governance_field_counts": candidate_risk_governance_field_counts,
         **probability_adapter_summary,
         **probability_hardening_summary_payload,
+        "risk_governance": risk_governance_summary,
+        **risk_governance_summary,
         "candidate_selector_field_counts": candidate_selector_field_counts,
         "line_classification_counts": line_classification_counts,
         "line_selection": line_selection_counts,
@@ -4010,11 +4054,13 @@ def generate_candidates(
         "trade_eligible_after_line_selection": len(line_selected_trades),
         "trade_eligible_after_game_scope_correlation": len(scope_selected_trades),
         "trade_eligible_after_live_like_selector": len(selector_selected_trades),
-        "trade_eligible_before_caps": len(selector_selected_trades),
+        "trade_eligible_after_risk_governance": len(risk_governance_selected_trades),
+        "trade_eligible_before_caps": len(risk_governance_selected_trades),
         "trades_blocked_by_edge_or_fee": trades_blocked_by_edge_or_fee,
         "trades_blocked_by_line_selection": line_selection_counts["line_selection_candidates_rejected"],
         "trades_blocked_by_live_like_selector": sum(selector_counts.values()),
         "trades_blocked_by_game_scope_correlation": game_scope_counts["game_scope_correlation_candidates_rejected"],
+        "trades_blocked_by_risk_governance": sum(risk_governance_counts.values()),
         "stale_price_count": stale_price_count,
         "paper_trades": paper_trades,
         "sizing_rejections": sizing_rejections,
@@ -4089,11 +4135,16 @@ def generate_candidates(
         "probability_adapter_policy_version": PROBABILITY_ADAPTER_POLICY_VERSION,
         "probability_hardening_policy_version": settings.paper_probability_hardening_policy_version,
         "probability_hardening_enabled": settings.paper_probability_hardening_enabled,
+        "risk_governance_policy_version": risk_governance_policy_version(settings),
+        "risk_governance_enabled": settings.paper_risk_governance_enabled,
         "candidate_exposure_field_counts": candidate_exposure_field_counts,
         "candidate_probability_adapter_field_counts": candidate_probability_adapter_field_counts,
         "candidate_probability_hardening_field_counts": candidate_probability_hardening_field_counts,
+        "candidate_risk_governance_field_counts": candidate_risk_governance_field_counts,
         **probability_adapter_summary,
         **probability_hardening_summary_payload,
+        "risk_governance": risk_governance_summary,
+        **risk_governance_summary,
         "candidate_selector_field_counts": candidate_selector_field_counts,
         "line_classification_counts": line_classification_counts,
         "selector": selector_summary,
@@ -4112,11 +4163,12 @@ def generate_candidates(
         "blocked_by_line_selection": gate_summary["blocked_by_line_selection"],
         "blocked_by_caps": gate_summary["blocked_by_caps"],
         "trade_eligible_after_side_conflict_guard": len(side_guarded_trades),
-        "trade_eligible_before_caps": len(selector_selected_trades),
+        "trade_eligible_before_caps": len(risk_governance_selected_trades),
         "trade_eligible_after_ev_filters": len(trade_intents),
         "trade_eligible_after_line_selection": len(line_selected_trades),
         "trade_eligible_after_game_scope_correlation": len(scope_selected_trades),
         "trade_eligible_after_live_like_selector": len(selector_selected_trades),
+        "trade_eligible_after_risk_governance": len(risk_governance_selected_trades),
         "trades_blocked_by_caps": trades_blocked_by_caps,
         "trades_blocked_by_edge_or_fee": trades_blocked_by_edge_or_fee,
         "trades_blocked_by_line_selection": line_selection_counts["line_selection_candidates_rejected"],
@@ -4124,6 +4176,7 @@ def generate_candidates(
         + all_cap_counts.get("no_trade_correlated_market_cap", 0)
         + game_scope_counts["game_scope_correlation_candidates_rejected"],
         "trades_blocked_by_live_like_selector": sum(selector_counts.values()),
+        "trades_blocked_by_risk_governance": sum(risk_governance_counts.values()),
         "trades_blocked_by_game_scope_correlation": game_scope_counts["game_scope_correlation_candidates_rejected"],
         "stale_price_count": stale_price_count,
         "non_executable_price_count": non_executable_price_count,
