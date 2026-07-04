@@ -3616,29 +3616,16 @@ def test_governance_job_scopes_resolved_samples_to_active_epoch() -> None:
         archived_id = archived.id
 
         for epoch_id, outcome in ((active_id, "win"), (archived_id, "loss")):
-            session.add(
-                ModelCandidate(
-                    paper_trading_epoch_id=epoch_id,
-                    mlb_game_id=game.id,
-                    evaluated_at=datetime(2026, 7, 2, 16, 0, tzinfo=UTC),
-                    features={},
-                    probability=Decimal("0.600000"),
-                    model_probability=Decimal("0.600000"),
-                    probability_calibrated=Decimal("0.600000"),
-                    target_date=target,
-                    fee_estimate=Decimal("0.010000"),
-                    price_status="fresh_executable",
-                    market_type="full_game_winner",
-                    market_family="full_game_winner",
-                    time_bucket="4H",
-                    time_to_start_minutes=420,
-                    decision="candidate_only",
-                    outcome=outcome,
-                    outcome_source="test",
-                    resolved_at=datetime(2026, 7, 2, 4, 0, tzinfo=UTC),
-                    feature_version=features.FEATURE_VERSION,
-                    training_eligible=True,
-                )
+            _add_governance_candidate(
+                session,
+                epoch_id=epoch_id,
+                game_id=game.id,
+                target_date=target,
+                evaluated_at=datetime(2026, 7, 2, 16, 0, tzinfo=UTC),
+                resolved_at=datetime(2026, 7, 2, 4, 0, tzinfo=UTC),
+                outcome=outcome,
+                probability=Decimal("0.600000"),
+                market_family="full_game_winner",
             )
         session.commit()
 
@@ -9182,6 +9169,7 @@ def _add_governance_candidate(
     market_family: str = "full_game_winner",
     probability: Decimal = Decimal("0.550000"),
     adapter_error: str | None = None,
+    include_adapter_metadata: bool = True,
 ) -> ModelCandidate:
     adapter_key = f"{market_family}_probability_adapter"
     adapter_version = probability_adapters.ADAPTER_VERSION_BY_FAMILY.get(market_family)
@@ -9215,15 +9203,19 @@ def _add_governance_candidate(
         feature_version=features.FEATURE_VERSION,
         training_eligible=True,
         market_family=market_family,
-        probability_adapter_key=adapter_key,
-        probability_adapter_version=adapter_version,
-        probability_adapter_policy_version=probability_adapters.PROBABILITY_ADAPTER_POLICY_VERSION,
-        probability_adapter_family=market_family,
-        probability_adapter_scope=adapter_scope,
-        probability_adapter_calibration_hook=calibration_hook,
-        probability_adapter_calibration_version="shared_parameter_offsets_pre_pr3v",
-        probability_adapter_feature_policy_version=probability_adapters.PROBABILITY_ADAPTER_FEATURE_POLICY_VERSION,
-        probability_adapter_metadata=adapter_metadata,
+        probability_adapter_key=adapter_key if include_adapter_metadata else None,
+        probability_adapter_version=adapter_version if include_adapter_metadata else None,
+        probability_adapter_policy_version=(
+            probability_adapters.PROBABILITY_ADAPTER_POLICY_VERSION if include_adapter_metadata else None
+        ),
+        probability_adapter_family=market_family if include_adapter_metadata else None,
+        probability_adapter_scope=adapter_scope if include_adapter_metadata else None,
+        probability_adapter_calibration_hook=calibration_hook if include_adapter_metadata else None,
+        probability_adapter_calibration_version="shared_parameter_offsets_pre_pr3v" if include_adapter_metadata else None,
+        probability_adapter_feature_policy_version=(
+            probability_adapters.PROBABILITY_ADAPTER_FEATURE_POLICY_VERSION if include_adapter_metadata else None
+        ),
+        probability_adapter_metadata=adapter_metadata if include_adapter_metadata else None,
     )
     session.add(candidate)
     return candidate
@@ -9492,6 +9484,53 @@ def test_pr3v_family_scope_governance_isolates_training_units(monkeypatch) -> No
     assert status["family_scope_units"]["first_five_spread"]["status"] == "skipped_not_enough_family_samples"
 
 
+def test_pr3v_family_thresholds_can_train_below_global_threshold(monkeypatch) -> None:
+    monkeypatch.setenv("MODEL_MIN_SAMPLES_TRAIN", "5")
+    monkeypatch.setenv("MODEL_MIN_SAMPLES_CALIBRATE", "5")
+    monkeypatch.setenv("MODEL_MIN_SAMPLES_PROMOTE", "99")
+    monkeypatch.setenv("MODEL_GOVERNANCE_FAMILY_MIN_SAMPLES_TRAIN", "3")
+    monkeypatch.setenv("MODEL_GOVERNANCE_FAMILY_MIN_SAMPLES_CALIBRATE", "3")
+    monkeypatch.setenv("MODEL_GOVERNANCE_FAMILY_MIN_SAMPLES_PROMOTE", "99")
+    monkeypatch.setenv("MODEL_GOVERNANCE_CLEAN_START_AT", "2026-07-02T00:00:00-04:00")
+    get_settings.cache_clear()
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        epoch_id = _active_epoch_id(session)
+        game = MlbGame(
+            external_game_id="pr3v-family-threshold",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 2, 23, 0, tzinfo=UTC),
+            status="Final",
+        )
+        session.add(game)
+        session.flush()
+        for index, outcome in enumerate(["win", "loss", "win", "win"], start=1):
+            _add_governance_candidate(
+                session,
+                epoch_id=epoch_id,
+                game_id=game.id,
+                target_date=date(2026, 7, 2),
+                evaluated_at=datetime(2026, 7, 2, 16, index, tzinfo=UTC),
+                resolved_at=datetime(2026, 7, 3, 4, index, tzinfo=UTC),
+                outcome=outcome,
+                market_family="full_game_total",
+            )
+        session.commit()
+
+        result = run_model_governance(session, now=datetime(2026, 7, 3, 12, 0, tzinfo=UTC))
+
+    assert result["status"] == "skipped_insufficient_samples"
+    assert result["resolved_samples"] == 4
+    assert result["family_scope_units"]["full_game_total"]["minimum_samples_train"] == 3
+    assert result["family_scope_units"]["full_game_total"]["status"] == "trained"
+    assert result["family_scope_units"]["full_game_total"]["challenger_version"] is not None
+
+
 def test_pr3v_adapter_errors_are_counted_and_excluded_from_training(monkeypatch) -> None:
     monkeypatch.setenv("MODEL_MIN_SAMPLES_TRAIN", "2")
     monkeypatch.setenv("MODEL_MIN_SAMPLES_CALIBRATE", "2")
@@ -9541,6 +9580,61 @@ def test_pr3v_adapter_errors_are_counted_and_excluded_from_training(monkeypatch)
     assert unit["adapter_error_count"] == 1
     assert unit["adapter_error_reason_counts"] == {"missing_total_direction_or_line": 1}
     assert unit["trainable_clean_samples"] == 2
+    assert unit["status"] == "trained"
+    assert dataset is not None
+    assert dataset.sample_count == 2
+
+
+def test_pr3v_missing_adapter_metadata_is_counted_and_excluded(monkeypatch) -> None:
+    monkeypatch.setenv("MODEL_MIN_SAMPLES_TRAIN", "2")
+    monkeypatch.setenv("MODEL_MIN_SAMPLES_CALIBRATE", "2")
+    monkeypatch.setenv("MODEL_MIN_SAMPLES_PROMOTE", "99")
+    monkeypatch.setenv("MODEL_GOVERNANCE_FAMILY_MIN_SAMPLES_TRAIN", "2")
+    monkeypatch.setenv("MODEL_GOVERNANCE_FAMILY_MIN_SAMPLES_CALIBRATE", "2")
+    monkeypatch.setenv("MODEL_GOVERNANCE_FAMILY_MIN_SAMPLES_PROMOTE", "99")
+    monkeypatch.setenv("MODEL_GOVERNANCE_CLEAN_START_AT", "2026-07-02T00:00:00-04:00")
+    get_settings.cache_clear()
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        epoch_id = _active_epoch_id(session)
+        game = MlbGame(
+            external_game_id="pr3v-missing-adapter",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 2, 23, 0, tzinfo=UTC),
+            status="Final",
+        )
+        session.add(game)
+        session.flush()
+        for index, include_adapter_metadata in enumerate([True, False, True], start=1):
+            _add_governance_candidate(
+                session,
+                epoch_id=epoch_id,
+                game_id=game.id,
+                target_date=date(2026, 7, 2),
+                evaluated_at=datetime(2026, 7, 2, 16, index, tzinfo=UTC),
+                resolved_at=datetime(2026, 7, 3, 4, index, tzinfo=UTC),
+                outcome="win" if index != 2 else "loss",
+                market_family="first_five_winner",
+                include_adapter_metadata=include_adapter_metadata,
+            )
+        session.commit()
+
+        result = run_model_governance(session, now=datetime(2026, 7, 3, 12, 0, tzinfo=UTC))
+        dataset = session.get(ModelTrainingDataset, result["training_dataset_id"])
+
+    unit = result["family_scope_units"]["first_five_winner"]
+    assert result["clean_resolved_mature_samples"] == 3
+    assert result["resolved_samples"] == 2
+    assert result["adapter_error_reason_counts"] == {"missing_probability_adapter_metadata": 1}
+    assert unit["clean_resolved_mature_samples"] == 3
+    assert unit["trainable_clean_samples"] == 2
+    assert unit["adapter_error_count"] == 1
+    assert unit["adapter_error_reason_counts"] == {"missing_probability_adapter_metadata": 1}
     assert unit["status"] == "trained"
     assert dataset is not None
     assert dataset.sample_count == 2
@@ -9823,26 +9917,16 @@ def test_model_governance_defaults_to_active_epoch_when_scope_omitted(monkeypatc
         active_id = active.id
         archived_id = archived.id
         for epoch_id, outcome in ((active_id, "win"), (archived_id, "loss")):
-            session.add(
-                ModelCandidate(
-                    paper_trading_epoch_id=epoch_id,
-                    mlb_game_id=game.id,
-                    evaluated_at=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
-                    features={},
-                    probability=Decimal("0.600000"),
-                    probability_calibrated=Decimal("0.600000"),
-                    target_date=date(2026, 7, 1),
-                    fee_estimate=Decimal("0.010000"),
-                    price_status="fresh_executable",
-                    time_to_start_minutes=420,
-                    decision="candidate_only",
-                    outcome=outcome,
-                    resolved_at=datetime(2026, 7, 2, 4, 0, tzinfo=UTC),
-                    model_version_tag=modeling.MATURE_MODEL_TAG,
-                    feature_version=features.FEATURE_VERSION,
-                    training_eligible=True,
-                    market_family="full_game_winner",
-                )
+            _add_governance_candidate(
+                session,
+                epoch_id=epoch_id,
+                game_id=game.id,
+                target_date=date(2026, 7, 1),
+                evaluated_at=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
+                resolved_at=datetime(2026, 7, 2, 4, 0, tzinfo=UTC),
+                outcome=outcome,
+                probability=Decimal("0.600000"),
+                market_family="full_game_winner",
             )
         session.commit()
 
@@ -15912,26 +15996,15 @@ def test_governance_trains_challenger_when_sample_threshold_met(monkeypatch) -> 
         session.add(game)
         session.flush()
         for index, outcome in enumerate(["win", "win", "loss", "win", "loss"], start=1):
-            session.add(
-                ModelCandidate(
-                    paper_trading_epoch_id=epoch_id,
-                    mlb_game_id=game.id,
-                    evaluated_at=datetime(2026, 7, 2, 16, index, tzinfo=UTC),
-                    features={},
-                    probability=Decimal("0.550000"),
-                    probability_calibrated=Decimal("0.550000"),
-                    fee_estimate=Decimal("0.010000"),
-                    target_date=target_date,
-                    price_status="fresh_executable",
-                    time_to_start_minutes=400,
-                    decision="candidate_only",
-                    outcome=outcome,
-                    resolved_at=datetime(2026, 7, 3, 4, index, tzinfo=UTC),
-                    model_version_tag=modeling.MATURE_MODEL_TAG,
-                    feature_version=features.FEATURE_VERSION,
-                    training_eligible=True,
-                    market_family="full_game_winner",
-                )
+            _add_governance_candidate(
+                session,
+                epoch_id=epoch_id,
+                game_id=game.id,
+                target_date=target_date,
+                evaluated_at=datetime(2026, 7, 2, 16, index, tzinfo=UTC),
+                resolved_at=datetime(2026, 7, 3, 4, index, tzinfo=UTC),
+                outcome=outcome,
+                market_family="full_game_winner",
             )
         session.commit()
 

@@ -1195,18 +1195,9 @@ def _governance_training_policy_payload(
 def _family_scope_minimums(settings=None) -> dict[str, int]:
     settings = settings or get_settings()
     return {
-        "minimum_samples_train": max(
-            int(settings.model_min_samples_train),
-            int(settings.model_governance_family_min_samples_train),
-        ),
-        "minimum_samples_calibrate": max(
-            int(settings.model_min_samples_calibrate),
-            int(settings.model_governance_family_min_samples_calibrate),
-        ),
-        "minimum_samples_promote": max(
-            int(settings.model_min_samples_promote),
-            int(settings.model_governance_family_min_samples_promote),
-        ),
+        "minimum_samples_train": int(settings.model_governance_family_min_samples_train),
+        "minimum_samples_calibrate": int(settings.model_governance_family_min_samples_calibrate),
+        "minimum_samples_promote": int(settings.model_governance_family_min_samples_promote),
     }
 
 
@@ -1238,7 +1229,9 @@ def _probability_adapter_error_reason(candidate: GovernanceCandidateSample) -> s
         candidate.probability_adapter_family,
         candidate.probability_adapter_calibration_hook,
     ]
-    if any(adapter_values) and not all(adapter_values):
+    if not any(adapter_values):
+        return "missing_probability_adapter_metadata"
+    if not all(adapter_values):
         return "incomplete_probability_adapter_metadata"
     return None
 
