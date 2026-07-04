@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from app.models import KalshiMarket, MarketMapping, MlbGame, ModelCandidate, PaperTrade, Position, Settlement
@@ -98,6 +98,7 @@ def _apply_trade_settlement_audit(
     checked_at: datetime,
     status: str,
     formula: str,
+    resolved_at: datetime | None = None,
     outcome: str | None = None,
     skip_reason: str | None = None,
     error_reason: str | None = None,
@@ -118,7 +119,7 @@ def _apply_trade_settlement_audit(
     trade.settlement_skip_reason = skip_reason
     trade.settlement_error_reason = error_reason
     if status in {"settled", "void", "already_settled"}:
-        trade.settlement_resolved_at = trade.settlement_resolved_at or checked_at
+        trade.settlement_resolved_at = trade.settlement_resolved_at or resolved_at or checked_at
     trade.settlement_payout = payout
     trade.settlement_fee_adjustment = fee_adjustment
 
@@ -561,6 +562,47 @@ def _settled_trade_count_for_target(
     return int(session.scalar(query) or 0)
 
 
+def _settled_trades_missing_audit(
+    session: Session,
+    *,
+    active_epoch_id: int | None,
+    bounds: tuple[datetime, datetime] | None,
+    include_archived: bool,
+) -> list[tuple[PaperTrade, ModelCandidate, MarketMapping, MlbGame, KalshiMarket, Settlement | None]]:
+    query = (
+        select(PaperTrade, ModelCandidate, MarketMapping, MlbGame, KalshiMarket, Settlement)
+        .join(ModelCandidate, PaperTrade.candidate_id == ModelCandidate.id)
+        .join(MarketMapping, ModelCandidate.mapping_id == MarketMapping.id)
+        .join(MlbGame, MarketMapping.mlb_game_id == MlbGame.id)
+        .join(KalshiMarket, MarketMapping.kalshi_market_id == KalshiMarket.id)
+        .outerjoin(Settlement, Settlement.paper_trade_id == PaperTrade.id)
+        .where(PaperTrade.status.in_(["settled", "closed", "void"]))
+        .where(
+            or_(
+                PaperTrade.settlement_audit_key.is_(None),
+                PaperTrade.settlement_formula_version.is_(None),
+                PaperTrade.settlement_formula.is_(None),
+                PaperTrade.settlement_status.is_(None),
+                PaperTrade.settlement_idempotency_key.is_(None),
+            )
+        )
+        .order_by(PaperTrade.id.asc())
+        .limit(1000)
+    )
+    if not include_archived:
+        query = query.where(PaperTrade.paper_trading_epoch_id == active_epoch_id)
+    if bounds is not None:
+        start, end = bounds
+        query = query.where(MlbGame.scheduled_start >= start).where(MlbGame.scheduled_start < end)
+    return list(session.execute(query).all())
+
+
+def _settled_audit_status(trade: PaperTrade) -> str:
+    if trade.status == "void" or trade.outcome == "void":
+        return "void"
+    return "settled"
+
+
 def settle_paper_trades(
     session: Session,
     target_date: date | None = None,
@@ -606,6 +648,12 @@ def settle_paper_trades(
         bounds=bounds,
         include_archived=include_archived,
     )
+    already_settled_missing_audit = _settled_trades_missing_audit(
+        session,
+        active_epoch_id=active_epoch.id,
+        bounds=bounds,
+        include_archived=include_archived,
+    )
     result = {
         "checked": len(rows) + already_settled_count,
         "settled": 0,
@@ -627,6 +675,7 @@ def settle_paper_trades(
         "skipped_spread_settlement_metadata_missing": 0,
         "skip_reasons": {},
         "already_settled": already_settled_count,
+        "already_settled_audit_backfilled": 0,
         "candidate_labels_checked": len(candidate_rows),
         "candidate_labels_created": 0,
         "candidate_labels_already_set": 0,
@@ -648,6 +697,41 @@ def settle_paper_trades(
         "candidate_label_skip_reasons": {},
         "snapshot_id": None,
     }
+
+    for trade, candidate, _mapping, game, market, existing_settlement in already_settled_missing_audit:
+        market_type = market_type_from_ticker(market.ticker, candidate.market_type)
+        line_value = _first_decimal(trade.line_value, _mapping.line_value, market.line_value)
+        selection_code = _first_text(trade.selection_code, _mapping.selection_code, market.selection_code)
+        over_under_side = _first_text(trade.over_under_side, _mapping.over_under_side, market.over_under_side)
+        inning_scope = _first_text(trade.inning_scope, _mapping.inning_scope, market.inning_scope)
+        verification = (
+            spread_verification_from_cached_metadata(mapping=_mapping, market=market)
+            if market_type == FULL_GAME_SPREAD
+            else None
+        )
+        formula = _settlement_formula(
+            market_type=market_type,
+            contract_side=trade.contract_side,
+            line_value=line_value,
+            selection_code=selection_code,
+            over_under_side=over_under_side,
+            inning_scope=inning_scope,
+            verification=verification,
+        )
+        _apply_trade_settlement_audit(
+            trade,
+            game=game,
+            market_type=market_type,
+            checked_at=settled_at,
+            resolved_at=trade.settled_at or (existing_settlement.settled_at if existing_settlement else None),
+            status=_settled_audit_status(trade),
+            formula=formula,
+            outcome=trade.outcome or (existing_settlement.outcome if existing_settlement else None),
+            payout=existing_settlement.payout if existing_settlement else trade.settlement_payout,
+            fee_adjustment=existing_settlement.fee_paid if existing_settlement else trade.fee_paid,
+        )
+        session.add(trade)
+        result["already_settled_audit_backfilled"] = int(result["already_settled_audit_backfilled"]) + 1
 
     for candidate, _mapping, game, market in candidate_rows:
         if candidate.outcome is not None:
