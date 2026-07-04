@@ -1042,6 +1042,15 @@ SELECTOR_DIAGNOSTIC_COMPACT_KEYS = (
     "selector_by_concept_cluster_sample",
 )
 
+PROBABILITY_ADAPTER_DIAGNOSTIC_COMPACT_KEYS = (
+    "probability_adapter_policy_version",
+    "probability_adapter_counts",
+    "probability_adapter_calibration_hook_counts",
+    "probability_adapter_family_counts",
+    "probability_adapter_missing_count",
+    "probability_adapter_error_count",
+)
+
 
 def _prediction_summary_json_value(section: str, key: str):
     return ModelPredictionRun.summary[section][key]
@@ -1057,6 +1066,10 @@ def _prediction_summary_compact_columns() -> list[object]:
         for key in QUALITY_EV_DIAGNOSTIC_COMPACT_KEYS
     )
     columns.extend(ModelPredictionRun.summary[key].label(f"selector_{key}") for key in SELECTOR_DIAGNOSTIC_COMPACT_KEYS)
+    columns.extend(
+        ModelPredictionRun.summary[key].label(f"probability_adapter_{key}")
+        for key in PROBABILITY_ADAPTER_DIAGNOSTIC_COMPACT_KEYS
+    )
     columns.extend(
         [
             func.json_array_length(
@@ -1113,12 +1126,18 @@ def _compact_prediction_summary_from_row(row) -> dict[str, object] | None:
         for key in SELECTOR_DIAGNOSTIC_COMPACT_KEYS
         if row.get(f"selector_{key}") is not None
     }
-    if not candidate and not quality_ev and not selector:
+    probability_adapter = {
+        key: row[f"probability_adapter_{key}"]
+        for key in PROBABILITY_ADAPTER_DIAGNOSTIC_COMPACT_KEYS
+        if row.get(f"probability_adapter_{key}") is not None
+    }
+    if not candidate and not quality_ev and not selector and not probability_adapter:
         return None
     return {
         "candidate_diagnostics": candidate,
         "quality_ev_diagnostics": quality_ev,
         "selector": selector,
+        "probability_adapter": probability_adapter,
     }
 
 
@@ -1163,6 +1182,11 @@ def _compact_candidate_diagnostics(
     selector = run_summary.get("selector")
     if not isinstance(selector, dict):
         selector = {key: run_summary.get(key) for key in SELECTOR_DIAGNOSTIC_COMPACT_KEYS if key in run_summary}
+    probability_adapter = {
+        key: run_summary.get(key)
+        for key in PROBABILITY_ADAPTER_DIAGNOSTIC_COMPACT_KEYS
+        if key in run_summary
+    }
     if include_details:
         return dict(
             _compact_payload(
@@ -1170,6 +1194,7 @@ def _compact_candidate_diagnostics(
                     "candidate_diagnostics": candidate or {},
                     "quality_ev_diagnostics": quality_ev or {},
                     "selector": selector or {},
+                    "probability_adapter": probability_adapter or {},
                 },
                 max_depth=5,
                 max_list_items=25,
@@ -1210,6 +1235,8 @@ def _compact_candidate_diagnostics(
             for key in SELECTOR_DIAGNOSTIC_COMPACT_KEYS
             if key in selector
         }
+    if probability_adapter:
+        result["probability_adapter"] = probability_adapter
     return result
 
 

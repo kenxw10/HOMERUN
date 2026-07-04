@@ -359,6 +359,14 @@ def _candidate_summary(candidate: ModelCandidate, game: MlbGame | None, market: 
         data_quality=_decimal_float(candidate.data_quality),
         calibration_status=candidate.calibration_status,
         training_eligible=candidate.training_eligible,
+        probability_adapter_key=candidate.probability_adapter_key,
+        probability_adapter_version=candidate.probability_adapter_version,
+        probability_adapter_policy_version=candidate.probability_adapter_policy_version,
+        probability_adapter_family=candidate.probability_adapter_family,
+        probability_adapter_scope=candidate.probability_adapter_scope,
+        probability_adapter_calibration_hook=candidate.probability_adapter_calibration_hook,
+        probability_adapter_calibration_version=candidate.probability_adapter_calibration_version,
+        probability_adapter_feature_policy_version=candidate.probability_adapter_feature_policy_version,
         decision=candidate.decision,
     )
 
@@ -790,6 +798,15 @@ def _model_predictions_for_date(target_date: date) -> dict[str, object]:
                         ModelCandidate.selector_shadow_only,
                         ModelCandidate.selector_live_like_eligible_before_cluster,
                         ModelCandidate.selector_live_like_eligible_after_cluster,
+                        ModelCandidate.probability_adapter_key,
+                        ModelCandidate.probability_adapter_version,
+                        ModelCandidate.probability_adapter_policy_version,
+                        ModelCandidate.probability_adapter_family,
+                        ModelCandidate.probability_adapter_scope,
+                        ModelCandidate.probability_adapter_rationale,
+                        ModelCandidate.probability_adapter_calibration_hook,
+                        ModelCandidate.probability_adapter_calibration_version,
+                        ModelCandidate.probability_adapter_feature_policy_version,
                     ),
                     load_only(KalshiMarket.id, KalshiMarket.ticker),
                     load_only(ModelPredictionRun.id, ModelPredictionRun.target_date),
@@ -811,6 +828,7 @@ def _model_predictions_for_date(target_date: date) -> dict[str, object]:
                 "line_value": _decimal_float(candidate.line_value) if candidate else None,
                 **_candidate_prediction_taxonomy(candidate),
                 **_candidate_prediction_selector(candidate),
+                **_candidate_prediction_probability_adapter(candidate),
                 "probability_raw": _decimal_float(output.probability_raw),
                 "probability_calibrated": _decimal_float(output.probability_calibrated),
                 "fair_value": _decimal_float(output.fair_value),
@@ -914,6 +932,32 @@ def _candidate_prediction_selector(candidate: ModelCandidate | None) -> dict[str
         "selector_shadow_only": candidate.selector_shadow_only,
         "selector_live_like_eligible_before_cluster": candidate.selector_live_like_eligible_before_cluster,
         "selector_live_like_eligible_after_cluster": candidate.selector_live_like_eligible_after_cluster,
+    }
+
+
+def _candidate_prediction_probability_adapter(candidate: ModelCandidate | None) -> dict[str, object]:
+    if candidate is None:
+        return {
+            "probability_adapter_key": None,
+            "probability_adapter_version": None,
+            "probability_adapter_policy_version": None,
+            "probability_adapter_family": None,
+            "probability_adapter_scope": None,
+            "probability_adapter_rationale": None,
+            "probability_adapter_calibration_hook": None,
+            "probability_adapter_calibration_version": None,
+            "probability_adapter_feature_policy_version": None,
+        }
+    return {
+        "probability_adapter_key": candidate.probability_adapter_key,
+        "probability_adapter_version": candidate.probability_adapter_version,
+        "probability_adapter_policy_version": candidate.probability_adapter_policy_version,
+        "probability_adapter_family": candidate.probability_adapter_family,
+        "probability_adapter_scope": candidate.probability_adapter_scope,
+        "probability_adapter_rationale": candidate.probability_adapter_rationale,
+        "probability_adapter_calibration_hook": candidate.probability_adapter_calibration_hook,
+        "probability_adapter_calibration_version": candidate.probability_adapter_calibration_version,
+        "probability_adapter_feature_policy_version": candidate.probability_adapter_feature_policy_version,
     }
 
 

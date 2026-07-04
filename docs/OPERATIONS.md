@@ -913,6 +913,48 @@ $final = Invoke-RestMethod -Headers $headers "$base/v1/dashboard/summary?closed_
 
 Expected: compact selector summary/rationale may appear, portfolio series metadata remains compact, and raw payload/features/scoring rationale/orderbook blobs do not appear in the default dashboard response.
 
+## PR3u Family/Scope Probability Adapter Validation
+
+PR3u adds compact, versioned candidate-stage probability adapter metadata. It does not enable PR3v calibration training and does not change live execution, cron cadence, source ingestion, selector rules, risk caps, EV thresholds, settlement, or spread audit gates.
+
+Use the known nonzero validation slate `2026-07-04`.
+
+```powershell
+$base = "https://homerun-production-2551.up.railway.app"
+$targetDate = "2026-07-04"
+$apiKeySecure = Read-Host -Prompt "Paste internal API key" -AsSecureString
+$apiKeyPtr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($apiKeySecure)
+try { $apiKey = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($apiKeyPtr).Trim() } finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($apiKeyPtr) }
+$headers = @{ "X-API-Key" = $apiKey }
+```
+
+Run a dry-run candidate sweep without opening paper trades:
+
+```powershell
+$label = "pr3u_validation_dry_run_" + (Get-Date -Format "yyyyMMdd_HHmmss")
+$dry = Invoke-RestMethod -Method Post -Headers $headers "$base/v1/jobs/run/candidate-sweep?target_date=$targetDate&min_time_to_start_minutes=0&max_time_to_start_minutes=1800&sweep_label=$label&dry_run_candidates_only=true"
+$engine = $dry.result.result.paper_candidate_engine
+if (-not $engine) { $engine = $dry.result.result.candidate_engine }
+if (-not $engine) { $engine = $dry.result.result }
+$engine | Select-Object target_date,dry_run_candidates_only,feature_sync_mode,heavy_feature_sync_skipped,candidates_evaluated,paper_trades,trades_created,probability_adapter_policy_version,probability_adapter_missing_count,probability_adapter_error_count | Format-List
+$engine.probability_adapter_counts
+$engine.probability_adapter_calibration_hook_counts
+$engine.probability_adapter_family_counts
+```
+
+Expected: nonzero candidates evaluated, `dry_run_candidates_only=true`, zero paper trades, `feature_sync_mode=cache_only`, `heavy_feature_sync_skipped=true`, `probability_adapter_policy_version=pr3u_family_scope_probability_adapters_v1`, adapter counts by key/version, hook counts, family counts, and no missing adapter fields for candidates with supported market families.
+
+Inspect compact prediction rows:
+
+```powershell
+$predictions = Invoke-RestMethod -Headers $headers "$base/v1/model/predictions?date=$targetDate"
+($predictions | ConvertTo-Json -Depth 100) -split "`n" |
+  Where-Object { $_ -match "probability_adapter|economic_exposure|selector_" } |
+  Select-Object -First 320
+```
+
+Expected: candidate rows include compact PR3u fields such as `probability_adapter_key`, `probability_adapter_version`, `probability_adapter_policy_version`, `probability_adapter_family`, `probability_adapter_scope`, `probability_adapter_calibration_hook`, `probability_adapter_calibration_version`, and `probability_adapter_feature_policy_version`. Raw adapter metadata, raw features, raw payloads, and full scoring rationale blobs should not appear in this prediction endpoint.
+
 ## Required Context Updates
 
 Every PR must update `PROJECT_CONTEXT.md`.

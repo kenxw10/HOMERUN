@@ -338,6 +338,12 @@ Expected result: health and system status remain safe, `/v1/system/status` repor
 
 PR3b deterministic discovery validation: the registry contains `KXMLBGAME`, `KXMLBSPREAD`, `KXMLBTOTAL`, `KXMLBF5`, `KXMLBF5SPREAD`, and `KXMLBF5TOTAL`. Normal market-family discovery does not redundantly probe `KXMLBGAME`, because full-game winner is handled by targeted sync/resolve. It does not probe guessed legacy variants or `KXMLBTEAMTOTAL`. If candidate probes return 404/no-match responses, the discovery POST should still return structured JSON with status `completed` or `partial_error`. The report GET should return the latest finalized run, not a stale running row. `markets_found=0` and zero `market_family_discovery_items` are valid when no markets are found, but `market_family_discovery_runs.raw_summary` must include attempted ticker counts, no-match counts, probe details, request/rate-limit metrics, and any warnings/errors. Mapping sync is the only step that can make non-winner families paper-supported, and only when line/selection/settlement metadata parses cleanly.
 
+## PR3u Probability Adapter Metadata
+
+Candidate sweeps now persist compact, versioned probability adapter metadata on newly scored candidates. The supported adapter families are full-game/first-five totals, winners, and spreads. Prediction rows expose adapter key/version/policy version, family, scope, rationale, calibration hook/version, and feature policy version without returning raw adapter metadata or feature blobs.
+
+PR3u is diagnostics and policy metadata only. It does not implement PR3v calibration training, does not change PR3t selector behavior, does not change EV thresholds/risk caps/settlement, and does not make candidate sweeps run heavy feature ingestion.
+
 ## Deployment
 
 - Railway backend setup: see `docs/RAILWAY_SETUP.md`.
