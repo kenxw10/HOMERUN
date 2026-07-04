@@ -71,6 +71,7 @@ from app.services import (
     modeling,
     position_refresh,
     probability_adapters,
+    probability_hardening,
     pybaseball_client,
     ws_market_data,
 )
@@ -149,6 +150,30 @@ PR3U_REQUIRED_CANDIDATE_FIELDS = (
     "probability_adapter_feature_policy_version",
 )
 
+PR3W_REQUIRED_CANDIDATE_FIELDS = (
+    "probability_hardening_policy_version",
+    "probability_hardening_enabled",
+    "probability_raw_adapter",
+    "probability_before_hardening",
+    "probability_after_hardening",
+    "probability_hardening_delta",
+    "probability_hardening_applied",
+    "probability_hardening_reason",
+    "probability_hardening_status",
+    "probability_hardening_line_class",
+    "probability_hardening_line_class_policy",
+    "probability_hardening_consistency_status",
+    "probability_hardening_monotonicity_status",
+    "probability_hardening_ladder_role",
+    "probability_hardening_ladder_size",
+    "probability_hardening_ladder_rank",
+    "probability_hardening_distance_from_central",
+    "probability_hardening_central_reference_probability",
+    "probability_hardening_dampening_factor",
+    "probability_hardening_shadow_only",
+    "probability_hardening_block_recommendation",
+)
+
 
 def _assert_pr3s_required_fields_populated(row: object) -> None:
     for field in PR3S_REQUIRED_CANDIDATE_FIELDS:
@@ -162,6 +187,11 @@ def _assert_pr3t_required_fields_populated(row: object) -> None:
 
 def _assert_pr3u_required_fields_populated(row: object) -> None:
     for field in PR3U_REQUIRED_CANDIDATE_FIELDS:
+        assert getattr(row, field) is not None, field
+
+
+def _assert_pr3w_required_fields_populated(row: object) -> None:
+    for field in PR3W_REQUIRED_CANDIDATE_FIELDS:
         assert getattr(row, field) is not None, field
 
 
@@ -499,6 +529,26 @@ def test_compact_dashboard_preserves_nested_probability_adapter_summary() -> Non
     assert compact["probability_adapter"]["probability_adapter_error_count"] == 0
 
 
+def test_compact_dashboard_preserves_nested_probability_hardening_summary() -> None:
+    compact = dashboard._compact_candidate_diagnostics(
+        {
+            "probability_hardening": {
+                "probability_hardening_policy_version": probability_hardening.PROBABILITY_HARDENING_POLICY_VERSION,
+                "probability_hardening_enabled": True,
+                "probability_hardening_applied_count": 3,
+                "probability_hardening_block_recommendation_count": 1,
+                "probability_hardening_by_line_class": {"tail": {"available": 1}},
+            }
+        }
+    )
+
+    assert compact["probability_hardening"]["probability_hardening_policy_version"] == (
+        probability_hardening.PROBABILITY_HARDENING_POLICY_VERSION
+    )
+    assert compact["probability_hardening"]["probability_hardening_applied_count"] == 3
+    assert compact["probability_hardening"]["probability_hardening_block_recommendation_count"] == 1
+
+
 def _cap_intent(
     session: Session,
     *,
@@ -611,6 +661,159 @@ def _selector_intent(candidate: ModelCandidate, *, price: str = "0.4000") -> can
         labels=SimpleNamespace(),
         score=Decimal("1.0000"),
     )
+
+
+def _hardening_candidate(
+    candidate_id: int,
+    *,
+    family: str = "full_game_total",
+    line: str = "8.5000",
+    direction: str = "over",
+    probability: str = "0.550000",
+    line_class: str = "central",
+    rank: int = 2,
+    distance: int = 0,
+    size: int = 5,
+    team: str | None = None,
+) -> ModelCandidate:
+    line_decimal = Decimal(line)
+    exposure_family = "spread" if family.endswith("spread") else "total"
+    scope = "first_five" if family.startswith("first_five") else "full_game"
+    return ModelCandidate(
+        id=candidate_id,
+        mlb_game_id=99,
+        evaluated_at=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
+        features={},
+        target_date=date(2026, 7, 1),
+        decision="eligible_for_paper_trade",
+        market_family=family,
+        market_type=family,
+        contract_side="yes",
+        probability=Decimal(probability),
+        probability_raw=Decimal(probability),
+        probability_calibrated=Decimal(probability),
+        data_quality=Decimal("1.0000"),
+        line_value=line_decimal,
+        economic_exposure_family=exposure_family,
+        economic_exposure_scope=scope,
+        economic_exposure_direction=direction,
+        economic_exposure_team=team,
+        economic_exposure_line=line_decimal,
+        inning_scope=scope,
+        line_class=line_class,
+        line_ladder_rank=rank,
+        line_ladder_distance_from_central=distance,
+        line_ladder_size=size,
+    )
+
+
+def test_probability_hardening_dampens_alternate_and_tail_lines() -> None:
+    central = _hardening_candidate(100, line="8.5000", probability="0.550000", line_class="central", rank=3)
+    near = _hardening_candidate(
+        101,
+        line="9.5000",
+        probability="0.500000",
+        line_class="near_alternate",
+        rank=4,
+        distance=1,
+    )
+    deep = _hardening_candidate(
+        102,
+        line="10.5000",
+        probability="0.450000",
+        line_class="deep_alternate",
+        rank=5,
+        distance=2,
+    )
+    tail = _hardening_candidate(
+        103,
+        line="11.5000",
+        probability="0.400000",
+        line_class="tail",
+        rank=6,
+        distance=3,
+        size=7,
+    )
+
+    rows = [central, near, deep, tail]
+    probability_hardening.apply_probability_hardening(rows, enabled=True)
+    summary = probability_hardening.probability_hardening_summary(rows, enabled=True)
+
+    assert central.probability_after_hardening == Decimal("0.550000")
+    assert central.probability_hardening_applied is False
+    assert near.probability_after_hardening == Decimal("0.505000")
+    assert deep.probability_after_hardening == Decimal("0.475000")
+    assert tail.probability_after_hardening == Decimal("0.475000")
+    assert tail.probability_hardening_shadow_only is True
+    assert tail.probability_hardening_block_recommendation is True
+    assert summary["probability_hardening_applied_count"] == 3
+    assert summary["probability_hardening_by_line_class"]["tail"]["available"] == 1
+    _assert_pr3w_required_fields_populated(tail)
+
+
+def test_probability_hardening_blocks_monotonicity_failures() -> None:
+    low_line = _hardening_candidate(110, line="7.5000", probability="0.450000", line_class="near_alternate", rank=1)
+    central = _hardening_candidate(111, line="8.5000", probability="0.500000", line_class="central", rank=2)
+    high_line = _hardening_candidate(112, line="9.5000", probability="0.700000", line_class="near_alternate", rank=3)
+
+    rows = [low_line, central, high_line]
+    probability_hardening.apply_probability_hardening(rows, enabled=True)
+
+    assert {row.probability_hardening_monotonicity_status for row in rows} == {"failed"}
+    assert high_line.probability_hardening_status == "failed"
+    assert high_line.probability_hardening_block_recommendation is True
+    assert high_line.probability_after_hardening == Decimal("0.600000")
+
+
+def test_probability_hardening_blocks_complement_inconsistency() -> None:
+    over = _hardening_candidate(120, line="8.5000", direction="over", probability="0.800000")
+    under = _hardening_candidate(121, line="8.5000", direction="under", probability="0.400000")
+
+    probability_hardening.apply_probability_hardening([over, under], enabled=True)
+
+    assert over.probability_hardening_consistency_status == "failed"
+    assert under.probability_hardening_consistency_status == "failed"
+    assert over.probability_hardening_block_recommendation is True
+    assert under.probability_hardening_block_recommendation is True
+
+
+def test_probability_hardening_exceptional_tail_can_pass_existing_selector(monkeypatch) -> None:
+    monkeypatch.setenv("PAPER_SELECTOR_MODE", "live_like")
+    get_settings.cache_clear()
+    settings = get_settings()
+    central = _hardening_candidate(130, line="8.5000", probability="0.800000", line_class="central", rank=3)
+    tail = _hardening_candidate(
+        131,
+        line="11.5000",
+        probability="0.720000",
+        line_class="tail",
+        rank=6,
+        distance=3,
+        size=7,
+    )
+
+    try:
+        probability_hardening.apply_probability_hardening([central, tail], enabled=True)
+        tail.net_expected_value = Decimal("0.130000")
+        tail.probability_edge = Decimal("0.090000")
+        probability_hardening.finalize_probability_hardening_recommendation(
+            tail,
+            exceptional_min_net_ev=Decimal("0.120000"),
+            exceptional_min_prob_edge=Decimal("0.080000"),
+        )
+        selected, counts, summary = live_like_selector.apply_live_like_selector(
+            candidates=[tail],
+            intents=[_selector_intent(tail, price="0.5000")],
+            settings=settings,
+        )
+    finally:
+        get_settings.cache_clear()
+
+    assert tail.probability_after_hardening == Decimal("0.760000")
+    assert tail.probability_hardening_block_recommendation is False
+    assert selected[0].candidate is tail
+    assert counts == {}
+    assert summary["selector_selected_after_cluster"] == 1
 
 
 def test_live_like_selector_enforces_family_scope_thresholds(monkeypatch) -> None:

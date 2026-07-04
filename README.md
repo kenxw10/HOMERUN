@@ -350,6 +350,14 @@ PR3v turns the PR3u calibration hooks into compact family/scope governance units
 
 Family calibrations remain paper-only governance artifacts. They are stored in existing compact governance JSON metadata, adapter errors are classified and excluded from training, and adapters report whether they used an active family calibration or the existing shared/uncalibrated fallback. PR3v does not change selector behavior, EV thresholds, risk caps, settlement, cron cadence, source ingestion, live execution, or candidate-sweep cache-only behavior.
 
+## PR3w Tail and Alternate-Line Probability Hardening
+
+PR3w hardens candidate probabilities for alternate and tail lines after PR3u adapters and before the PR3t selector. It uses only current Kalshi ladder metadata from PR3s, not sportsbook data, team totals, umpire inputs, or new market data sources.
+
+When enabled by `PAPER_PROBABILITY_HARDENING_ENABLED=true`, near alternate, deep alternate, and tail line probabilities are dampened toward a central ladder reference. Monotonicity or complement-consistency failures are surfaced as compact candidate diagnostics and can shadow/block candidates before selector/risk sizing. Sparse single-line ladders are reported as insufficient ladder depth but are not newly blocked solely for lacking ladder depth.
+
+New scored candidates expose compact before/after hardening fields in `/v1/model/predictions`, `/v1/candidates/today`, candidate-sweep summaries, and compact dashboard diagnostics. Raw PR3u adapter probability remains preserved as `probability_raw_adapter`. PR3w adds a nullable `model_candidates` migration and does not change live execution, settlement, cron schedules, source ingestion, risk caps, selector thresholds, credentials, or sportsbook/team-total/umpire scope.
+
 ## Deployment
 
 - Railway backend setup: see `docs/RAILWAY_SETUP.md`.

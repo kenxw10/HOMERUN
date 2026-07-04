@@ -108,6 +108,11 @@ class Settings(BaseSettings):
     paper_allow_last_price_fallback_for_trade: bool = Field(
         default=False, alias="PAPER_ALLOW_LAST_PRICE_FALLBACK_FOR_TRADE"
     )
+    paper_probability_hardening_enabled: bool = Field(default=True, alias="PAPER_PROBABILITY_HARDENING_ENABLED")
+    paper_probability_hardening_policy_version: str = Field(
+        default="pr3w_tail_alternate_probability_hardening_v1",
+        alias="PAPER_PROBABILITY_HARDENING_POLICY_VERSION",
+    )
     paper_starting_balance: Decimal = Field(default=Decimal("1000.00"), alias="PAPER_STARTING_BALANCE")
     paper_bankroll_starting_balance: Decimal = Field(
         default=Decimal("500.00"), alias="PAPER_BANKROLL_STARTING_BALANCE"

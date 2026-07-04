@@ -59,6 +59,13 @@ from app.services.probability_adapters import (
     probability_adapter_candidate_payload,
     score_probability_adapter,
 )
+from app.services.probability_hardening import (
+    apply_probability_hardening,
+    finalize_probability_hardening_recommendation,
+    probability_hardening_candidate_payload,
+    probability_hardening_field_counts,
+    probability_hardening_summary,
+)
 from app.services.portfolio import calculate_paper_portfolio, create_balance_snapshot, paper_trade_fee
 from app.services.paper_epoch import get_or_create_active_paper_epoch
 from app.services.spread_verification import (
@@ -410,6 +417,36 @@ def _probability_adapter_summary(candidates: list[ModelCandidate]) -> dict[str, 
         "probability_adapter_error_family_counts": error_family_counts,
         "probability_adapter_errors_excluded_from_governance_training": True,
     }
+
+
+def _apply_probability_hardening_payload(
+    candidate: ModelCandidate,
+    output: ModelPredictionOutput | None = None,
+) -> dict[str, object]:
+    payload = probability_hardening_candidate_payload(candidate)
+    features = dict(candidate.features or {})
+    market_context = dict(features.get("market_context") or {})
+    market_context["probability_hardening"] = payload
+    features["market_context"] = market_context
+    features["probability_hardening"] = payload
+    candidate.features = features
+
+    candidate.scoring_rationale = {
+        **(candidate.scoring_rationale or {}),
+        "probability_hardening": payload,
+    }
+    diagnostics = dict(candidate.gate_diagnostics or {})
+    diagnostics["probability_hardening"] = payload
+    candidate.gate_diagnostics = diagnostics
+
+    if output is not None:
+        raw = dict(output.raw_output or {})
+        raw["probability_hardening"] = payload
+        gate_diagnostics = dict(raw.get("gate_diagnostics") or {})
+        gate_diagnostics["probability_hardening"] = payload
+        raw["gate_diagnostics"] = gate_diagnostics
+        output.raw_output = raw
+    return payload
 
 
 def _apply_candidate_line_classifications(
@@ -2761,6 +2798,8 @@ def generate_candidates(
             "paper_selector_mode": settings.paper_selector_mode,
             "selector_policy_version": SELECTOR_POLICY_VERSION,
             "probability_adapter_policy_version": PROBABILITY_ADAPTER_POLICY_VERSION,
+            "paper_probability_hardening_enabled": settings.paper_probability_hardening_enabled,
+            "paper_probability_hardening_policy_version": settings.paper_probability_hardening_policy_version,
             "paper_spread_trading_enabled": settings.paper_spread_trading_enabled,
             "paper_first_five_spread_trading_enabled": settings.paper_spread_trading_enabled,
             "paper_full_game_spread_trading_enabled": settings.paper_full_game_spread_trading_enabled,
@@ -2840,6 +2879,7 @@ def generate_candidates(
     trade_intents: list[TradeIntent] = []
     evaluated_candidates: list[ModelCandidate] = []
     outputs_by_candidate_id: dict[int, ModelPredictionOutput] = {}
+    candidate_eval_contexts: dict[int, dict[str, object]] = {}
     open_trade_metadata_refreshes: list[tuple[ModelCandidate, PaperTrade]] = []
     stale_price_count = 0
     non_executable_price_count = 0
@@ -3306,6 +3346,26 @@ def generate_candidates(
             )
             session.add(output)
             outputs_by_candidate_id[candidate.id] = output
+            candidate_eval_contexts[candidate.id] = {
+                "mapping": mapping,
+                "game": game,
+                "market": market,
+                "market_type": market_type,
+                "day": day,
+                "minutes_to_start": minutes_to_start,
+                "price_context": price_context,
+                "price": price,
+                "quality_context": quality_context,
+                "candidate_stage_market_context": candidate_stage_market_context,
+                "adapter_result": adapter_result,
+                "labels": labels,
+                "spread_audit_metadata": spread_audit_metadata,
+                "exposure_taxonomy": exposure_taxonomy,
+                "contract_side": contract_side,
+                "traded_candidate_exists": bool(traded_candidate_ids),
+                "open_trade_for_market_exists": open_trade_for_market is not None,
+                "opposite_open_trade_exists": opposite_open_trade is not None,
+            }
 
             if price is not None and (
                 decision == "eligible_for_paper_trade" or (dry_run_candidates_only and eligible_for_intent)
@@ -3322,9 +3382,226 @@ def generate_candidates(
                 )
 
     line_classification_counts = _apply_candidate_line_classifications(evaluated_candidates, outputs_by_candidate_id)
+    apply_probability_hardening(
+        evaluated_candidates,
+        enabled=settings.paper_probability_hardening_enabled,
+        policy_version=settings.paper_probability_hardening_policy_version,
+    )
+    trade_intents = []
+    exceptional_tail_net_ev = max(settings.paper_min_net_ev, Decimal("0.12"))
+    exceptional_tail_probability_edge = max(settings.paper_min_prob_edge, Decimal("0.08"))
+    for candidate in evaluated_candidates:
+        if candidate.id is None:
+            continue
+        context = candidate_eval_contexts.get(candidate.id)
+        if context is None:
+            continue
+        probability = candidate.probability_after_hardening
+        if probability is None:
+            probability = candidate.probability_calibrated
+        if probability is None:
+            probability = candidate.probability
+        price = context["price"]
+        price_context = context["price_context"]
+        gross_ev, fee, net_ev, probability_edge = _expected_values(probability, price, 1)
+        candidate.probability = probability
+        candidate.model_probability = probability
+        candidate.probability_calibrated = probability
+        candidate.fair_value = probability.quantize(Decimal("0.0001")) if probability is not None else None
+        candidate.expected_value = gross_ev
+        candidate.fee_estimate = fee
+        candidate.net_expected_value = net_ev
+        candidate.probability_edge = probability_edge
+
+        contract_side = str(context["contract_side"])
+        actual_yes_probability = (
+            probability
+            if contract_side == "yes"
+            else (Decimal("1.000000") - probability).quantize(Decimal("0.000001"))
+            if probability is not None
+            else None
+        )
+        actual_no_probability = (
+            probability
+            if contract_side == "no"
+            else (Decimal("1.000000") - probability).quantize(Decimal("0.000001"))
+            if probability is not None
+            else None
+        )
+        features = dict(candidate.features or {})
+        market_context = dict(features.get("market_context") or {})
+        market_context["side_probability"] = float(probability) if probability is not None else None
+        market_context["actual_yes_probability"] = (
+            float(actual_yes_probability) if actual_yes_probability is not None else None
+        )
+        market_context["actual_no_probability"] = (
+            float(actual_no_probability) if actual_no_probability is not None else None
+        )
+        market_context["fee_estimate"] = float(fee) if fee is not None else None
+        features["market_context"] = market_context
+        candidate.features = features
+
+        finalize_probability_hardening_recommendation(
+            candidate,
+            exceptional_min_net_ev=exceptional_tail_net_ev,
+            exceptional_min_prob_edge=exceptional_tail_probability_edge,
+        )
+
+        mapping = context["mapping"]
+        game = context["game"]
+        market = context["market"]
+        market_type = str(context["market_type"])
+        minutes_to_start = int(context["minutes_to_start"])
+        quality_context = context["quality_context"]
+        adapter_result = context["adapter_result"]
+        decision = _base_decision(
+            mapping,
+            game,
+            market,
+            market_type,
+            day,
+            minutes_to_start,
+            price_context,
+            probability,
+            gross_ev,
+            fee,
+            net_ev,
+            probability_edge,
+            quality_context.paper_observation_data_quality,
+            adapter_result.calibration_status,
+            adapter_result.push_probability,
+        )
+        if (
+            decision == "eligible_for_paper_trade"
+            and candidate.probability_hardening_block_recommendation
+        ):
+            decision = "no_trade_probability_hardening_shadow_only"
+        eligible_for_intent = decision == "eligible_for_paper_trade" and price is not None
+        if decision == "eligible_for_paper_trade":
+            if dry_run_candidates_only:
+                decision = "candidate_only_dry_run"
+            elif context["traded_candidate_exists"] or context["open_trade_for_market_exists"]:
+                decision = "candidate_only_existing_trade"
+            elif context["opposite_open_trade_exists"]:
+                decision = "no_trade_opposite_side_open"
+        candidate.decision = decision
+
+        labels = context["labels"]
+        candidate_stage_market_context = context["candidate_stage_market_context"]
+        spread_audit_metadata = context["spread_audit_metadata"]
+        ev_decomposition = _ev_decomposition(
+            probability=probability,
+            price=price,
+            gross_ev=gross_ev,
+            fee_estimate=fee,
+            net_ev=net_ev,
+            probability_edge=probability_edge,
+        )
+        candidate.scoring_rationale = {
+            **(candidate.scoring_rationale or {}),
+            "probability_raw": float(candidate.probability_raw) if candidate.probability_raw is not None else None,
+            "probability_calibrated": float(probability) if probability is not None else None,
+            "fair_value": float(candidate.fair_value) if candidate.fair_value is not None else None,
+            "ev_decomposition": ev_decomposition,
+            "side_probability": float(probability) if probability is not None else None,
+            "actual_yes_probability": float(actual_yes_probability) if actual_yes_probability is not None else None,
+            "actual_no_probability": float(actual_no_probability) if actual_no_probability is not None else None,
+        }
+        diagnostics = _diagnostics_payload(
+            mapping=mapping,
+            game=game,
+            market=market,
+            market_type=market_type,
+            target_date=day,
+            minutes_to_start=minutes_to_start,
+            price_context=price_context,
+            probability=probability,
+            gross_ev=gross_ev,
+            fee_estimate=fee,
+            net_ev=net_ev,
+            probability_edge=probability_edge,
+            data_quality=quality_context.paper_observation_data_quality,
+            calibration_status=adapter_result.calibration_status,
+            push_probability=adapter_result.push_probability,
+            open_trade_exists=bool(context["open_trade_for_market_exists"] or context["opposite_open_trade_exists"]),
+        )
+        diagnostics["raw_feature_snapshot_data_quality"] = (
+            float(quality_context.raw_feature_snapshot_data_quality)
+            if quality_context.raw_feature_snapshot_data_quality is not None
+            else None
+        )
+        diagnostics["paper_observation_data_quality"] = float(quality_context.paper_observation_data_quality)
+        diagnostics["quality_threshold"] = float(quality_context.threshold)
+        diagnostics["quality_decomposition"] = quality_context.decomposition
+        diagnostics["quality_block_reason"] = quality_context.quality_block_reason
+        diagnostics["candidate_stage_market_context_status"] = candidate_stage_market_context["source_status"]
+        diagnostics["ev_decomposition"] = ev_decomposition
+        diagnostics["actual_contract_display"] = labels.actual_contract_display
+        diagnostics["normalized_equivalent_display"] = labels.normalized_equivalent_display
+        diagnostics["display_title"] = labels.display_title
+        diagnostics["display_subtitle"] = labels.display_subtitle
+        diagnostics["raw_ticker_display"] = labels.raw_ticker_display
+        diagnostics["exposure_taxonomy"] = context["exposure_taxonomy"].as_dict()
+        diagnostics["probability_adapter"] = adapter_result.compact_metadata()
+        diagnostics["gate_probability_hardening_ok"] = not bool(candidate.probability_hardening_block_recommendation)
+        if spread_audit_metadata is not None:
+            diagnostics["spread_verification"] = spread_audit_metadata
+        diagnostics["sweep_label"] = normalized_sweep_label
+        diagnostics["sweep_window_enabled"] = sweep_window_enabled
+        diagnostics["dry_run_candidates_only"] = dry_run_candidates_only
+        if decision in {
+            "candidate_only_existing_trade",
+            "candidate_only_dry_run",
+            "no_trade_opposite_side_open",
+            "no_trade_probability_hardening_shadow_only",
+        }:
+            diagnostics["gate_open_position_ok"] = False
+            diagnostics["gate_final_trade_eligible"] = False
+        if candidate.probability_hardening_block_recommendation:
+            diagnostics["gate_final_trade_eligible"] = False
+        _apply_gate_fields(candidate, diagnostics)
+        output = outputs_by_candidate_id.get(candidate.id)
+        _apply_probability_hardening_payload(candidate, output)
+        if output is not None:
+            output.probability_calibrated = candidate.probability_calibrated
+            output.fair_value = candidate.fair_value
+            output.expected_value_gross = candidate.expected_value
+            output.fee_estimate = candidate.fee_estimate
+            output.expected_value_net = candidate.net_expected_value
+            output.probability_edge = candidate.probability_edge
+            output.decision_reason = candidate.decision
+            raw = dict(output.raw_output or {})
+            raw["ev_decomposition"] = ev_decomposition
+            raw["gate_diagnostics"] = candidate.gate_diagnostics or {}
+            fee_context = dict(raw.get("fee_context") or {})
+            fee_context["fee_estimate"] = float(fee) if fee is not None else None
+            raw["fee_context"] = fee_context
+            output.raw_output = raw
+            session.add(output)
+        if price is not None and (
+            decision == "eligible_for_paper_trade" or (dry_run_candidates_only and eligible_for_intent)
+        ):
+            trade_intents.append(
+                TradeIntent(
+                    candidate=candidate,
+                    game=game,
+                    market=market,
+                    price=price,
+                    labels=labels,
+                    score=_trade_rank_score(candidate),
+                )
+            )
+        session.add(candidate)
+
     candidate_exposure_field_counts = _candidate_exposure_field_counts(evaluated_candidates)
     candidate_probability_adapter_field_counts = _candidate_probability_adapter_field_counts(evaluated_candidates)
     probability_adapter_summary = _probability_adapter_summary(evaluated_candidates)
+    candidate_probability_hardening_field_counts = probability_hardening_field_counts(evaluated_candidates)
+    probability_hardening_summary_payload = probability_hardening_summary(
+        evaluated_candidates,
+        enabled=settings.paper_probability_hardening_enabled,
+        policy_version=settings.paper_probability_hardening_policy_version,
+    )
     for candidate, open_trade in open_trade_metadata_refreshes:
         _copy_exposure_metadata_to_trade(open_trade, candidate)
         session.add(open_trade)
@@ -3711,9 +3988,13 @@ def generate_candidates(
         "exposure_taxonomy_version": EXPOSURE_TAXONOMY_VERSION,
         "line_classification_policy_version": LINE_CLASSIFICATION_POLICY_VERSION,
         "probability_adapter_policy_version": PROBABILITY_ADAPTER_POLICY_VERSION,
+        "probability_hardening_policy_version": settings.paper_probability_hardening_policy_version,
+        "probability_hardening_enabled": settings.paper_probability_hardening_enabled,
         "candidate_exposure_field_counts": candidate_exposure_field_counts,
         "candidate_probability_adapter_field_counts": candidate_probability_adapter_field_counts,
+        "candidate_probability_hardening_field_counts": candidate_probability_hardening_field_counts,
         **probability_adapter_summary,
+        **probability_hardening_summary_payload,
         "candidate_selector_field_counts": candidate_selector_field_counts,
         "line_classification_counts": line_classification_counts,
         "line_selection": line_selection_counts,
@@ -3802,9 +4083,13 @@ def generate_candidates(
         "exposure_taxonomy_version": EXPOSURE_TAXONOMY_VERSION,
         "line_classification_policy_version": LINE_CLASSIFICATION_POLICY_VERSION,
         "probability_adapter_policy_version": PROBABILITY_ADAPTER_POLICY_VERSION,
+        "probability_hardening_policy_version": settings.paper_probability_hardening_policy_version,
+        "probability_hardening_enabled": settings.paper_probability_hardening_enabled,
         "candidate_exposure_field_counts": candidate_exposure_field_counts,
         "candidate_probability_adapter_field_counts": candidate_probability_adapter_field_counts,
+        "candidate_probability_hardening_field_counts": candidate_probability_hardening_field_counts,
         **probability_adapter_summary,
+        **probability_hardening_summary_payload,
         "candidate_selector_field_counts": candidate_selector_field_counts,
         "line_classification_counts": line_classification_counts,
         "selector": selector_summary,
