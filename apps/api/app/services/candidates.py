@@ -53,6 +53,12 @@ from app.services.modeling import (
     get_or_create_mature_model_version,
     score_mature_candidate,
 )
+from app.services.probability_adapters import (
+    PROBABILITY_ADAPTER_POLICY_VERSION,
+    ProbabilityAdapterContext,
+    probability_adapter_candidate_payload,
+    score_probability_adapter,
+)
 from app.services.portfolio import calculate_paper_portfolio, create_balance_snapshot, paper_trade_fee
 from app.services.paper_epoch import get_or_create_active_paper_epoch
 from app.services.spread_verification import (
@@ -107,6 +113,18 @@ COMPACT_SPREAD_AUDIT_KEYS = (
     "no_text_source",
     "no_complement_source",
     "no_complement_confidence",
+)
+
+PROBABILITY_ADAPTER_CANDIDATE_FIELDS = (
+    "probability_adapter_key",
+    "probability_adapter_version",
+    "probability_adapter_policy_version",
+    "probability_adapter_family",
+    "probability_adapter_scope",
+    "probability_adapter_rationale",
+    "probability_adapter_calibration_hook",
+    "probability_adapter_calibration_version",
+    "probability_adapter_feature_policy_version",
 )
 
 
@@ -312,6 +330,76 @@ def _candidate_selector_field_counts(candidates: list[ModelCandidate]) -> dict[s
             if value is not None:
                 counts[field] += 1
     return counts
+
+
+def _apply_probability_adapter_metadata(candidate: ModelCandidate, payload: dict[str, object]) -> None:
+    candidate.probability_adapter_key = payload.get("probability_adapter_key")
+    candidate.probability_adapter_version = payload.get("probability_adapter_version")
+    candidate.probability_adapter_policy_version = payload.get("probability_adapter_policy_version")
+    candidate.probability_adapter_family = payload.get("probability_adapter_family")
+    candidate.probability_adapter_scope = payload.get("probability_adapter_scope")
+    candidate.probability_adapter_rationale = payload.get("probability_adapter_rationale")
+    candidate.probability_adapter_calibration_hook = payload.get("probability_adapter_calibration_hook")
+    candidate.probability_adapter_calibration_version = payload.get("probability_adapter_calibration_version")
+    candidate.probability_adapter_feature_policy_version = payload.get("probability_adapter_feature_policy_version")
+    candidate.probability_adapter_metadata = payload.get("probability_adapter_metadata")
+
+
+def _candidate_probability_adapter_payload(candidate: ModelCandidate) -> dict[str, object]:
+    return {
+        "probability_adapter_key": candidate.probability_adapter_key,
+        "probability_adapter_version": candidate.probability_adapter_version,
+        "probability_adapter_policy_version": candidate.probability_adapter_policy_version,
+        "probability_adapter_family": candidate.probability_adapter_family,
+        "probability_adapter_scope": candidate.probability_adapter_scope,
+        "probability_adapter_rationale": candidate.probability_adapter_rationale,
+        "probability_adapter_calibration_hook": candidate.probability_adapter_calibration_hook,
+        "probability_adapter_calibration_version": candidate.probability_adapter_calibration_version,
+        "probability_adapter_feature_policy_version": candidate.probability_adapter_feature_policy_version,
+    }
+
+
+def _candidate_probability_adapter_field_counts(candidates: list[ModelCandidate]) -> dict[str, int]:
+    counts = {field: 0 for field in PROBABILITY_ADAPTER_CANDIDATE_FIELDS}
+    for candidate in candidates:
+        payload = _candidate_probability_adapter_payload(candidate)
+        for field, value in payload.items():
+            if value is not None:
+                counts[field] += 1
+    return counts
+
+
+def _probability_adapter_summary(candidates: list[ModelCandidate]) -> dict[str, object]:
+    adapter_counts: dict[str, int] = {}
+    hook_counts: dict[str, int] = {}
+    family_counts: dict[str, int] = {}
+    missing_count = 0
+    error_count = 0
+    for candidate in candidates:
+        key = candidate.probability_adapter_key
+        version = candidate.probability_adapter_version
+        hook = candidate.probability_adapter_calibration_hook
+        family = candidate.probability_adapter_family
+        if key and version:
+            adapter_counts[f"{key}:{version}"] = adapter_counts.get(f"{key}:{version}", 0) + 1
+        else:
+            missing_count += 1
+        if hook:
+            hook_counts[hook] = hook_counts.get(hook, 0) + 1
+        if family:
+            family_counts[family] = family_counts.get(family, 0) + 1
+        metadata = candidate.probability_adapter_metadata if isinstance(candidate.probability_adapter_metadata, dict) else {}
+        diagnostics = metadata.get("diagnostics") if isinstance(metadata.get("diagnostics"), dict) else {}
+        if diagnostics.get("adapter_error"):
+            error_count += 1
+    return {
+        "probability_adapter_policy_version": PROBABILITY_ADAPTER_POLICY_VERSION,
+        "probability_adapter_counts": adapter_counts,
+        "probability_adapter_calibration_hook_counts": hook_counts,
+        "probability_adapter_family_counts": family_counts,
+        "probability_adapter_missing_count": missing_count,
+        "probability_adapter_error_count": error_count,
+    }
 
 
 def _apply_candidate_line_classifications(
@@ -2662,6 +2750,7 @@ def generate_candidates(
             "paper_allow_multiple_f5_winner_outcomes": settings.paper_allow_multiple_f5_winner_outcomes,
             "paper_selector_mode": settings.paper_selector_mode,
             "selector_policy_version": SELECTOR_POLICY_VERSION,
+            "probability_adapter_policy_version": PROBABILITY_ADAPTER_POLICY_VERSION,
             "paper_spread_trading_enabled": settings.paper_spread_trading_enabled,
             "paper_first_five_spread_trading_enabled": settings.paper_spread_trading_enabled,
             "paper_full_game_spread_trading_enabled": settings.paper_full_game_spread_trading_enabled,
@@ -2787,19 +2876,9 @@ def generate_candidates(
 
         for contract_side, price_context in price_contexts.items():
             price = price_context.executable_price
-            probability = actual_yes_probability if contract_side == "yes" else actual_no_probability
-            probability_raw = (
-                model_score.probability_raw
-                if contract_side == "yes"
-                else (Decimal("1.000000") - model_score.probability_raw).quantize(Decimal("0.000001"))
-            )
-            fair_value = probability.quantize(Decimal("0.0001"))
             features = {**base_features}
             market_context = dict(features.get("market_context") or {})
             market_context["contract_side"] = contract_side
-            market_context["side_probability"] = float(probability)
-            market_context["actual_yes_probability"] = float(actual_yes_probability)
-            market_context["actual_no_probability"] = float(actual_no_probability)
             market_context["executable_price"] = float(price) if price is not None else None
             market_context["executable_price_source"] = price_context.source
             market_context["market_price"] = float(price_context.market_price) if price_context.market_price is not None else None
@@ -2810,6 +2889,59 @@ def generate_candidates(
             if spread_audit_metadata is not None:
                 market_context["spread_verification"] = spread_audit_metadata
             features["market_context"] = market_context
+            labels = contract_labels(
+                game=game,
+                market=market,
+                market_ticker=market.ticker,
+                market_type=market_type,
+                selection_code=parsed_selection_code,
+                contract_side=contract_side,
+            )
+            actual_display = labels.actual_contract_display or labels.contract_display
+            exposure_taxonomy = exposure_taxonomy_for_candidate(
+                game=game,
+                market_family=mapping.market_family or market.market_family or market_type,
+                selection_code=parsed_selection_code,
+                line_value=parsed_line_value,
+                over_under_side=mapping.over_under_side or market.over_under_side,
+                contract_side=contract_side,
+                contract_mechanics_label=actual_display,
+                spread_verification=spread_verification,
+            )
+            market_context["exposure_taxonomy"] = exposure_taxonomy.as_dict()
+            features["exposure_taxonomy"] = exposure_taxonomy.as_dict()
+            adapter_result = score_probability_adapter(
+                ProbabilityAdapterContext(
+                    features=features,
+                    market_type=market_type,
+                    contract_side=contract_side,
+                    settlement_status=_settlement_status(mapping, market),
+                    parameters=parameter_version.parameters,
+                    parameter_version_tag=parameter_version.version_tag,
+                    exposure_taxonomy=exposure_taxonomy,
+                    base_model_score=model_score,
+                    spread_verification=spread_verification,
+                )
+            )
+            probability = adapter_result.probability
+            probability_raw = adapter_result.probability_raw
+            fair_value = adapter_result.fair_value
+            actual_yes_probability = (
+                probability
+                if contract_side == "yes"
+                else (Decimal("1.000000") - probability).quantize(Decimal("0.000001"))
+            )
+            actual_no_probability = (
+                probability
+                if contract_side == "no"
+                else (Decimal("1.000000") - probability).quantize(Decimal("0.000001"))
+            )
+            adapter_payload = probability_adapter_candidate_payload(adapter_result)
+            market_context["side_probability"] = float(probability)
+            market_context["actual_yes_probability"] = float(actual_yes_probability)
+            market_context["actual_no_probability"] = float(actual_no_probability)
+            market_context["probability_adapter"] = adapter_result.compact_metadata()
+            features["probability_adapter"] = adapter_result.compact_metadata()
             candidate_stage_market_context = _candidate_stage_market_context(
                 mapping=mapping,
                 game=game,
@@ -2822,7 +2954,7 @@ def generate_candidates(
                 features=features,
                 market_type=market_type,
                 candidate_stage_market_context=candidate_stage_market_context,
-                model_score_data_quality=model_score.data_quality,
+                model_score_data_quality=adapter_result.data_quality,
             )
             features["raw_feature_snapshot_data_quality"] = (
                 float(quality_context.raw_feature_snapshot_data_quality)
@@ -2847,27 +2979,6 @@ def generate_candidates(
                 "candidate_stage_market_context_status": candidate_stage_market_context["source_status"],
                 "paper_observation": quality_context.decomposition["paper_observation"],
             }
-            labels = contract_labels(
-                game=game,
-                market=market,
-                market_ticker=market.ticker,
-                market_type=market_type,
-                selection_code=parsed_selection_code,
-                contract_side=contract_side,
-            )
-            actual_display = labels.actual_contract_display or labels.contract_display
-            exposure_taxonomy = exposure_taxonomy_for_candidate(
-                game=game,
-                market_family=mapping.market_family or market.market_family or market_type,
-                selection_code=parsed_selection_code,
-                line_value=parsed_line_value,
-                over_under_side=mapping.over_under_side or market.over_under_side,
-                contract_side=contract_side,
-                contract_mechanics_label=actual_display,
-                spread_verification=spread_verification,
-            )
-            market_context["exposure_taxonomy"] = exposure_taxonomy.as_dict()
-            features["exposure_taxonomy"] = exposure_taxonomy.as_dict()
             gross_ev, fee, net_ev, probability_edge = _expected_values(probability, price, 1)
             market_context["fee_estimate"] = float(fee) if fee is not None else None
             if price_context.status == "stale":
@@ -2888,8 +2999,8 @@ def generate_candidates(
                 net_ev,
                 probability_edge,
                 quality_context.paper_observation_data_quality,
-                model_score.calibration_status,
-                model_score.push_probability,
+                adapter_result.calibration_status,
+                adapter_result.push_probability,
             )
 
             existing_candidates = list(
@@ -2985,8 +3096,8 @@ def generate_candidates(
             candidate.decision = decision
             candidate.model_version_tag = MATURE_MODEL_TAG
             candidate.feature_version = FEATURE_VERSION
-            candidate.training_eligible = model_score.training_eligible
-            candidate.training_exclusion_reason = model_score.training_exclusion_reason
+            candidate.training_eligible = adapter_result.training_eligible
+            candidate.training_exclusion_reason = adapter_result.training_exclusion_reason
             if _eastern_date(game.scheduled_start) != day:
                 candidate.training_eligible = False
                 candidate.training_exclusion_reason = "target_date_mismatch"
@@ -3015,9 +3126,15 @@ def generate_candidates(
                 candidate.training_eligible = False
                 candidate.training_exclusion_reason = "dry_run_candidates_only"
             candidate.data_quality = quality_context.paper_observation_data_quality
-            candidate.calibration_status = model_score.calibration_status
+            candidate.calibration_status = adapter_result.calibration_status
             candidate.scoring_rationale = {
                 **model_score.rationale,
+                "probability_raw": float(probability_raw),
+                "probability_calibrated": float(probability),
+                "push_probability": float(adapter_result.push_probability),
+                "calibration_status": adapter_result.calibration_status,
+                "probability_adapter": adapter_result.compact_metadata(),
+                "probability_adapter_policy_version": PROBABILITY_ADAPTER_POLICY_VERSION,
                 "raw_feature_snapshot_data_quality": (
                     float(quality_context.raw_feature_snapshot_data_quality)
                     if quality_context.raw_feature_snapshot_data_quality is not None
@@ -3061,6 +3178,7 @@ def generate_candidates(
             candidate.inning_scope = mapping.inning_scope or market.inning_scope
             candidate.settlement_rule_status = mapping.settlement_rule_status or market.settlement_rule_status
             _apply_exposure_taxonomy(candidate, exposure_taxonomy)
+            _apply_probability_adapter_metadata(candidate, adapter_payload)
             if open_trade_for_market is not None and not dry_run_candidates_only:
                 _copy_exposure_metadata_to_trade(open_trade_for_market, candidate)
                 open_trade_metadata_refreshes.append((candidate, open_trade_for_market))
@@ -3078,8 +3196,8 @@ def generate_candidates(
                 net_ev=net_ev,
                 probability_edge=probability_edge,
                 data_quality=quality_context.paper_observation_data_quality,
-                calibration_status=model_score.calibration_status,
-                push_probability=model_score.push_probability,
+                calibration_status=adapter_result.calibration_status,
+                push_probability=adapter_result.push_probability,
                 open_trade_exists=open_trade_for_market is not None or opposite_open_trade is not None,
             )
             diagnostics["raw_feature_snapshot_data_quality"] = (
@@ -3106,6 +3224,7 @@ def generate_candidates(
             diagnostics["display_subtitle"] = labels.display_subtitle
             diagnostics["raw_ticker_display"] = labels.raw_ticker_display
             diagnostics["exposure_taxonomy"] = exposure_taxonomy.as_dict()
+            diagnostics["probability_adapter"] = adapter_result.compact_metadata()
             if spread_audit_metadata is not None:
                 diagnostics["spread_verification"] = spread_audit_metadata
             diagnostics["sweep_label"] = normalized_sweep_label
@@ -3194,6 +3313,8 @@ def generate_candidates(
 
     line_classification_counts = _apply_candidate_line_classifications(evaluated_candidates, outputs_by_candidate_id)
     candidate_exposure_field_counts = _candidate_exposure_field_counts(evaluated_candidates)
+    candidate_probability_adapter_field_counts = _candidate_probability_adapter_field_counts(evaluated_candidates)
+    probability_adapter_summary = _probability_adapter_summary(evaluated_candidates)
     for candidate, open_trade in open_trade_metadata_refreshes:
         _copy_exposure_metadata_to_trade(open_trade, candidate)
         session.add(open_trade)
@@ -3579,7 +3700,10 @@ def generate_candidates(
         "side_aware_verified_count": created_or_updated,
         "exposure_taxonomy_version": EXPOSURE_TAXONOMY_VERSION,
         "line_classification_policy_version": LINE_CLASSIFICATION_POLICY_VERSION,
+        "probability_adapter_policy_version": PROBABILITY_ADAPTER_POLICY_VERSION,
         "candidate_exposure_field_counts": candidate_exposure_field_counts,
+        "candidate_probability_adapter_field_counts": candidate_probability_adapter_field_counts,
+        **probability_adapter_summary,
         "candidate_selector_field_counts": candidate_selector_field_counts,
         "line_classification_counts": line_classification_counts,
         "line_selection": line_selection_counts,
@@ -3667,7 +3791,10 @@ def generate_candidates(
         "side_aware_verified_count": created_or_updated,
         "exposure_taxonomy_version": EXPOSURE_TAXONOMY_VERSION,
         "line_classification_policy_version": LINE_CLASSIFICATION_POLICY_VERSION,
+        "probability_adapter_policy_version": PROBABILITY_ADAPTER_POLICY_VERSION,
         "candidate_exposure_field_counts": candidate_exposure_field_counts,
+        "candidate_probability_adapter_field_counts": candidate_probability_adapter_field_counts,
+        **probability_adapter_summary,
         "candidate_selector_field_counts": candidate_selector_field_counts,
         "line_classification_counts": line_classification_counts,
         "selector": selector_summary,

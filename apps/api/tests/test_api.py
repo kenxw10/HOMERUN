@@ -70,6 +70,7 @@ from app.services import (
     mlb_stats_client,
     modeling,
     position_refresh,
+    probability_adapters,
     pybaseball_client,
     ws_market_data,
 )
@@ -136,6 +137,18 @@ PR3T_REQUIRED_CANDIDATE_FIELDS = (
     "selector_live_like_eligible_before_cluster",
 )
 
+PR3U_REQUIRED_CANDIDATE_FIELDS = (
+    "probability_adapter_key",
+    "probability_adapter_version",
+    "probability_adapter_policy_version",
+    "probability_adapter_family",
+    "probability_adapter_scope",
+    "probability_adapter_rationale",
+    "probability_adapter_calibration_hook",
+    "probability_adapter_calibration_version",
+    "probability_adapter_feature_policy_version",
+)
+
 
 def _assert_pr3s_required_fields_populated(row: object) -> None:
     for field in PR3S_REQUIRED_CANDIDATE_FIELDS:
@@ -144,6 +157,11 @@ def _assert_pr3s_required_fields_populated(row: object) -> None:
 
 def _assert_pr3t_required_fields_populated(row: object) -> None:
     for field in PR3T_REQUIRED_CANDIDATE_FIELDS:
+        assert getattr(row, field) is not None, field
+
+
+def _assert_pr3u_required_fields_populated(row: object) -> None:
+    for field in PR3U_REQUIRED_CANDIDATE_FIELDS:
         assert getattr(row, field) is not None, field
 
 
@@ -259,6 +277,224 @@ def _fixed_model_score(
         training_exclusion_reason=None,
         push_probability=Decimal(push_probability),
     )
+
+
+def _adapter_features(
+    market_type: str,
+    *,
+    selection_code: str = "PIT",
+    line_value: str = "8.5",
+    over_under_side: str = "over",
+) -> dict[str, object]:
+    return {
+        "feature_version": features.FEATURE_VERSION,
+        "data_quality": 1.0,
+        "game_context": {
+            "home_abbreviation": "PIT",
+            "away_abbreviation": "SEA",
+        },
+        "market_context": {
+            "market_family": market_type,
+            "selection_code": selection_code,
+            "line_value": line_value,
+            "over_under_side": over_under_side,
+        },
+    }
+
+
+def _adapter_context(
+    market_type: str,
+    *,
+    contract_side: str = "yes",
+    selection_code: str = "PIT",
+    line_value: str = "8.5",
+    over_under_side: str = "over",
+    exposure_direction: str | None = None,
+    exposure_team: str | None = "PIT",
+    exposure_line: str | None = None,
+) -> probability_adapters.ProbabilityAdapterContext:
+    taxonomy = SimpleNamespace(
+        economic_exposure_direction=exposure_direction or over_under_side,
+        economic_exposure_team=exposure_team,
+        economic_exposure_line=Decimal(exposure_line or line_value),
+    )
+    return probability_adapters.ProbabilityAdapterContext(
+        features=_adapter_features(
+            market_type,
+            selection_code=selection_code,
+            line_value=line_value,
+            over_under_side=over_under_side,
+        ),
+        market_type=market_type,
+        contract_side=contract_side,
+        settlement_status="paper_supported",
+        exposure_taxonomy=taxonomy,
+    )
+
+
+def test_probability_adapters_dispatch_all_supported_families() -> None:
+    families = (
+        "full_game_total",
+        "first_five_total",
+        "full_game_winner",
+        "first_five_winner",
+        "full_game_spread",
+        "first_five_spread",
+    )
+    for family in families:
+        context = _adapter_context(
+            family,
+            line_value="1.5" if family.endswith("spread") else "8.5",
+            exposure_direction="cover" if family.endswith("spread") else "win" if family.endswith("winner") else "over",
+        )
+        result = probability_adapters.score_probability_adapter(context)
+        assert result.adapter_family == family
+        assert result.adapter_version == probability_adapters.ADAPTER_VERSION_BY_FAMILY[family]
+        assert result.adapter_key == f"{family}_probability_adapter"
+        assert result.calibration_hook == probability_adapters.CALIBRATION_HOOK_BY_FAMILY[family]
+        assert result.model_policy_metadata["policy_version"] == probability_adapters.PROBABILITY_ADAPTER_POLICY_VERSION
+
+
+def test_probability_adapters_scope_policy_metadata_separates_full_game_and_first_five() -> None:
+    full_game = probability_adapters.score_probability_adapter(
+        _adapter_context("full_game_winner", exposure_direction="win")
+    )
+    first_five = probability_adapters.score_probability_adapter(
+        _adapter_context("first_five_winner", exposure_direction="win")
+    )
+
+    assert full_game.adapter_scope == "full_game"
+    assert full_game.model_policy_metadata["scope_policy"] == "full_game_bullpen_aware"
+    assert full_game.diagnostics["run_mean_source"] == "full_game_bullpen_aware"
+    assert first_five.adapter_scope == "first_five"
+    assert first_five.model_policy_metadata["scope_policy"] == "first_five_starter_heavy"
+    assert first_five.diagnostics["run_mean_source"] == "first_five_starter_heavy"
+
+
+def test_probability_adapters_normalize_total_contract_sides() -> None:
+    yes_over = probability_adapters.score_probability_adapter(
+        _adapter_context("full_game_total", contract_side="yes", over_under_side="over", exposure_direction="over")
+    )
+    no_over = probability_adapters.score_probability_adapter(
+        _adapter_context("full_game_total", contract_side="no", over_under_side="over", exposure_direction="under")
+    )
+    yes_under = probability_adapters.score_probability_adapter(
+        _adapter_context("full_game_total", contract_side="yes", over_under_side="under", exposure_direction="under")
+    )
+    no_under = probability_adapters.score_probability_adapter(
+        _adapter_context("full_game_total", contract_side="no", over_under_side="under", exposure_direction="over")
+    )
+
+    assert yes_over.diagnostics["normalized_total_direction"] == "over"
+    assert no_over.diagnostics["normalized_total_direction"] == "under"
+    assert yes_under.diagnostics["normalized_total_direction"] == "under"
+    assert no_under.diagnostics["normalized_total_direction"] == "over"
+    assert no_over.probability_raw == yes_under.probability_raw
+    assert no_under.probability_raw == yes_over.probability_raw
+
+
+def test_probability_adapters_preserve_winner_tie_semantics() -> None:
+    full_no = probability_adapters.score_probability_adapter(
+        _adapter_context(
+            "full_game_winner",
+            contract_side="no",
+            selection_code="PIT",
+            exposure_direction="win",
+            exposure_team="SEA",
+        )
+    )
+    first_five_no = probability_adapters.score_probability_adapter(
+        _adapter_context(
+            "first_five_winner",
+            contract_side="no",
+            selection_code="PIT",
+            exposure_direction="not_win",
+            exposure_team="PIT",
+        )
+    )
+    first_five_tie = probability_adapters.score_probability_adapter(
+        _adapter_context(
+            "first_five_winner",
+            contract_side="yes",
+            selection_code="TIE",
+            exposure_direction="tie",
+            exposure_team=None,
+        )
+    )
+    first_five_no_tie = probability_adapters.score_probability_adapter(
+        _adapter_context(
+            "first_five_winner",
+            contract_side="no",
+            selection_code="TIE",
+            exposure_direction="either_team_win",
+            exposure_team=None,
+        )
+    )
+
+    assert full_no.diagnostics["winner_team"] == "SEA"
+    assert full_no.diagnostics["tie_policy"] == "excluded_full_game"
+    assert first_five_no.diagnostics["winner_team"] == "PIT"
+    assert first_five_no.diagnostics["tie_policy"] == "tie_included_in_no_contract"
+    assert first_five_tie.diagnostics["winner_team"] == "TIE"
+    assert first_five_tie.diagnostics["tie_policy"] == "tie_contract_diagnostics_only"
+    assert first_five_no_tie.diagnostics["winner_team"] is None
+    assert first_five_no_tie.diagnostics["tie_policy"] == "no_on_tie_means_either_team_wins"
+    assert first_five_no_tie.probability_raw == Decimal("1.000000") - first_five_tie.probability_raw
+
+
+def test_probability_adapters_do_not_invent_ambiguous_spread_complements() -> None:
+    safe_yes = probability_adapters.score_probability_adapter(
+        _adapter_context(
+            "full_game_spread",
+            contract_side="yes",
+            line_value="-1.5",
+            exposure_line="-1.5",
+            exposure_direction="cover",
+            exposure_team="PIT",
+        )
+    )
+    ambiguous_no = probability_adapters.score_probability_adapter(
+        _adapter_context(
+            "full_game_spread",
+            contract_side="no",
+            line_value="-1.5",
+            exposure_line="-1.5",
+            exposure_direction="not_cover",
+            exposure_team="PIT",
+        )
+    )
+
+    assert safe_yes.diagnostics["spread_direction"] == "cover"
+    assert ambiguous_no.probability_raw == Decimal("0.500000")
+    assert ambiguous_no.diagnostics["adapter_error"] == "ambiguous_spread_complement"
+    assert ambiguous_no.diagnostics["ambiguous_spread_complement"] is True
+
+
+def test_compact_dashboard_preserves_nested_probability_adapter_summary() -> None:
+    compact = dashboard._compact_candidate_diagnostics(
+        {
+            "probability_adapter": {
+                "probability_adapter_policy_version": probability_adapters.PROBABILITY_ADAPTER_POLICY_VERSION,
+                "probability_adapter_counts": {
+                    "full_game_total_probability_adapter:full_game_total_adapter_v1": 12,
+                },
+                "probability_adapter_calibration_hook_counts": {
+                    "calibration_hook_full_game_total": 12,
+                },
+                "probability_adapter_family_counts": {"full_game_total": 12},
+                "probability_adapter_missing_count": 0,
+                "probability_adapter_error_count": 0,
+            }
+        }
+    )
+
+    assert compact["probability_adapter"]["probability_adapter_policy_version"] == (
+        probability_adapters.PROBABILITY_ADAPTER_POLICY_VERSION
+    )
+    assert compact["probability_adapter"]["probability_adapter_counts"] == {
+        "full_game_total_probability_adapter:full_game_total_adapter_v1": 12
+    }
+    assert compact["probability_adapter"]["probability_adapter_error_count"] == 0
 
 
 def _cap_intent(
@@ -2053,7 +2289,12 @@ def test_generate_candidates_dry_run_scores_without_opening_no_trade(monkeypatch
     assert no_candidate.training_exclusion_reason == "dry_run_candidates_only"
     _assert_pr3s_required_fields_populated(no_candidate)
     _assert_pr3t_required_fields_populated(no_candidate)
+    _assert_pr3u_required_fields_populated(no_candidate)
     assert no_candidate.economic_exposure_label == "SEA FULL GAME WINNER"
+    assert no_candidate.probability_adapter_key == "full_game_winner_probability_adapter"
+    assert no_candidate.probability_adapter_policy_version == probability_adapters.PROBABILITY_ADAPTER_POLICY_VERSION
+    assert no_candidate.probability_adapter_calibration_hook == "calibration_hook_full_game_winner"
+    assert no_candidate.scoring_rationale["probability_adapter"]["adapter_scope"] == "full_game"
     assert no_candidate.selector_policy_version == live_like_selector.SELECTOR_POLICY_VERSION
     assert no_candidate.selector_mode == "live_like"
     assert no_candidate.selector_decision == "selected_live_like"
@@ -2063,10 +2304,17 @@ def test_generate_candidates_dry_run_scores_without_opening_no_trade(monkeypatch
     assert yes_candidate is not None
     assert yes_candidate.decision == "no_trade_missing_price"
     _assert_pr3s_required_fields_populated(yes_candidate)
+    _assert_pr3u_required_fields_populated(yes_candidate)
     assert yes_candidate.selector_policy_version == live_like_selector.SELECTOR_POLICY_VERSION
     assert yes_candidate.selector_status == "not_considered"
     assert result["candidate_exposure_field_counts"]["economic_exposure_label"] == 2
     assert result["candidate_exposure_field_counts"]["line_classification_policy_version"] == 2
+    assert result["candidate_probability_adapter_field_counts"]["probability_adapter_key"] == 2
+    assert result["probability_adapter_policy_version"] == probability_adapters.PROBABILITY_ADAPTER_POLICY_VERSION
+    assert result["probability_adapter_counts"]["full_game_winner_probability_adapter:full_game_winner_adapter_v1"] == 2
+    assert result["probability_adapter_calibration_hook_counts"]["calibration_hook_full_game_winner"] == 2
+    assert result["probability_adapter_family_counts"]["full_game_winner"] == 2
+    assert result["probability_adapter_missing_count"] == 0
     assert result["candidate_selector_field_counts"]["selector_policy_version"] == 2
     assert result["selector_policy_version"] == live_like_selector.SELECTOR_POLICY_VERSION
     assert result["selector_mode"] == "live_like"
@@ -17295,6 +17543,16 @@ def test_model_predictions_today_filters_by_prediction_run_target_date(monkeypat
             selector_shadow_only=False,
             selector_live_like_eligible_before_cluster=True,
             selector_live_like_eligible_after_cluster=True,
+            probability_adapter_key="full_game_total_probability_adapter",
+            probability_adapter_version="full_game_total_adapter_v1",
+            probability_adapter_policy_version=probability_adapters.PROBABILITY_ADAPTER_POLICY_VERSION,
+            probability_adapter_family="full_game_total",
+            probability_adapter_scope="full_game",
+            probability_adapter_rationale="full_game total probability adapter using mature run distribution v2",
+            probability_adapter_calibration_hook="calibration_hook_full_game_total",
+            probability_adapter_calibration_version="shared_parameter_offsets_pre_pr3v",
+            probability_adapter_feature_policy_version=probability_adapters.PROBABILITY_ADAPTER_FEATURE_POLICY_VERSION,
+            probability_adapter_metadata={"raw": "must_not_serialize"},
         )
         session.add(today_candidate)
         session.flush()
@@ -17399,9 +17657,18 @@ def test_model_predictions_today_filters_by_prediction_run_target_date(monkeypat
     assert item["selector_shadow_only"] is False
     assert item["selector_live_like_eligible_before_cluster"] is True
     assert item["selector_live_like_eligible_after_cluster"] is True
+    assert item["probability_adapter_key"] == "full_game_total_probability_adapter"
+    assert item["probability_adapter_version"] == "full_game_total_adapter_v1"
+    assert item["probability_adapter_policy_version"] == probability_adapters.PROBABILITY_ADAPTER_POLICY_VERSION
+    assert item["probability_adapter_family"] == "full_game_total"
+    assert item["probability_adapter_scope"] == "full_game"
+    assert item["probability_adapter_calibration_hook"] == "calibration_hook_full_game_total"
+    assert item["probability_adapter_calibration_version"] == "shared_parameter_offsets_pre_pr3v"
+    assert item["probability_adapter_feature_policy_version"] == probability_adapters.PROBABILITY_ADAPTER_FEATURE_POLICY_VERSION
     assert "raw_output" not in item
     assert "features" not in item
     assert "scoring_rationale" not in item
+    assert "probability_adapter_metadata" not in item
     assert dated_response.status_code == 200
     assert dated_payload["result"]["date"] == "2026-07-01"
     assert dated_payload["result"]["count"] == 1

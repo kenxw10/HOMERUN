@@ -320,6 +320,14 @@ class CandidateSummary(BaseModel):
     data_quality: float | None = None
     calibration_status: str | None = None
     training_eligible: bool | None = None
+    probability_adapter_key: str | None = None
+    probability_adapter_version: str | None = None
+    probability_adapter_policy_version: str | None = None
+    probability_adapter_family: str | None = None
+    probability_adapter_scope: str | None = None
+    probability_adapter_calibration_hook: str | None = None
+    probability_adapter_calibration_version: str | None = None
+    probability_adapter_feature_policy_version: str | None = None
     decision: str
 
 
