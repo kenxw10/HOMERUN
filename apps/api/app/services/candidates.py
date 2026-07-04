@@ -3563,6 +3563,7 @@ def generate_candidates(
         output = outputs_by_candidate_id.get(candidate.id)
         _apply_probability_hardening_payload(candidate, output)
         if output is not None:
+            output.probability_raw = candidate.probability_raw
             output.probability_calibrated = candidate.probability_calibrated
             output.fair_value = candidate.fair_value
             output.expected_value_gross = candidate.expected_value
@@ -3571,6 +3572,7 @@ def generate_candidates(
             output.probability_edge = candidate.probability_edge
             output.decision_reason = candidate.decision
             raw = dict(output.raw_output or {})
+            raw.update(candidate.scoring_rationale or {})
             raw["ev_decomposition"] = ev_decomposition
             raw["gate_diagnostics"] = candidate.gate_diagnostics or {}
             fee_context = dict(raw.get("fee_context") or {})
@@ -3592,6 +3594,8 @@ def generate_candidates(
                 )
             )
         session.add(candidate)
+
+    session.flush()
 
     candidate_exposure_field_counts = _candidate_exposure_field_counts(evaluated_candidates)
     candidate_probability_adapter_field_counts = _candidate_probability_adapter_field_counts(evaluated_candidates)

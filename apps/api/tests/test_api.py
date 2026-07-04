@@ -174,6 +174,25 @@ PR3W_REQUIRED_CANDIDATE_FIELDS = (
     "probability_hardening_block_recommendation",
 )
 
+PR3W_CORE_REQUIRED_CANDIDATE_FIELDS = (
+    "probability_hardening_policy_version",
+    "probability_hardening_enabled",
+    "probability_raw_adapter",
+    "probability_before_hardening",
+    "probability_after_hardening",
+    "probability_hardening_delta",
+    "probability_hardening_applied",
+    "probability_hardening_reason",
+    "probability_hardening_status",
+    "probability_hardening_line_class",
+    "probability_hardening_line_class_policy",
+    "probability_hardening_consistency_status",
+    "probability_hardening_monotonicity_status",
+    "probability_hardening_dampening_factor",
+    "probability_hardening_shadow_only",
+    "probability_hardening_block_recommendation",
+)
+
 
 def _assert_pr3s_required_fields_populated(row: object) -> None:
     for field in PR3S_REQUIRED_CANDIDATE_FIELDS:
@@ -191,7 +210,7 @@ def _assert_pr3u_required_fields_populated(row: object) -> None:
 
 
 def _assert_pr3w_required_fields_populated(row: object) -> None:
-    for field in PR3W_REQUIRED_CANDIDATE_FIELDS:
+    for field in PR3W_CORE_REQUIRED_CANDIDATE_FIELDS:
         assert getattr(row, field) is not None, field
 
 
@@ -2495,11 +2514,21 @@ def test_generate_candidates_dry_run_scores_without_opening_no_trade(monkeypatch
     _assert_pr3s_required_fields_populated(no_candidate)
     _assert_pr3t_required_fields_populated(no_candidate)
     _assert_pr3u_required_fields_populated(no_candidate)
+    _assert_pr3w_required_fields_populated(no_candidate)
     assert no_candidate.economic_exposure_label == "SEA FULL GAME WINNER"
     assert no_candidate.probability_adapter_key == "full_game_winner_probability_adapter"
     assert no_candidate.probability_adapter_policy_version == probability_adapters.PROBABILITY_ADAPTER_POLICY_VERSION
     assert no_candidate.probability_adapter_calibration_hook == "calibration_hook_full_game_winner"
+    assert no_candidate.probability_hardening_policy_version == probability_hardening.PROBABILITY_HARDENING_POLICY_VERSION
+    assert no_candidate.probability_hardening_enabled is True
+    assert no_candidate.probability_hardening_applied is False
+    assert no_candidate.probability_hardening_line_class == "not_applicable"
+    assert no_candidate.probability_hardening_status == "not_applicable"
+    assert no_candidate.probability_hardening_dampening_factor == Decimal("1.0000")
+    assert no_candidate.probability_before_hardening == no_candidate.probability_raw_adapter
+    assert no_candidate.probability_after_hardening == no_candidate.probability_calibrated
     assert no_candidate.scoring_rationale["probability_adapter"]["adapter_scope"] == "full_game"
+    assert no_candidate.scoring_rationale["probability_hardening"]["probability_hardening_enabled"] is True
     assert no_candidate.selector_policy_version == live_like_selector.SELECTOR_POLICY_VERSION
     assert no_candidate.selector_mode == "live_like"
     assert no_candidate.selector_decision == "selected_live_like"
@@ -2510,11 +2539,18 @@ def test_generate_candidates_dry_run_scores_without_opening_no_trade(monkeypatch
     assert yes_candidate.decision == "no_trade_missing_price"
     _assert_pr3s_required_fields_populated(yes_candidate)
     _assert_pr3u_required_fields_populated(yes_candidate)
+    _assert_pr3w_required_fields_populated(yes_candidate)
     assert yes_candidate.selector_policy_version == live_like_selector.SELECTOR_POLICY_VERSION
     assert yes_candidate.selector_status == "not_considered"
     assert result["candidate_exposure_field_counts"]["economic_exposure_label"] == 2
     assert result["candidate_exposure_field_counts"]["line_classification_policy_version"] == 2
     assert result["candidate_probability_adapter_field_counts"]["probability_adapter_key"] == 2
+    assert result["candidate_probability_hardening_field_counts"]["probability_hardening_policy_version"] == 2
+    assert result["candidate_probability_hardening_field_counts"]["probability_before_hardening"] == 2
+    assert result["candidate_probability_hardening_field_counts"]["probability_after_hardening"] == 2
+    assert result["probability_hardening_policy_version"] == probability_hardening.PROBABILITY_HARDENING_POLICY_VERSION
+    assert result["probability_hardening_missing_count"] == 0
+    assert result["probability_hardening_status_counts"] == {"not_applicable": 2}
     assert result["probability_adapter_policy_version"] == probability_adapters.PROBABILITY_ADAPTER_POLICY_VERSION
     assert result["probability_adapter_counts"]["full_game_winner_probability_adapter:full_game_winner_adapter_v1"] == 2
     assert result["probability_adapter_calibration_hook_counts"]["calibration_hook_full_game_winner"] == 2
@@ -2524,6 +2560,145 @@ def test_generate_candidates_dry_run_scores_without_opening_no_trade(monkeypatch
     assert result["selector_policy_version"] == live_like_selector.SELECTOR_POLICY_VERSION
     assert result["selector_mode"] == "live_like"
     assert result["selector_selected_after_cluster"] == 1
+
+
+def test_generate_candidates_populates_probability_hardening_for_total_ladder(monkeypatch) -> None:
+    _relax_data_quality_gate(monkeypatch)
+    monkeypatch.setenv("PAPER_MIN_NET_EV", "0")
+    monkeypatch.setenv("PAPER_MIN_PROB_EDGE", "0")
+    get_settings.cache_clear()
+    now = datetime(2026, 7, 2, 16, 0, tzinfo=UTC)
+    monkeypatch.setattr(candidates, "utc_now", lambda: now)
+
+    def score_by_line(snapshot: dict[str, object], *_args, **_kwargs) -> modeling.ModelScore:
+        market_context = snapshot.get("market_context") if isinstance(snapshot.get("market_context"), dict) else {}
+        line = Decimal(str(market_context.get("line_value") or "8.5"))
+        probability_by_line = {
+            Decimal("5.5000"): "0.680000",
+            Decimal("6.5000"): "0.640000",
+            Decimal("7.5000"): "0.600000",
+            Decimal("8.5000"): "0.560000",
+            Decimal("9.5000"): "0.520000",
+            Decimal("10.5000"): "0.480000",
+            Decimal("11.5000"): "0.440000",
+        }
+        return _fixed_model_score(probability_by_line[line])
+
+    monkeypatch.setattr(candidates, "score_mature_candidate", score_by_line)
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        game = MlbGame(
+            external_game_id="hardening-total-ladder",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=now + timedelta(minutes=90),
+            status="scheduled",
+        )
+        session.add(game)
+        session.flush()
+        for index, line in enumerate(
+            (
+                Decimal("5.5000"),
+                Decimal("6.5000"),
+                Decimal("7.5000"),
+                Decimal("8.5000"),
+                Decimal("9.5000"),
+                Decimal("10.5000"),
+                Decimal("11.5000"),
+            )
+        ):
+            market = KalshiMarket(
+                kalshi_market_id=f"KX-HARDENING-LADDER-{index}",
+                ticker=f"KXMLBTOTAL-HARDENING-LADDER-{index}-OVER-{line}",
+                title=f"Game total over {line}",
+                status="open",
+                implied_yes_ask=Decimal("0.6000"),
+                market_family="full_game_total",
+                market_type="full_game_total",
+                line_value=line,
+                over_under_side="over",
+                inning_scope="full_game",
+                settlement_rule_status="paper_supported",
+                market_price_updated_at=now,
+            )
+            session.add(market)
+            _add_candidate_mapping(
+                session,
+                game,
+                market,
+                mapping_status="confirmed",
+                market_family="full_game_total",
+                market_type="full_game_total",
+                line_value=line,
+                over_under_side="over",
+                inning_scope="full_game",
+                settlement_rule_status="paper_supported",
+            )
+        session.commit()
+
+        result = candidates.generate_candidates(
+            session,
+            target_date=date(2026, 7, 2),
+            min_time_to_start_minutes=45,
+            max_time_to_start_minutes=180,
+            dry_run_candidates_only=True,
+        )
+        candidate_rows = list(session.scalars(select(ModelCandidate).order_by(ModelCandidate.line_value.asc())))
+        output_rows = list(session.scalars(select(ModelPredictionOutput).order_by(ModelPredictionOutput.id.asc())))
+        trades = list(session.scalars(select(PaperTrade)))
+
+    assert result["dry_run_candidates_only"] is True
+    assert result["paper_trades"] == 0
+    assert trades == []
+    assert len(candidate_rows) == 7
+    assert len(output_rows) == 7
+    assert [candidate.line_class for candidate in candidate_rows] == [
+        "tail",
+        "deep_alternate",
+        "near_alternate",
+        "central",
+        "near_alternate",
+        "deep_alternate",
+        "tail",
+    ]
+    assert result["probability_hardening_policy_version"] == probability_hardening.PROBABILITY_HARDENING_POLICY_VERSION
+    assert result["probability_hardening_missing_count"] == 0
+    assert result["candidate_probability_hardening_field_counts"]["probability_hardening_policy_version"] == 7
+    assert result["candidate_probability_hardening_field_counts"]["probability_after_hardening"] == 7
+    assert result["probability_hardening_by_line_class"]["tail"]["available"] == 2
+    assert result["probability_hardening_by_line_class"]["deep_alternate"]["available"] == 2
+    assert result["probability_hardening_by_line_class"]["near_alternate"]["available"] == 2
+    for candidate in candidate_rows:
+        _assert_pr3s_required_fields_populated(candidate)
+        _assert_pr3u_required_fields_populated(candidate)
+        _assert_pr3w_required_fields_populated(candidate)
+        assert candidate.probability_before_hardening == candidate.probability_raw_adapter
+        assert candidate.probability_after_hardening == candidate.probability_calibrated
+        assert candidate.scoring_rationale["probability_hardening"]["probability_hardening_policy_version"] == (
+            probability_hardening.PROBABILITY_HARDENING_POLICY_VERSION
+        )
+        assert candidate.gate_diagnostics["probability_hardening"]["probability_hardening_enabled"] is True
+    central = next(candidate for candidate in candidate_rows if candidate.line_class == "central")
+    near = next(candidate for candidate in candidate_rows if candidate.line_class == "near_alternate")
+    deep = next(candidate for candidate in candidate_rows if candidate.line_class == "deep_alternate")
+    tail = next(candidate for candidate in candidate_rows if candidate.line_class == "tail")
+    assert central.probability_hardening_dampening_factor == Decimal("1.0000")
+    assert near.probability_hardening_dampening_factor == Decimal("0.9000")
+    assert deep.probability_hardening_dampening_factor == Decimal("0.7500")
+    assert tail.probability_hardening_dampening_factor == Decimal("0.5000")
+    assert tail.probability_hardening_shadow_only is True
+    assert tail.probability_hardening_block_recommendation is True
+    for output in output_rows:
+        raw = output.raw_output or {}
+        assert raw["probability_hardening"]["probability_hardening_policy_version"] == (
+            probability_hardening.PROBABILITY_HARDENING_POLICY_VERSION
+        )
+        assert raw["gate_diagnostics"]["probability_hardening"]["probability_hardening_enabled"] is True
 
 
 def test_generate_candidates_dry_run_does_not_mutate_candidates_with_trade_guards(monkeypatch) -> None:
@@ -18259,6 +18434,28 @@ def test_model_predictions_today_filters_by_prediction_run_target_date(monkeypat
             probability_adapter_calibration_version="shared_parameter_offsets_pre_pr3v",
             probability_adapter_feature_policy_version=probability_adapters.PROBABILITY_ADAPTER_FEATURE_POLICY_VERSION,
             probability_adapter_metadata={"raw": "must_not_serialize"},
+            probability_hardening_policy_version=probability_hardening.PROBABILITY_HARDENING_POLICY_VERSION,
+            probability_hardening_enabled=True,
+            probability_raw_adapter=Decimal("0.550000"),
+            probability_before_hardening=Decimal("0.550000"),
+            probability_after_hardening=Decimal("0.550000"),
+            probability_hardening_delta=Decimal("0.000000"),
+            probability_hardening_applied=False,
+            probability_hardening_reason="central_line_no_hardening",
+            probability_hardening_status="available",
+            probability_hardening_line_class="central",
+            probability_hardening_line_class_policy=probability_hardening.PROBABILITY_HARDENING_LINE_CLASS_POLICY,
+            probability_hardening_consistency_status="passed",
+            probability_hardening_monotonicity_status="passed",
+            probability_hardening_ladder_role="central_line_anchor",
+            probability_hardening_ladder_size=3,
+            probability_hardening_ladder_rank=2,
+            probability_hardening_distance_from_central=0,
+            probability_hardening_central_reference_line=Decimal("8.5000"),
+            probability_hardening_central_reference_probability=Decimal("0.550000"),
+            probability_hardening_dampening_factor=Decimal("1.0000"),
+            probability_hardening_shadow_only=False,
+            probability_hardening_block_recommendation=False,
         )
         session.add(today_candidate)
         session.flush()
@@ -18371,6 +18568,22 @@ def test_model_predictions_today_filters_by_prediction_run_target_date(monkeypat
     assert item["probability_adapter_calibration_hook"] == "calibration_hook_full_game_total"
     assert item["probability_adapter_calibration_version"] == "shared_parameter_offsets_pre_pr3v"
     assert item["probability_adapter_feature_policy_version"] == probability_adapters.PROBABILITY_ADAPTER_FEATURE_POLICY_VERSION
+    assert item["probability_hardening_policy_version"] == probability_hardening.PROBABILITY_HARDENING_POLICY_VERSION
+    assert item["probability_hardening_enabled"] is True
+    assert item["probability_raw_adapter"] == 0.55
+    assert item["probability_before_hardening"] == 0.55
+    assert item["probability_after_hardening"] == 0.55
+    assert item["probability_hardening_delta"] == 0.0
+    assert item["probability_hardening_applied"] is False
+    assert item["probability_hardening_reason"] == "central_line_no_hardening"
+    assert item["probability_hardening_status"] == "available"
+    assert item["probability_hardening_line_class"] == "central"
+    assert item["probability_hardening_line_class_policy"] == probability_hardening.PROBABILITY_HARDENING_LINE_CLASS_POLICY
+    assert item["probability_hardening_consistency_status"] == "passed"
+    assert item["probability_hardening_monotonicity_status"] == "passed"
+    assert item["probability_hardening_dampening_factor"] == 1.0
+    assert item["probability_hardening_shadow_only"] is False
+    assert item["probability_hardening_block_recommendation"] is False
     assert "raw_output" not in item
     assert "features" not in item
     assert "scoring_rationale" not in item

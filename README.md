@@ -358,6 +358,8 @@ When enabled by `PAPER_PROBABILITY_HARDENING_ENABLED=true`, near alternate, deep
 
 New scored candidates expose compact before/after hardening fields in `/v1/model/predictions`, `/v1/candidates/today`, candidate-sweep summaries, and compact dashboard diagnostics. Raw PR3u adapter probability remains preserved as `probability_raw_adapter`. PR3w adds a nullable `model_candidates` migration and does not change live execution, settlement, cron schedules, source ingestion, risk caps, selector thresholds, credentials, or sportsbook/team-total/umpire scope.
 
+PR3w.1 fixes the candidate-level population path for that metadata. Candidate generation now persists and flushes post-hardening scalar fields before PR3t selector/risk handoff, prediction outputs use the hardened EV/edge values, and `/v1/model/predictions` exposes the compact PR3w fields while preserving raw PR3u adapter probability for audit. This remains paper-only and does not add raw payloads, new trading controls, schema changes, or source-ingestion changes.
+
 ## Deployment
 
 - Railway backend setup: see `docs/RAILWAY_SETUP.md`.

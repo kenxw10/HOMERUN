@@ -1051,6 +1051,47 @@ $predictions = Invoke-RestMethod -Headers $headers "$base/v1/model/predictions?d
 
 Expected: candidate rows include compact PR3w fields such as `probability_before_hardening`, `probability_after_hardening`, `probability_hardening_delta`, `probability_hardening_line_class`, consistency/monotonicity statuses, dampening factor, shadow/block recommendation, and `probability_raw_adapter`. Raw features, scoring rationale blobs, and full payloads should not appear in this prediction endpoint.
 
+## PR3w.1 Candidate-Level Hardening Population Validation
+
+PR3w.1 fixes the production validation gap where hardening config appeared in dashboard status but newly scored candidate/prediction rows still showed null PR3w fields. Validate against the fixed production backend and known replay slate `2026-07-04`. Prompt only for the internal API key.
+
+Use the same helper setup from the PR3w validation section, then run a dry-run candidate sweep:
+
+```powershell
+$label = "pr3w1_validation_dry_run_" + (Get-Date -Format "yyyyMMdd_HHmmss")
+$dry = Invoke-RestMethod -Method Post -Headers $headers "$base/v1/jobs/run/candidate-sweep?target_date=$targetDate&min_time_to_start_minutes=0&max_time_to_start_minutes=1800&sweep_label=$label&dry_run_candidates_only=true"
+$engine = $dry.result.result.paper_candidate_engine
+if (-not $engine) { $engine = $dry.result.result.candidate_engine }
+if (-not $engine) { $engine = $dry.result.result }
+$engine | Select-Object target_date,dry_run_candidates_only,feature_sync_mode,heavy_feature_sync_skipped,candidates_evaluated,paper_trades_created,probability_hardening_policy_version,probability_hardening_enabled,probability_hardening_missing_count,probability_hardening_applied_count,probability_hardening_shadow_only_count,probability_hardening_block_recommendation_count | Format-List
+$engine.candidate_probability_hardening_field_counts
+$engine.probability_hardening_status_counts
+$engine.probability_hardening_by_line_class
+```
+
+Expected: nonzero candidates, `dry_run_candidates_only=true`, zero paper trades, `feature_sync_mode=cache_only`, `heavy_feature_sync_skipped=true`, `probability_hardening_policy_version=pr3w_tail_alternate_probability_hardening_v1`, `probability_hardening_missing_count=0`, and non-null field counts from evaluated `ModelCandidate` rows.
+
+Inspect predictions:
+
+```powershell
+$predictions = Invoke-RestMethod -Headers $headers "$base/v1/model/predictions?date=$targetDate"
+($predictions | ConvertTo-Json -Depth 100) -split "`n" |
+  Where-Object { $_ -match "probability_hardening|probability_raw_adapter|probability_before_hardening|probability_after_hardening|probability_adapter|selector_|economic_exposure|line_class" } |
+  Select-Object -First 1000
+```
+
+Expected: prediction rows expose non-null `probability_hardening_policy_version`, `probability_hardening_enabled`, `probability_raw_adapter`, before/after probability, status/reason, line class, consistency/monotonicity status, dampening factor, and shadow/block recommendation. Winner/not-applicable rows should carry no-hardening metadata; central rows should carry no-hardening metadata; near/deep/tail rows should carry dampening metadata. PR3s taxonomy, PR3u adapter metadata, and PR3t selector metadata should remain present.
+
+Finish with governance and safety checks:
+
+```powershell
+Invoke-RestMethod -Method Post -Headers $headers "$base/v1/jobs/run/governance"
+$statusFinal = Invoke-RestMethod -Headers $headers "$base/v1/system/status"
+$statusFinal.config | Select-Object paper_trading,live_trading_enabled,execution_kill_switch,kalshi_env,kalshi_credentials | Format-List
+```
+
+Expected: governance succeeds or cleanly skips by existing thresholds, and safety remains paper trading true, live trading false, kill switch true, Kalshi demo, and no production credential requirement. PR3w.1 does not add migrations, live execution, sportsbook data, team totals, umpire factors, MVE/multivariate markets, cron changes, source-ingestion changes, settlement changes, or raw payload/debug response bloat.
+
 ## Required Context Updates
 
 Every PR must update `PROJECT_CONTEXT.md`.
