@@ -975,6 +975,10 @@ def test_risk_governance_family_shadow_and_new_caps(monkeypatch) -> None:
             rank_score="1",
         )
         candidates_for_risk = [approved_a, approved_b, capped, shadow]
+        for row in candidates_for_risk:
+            row.gate_caps_ok = True
+            row.gate_final_trade_eligible = True
+            row.gate_diagnostics = {"gate_caps_ok": True, "gate_final_trade_eligible": True}
         session.add_all(candidates_for_risk)
         session.flush()
         intents = [
@@ -1008,6 +1012,12 @@ def test_risk_governance_family_shadow_and_new_caps(monkeypatch) -> None:
     assert summary["risk_shadow_only_count"] == 1
     assert capped.risk_governance_decision == "rejected_by_family_cap"
     assert shadow.risk_governance_status == "shadow_only"
+    assert shadow.risk_governance_blocked is True
+    assert shadow.decision == "no_trade_risk_family_shadow_only"
+    assert shadow.gate_caps_ok is False
+    assert shadow.gate_final_trade_eligible is False
+    assert shadow.gate_diagnostics["gate_risk_governance_ok"] is False
+    assert shadow.gate_diagnostics["gate_final_trade_eligible"] is False
     for row in candidates_for_risk:
         _assert_pr3x_required_fields_populated(row)
 
@@ -1042,6 +1052,9 @@ def test_risk_governance_drawdown_halt_blocks_new_paper_trades(monkeypatch) -> N
         session.add(game)
         session.flush()
         candidate = _risk_governance_test_candidate(epoch=epoch, game=game, now=now)
+        candidate.gate_caps_ok = True
+        candidate.gate_final_trade_eligible = True
+        candidate.gate_diagnostics = {"gate_caps_ok": True, "gate_final_trade_eligible": True}
         session.add(candidate)
         session.flush()
         intent = SimpleNamespace(
@@ -1068,6 +1081,10 @@ def test_risk_governance_drawdown_halt_blocks_new_paper_trades(monkeypatch) -> N
     assert summary["risk_drawdown_summary"]["status"] == "halted"
     assert candidate.risk_governance_decision == "rejected_by_drawdown_halt"
     assert candidate.risk_governance_drawdown_status == "halted"
+    assert candidate.gate_caps_ok is False
+    assert candidate.gate_final_trade_eligible is False
+    assert candidate.gate_diagnostics["gate_risk_governance_ok"] is False
+    assert candidate.gate_diagnostics["gate_final_trade_eligible"] is False
     _assert_pr3x_required_fields_populated(candidate)
 
 

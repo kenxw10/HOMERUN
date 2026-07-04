@@ -235,8 +235,9 @@ def _apply_payload(candidate: ModelCandidate, payload: dict[str, object], *, mut
     diagnostics = dict(candidate.gate_diagnostics or {})
     diagnostics["risk_governance"] = risk_governance_payload(candidate)
     approved = bool(payload.get("risk_governance_approved_after_caps"))
+    rejected = payload.get("risk_governance_status") in {"rejected", "shadow_only"}
     diagnostics["gate_risk_governance_ok"] = approved
-    if mutate_trade_gates and not approved and payload.get("risk_governance_approved_before_caps"):
+    if mutate_trade_gates and not approved and rejected:
         diagnostics["gate_caps_ok"] = False
         diagnostics["gate_final_trade_eligible"] = False
         candidate.gate_caps_ok = False
@@ -511,6 +512,7 @@ def apply_risk_governance(
                     "risk_governance_shadow_only": True,
                     "risk_governance_approved_before_caps": False,
                     "risk_governance_approved_after_caps": False,
+                    "risk_governance_blocked": True,
                 }
             )
             _bump(counts, "no_trade_risk_family_shadow_only")
