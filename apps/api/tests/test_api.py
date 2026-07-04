@@ -1022,6 +1022,93 @@ def test_risk_governance_family_shadow_and_new_caps(monkeypatch) -> None:
         _assert_pr3x_required_fields_populated(row)
 
 
+def test_risk_governance_family_open_cap_counts_selected_trades(monkeypatch) -> None:
+    get_settings.cache_clear()
+    settings = get_settings()
+    now = datetime(2026, 7, 2, 16, 0, tzinfo=UTC)
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        epoch = get_or_create_active_paper_epoch(session)
+        games = [
+            MlbGame(
+                external_game_id=f"risk-family-open-cap-{index}",
+                home_team="Pittsburgh Pirates",
+                away_team="Seattle Mariners",
+                home_abbreviation="PIT",
+                away_abbreviation="SEA",
+                scheduled_start=now + timedelta(minutes=90 + index),
+                status="scheduled",
+            )
+            for index in range(2)
+        ]
+        session.add_all(games)
+        session.flush()
+        session.add_all(
+            [
+                PaperTrade(
+                    paper_trading_epoch_id=epoch.id,
+                    market_ticker=f"OPEN-TOTAL-{index}",
+                    contract_side="yes",
+                    entry_price=Decimal("0.5000"),
+                    current_price=Decimal("0.5000"),
+                    quantity=1,
+                    entry_time=now - timedelta(minutes=30 + index),
+                    status="open",
+                    market_family="full_game_total",
+                    line_class="central",
+                )
+                for index in range(2)
+            ]
+        )
+        candidates_for_risk = [
+            _risk_governance_test_candidate(
+                epoch=epoch,
+                game=games[index],
+                now=now,
+                family="full_game_total",
+                concept_key=f"total:full:over:{8.5 + index}",
+                line_class="central",
+                rank_score=str(2 - index),
+            )
+            for index in range(2)
+        ]
+        session.add_all(candidates_for_risk)
+        session.flush()
+        intents = [
+            SimpleNamespace(
+                candidate=row,
+                game=games[index],
+                market=SimpleNamespace(ticker=f"RISK-OPEN-CAP-{index}"),
+                price=Decimal("0.5000"),
+                score=Decimal("1"),
+            )
+            for index, row in enumerate(candidates_for_risk)
+        ]
+
+        selected, counts, summary = risk_governance.apply_risk_governance(
+            session,
+            candidates=candidates_for_risk,
+            intents=intents,
+            settings=settings,
+            active_epoch=epoch,
+            target_date=date(2026, 7, 2),
+            day_start=now,
+            day_end=now + timedelta(days=1),
+        )
+
+    assert selected == intents[:1]
+    assert counts["no_trade_risk_family_open_cap"] == 1
+    assert summary["risk_approved_after_caps"] == 1
+    assert summary["risk_rejected_by_family_cap"] == 1
+    assert candidates_for_risk[1].risk_governance_decision == "rejected_by_family_cap"
+    assert candidates_for_risk[1].risk_governance_family_cap_status == "open_cap_reached"
+    assert candidates_for_risk[1].decision == "no_trade_risk_family_open_cap"
+    for row in candidates_for_risk:
+        _assert_pr3x_required_fields_populated(row)
+
+
 def test_risk_governance_drawdown_halt_blocks_new_paper_trades(monkeypatch) -> None:
     get_settings.cache_clear()
     settings = get_settings()
@@ -18199,6 +18286,7 @@ def test_open_position_cap_refills_after_sizing_and_post_cap_rejections(monkeypa
     monkeypatch.setenv("PAPER_MIN_PROB_EDGE", "0.00")
     monkeypatch.setenv("PAPER_LOW_PRICE_MIN_NET_EV", "0.00")
     monkeypatch.setenv("PAPER_LOW_PRICE_MIN_PROB_EDGE", "0.00")
+    monkeypatch.setenv("PAPER_RISK_GOVERNANCE_ENABLED", "false")
     get_settings.cache_clear()
     now = datetime(2026, 7, 1, 20, 0, tzinfo=UTC)
     monkeypatch.setattr(candidates, "utc_now", lambda: now)

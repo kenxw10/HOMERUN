@@ -555,7 +555,7 @@ def apply_risk_governance(
                     "risk_governance_family_cap_status",
                     "new_cap_reached",
                 )
-            elif usage.family_open.get(family, 0) >= max_open:
+            elif usage.family_open.get(family, 0) + selected_family.get(family, 0) >= max_open:
                 reject(
                     "rejected_by_family_cap",
                     "no_trade_risk_family_open_cap",
