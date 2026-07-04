@@ -851,3 +851,11 @@ Every future PR must update this section with:
 - Hardened probability now feeds fair value, EV, net EV, probability edge, selector ranking, prediction output economics, and governance-visible candidate probabilities. Raw PR3u adapter probability is preserved separately as `probability_raw_adapter` plus before/after/delta fields.
 - New safe defaults: `PAPER_PROBABILITY_HARDENING_ENABLED=true` and `PAPER_PROBABILITY_HARDENING_POLICY_VERSION=pr3w_tail_alternate_probability_hardening_v1`.
 - Schema migration `0016_pr3w_probability_hardening` adds nullable compact PR3w columns to `model_candidates`. No paper trade table, settlement, risk-cap, cron, source-ingestion, WebSocket, live execution, credential, sportsbook/team-total/umpire, MVE, or selector-threshold behavior changed.
+
+### PR3w.1 - Candidate-Level Probability Hardening Population Fix
+
+- Root cause: PR3w production validation showed dashboard/config hardening status, but newly scored candidate and prediction rows could still expose null compact PR3w hardening fields. That made the dry-run validation fail on missing `pr3w_tail_alternate_probability_hardening_v1` / `probability_hardening_policy_version` evidence at the candidate level.
+- Candidate generation now explicitly refreshes prediction-output economics from the post-hardening candidate state and flushes candidates/outputs immediately after hardening and EV/edge recomputation, before PR3t selector and later risk/cap logic continue.
+- Regression tests now prove dry-run full-game winner rows get no-hardening metadata, full-game total ladders get central/near/deep/tail hardening metadata and summary counts, and `/v1/model/predictions` exposes compact PR3w scalar fields without raw payloads or scoring blobs.
+- Hardened probabilities continue to feed fair value, EV, net EV, probability edge, and selector-facing values. Raw PR3u adapter probability remains auditable through `probability_raw_adapter` and before/after hardening fields.
+- No schema migration, paper-trade table change, live execution, cron schedule, source-ingestion, settlement, risk-cap, selector-threshold, credential, sportsbook/team-total/umpire, MVE, or raw-payload response change was added. Safety posture remains paper-only, demo Kalshi, live trading disabled, and kill switch on.
