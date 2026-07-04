@@ -2073,6 +2073,75 @@ def test_generate_candidates_dry_run_scores_without_opening_no_trade(monkeypatch
     assert result["selector_selected_after_cluster"] == 1
 
 
+def test_generate_candidates_dry_run_does_not_mutate_candidates_with_trade_guards(monkeypatch) -> None:
+    _relax_data_quality_gate(monkeypatch)
+    now = datetime(2026, 7, 2, 16, 0, tzinfo=UTC)
+    monkeypatch.setattr(candidates, "utc_now", lambda: now)
+    monkeypatch.setattr(candidates, "score_mature_candidate", lambda *_args, **_kwargs: _fixed_model_score("0.200000"))
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        game = MlbGame(
+            external_game_id="window-dry-run-line-selection",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=now + timedelta(minutes=90),
+            status="scheduled",
+        )
+        session.add(game)
+        for index in range(2):
+            market = KalshiMarket(
+                kalshi_market_id=f"KX-WINDOW-DRY-LINE-{index}",
+                ticker=f"KXMLBGAME-WINDOW-DRY-LINE-{index}-PIT",
+                title="Will Pittsburgh win?",
+                status="open",
+                no_ask=Decimal("0.4000"),
+                market_price_updated_at=now,
+            )
+            session.add(market)
+            _add_candidate_mapping(
+                session,
+                game,
+                market,
+                mapping_status="confirmed",
+                market_family="full_game_winner",
+                market_type="full_game_winner",
+                selection_code="PIT",
+                settlement_rule_status="paper_supported",
+            )
+        session.commit()
+
+        result = candidates.generate_candidates(
+            session,
+            target_date=date(2026, 7, 2),
+            min_time_to_start_minutes=45,
+            max_time_to_start_minutes=180,
+            dry_run_candidates_only=True,
+        )
+        no_candidates = list(
+            session.scalars(
+                select(ModelCandidate)
+                .where(ModelCandidate.contract_side == "no")
+                .order_by(ModelCandidate.kalshi_market_id)
+            )
+        )
+        trades = list(session.scalars(select(PaperTrade)))
+
+    assert result["dry_run_candidates_only"] is True
+    assert result["paper_trades"] == 0
+    assert trades == []
+    assert len(no_candidates) == 2
+    assert {candidate.decision for candidate in no_candidates} == {"candidate_only_dry_run"}
+    assert result["trade_eligible_after_ev_filters"] == 2
+    assert result["selector_candidates_considered"] == 2
+    assert result["line_selection_candidates_rejected"] == 0
+    assert {candidate.selector_status for candidate in no_candidates} == {"selected", "rejected"}
+
+
 def test_generate_candidates_window_uses_global_daily_trade_caps(monkeypatch) -> None:
     _relax_data_quality_gate(monkeypatch)
     monkeypatch.setenv("PAPER_MAX_TRADES_PER_SLATE", "1")
@@ -4999,6 +5068,17 @@ def test_generate_candidates_refreshes_existing_open_trade_price(monkeypatch) ->
         trade = session.scalar(select(PaperTrade).where(PaperTrade.market_ticker == "KXMLBGAME-REFRESH-NYY"))
         assert trade is not None
         assert trade.current_price == Decimal("0.4000")
+        _assert_pr3t_required_fields_populated(trade)
+        original_selector = {
+            field: getattr(trade, field)
+            for field in (
+                *PR3T_REQUIRED_CANDIDATE_FIELDS,
+                "selector_decision",
+                "selector_selected_from_cluster",
+                "selector_live_like_eligible_after_cluster",
+            )
+        }
+        assert original_selector["selector_status"] == "selected"
 
         current_time["now"] = datetime(2026, 7, 2, 16, 0, tzinfo=UTC)
         market.implied_yes_ask = Decimal("0.3200")
@@ -5017,6 +5097,8 @@ def test_generate_candidates_refreshes_existing_open_trade_price(monkeypatch) ->
     assert refreshed_trade is not None
     assert refreshed_trade.entry_price == Decimal("0.4000")
     assert refreshed_trade.current_price == Decimal("0.2800")
+    for field, expected in original_selector.items():
+        assert getattr(refreshed_trade, field) == expected, field
 
 
 def test_generate_candidates_refreshes_existing_no_trade_with_no_bid_mark(monkeypatch) -> None:

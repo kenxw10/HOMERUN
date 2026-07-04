@@ -210,7 +210,6 @@ def _copy_exposure_metadata_to_trade(trade: PaperTrade, candidate: ModelCandidat
     trade.line_ladder_size = candidate.line_ladder_size
     trade.exposure_taxonomy_version = candidate.exposure_taxonomy_version
     trade.line_classification_policy_version = candidate.line_classification_policy_version
-    _copy_selector_metadata_to_trade(trade, candidate)
 
 
 def _copy_selector_metadata_to_trade(trade: PaperTrade, candidate: ModelCandidate) -> None:
@@ -3203,13 +3202,37 @@ def generate_candidates(
     for output in outputs_by_candidate_id.values():
         session.add(output)
 
-    side_guarded_trades, side_conflict_counts = _apply_side_conflict_guard(trade_intents)
-    line_selected_trades, line_selection_counts = _apply_line_selection(side_guarded_trades)
-    scope_selected_trades, game_scope_counts, game_scope_summary = _apply_game_scope_correlation(
-        session,
-        line_selected_trades,
-        active_epoch.id,
-    )
+    if dry_run_candidates_only:
+        side_guarded_trades = trade_intents
+        line_selected_trades = side_guarded_trades
+        scope_selected_trades = line_selected_trades
+        side_conflict_counts = {"no_trade_conflicting_side_signals": 0}
+        line_selection_counts = {
+            "line_selection_groups_considered": 0,
+            "line_selection_candidates_kept": len(line_selected_trades),
+            "line_selection_candidates_rejected": 0,
+        }
+        game_scope_counts = {
+            "game_scope_correlation_groups_considered": 0,
+            "game_scope_correlation_candidates_kept": len(scope_selected_trades),
+            "game_scope_correlation_candidates_rejected": 0,
+            "no_trade_game_scope_correlation_cap": 0,
+            "no_trade_same_game_scope_correlation_not_best": 0,
+        }
+        game_scope_summary = {
+            "limit": max(settings.paper_max_trades_per_game_scope, 1),
+            "groups": {},
+            "dry_run_candidates_only": True,
+            "guard_skipped": True,
+        }
+    else:
+        side_guarded_trades, side_conflict_counts = _apply_side_conflict_guard(trade_intents)
+        line_selected_trades, line_selection_counts = _apply_line_selection(side_guarded_trades)
+        scope_selected_trades, game_scope_counts, game_scope_summary = _apply_game_scope_correlation(
+            session,
+            line_selected_trades,
+            active_epoch.id,
+        )
     selector_selected_trades, selector_counts, selector_summary = apply_live_like_selector(
         candidates=evaluated_candidates,
         intents=scope_selected_trades,
@@ -3217,9 +3240,6 @@ def generate_candidates(
         dry_run_candidates_only=dry_run_candidates_only,
     )
     candidate_selector_field_counts = _candidate_selector_field_counts(evaluated_candidates)
-    for candidate, open_trade in open_trade_metadata_refreshes:
-        _copy_selector_metadata_to_trade(open_trade, candidate)
-        session.add(open_trade)
     for candidate in evaluated_candidates:
         output = outputs_by_candidate_id.get(candidate.id)
         if output is not None:
@@ -3434,6 +3454,7 @@ def generate_candidates(
             total_fee_estimate=candidate.total_fee_estimate,
         )
         _copy_exposure_metadata_to_trade(trade, candidate)
+        _copy_selector_metadata_to_trade(trade, candidate)
         session.add(trade)
         output = outputs_by_candidate_id.get(candidate.id)
         if output is not None:
