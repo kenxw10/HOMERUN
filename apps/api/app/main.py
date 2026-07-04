@@ -57,7 +57,11 @@ from app.services.features import (
     sync_travel_schedule_features,
     sync_weather_features,
 )
-from app.services.risk_governance import RISK_GOVERNANCE_FIELD_NAMES
+from app.services.risk_governance import (
+    DRAWDOWN_LIVE_HALT_THRESHOLD_ABS,
+    DRAWDOWN_POLICY_VERSION,
+    RISK_GOVERNANCE_FIELD_NAMES,
+)
 from app.services.modeling import (
     active_parameter_payload,
     governance_status,
@@ -234,6 +238,12 @@ def system_status() -> SystemStatus:
         "paper_drawdown_halt_enabled": settings.paper_drawdown_halt_enabled,
         "paper_drawdown_halt_threshold_abs": float(settings.paper_drawdown_halt_threshold_abs),
         "paper_drawdown_halt_threshold_pct": float(settings.paper_drawdown_halt_threshold_pct),
+        "drawdown_policy_version": DRAWDOWN_POLICY_VERSION,
+        "drawdown_observation_mode": bool(settings.paper_trading and not settings.live_trading_enabled),
+        "drawdown_basis": "starting_bankroll_minus_current_equity",
+        "drawdown_halt_enforced": False,
+        "drawdown_live_halt_threshold_abs": float(DRAWDOWN_LIVE_HALT_THRESHOLD_ABS),
+        "drawdown_live_halt_basis": "starting_bankroll_minus_150",
     }
     if db_status["ready"]:
         try:
@@ -253,10 +263,16 @@ def system_status() -> SystemStatus:
                         "optional_weather_provider_configured",
                         "paper_risk_governance_enabled",
                         "paper_risk_governance_policy_version",
-                        "paper_drawdown_halt_enabled",
-                        "paper_drawdown_halt_threshold_abs",
-                        "paper_drawdown_halt_threshold_pct",
-                    )
+                    "paper_drawdown_halt_enabled",
+                    "paper_drawdown_halt_threshold_abs",
+                    "paper_drawdown_halt_threshold_pct",
+                    "drawdown_policy_version",
+                    "drawdown_observation_mode",
+                    "drawdown_basis",
+                    "drawdown_halt_enforced",
+                    "drawdown_live_halt_threshold_abs",
+                    "drawdown_live_halt_basis",
+                )
                     if key in full_source_status
                 }
                 risk_config_fields = {
@@ -265,6 +281,12 @@ def system_status() -> SystemStatus:
                     "paper_drawdown_halt_enabled": settings.paper_drawdown_halt_enabled,
                     "paper_drawdown_halt_threshold_abs": float(settings.paper_drawdown_halt_threshold_abs),
                     "paper_drawdown_halt_threshold_pct": float(settings.paper_drawdown_halt_threshold_pct),
+                    "drawdown_policy_version": DRAWDOWN_POLICY_VERSION,
+                    "drawdown_observation_mode": bool(settings.paper_trading and not settings.live_trading_enabled),
+                    "drawdown_basis": "starting_bankroll_minus_current_equity",
+                    "drawdown_halt_enforced": False,
+                    "drawdown_live_halt_threshold_abs": float(DRAWDOWN_LIVE_HALT_THRESHOLD_ABS),
+                    "drawdown_live_halt_basis": "starting_bankroll_minus_150",
                 }
                 source_status = {**compact_source_status, **config_fields, **risk_config_fields}
         except Exception:

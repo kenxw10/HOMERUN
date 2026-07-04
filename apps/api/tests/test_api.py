@@ -1109,7 +1109,7 @@ def test_risk_governance_family_open_cap_counts_selected_trades(monkeypatch) -> 
         _assert_pr3x_required_fields_populated(row)
 
 
-def test_risk_governance_drawdown_halt_blocks_new_paper_trades(monkeypatch) -> None:
+def test_risk_governance_drawdown_halt_is_diagnostic_in_paper_observation(monkeypatch) -> None:
     get_settings.cache_clear()
     settings = get_settings()
     now = datetime(2026, 7, 2, 16, 0, tzinfo=UTC)
@@ -1143,6 +1143,18 @@ def test_risk_governance_drawdown_halt_blocks_new_paper_trades(monkeypatch) -> N
         candidate.gate_final_trade_eligible = True
         candidate.gate_diagnostics = {"gate_caps_ok": True, "gate_final_trade_eligible": True}
         session.add(candidate)
+        session.add(
+            PaperTrade(
+                paper_trading_epoch_id=epoch.id,
+                market_ticker="RISK-DRAWDOWN-OPEN",
+                contract_side="yes",
+                entry_price=Decimal("0.5000"),
+                current_price=Decimal("0.0000"),
+                quantity=400,
+                entry_time=now - timedelta(hours=1),
+                status="open",
+            )
+        )
         session.flush()
         intent = SimpleNamespace(
             candidate=candidate,
@@ -1163,15 +1175,18 @@ def test_risk_governance_drawdown_halt_blocks_new_paper_trades(monkeypatch) -> N
             day_end=now + timedelta(days=1),
         )
 
-    assert selected == []
-    assert counts["no_trade_risk_drawdown_halt"] == 1
-    assert summary["risk_drawdown_summary"]["status"] == "halted"
-    assert candidate.risk_governance_decision == "rejected_by_drawdown_halt"
-    assert candidate.risk_governance_drawdown_status == "halted"
-    assert candidate.gate_caps_ok is False
-    assert candidate.gate_final_trade_eligible is False
-    assert candidate.gate_diagnostics["gate_risk_governance_ok"] is False
-    assert candidate.gate_diagnostics["gate_final_trade_eligible"] is False
+    assert selected == [intent]
+    assert counts.get("no_trade_risk_drawdown_halt", 0) == 0
+    assert summary["risk_drawdown_summary"]["status"] == "would_have_halted"
+    assert summary["risk_drawdown_summary"]["drawdown_would_have_halted"] is True
+    assert summary["risk_drawdown_summary"]["drawdown_halt_enforced"] is False
+    assert summary["risk_drawdown_summary"]["drawdown_observation_mode"] is True
+    assert candidate.risk_governance_decision == "approved_for_paper_trade"
+    assert candidate.risk_governance_drawdown_status == "would_have_halted"
+    assert candidate.gate_caps_ok is True
+    assert candidate.gate_final_trade_eligible is True
+    assert candidate.gate_diagnostics["gate_risk_governance_ok"] is True
+    assert candidate.gate_diagnostics["gate_final_trade_eligible"] is True
     _assert_pr3x_required_fields_populated(candidate)
 
 
@@ -2729,6 +2744,12 @@ def test_generate_candidates_time_window_filters_games(monkeypatch) -> None:
     assert all_candidates[0].selector_selected_from_cluster is True
     assert all_trades[0].selector_policy_version == live_like_selector.SELECTOR_POLICY_VERSION
     assert all_trades[0].selector_selected_from_cluster is True
+    assert all_trades[0].probability_adapter_key == all_candidates[0].probability_adapter_key
+    assert all_trades[0].probability_adapter_key is not None
+    assert all_trades[0].probability_adapter_version == all_candidates[0].probability_adapter_version
+    assert all_trades[0].probability_hardening_policy_version == all_candidates[0].probability_hardening_policy_version
+    assert all_trades[0].probability_after_hardening == all_candidates[0].probability_after_hardening
+    assert all_trades[0].calibration_status == all_candidates[0].calibration_status
 
 
 def test_generate_candidates_time_window_returns_skipped_when_empty(monkeypatch) -> None:
@@ -8598,11 +8619,28 @@ def test_paper_settlement_sync_settles_wins_losses_and_is_idempotent() -> None:
     assert second_result["candidate_labels_already_set"] == 3
     assert result["settled"] == 2
     assert second_result["settled"] == 0
+    assert second_result["already_settled"] == 2
     assert len(settlements) == 2
     assert len(snapshots) == 1
     assert second_result["snapshot_id"] == result["snapshot_id"]
     assert [trade.outcome for trade in trades] == ["win", "loss"]
     assert [trade.realized_pnl for trade in trades] == [Decimal("1.20"), Decimal("-0.90")]
+    assert {trade.settlement_status for trade in trades} == {"settled"}
+    assert {trade.settlement_formula_version for trade in trades} == {"pr4a_settlement_formula_v1"}
+    assert {trade.settlement_source for trade in trades} == {"mlb_stats_api_final_score"}
+    assert all(trade.settlement_audit_key for trade in trades)
+    assert all(trade.settlement_idempotency_key == trade.settlement_audit_key for trade in trades)
+    assert all(trade.settlement_source_game_id == "settle-1" for trade in trades)
+    assert all(trade.settlement_source_market_ticker == trade.market_ticker for trade in trades)
+    assert all(
+        trade.settlement_checked_at is not None and trade.settlement_checked_at.replace(tzinfo=UTC) == settled_at
+        for trade in trades
+    )
+    assert all(
+        trade.settlement_resolved_at is not None and trade.settlement_resolved_at.replace(tzinfo=UTC) == settled_at
+        for trade in trades
+    )
+    assert all(trade.settlement_formula and "full_game" in trade.settlement_formula for trade in trades)
     assert no_trade is not None
     assert no_trade.outcome == "win"
     assert no_trade.outcome_source == "mlb_results_sync"

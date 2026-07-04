@@ -265,6 +265,47 @@ def _copy_selector_metadata_to_trade(trade: PaperTrade, candidate: ModelCandidat
     trade.selector_live_like_eligible_after_cluster = candidate.selector_live_like_eligible_after_cluster
 
 
+TRADE_MODEL_AUDIT_FIELD_NAMES: tuple[str, ...] = (
+    "probability_adapter_key",
+    "probability_adapter_version",
+    "probability_adapter_policy_version",
+    "probability_adapter_family",
+    "probability_adapter_scope",
+    "probability_adapter_calibration_hook",
+    "probability_adapter_calibration_version",
+    "probability_adapter_feature_policy_version",
+    "probability_hardening_policy_version",
+    "probability_hardening_enabled",
+    "probability_raw_adapter",
+    "probability_before_hardening",
+    "probability_after_hardening",
+    "probability_hardening_delta",
+    "probability_hardening_applied",
+    "probability_hardening_reason",
+    "probability_hardening_status",
+    "probability_hardening_line_class",
+    "probability_hardening_line_class_policy",
+    "probability_hardening_consistency_status",
+    "probability_hardening_monotonicity_status",
+    "probability_hardening_ladder_role",
+    "probability_hardening_ladder_size",
+    "probability_hardening_ladder_rank",
+    "probability_hardening_distance_from_central",
+    "probability_hardening_central_reference_line",
+    "probability_hardening_central_reference_probability",
+    "probability_hardening_dampening_factor",
+    "probability_hardening_shadow_only",
+    "probability_hardening_block_recommendation",
+    "probability_hardening_error_reason",
+    "calibration_status",
+)
+
+
+def _copy_model_audit_metadata_to_trade(trade: PaperTrade, candidate: ModelCandidate) -> None:
+    for field_name in TRADE_MODEL_AUDIT_FIELD_NAMES:
+        setattr(trade, field_name, getattr(candidate, field_name, None))
+
+
 def _candidate_exposure_payload(candidate: ModelCandidate) -> dict[str, object]:
     return {
         "economic_exposure_label": candidate.economic_exposure_label,
@@ -3902,6 +3943,7 @@ def generate_candidates(
         )
         _copy_exposure_metadata_to_trade(trade, candidate)
         _copy_selector_metadata_to_trade(trade, candidate)
+        _copy_model_audit_metadata_to_trade(trade, candidate)
         copy_risk_governance_metadata_to_trade(trade, candidate)
         session.add(trade)
         output = outputs_by_candidate_id.get(candidate.id)

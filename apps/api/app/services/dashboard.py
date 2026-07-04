@@ -44,7 +44,12 @@ from app.services.features import FEATURE_VERSION, source_status_report, starter
 from app.services.modeling import governance_status as model_governance_status
 from app.services.portfolio import calculate_paper_portfolio, paper_trade_fee
 from app.services.paper_epoch import resolve_epoch_filter
-from app.services.risk_governance import RISK_GOVERNANCE_FIELD_NAMES
+from app.services.risk_governance import (
+    DRAWDOWN_LIVE_HALT_THRESHOLD_ABS,
+    DRAWDOWN_POLICY_VERSION,
+    RISK_GOVERNANCE_FIELD_NAMES,
+    drawdown_summary,
+)
 from app.services.ws_market_data import ws_status_running_is_fresh
 from app.time_utils import eastern_display, ensure_aware_utc, get_dashboard_zone, to_eastern_iso, today_eastern, utc_now
 
@@ -250,6 +255,69 @@ def _position_risk_governance_payload(trade: PaperTrade) -> dict[str, object] | 
     return compact or None
 
 
+def _position_model_audit_payload(trade: PaperTrade) -> dict[str, object] | None:
+    payload = {
+        "probability_adapter_key": trade.probability_adapter_key,
+        "probability_adapter_version": trade.probability_adapter_version,
+        "probability_adapter_policy_version": trade.probability_adapter_policy_version,
+        "probability_adapter_family": trade.probability_adapter_family,
+        "probability_adapter_scope": trade.probability_adapter_scope,
+        "probability_adapter_calibration_hook": trade.probability_adapter_calibration_hook,
+        "probability_adapter_calibration_version": trade.probability_adapter_calibration_version,
+        "probability_adapter_feature_policy_version": trade.probability_adapter_feature_policy_version,
+        "probability_hardening_policy_version": trade.probability_hardening_policy_version,
+        "probability_hardening_enabled": trade.probability_hardening_enabled,
+        "probability_raw_adapter": _float(trade.probability_raw_adapter),
+        "probability_before_hardening": _float(trade.probability_before_hardening),
+        "probability_after_hardening": _float(trade.probability_after_hardening),
+        "probability_hardening_delta": _float(trade.probability_hardening_delta),
+        "probability_hardening_applied": trade.probability_hardening_applied,
+        "probability_hardening_reason": trade.probability_hardening_reason,
+        "probability_hardening_status": trade.probability_hardening_status,
+        "probability_hardening_line_class": trade.probability_hardening_line_class,
+        "probability_hardening_line_class_policy": trade.probability_hardening_line_class_policy,
+        "probability_hardening_consistency_status": trade.probability_hardening_consistency_status,
+        "probability_hardening_monotonicity_status": trade.probability_hardening_monotonicity_status,
+        "probability_hardening_ladder_role": trade.probability_hardening_ladder_role,
+        "probability_hardening_ladder_size": trade.probability_hardening_ladder_size,
+        "probability_hardening_ladder_rank": trade.probability_hardening_ladder_rank,
+        "probability_hardening_distance_from_central": trade.probability_hardening_distance_from_central,
+        "probability_hardening_central_reference_line": _float(trade.probability_hardening_central_reference_line),
+        "probability_hardening_central_reference_probability": _float(
+            trade.probability_hardening_central_reference_probability
+        ),
+        "probability_hardening_dampening_factor": _float(trade.probability_hardening_dampening_factor),
+        "probability_hardening_shadow_only": trade.probability_hardening_shadow_only,
+        "probability_hardening_block_recommendation": trade.probability_hardening_block_recommendation,
+        "probability_hardening_error_reason": trade.probability_hardening_error_reason,
+        "calibration_status": trade.calibration_status,
+    }
+    compact = {key: value for key, value in payload.items() if value is not None}
+    return compact or None
+
+
+def _position_settlement_payload(trade: PaperTrade) -> dict[str, object] | None:
+    payload = {
+        "settlement_audit_key": trade.settlement_audit_key,
+        "settlement_formula_version": trade.settlement_formula_version,
+        "settlement_formula": trade.settlement_formula,
+        "settlement_source": trade.settlement_source,
+        "settlement_source_game_id": trade.settlement_source_game_id,
+        "settlement_source_market_ticker": trade.settlement_source_market_ticker,
+        "settlement_checked_at": to_eastern_iso(trade.settlement_checked_at),
+        "settlement_resolved_at": to_eastern_iso(trade.settlement_resolved_at),
+        "settlement_status": trade.settlement_status,
+        "settlement_outcome": trade.settlement_outcome,
+        "settlement_skip_reason": trade.settlement_skip_reason,
+        "settlement_error_reason": trade.settlement_error_reason,
+        "settlement_idempotency_key": trade.settlement_idempotency_key,
+        "settlement_payout": _float(trade.settlement_payout),
+        "settlement_fee_adjustment": _float(trade.settlement_fee_adjustment),
+    }
+    compact = {key: value for key, value in payload.items() if value is not None}
+    return compact or None
+
+
 def _position_from_trade(
     trade: PaperTrade,
     game: MlbGame | None = None,
@@ -290,6 +358,12 @@ def _position_from_trade(
     risk_governance_payload = _position_risk_governance_payload(trade)
     if risk_governance_payload is not None:
         selected_rationale["risk_governance"] = risk_governance_payload
+    model_audit_payload = _position_model_audit_payload(trade)
+    if model_audit_payload is not None:
+        selected_rationale["model_audit"] = model_audit_payload
+    settlement_payload = _position_settlement_payload(trade)
+    if settlement_payload is not None:
+        selected_rationale["settlement_audit"] = settlement_payload
     return PositionSummary(
         time_entered=to_eastern_iso(trade.entry_time),
         time_entered_display=eastern_display(trade.entry_time),
@@ -353,6 +427,55 @@ def _position_from_trade(
         risk_governance_blocked=trade.risk_governance_blocked,
         risk_governance_rank=trade.risk_governance_rank,
         risk_governance_rank_score=_float(trade.risk_governance_rank_score),
+        probability_adapter_key=trade.probability_adapter_key,
+        probability_adapter_version=trade.probability_adapter_version,
+        probability_adapter_policy_version=trade.probability_adapter_policy_version,
+        probability_adapter_family=trade.probability_adapter_family,
+        probability_adapter_scope=trade.probability_adapter_scope,
+        probability_adapter_calibration_hook=trade.probability_adapter_calibration_hook,
+        probability_adapter_calibration_version=trade.probability_adapter_calibration_version,
+        probability_adapter_feature_policy_version=trade.probability_adapter_feature_policy_version,
+        probability_hardening_policy_version=trade.probability_hardening_policy_version,
+        probability_hardening_enabled=trade.probability_hardening_enabled,
+        probability_raw_adapter=_float(trade.probability_raw_adapter),
+        probability_before_hardening=_float(trade.probability_before_hardening),
+        probability_after_hardening=_float(trade.probability_after_hardening),
+        probability_hardening_delta=_float(trade.probability_hardening_delta),
+        probability_hardening_applied=trade.probability_hardening_applied,
+        probability_hardening_reason=trade.probability_hardening_reason,
+        probability_hardening_status=trade.probability_hardening_status,
+        probability_hardening_line_class=trade.probability_hardening_line_class,
+        probability_hardening_line_class_policy=trade.probability_hardening_line_class_policy,
+        probability_hardening_consistency_status=trade.probability_hardening_consistency_status,
+        probability_hardening_monotonicity_status=trade.probability_hardening_monotonicity_status,
+        probability_hardening_ladder_role=trade.probability_hardening_ladder_role,
+        probability_hardening_ladder_size=trade.probability_hardening_ladder_size,
+        probability_hardening_ladder_rank=trade.probability_hardening_ladder_rank,
+        probability_hardening_distance_from_central=trade.probability_hardening_distance_from_central,
+        probability_hardening_central_reference_line=_float(trade.probability_hardening_central_reference_line),
+        probability_hardening_central_reference_probability=_float(
+            trade.probability_hardening_central_reference_probability
+        ),
+        probability_hardening_dampening_factor=_float(trade.probability_hardening_dampening_factor),
+        probability_hardening_shadow_only=trade.probability_hardening_shadow_only,
+        probability_hardening_block_recommendation=trade.probability_hardening_block_recommendation,
+        probability_hardening_error_reason=trade.probability_hardening_error_reason,
+        calibration_status=trade.calibration_status,
+        settlement_audit_key=trade.settlement_audit_key,
+        settlement_formula_version=trade.settlement_formula_version,
+        settlement_formula=trade.settlement_formula,
+        settlement_source=trade.settlement_source,
+        settlement_source_game_id=trade.settlement_source_game_id,
+        settlement_source_market_ticker=trade.settlement_source_market_ticker,
+        settlement_checked_at=to_eastern_iso(trade.settlement_checked_at),
+        settlement_resolved_at=to_eastern_iso(trade.settlement_resolved_at),
+        settlement_status=trade.settlement_status,
+        settlement_outcome=trade.settlement_outcome,
+        settlement_skip_reason=trade.settlement_skip_reason,
+        settlement_error_reason=trade.settlement_error_reason,
+        settlement_idempotency_key=trade.settlement_idempotency_key,
+        settlement_payout=_float(trade.settlement_payout),
+        settlement_fee_adjustment=_float(trade.settlement_fee_adjustment),
         display_title=fallback_labels.display_title,
         display_subtitle=fallback_labels.display_subtitle,
         raw_ticker_display=fallback_labels.raw_ticker_display,
@@ -1689,11 +1812,29 @@ def dashboard_summary_from_db(
             summary.portfolio_value = float(portfolio_value)
 
     settled = [trade for trade in filtered_trades if trade.status in {"settled", "closed", "void"}]
+    open_trades_for_accounting = [trade for trade in filtered_trades if trade.status == "open"]
     wins = sum(1 for trade in settled if trade.outcome == "win" or (trade.realized_pnl or Decimal("0")) > 0)
     losses = sum(1 for trade in settled if trade.outcome == "loss" or (trade.realized_pnl or Decimal("0")) < 0)
     pushes = sum(1 for trade in settled if trade.outcome in {"push", "void"})
     realized = sum((trade.realized_pnl or Decimal("0")) for trade in settled)
     stake = sum(((trade.entry_price * trade.quantity) + paper_trade_fee(trade)) for trade in settled)
+    open_cost = sum(((trade.entry_price * trade.quantity) + paper_trade_fee(trade)) for trade in open_trades_for_accounting)
+    open_mark_value = sum(
+        ((trade.current_price if trade.current_price is not None else trade.entry_price) * trade.quantity)
+        for trade in open_trades_for_accounting
+    )
+    fees_paid = sum(paper_trade_fee(trade) for trade in settled)
+    fees_estimated_open = sum(paper_trade_fee(trade) for trade in open_trades_for_accounting)
+    unrealized = open_mark_value - open_cost
+    summary.current_equity = summary.portfolio_value
+    summary.settled_profit_loss = float(realized)
+    summary.unrealized_profit_loss = float(unrealized)
+    summary.fees_paid = float(fees_paid)
+    summary.fees_estimated_open = float(fees_estimated_open)
+    summary.open_cost = float(open_cost)
+    summary.open_mark_value = float(open_mark_value)
+    summary.open_trade_count = len(open_trades_for_accounting)
+    summary.settled_trade_count = len(settled)
     summary.performance = PerformanceMetrics(
         win_rate=(wins / len(settled)) if settled else None,
         roi=(float(realized / stake) if stake else None),
@@ -1943,6 +2084,21 @@ def dashboard_summary_from_db(
     )
     starter_report = starter_status_report(session, today_eastern())
     settings = get_settings()
+    drawdown = drawdown_summary(session, active_epoch, settings)
+    summary.drawdown_policy_version = str(drawdown.get("drawdown_policy_version") or DRAWDOWN_POLICY_VERSION)
+    summary.drawdown_observation_mode = bool(drawdown.get("drawdown_observation_mode"))
+    summary.drawdown_basis = str(drawdown.get("drawdown_basis") or "")
+    summary.drawdown_halt_enforced = bool(drawdown.get("drawdown_halt_enforced"))
+    summary.drawdown_would_have_halted = bool(drawdown.get("drawdown_would_have_halted"))
+    summary.drawdown_live_halt_threshold_abs = float(
+        drawdown.get("drawdown_live_halt_threshold_abs") or DRAWDOWN_LIVE_HALT_THRESHOLD_ABS
+    )
+    summary.drawdown_live_halt_basis = str(drawdown.get("drawdown_live_halt_basis") or "")
+    summary.drawdown_starting_bankroll = float(drawdown.get("drawdown_starting_bankroll") or active_epoch.starting_balance)
+    summary.drawdown_halt_level = float(drawdown.get("drawdown_halt_level") or 0)
+    summary.drawdown_abs = float(drawdown.get("drawdown_abs") or 0)
+    summary.drawdown_pct = float(drawdown.get("drawdown_pct") or 0)
+    summary.drawdown_status = str(drawdown.get("status") or "clear")
     trade_policy = dict(last_prediction["trade_policy"] if last_prediction and last_prediction["trade_policy"] else {})
     trade_policy.update(
         {
@@ -1955,6 +2111,18 @@ def dashboard_summary_from_db(
             "paper_drawdown_halt_enabled": settings.paper_drawdown_halt_enabled,
             "paper_drawdown_halt_threshold_abs": float(settings.paper_drawdown_halt_threshold_abs),
             "paper_drawdown_halt_threshold_pct": float(settings.paper_drawdown_halt_threshold_pct),
+            "drawdown_policy_version": summary.drawdown_policy_version,
+            "drawdown_observation_mode": summary.drawdown_observation_mode,
+            "drawdown_basis": summary.drawdown_basis,
+            "drawdown_halt_enforced": summary.drawdown_halt_enforced,
+            "drawdown_would_have_halted": summary.drawdown_would_have_halted,
+            "drawdown_live_halt_threshold_abs": summary.drawdown_live_halt_threshold_abs,
+            "drawdown_live_halt_basis": summary.drawdown_live_halt_basis,
+            "drawdown_starting_bankroll": summary.drawdown_starting_bankroll,
+            "drawdown_halt_level": summary.drawdown_halt_level,
+            "drawdown_abs": summary.drawdown_abs,
+            "drawdown_pct": summary.drawdown_pct,
+            "drawdown_status": summary.drawdown_status,
         }
     )
     summary.model_status = ModelStatus(
