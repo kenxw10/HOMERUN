@@ -841,3 +841,13 @@ Every future PR must update this section with:
 - Promotion is guarded per family/scope. A passing `full_game_total` challenger can activate only that unit's family calibration without promoting global/shared parameters or changing other units.
 - If no active family calibration exists, adapters keep the explicit shared/uncalibrated fallback status. If an active family calibration exists, adapter metadata reports the family calibration version/status.
 - Safety and selection behavior are unchanged: no live orders, no sportsbook/Odds API data, no team totals, no umpire inputs, no source-ingestion or cron change, no PR3t selector bypass, no settlement/risk-cap change, and candidate sweeps remain heavy-source cache-only.
+
+### PR3w - Tail and Alternate-Line Probability Hardening
+
+- Candidate generation now runs a conservative PR3w probability hardening pass after PR3u family/scope adapters and PR3s Kalshi ladder classification, before the PR3t live-like selector.
+- Alternate and tail line probabilities are shrunk toward a same-ladder central reference when enough current Kalshi ladder evidence exists. `near_alternate`, `deep_alternate`, and `tail` lines use progressively stronger dampening; central and non-line markets remain unchanged.
+- The hardening pass checks ladder monotonicity and simple complement consistency for line markets. Failed checks set compact failure metadata and block/shadow the candidate before selector/risk sizing. Tail lines remain shadow-only unless they still clear exceptional EV/edge after hardening.
+- Insufficient ladder depth is recorded as diagnostics but does not create a new hard block by itself, preserving existing trusted single-line spread and same-scope behavior when the current mapped ladder is too sparse to prove alternate/tail status.
+- Hardened probability now feeds fair value, EV, net EV, probability edge, selector ranking, prediction output economics, and governance-visible candidate probabilities. Raw PR3u adapter probability is preserved separately as `probability_raw_adapter` plus before/after/delta fields.
+- New safe defaults: `PAPER_PROBABILITY_HARDENING_ENABLED=true` and `PAPER_PROBABILITY_HARDENING_POLICY_VERSION=pr3w_tail_alternate_probability_hardening_v1`.
+- Schema migration `0016_pr3w_probability_hardening` adds nullable compact PR3w columns to `model_candidates`. No paper trade table, settlement, risk-cap, cron, source-ingestion, WebSocket, live execution, credential, sportsbook/team-total/umpire, MVE, or selector-threshold behavior changed.

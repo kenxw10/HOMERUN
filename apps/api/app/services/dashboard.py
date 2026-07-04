@@ -1054,6 +1054,23 @@ PROBABILITY_ADAPTER_DIAGNOSTIC_COMPACT_KEYS = (
     "probability_adapter_errors_excluded_from_governance_training",
 )
 
+PROBABILITY_HARDENING_DIAGNOSTIC_COMPACT_KEYS = (
+    "probability_hardening_policy_version",
+    "probability_hardening_enabled",
+    "probability_hardening_line_class_policy",
+    "probability_hardening_applied_count",
+    "probability_hardening_shadow_only_count",
+    "probability_hardening_block_recommendation_count",
+    "probability_hardening_error_count",
+    "probability_hardening_missing_count",
+    "probability_hardening_status_counts",
+    "probability_hardening_reason_counts",
+    "probability_hardening_by_line_class",
+    "probability_hardening_by_family_scope",
+    "probability_hardening_consistency_status_counts",
+    "probability_hardening_monotonicity_status_counts",
+)
+
 
 def _prediction_summary_json_value(section: str, key: str):
     return ModelPredictionRun.summary[section][key]
@@ -1072,6 +1089,10 @@ def _prediction_summary_compact_columns() -> list[object]:
     columns.extend(
         ModelPredictionRun.summary[key].label(f"probability_adapter_{key}")
         for key in PROBABILITY_ADAPTER_DIAGNOSTIC_COMPACT_KEYS
+    )
+    columns.extend(
+        ModelPredictionRun.summary[key].label(f"probability_hardening_{key}")
+        for key in PROBABILITY_HARDENING_DIAGNOSTIC_COMPACT_KEYS
     )
     columns.extend(
         [
@@ -1134,13 +1155,19 @@ def _compact_prediction_summary_from_row(row) -> dict[str, object] | None:
         for key in PROBABILITY_ADAPTER_DIAGNOSTIC_COMPACT_KEYS
         if row.get(f"probability_adapter_{key}") is not None
     }
-    if not candidate and not quality_ev and not selector and not probability_adapter:
+    probability_hardening = {
+        key: row[f"probability_hardening_{key}"]
+        for key in PROBABILITY_HARDENING_DIAGNOSTIC_COMPACT_KEYS
+        if row.get(f"probability_hardening_{key}") is not None
+    }
+    if not candidate and not quality_ev and not selector and not probability_adapter and not probability_hardening:
         return None
     return {
         "candidate_diagnostics": candidate,
         "quality_ev_diagnostics": quality_ev,
         "selector": selector,
         "probability_adapter": probability_adapter,
+        "probability_hardening": probability_hardening,
     }
 
 
@@ -1192,6 +1219,13 @@ def _compact_candidate_diagnostics(
             for key in PROBABILITY_ADAPTER_DIAGNOSTIC_COMPACT_KEYS
             if key in run_summary
         }
+    probability_hardening = run_summary.get("probability_hardening")
+    if not isinstance(probability_hardening, dict):
+        probability_hardening = {
+            key: run_summary.get(key)
+            for key in PROBABILITY_HARDENING_DIAGNOSTIC_COMPACT_KEYS
+            if key in run_summary
+        }
     if include_details:
         return dict(
             _compact_payload(
@@ -1200,6 +1234,7 @@ def _compact_candidate_diagnostics(
                     "quality_ev_diagnostics": quality_ev or {},
                     "selector": selector or {},
                     "probability_adapter": probability_adapter or {},
+                    "probability_hardening": probability_hardening or {},
                 },
                 max_depth=5,
                 max_list_items=25,
@@ -1242,6 +1277,8 @@ def _compact_candidate_diagnostics(
         }
     if probability_adapter:
         result["probability_adapter"] = probability_adapter
+    if probability_hardening:
+        result["probability_hardening"] = probability_hardening
     return result
 
 

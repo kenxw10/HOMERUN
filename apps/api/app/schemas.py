@@ -329,6 +329,29 @@ class CandidateSummary(BaseModel):
     probability_adapter_calibration_hook: str | None = None
     probability_adapter_calibration_version: str | None = None
     probability_adapter_feature_policy_version: str | None = None
+    probability_hardening_policy_version: str | None = None
+    probability_hardening_enabled: bool | None = None
+    probability_raw_adapter: float | None = None
+    probability_before_hardening: float | None = None
+    probability_after_hardening: float | None = None
+    probability_hardening_delta: float | None = None
+    probability_hardening_applied: bool | None = None
+    probability_hardening_reason: str | None = None
+    probability_hardening_status: str | None = None
+    probability_hardening_line_class: str | None = None
+    probability_hardening_line_class_policy: str | None = None
+    probability_hardening_consistency_status: str | None = None
+    probability_hardening_monotonicity_status: str | None = None
+    probability_hardening_ladder_role: str | None = None
+    probability_hardening_ladder_size: int | None = None
+    probability_hardening_ladder_rank: int | None = None
+    probability_hardening_distance_from_central: int | None = None
+    probability_hardening_central_reference_line: float | None = None
+    probability_hardening_central_reference_probability: float | None = None
+    probability_hardening_dampening_factor: float | None = None
+    probability_hardening_shadow_only: bool | None = None
+    probability_hardening_block_recommendation: bool | None = None
+    probability_hardening_error_reason: str | None = None
     decision: str
 
 

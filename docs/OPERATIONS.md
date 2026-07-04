@@ -1010,6 +1010,47 @@ $status.config | Select-Object paper_trading,live_trading_enabled,execution_kill
 
 Expected: predictions still expose compact PR3u adapter fields, calibration hook/version/status, PR3s taxonomy, and PR3t selector fields without raw payload/features/scoring-rationale blobs. Final safety remains paper mode, demo Kalshi, live trading disabled, execution kill switch enabled, and no production credential requirement.
 
+## PR3w Tail and Alternate-Line Probability Hardening Validation
+
+PR3w keeps candidate sweeps cache-only and paper-only while hardening alternate/tail line probabilities before PR3t selection. Validate it against the fixed production backend and known replay slate `2026-07-04`. Prompt only for the internal API key.
+
+```powershell
+$base = "https://homerun-production-2551.up.railway.app"
+$targetDate = "2026-07-04"
+$apiKeySecure = Read-Host -Prompt "Paste internal API key" -AsSecureString
+$apiKeyPtr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($apiKeySecure)
+try { $apiKey = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($apiKeyPtr).Trim() } finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($apiKeyPtr) }
+$headers = @{ "X-API-Key" = $apiKey }
+```
+
+Run a dry-run sweep and inspect hardening summary:
+
+```powershell
+$label = "pr3w_validation_dry_run_" + (Get-Date -Format "yyyyMMdd_HHmmss")
+$dry = Invoke-RestMethod -Method Post -Headers $headers "$base/v1/jobs/run/candidate-sweep?target_date=$targetDate&min_time_to_start_minutes=0&max_time_to_start_minutes=1800&sweep_label=$label&dry_run_candidates_only=true"
+$engine = $dry.result.result.paper_candidate_engine
+if (-not $engine) { $engine = $dry.result.result.candidate_engine }
+if (-not $engine) { $engine = $dry.result.result }
+$engine | Select-Object target_date,dry_run_candidates_only,feature_sync_mode,heavy_feature_sync_skipped,candidates_evaluated,paper_trades_created,probability_hardening_policy_version,probability_hardening_enabled,probability_hardening_applied_count,probability_hardening_shadow_only_count,probability_hardening_block_recommendation_count | Format-List
+$engine.probability_hardening_status_counts
+$engine.probability_hardening_by_line_class
+$engine.probability_hardening_monotonicity_status_counts
+$engine.probability_hardening_consistency_status_counts
+```
+
+Expected: nonzero candidates are evaluated, no paper trades are created, `feature_sync_mode=cache_only`, `heavy_feature_sync_skipped=true`, `probability_hardening_policy_version=pr3w_tail_alternate_probability_hardening_v1`, hardening summary counts are present, and tail/ambiguous hardening does not enable live execution.
+
+Inspect compact prediction rows:
+
+```powershell
+$predictions = Invoke-RestMethod -Headers $headers "$base/v1/model/predictions?date=$targetDate"
+($predictions | ConvertTo-Json -Depth 100) -split "`n" |
+  Where-Object { $_ -match "probability_hardening|probability_raw_adapter|line_class|selector_" } |
+  Select-Object -First 700
+```
+
+Expected: candidate rows include compact PR3w fields such as `probability_before_hardening`, `probability_after_hardening`, `probability_hardening_delta`, `probability_hardening_line_class`, consistency/monotonicity statuses, dampening factor, shadow/block recommendation, and `probability_raw_adapter`. Raw features, scoring rationale blobs, and full payloads should not appear in this prediction endpoint.
+
 ## Required Context Updates
 
 Every PR must update `PROJECT_CONTEXT.md`.
