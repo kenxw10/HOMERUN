@@ -312,6 +312,7 @@ def _adapter_context(
     exposure_direction: str | None = None,
     exposure_team: str | None = "PIT",
     exposure_line: str | None = None,
+    parameters: dict[str, object] | None = None,
 ) -> probability_adapters.ProbabilityAdapterContext:
     taxonomy = SimpleNamespace(
         economic_exposure_direction=exposure_direction or over_under_side,
@@ -328,6 +329,7 @@ def _adapter_context(
         market_type=market_type,
         contract_side=contract_side,
         settlement_status="paper_supported",
+        parameters=parameters,
         exposure_taxonomy=taxonomy,
     )
 
@@ -9177,14 +9179,31 @@ def _add_governance_candidate(
     evaluated_at: datetime,
     resolved_at: datetime,
     outcome: str = "win",
+    market_family: str = "full_game_winner",
+    probability: Decimal = Decimal("0.550000"),
+    adapter_error: str | None = None,
 ) -> ModelCandidate:
+    adapter_key = f"{market_family}_probability_adapter"
+    adapter_version = probability_adapters.ADAPTER_VERSION_BY_FAMILY.get(market_family)
+    calibration_hook = probability_adapters.CALIBRATION_HOOK_BY_FAMILY.get(market_family)
+    adapter_scope = probability_adapters.SCOPE_BY_FAMILY.get(market_family)
+    adapter_metadata = {
+        "adapter_key": adapter_key,
+        "adapter_version": adapter_version,
+        "adapter_policy_version": probability_adapters.PROBABILITY_ADAPTER_POLICY_VERSION,
+        "adapter_family": market_family,
+        "adapter_scope": adapter_scope,
+        "calibration_hook": calibration_hook,
+        "calibration_version": "shared_parameter_offsets_pre_pr3v",
+        "diagnostics": {"adapter_error": adapter_error} if adapter_error else {},
+    }
     candidate = ModelCandidate(
         paper_trading_epoch_id=epoch_id,
         mlb_game_id=game_id,
         evaluated_at=evaluated_at,
         features={},
-        probability=Decimal("0.550000"),
-        probability_calibrated=Decimal("0.550000"),
+        probability=probability,
+        probability_calibrated=probability,
         target_date=target_date,
         fee_estimate=Decimal("0.010000"),
         price_status="fresh_executable",
@@ -9195,7 +9214,16 @@ def _add_governance_candidate(
         model_version_tag=modeling.MATURE_MODEL_TAG,
         feature_version=features.FEATURE_VERSION,
         training_eligible=True,
-        market_family="full_game_winner",
+        market_family=market_family,
+        probability_adapter_key=adapter_key,
+        probability_adapter_version=adapter_version,
+        probability_adapter_policy_version=probability_adapters.PROBABILITY_ADAPTER_POLICY_VERSION,
+        probability_adapter_family=market_family,
+        probability_adapter_scope=adapter_scope,
+        probability_adapter_calibration_hook=calibration_hook,
+        probability_adapter_calibration_version="shared_parameter_offsets_pre_pr3v",
+        probability_adapter_feature_policy_version=probability_adapters.PROBABILITY_ADAPTER_FEATURE_POLICY_VERSION,
+        probability_adapter_metadata=adapter_metadata,
     )
     session.add(candidate)
     return candidate
@@ -9401,6 +9429,181 @@ def test_model_governance_uses_scalar_samples_and_records_phase_metrics(monkeypa
     assert training is not None
     persisted_phase_names = {phase["phase"] for phase in training.metrics["governance_phase_metrics"]}
     assert "load_clean_training_samples" in persisted_phase_names
+
+
+def test_pr3v_family_scope_governance_isolates_training_units(monkeypatch) -> None:
+    monkeypatch.setenv("MODEL_MIN_SAMPLES_TRAIN", "3")
+    monkeypatch.setenv("MODEL_MIN_SAMPLES_CALIBRATE", "3")
+    monkeypatch.setenv("MODEL_MIN_SAMPLES_PROMOTE", "99")
+    monkeypatch.setenv("MODEL_GOVERNANCE_FAMILY_MIN_SAMPLES_TRAIN", "3")
+    monkeypatch.setenv("MODEL_GOVERNANCE_FAMILY_MIN_SAMPLES_CALIBRATE", "3")
+    monkeypatch.setenv("MODEL_GOVERNANCE_FAMILY_MIN_SAMPLES_PROMOTE", "99")
+    monkeypatch.setenv("MODEL_GOVERNANCE_CLEAN_START_AT", "2026-07-02T00:00:00-04:00")
+    get_settings.cache_clear()
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        epoch_id = _active_epoch_id(session)
+        game = MlbGame(
+            external_game_id="pr3v-family-isolation",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 2, 23, 0, tzinfo=UTC),
+            status="Final",
+        )
+        session.add(game)
+        session.flush()
+        for index, outcome in enumerate(["win", "win", "loss", "win"], start=1):
+            _add_governance_candidate(
+                session,
+                epoch_id=epoch_id,
+                game_id=game.id,
+                target_date=date(2026, 7, 2),
+                evaluated_at=datetime(2026, 7, 2, 16, index, tzinfo=UTC),
+                resolved_at=datetime(2026, 7, 3, 4, index, tzinfo=UTC),
+                outcome=outcome,
+                market_family="full_game_total",
+            )
+        _add_governance_candidate(
+            session,
+            epoch_id=epoch_id,
+            game_id=game.id,
+            target_date=date(2026, 7, 2),
+            evaluated_at=datetime(2026, 7, 2, 17, 0, tzinfo=UTC),
+            resolved_at=datetime(2026, 7, 3, 5, 0, tzinfo=UTC),
+            outcome="loss",
+            market_family="first_five_spread",
+        )
+        session.commit()
+
+        result = run_model_governance(session, now=datetime(2026, 7, 3, 12, 0, tzinfo=UTC))
+        status = modeling.governance_status(session)
+
+    units = result["family_scope_units"]
+    assert units["full_game_total"]["status"] == "trained"
+    assert units["full_game_total"]["clean_resolved_mature_samples"] == 4
+    assert units["full_game_total"]["challenger_version"] is not None
+    assert units["first_five_spread"]["status"] == "skipped_not_enough_family_samples"
+    assert units["first_five_spread"]["clean_resolved_mature_samples"] == 1
+    assert status["family_scope_units"]["full_game_total"]["status"] == "trained"
+    assert status["family_scope_units"]["first_five_spread"]["status"] == "skipped_not_enough_family_samples"
+
+
+def test_pr3v_adapter_errors_are_counted_and_excluded_from_training(monkeypatch) -> None:
+    monkeypatch.setenv("MODEL_MIN_SAMPLES_TRAIN", "2")
+    monkeypatch.setenv("MODEL_MIN_SAMPLES_CALIBRATE", "2")
+    monkeypatch.setenv("MODEL_MIN_SAMPLES_PROMOTE", "99")
+    monkeypatch.setenv("MODEL_GOVERNANCE_FAMILY_MIN_SAMPLES_TRAIN", "2")
+    monkeypatch.setenv("MODEL_GOVERNANCE_FAMILY_MIN_SAMPLES_CALIBRATE", "2")
+    monkeypatch.setenv("MODEL_GOVERNANCE_FAMILY_MIN_SAMPLES_PROMOTE", "99")
+    monkeypatch.setenv("MODEL_GOVERNANCE_CLEAN_START_AT", "2026-07-02T00:00:00-04:00")
+    get_settings.cache_clear()
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        epoch_id = _active_epoch_id(session)
+        game = MlbGame(
+            external_game_id="pr3v-adapter-error",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 2, 23, 0, tzinfo=UTC),
+            status="Final",
+        )
+        session.add(game)
+        session.flush()
+        for index, error in enumerate([None, "missing_total_direction_or_line", None], start=1):
+            _add_governance_candidate(
+                session,
+                epoch_id=epoch_id,
+                game_id=game.id,
+                target_date=date(2026, 7, 2),
+                evaluated_at=datetime(2026, 7, 2, 16, index, tzinfo=UTC),
+                resolved_at=datetime(2026, 7, 3, 4, index, tzinfo=UTC),
+                outcome="win" if index != 2 else "loss",
+                market_family="first_five_total",
+                adapter_error=error,
+            )
+        session.commit()
+
+        result = run_model_governance(session, now=datetime(2026, 7, 3, 12, 0, tzinfo=UTC))
+        dataset = session.get(ModelTrainingDataset, result["training_dataset_id"])
+
+    unit = result["family_scope_units"]["first_five_total"]
+    assert result["clean_resolved_mature_samples"] == 3
+    assert result["resolved_samples"] == 2
+    assert result["adapter_error_reason_counts"] == {"missing_total_direction_or_line": 1}
+    assert unit["adapter_error_count"] == 1
+    assert unit["adapter_error_reason_counts"] == {"missing_total_direction_or_line": 1}
+    assert unit["trainable_clean_samples"] == 2
+    assert unit["status"] == "trained"
+    assert dataset is not None
+    assert dataset.sample_count == 2
+
+
+def test_pr3v_active_family_calibration_is_used_by_adapter_metadata() -> None:
+    parameters = {
+        **modeling.DEFAULT_MODEL_PARAMETERS,
+        "family_scope_probability_offsets": {"full_game_total": 0.02},
+        "family_scope_calibrations": {
+            "full_game_total": {
+                "governance_family_scope_key": "full_game_total",
+                "calibration_version": "pr3v_family_scope_governance_v1_full_game_total_7",
+                "promotion_status": "promoted",
+                "role": "active",
+            }
+        },
+        "family_scope_calibration_policy_version": modeling.FAMILY_SCOPE_GOVERNANCE_POLICY,
+        "trained_from_samples": True,
+    }
+
+    result = probability_adapters.score_probability_adapter(
+        _adapter_context(
+            "full_game_total",
+            line_value=Decimal("8.5000"),
+            over_under_side="over",
+            parameters=parameters,
+        )
+    )
+
+    assert result.calibration_status == "family_scope_active"
+    assert result.calibration_version == "pr3v_family_scope_governance_v1_full_game_total_7"
+    assert result.calibration_hook_status == "family_scope_active"
+    assert result.model_policy_metadata["calibration_mode"] == "family_scope_active"
+
+
+def test_pr3v_governance_status_remains_compact(monkeypatch) -> None:
+    monkeypatch.setenv("MODEL_GOVERNANCE_CLEAN_START_AT", "2026-07-02T00:00:00-04:00")
+    get_settings.cache_clear()
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    def reject_status_sample_materialization(*_args, **_kwargs):
+        raise AssertionError("compact governance status must not materialize the training sample list")
+
+    monkeypatch.setattr(modeling, "_resolved_mature_candidate_samples", reject_status_sample_materialization)
+
+    with Session(engine) as session:
+        status = modeling.governance_status(session)
+
+    dumped = json.dumps(status, default=str)
+    assert status["family_scope_governance_enabled"] is True
+    assert set(status["family_scope_units"]) >= {
+        "full_game_total",
+        "first_five_total",
+        "full_game_winner",
+        "first_five_winner",
+        "full_game_spread",
+        "first_five_spread",
+    }
+    assert '"features":' not in dumped
+    assert '"scoring_rationale":' not in dumped
+    assert '"raw_payload":' not in dumped
 
 
 def test_dashboard_summary_does_not_deserialize_candidate_json_for_compact_counts(monkeypatch) -> None:

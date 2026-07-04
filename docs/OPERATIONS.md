@@ -955,6 +955,61 @@ $predictions = Invoke-RestMethod -Headers $headers "$base/v1/model/predictions?d
 
 Expected: candidate rows include compact PR3u fields such as `probability_adapter_key`, `probability_adapter_version`, `probability_adapter_policy_version`, `probability_adapter_family`, `probability_adapter_scope`, `probability_adapter_calibration_hook`, `probability_adapter_calibration_version`, and `probability_adapter_feature_policy_version`. Raw adapter metadata, raw features, raw payloads, and full scoring rationale blobs should not appear in this prediction endpoint.
 
+## PR3v Family-Specific Calibration Governance Validation
+
+PR3v keeps the system paper-only and turns PR3u adapter hooks into compact family/scope governance units. Validate it against the fixed production backend and known replay slate `2026-07-04`. Prompt only for the internal API key.
+
+```powershell
+$base = "https://homerun-production-2551.up.railway.app"
+$targetDate = "2026-07-04"
+$apiKeySecure = Read-Host -Prompt "Paste internal API key" -AsSecureString
+$apiKeyPtr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($apiKeySecure)
+try { $apiKey = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($apiKeyPtr).Trim() } finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($apiKeyPtr) }
+$headers = @{ "X-API-Key" = $apiKey }
+```
+
+Run governance and inspect compact family/scope status:
+
+```powershell
+$govRun = Invoke-RestMethod -Method Post -Headers $headers "$base/v1/jobs/run/governance"
+$govAfter = Invoke-RestMethod -Headers $headers "$base/v1/model/governance/status"
+$paramsAfter = Invoke-RestMethod -Headers $headers "$base/v1/model/parameters/active"
+
+($govRun, $govAfter, $paramsAfter | ConvertTo-Json -Depth 100) -split "`n" |
+  Where-Object { $_ -match "family_scope|calibration_hook|full_game_total|first_five_total|full_game_winner|first_five_winner|full_game_spread|first_five_spread|clean_resolved|pre_clean|train_sample|holdout|adapter_error|promoted|skipped|active" } |
+  Select-Object -First 900
+```
+
+Expected: the governance job succeeds, clean cutoff remains enforced, all six family/scope units are present, units below thresholds skip explicitly, trained units report family-specific challenger/calibration metadata, adapter errors are counted and excluded from training, and any promotion is isolated to that family/scope only.
+
+Run a dry-run candidate sweep regression:
+
+```powershell
+$label = "pr3v_validation_dry_run_" + (Get-Date -Format "yyyyMMdd_HHmmss")
+$dry = Invoke-RestMethod -Method Post -Headers $headers "$base/v1/jobs/run/candidate-sweep?target_date=$targetDate&min_time_to_start_minutes=0&max_time_to_start_minutes=1800&sweep_label=$label&dry_run_candidates_only=true"
+$engine = $dry.result.result.paper_candidate_engine
+if (-not $engine) { $engine = $dry.result.result.candidate_engine }
+if (-not $engine) { $engine = $dry.result.result }
+$engine | Select-Object target_date,dry_run_candidates_only,feature_sync_mode,heavy_feature_sync_skipped,candidates_evaluated,paper_trades_created,probability_adapter_policy_version,selector_policy_version,selector_mode | Format-List
+```
+
+Expected: nonzero candidates are evaluated, no paper trades are created, `feature_sync_mode=cache_only`, `heavy_feature_sync_skipped=true`, PR3u adapter metadata remains present, and PR3t selector metadata remains present.
+
+Inspect prediction rows and final safety:
+
+```powershell
+$predictions = Invoke-RestMethod -Headers $headers "$base/v1/model/predictions?date=$targetDate"
+$status = Invoke-RestMethod -Headers $headers "$base/v1/system/status"
+
+($predictions | ConvertTo-Json -Depth 100) -split "`n" |
+  Where-Object { $_ -match "probability_adapter|calibration_hook|calibration_version|calibration_status|family_scope|economic_exposure|selector_" } |
+  Select-Object -First 600
+
+$status.config | Select-Object paper_trading,live_trading_enabled,execution_kill_switch,kalshi_env,kalshi_credentials | Format-List
+```
+
+Expected: predictions still expose compact PR3u adapter fields, calibration hook/version/status, PR3s taxonomy, and PR3t selector fields without raw payload/features/scoring-rationale blobs. Final safety remains paper mode, demo Kalshi, live trading disabled, execution kill switch enabled, and no production credential requirement.
+
 ## Required Context Updates
 
 Every PR must update `PROJECT_CONTEXT.md`.

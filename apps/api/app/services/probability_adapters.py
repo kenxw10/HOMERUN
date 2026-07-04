@@ -20,6 +20,7 @@ from app.services.modeling import (
     MATURE_MODEL_TAG,
     ModelScore,
     RunExpectations,
+    _active_family_scope_calibration,
     _bounded,
     _calibrate_probability,
     _decimal,
@@ -208,6 +209,18 @@ def _score_family_adapter(
             market_type=context.market_type,
             parameters=parameters,
         )
+    active_family_calibration = _active_family_scope_calibration(parameters, context.market_type)
+    family_calibration_version = (
+        str(active_family_calibration.get("calibration_version"))
+        if isinstance(active_family_calibration, dict) and active_family_calibration.get("calibration_version")
+        else PROBABILITY_ADAPTER_CALIBRATION_VERSION
+    )
+    family_calibration_hook_status = (
+        "family_scope_active" if active_family_calibration is not None else "metadata_only_pending_pr3v"
+    )
+    family_calibration_mode = (
+        "family_scope_active" if active_family_calibration is not None else "shared_or_uncalibrated_until_pr3v"
+    )
     training_eligible, training_exclusion_reason = _training_eligibility(
         context.features,
         context.market_type,
@@ -238,8 +251,9 @@ def _score_family_adapter(
         "feature_version": FEATURE_VERSION,
         "family_kind": family_kind,
         "scope_policy": scope_policy,
-        "calibration_mode": "shared_or_uncalibrated_until_pr3v",
+        "calibration_mode": family_calibration_mode,
         "calibration_status": calibration_status,
+        "family_scope_calibration": active_family_calibration or {},
         "uses_market_price": False,
     }
     return ProbabilityAdapterResult(
@@ -258,8 +272,8 @@ def _score_family_adapter(
         adapter_scope=adapter.scope,
         adapter_rationale=f"{adapter.scope} {family_kind} probability adapter using mature run distribution v2",
         calibration_hook=CALIBRATION_HOOK_BY_FAMILY[context.market_type],
-        calibration_version=PROBABILITY_ADAPTER_CALIBRATION_VERSION,
-        calibration_hook_status="metadata_only_pending_pr3v",
+        calibration_version=family_calibration_version,
+        calibration_hook_status=family_calibration_hook_status,
         feature_policy_version=PROBABILITY_ADAPTER_FEATURE_POLICY_VERSION,
         model_policy_metadata=model_policy_metadata,
         diagnostics=diagnostics,

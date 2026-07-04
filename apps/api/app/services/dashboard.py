@@ -1049,6 +1049,9 @@ PROBABILITY_ADAPTER_DIAGNOSTIC_COMPACT_KEYS = (
     "probability_adapter_family_counts",
     "probability_adapter_missing_count",
     "probability_adapter_error_count",
+    "probability_adapter_error_reason_counts",
+    "probability_adapter_error_family_counts",
+    "probability_adapter_errors_excluded_from_governance_training",
 )
 
 
@@ -1849,6 +1852,18 @@ def dashboard_summary_from_db(
             governance_summary.get("governance_parameter_registry"),
             include_details=include_governance_registry_details,
         ),
+        family_scope_governance={
+            "governance_policy_version": governance_summary.get("governance_policy_version"),
+            "enabled": bool(governance_summary.get("family_scope_governance_enabled")),
+            "unit_count": governance_summary.get("family_scope_unit_count"),
+            "units": governance_summary.get("family_scope_units", {}),
+            "adapter_error_count": governance_summary.get("adapter_error_count", 0),
+            "adapter_error_reason_counts": governance_summary.get("adapter_error_reason_counts", {}),
+            "adapter_errors_excluded_from_training": governance_summary.get(
+                "adapter_errors_excluded_from_training",
+                True,
+            ),
+        },
         governance_status=str(governance_summary.get("last_governance_status") or "not_run"),
         trade_policy=trade_policy,
         trade_caps_used=trade_caps_used,

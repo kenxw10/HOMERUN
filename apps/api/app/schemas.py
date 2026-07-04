@@ -179,6 +179,7 @@ class ModelStatus(BaseModel):
     clean_filter_exclusion_counts: dict[str, int] = Field(default_factory=dict)
     ignored_pre_clean_artifacts: dict[str, object] = Field(default_factory=dict)
     governance_parameter_registry: dict[str, object] = Field(default_factory=dict)
+    family_scope_governance: dict[str, object] = Field(default_factory=dict)
     trade_policy: dict[str, object] = Field(default_factory=dict)
     trade_caps_used: dict[str, object] = Field(default_factory=dict)
     trade_threshold_policy: dict[str, object] = Field(default_factory=dict)
