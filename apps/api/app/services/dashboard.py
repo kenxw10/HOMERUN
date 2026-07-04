@@ -217,6 +217,31 @@ def _position_exposure_payload(trade: PaperTrade) -> dict[str, object] | None:
     return compact or None
 
 
+def _position_selector_payload(trade: PaperTrade) -> dict[str, object] | None:
+    payload = {
+        "selector_policy_version": trade.selector_policy_version,
+        "selector_mode": trade.selector_mode,
+        "selector_status": trade.selector_status,
+        "selector_decision": trade.selector_decision,
+        "selector_rejection_reason": trade.selector_rejection_reason,
+        "selector_threshold_profile": trade.selector_threshold_profile,
+        "selector_min_net_ev": _float(trade.selector_min_net_ev),
+        "selector_min_prob_edge": _float(trade.selector_min_prob_edge),
+        "selector_min_data_quality": _float(trade.selector_min_data_quality),
+        "selector_line_class_policy": trade.selector_line_class_policy,
+        "selector_concept_cluster_key": trade.selector_concept_cluster_key,
+        "selector_same_game_concept_cluster_key": trade.selector_same_game_concept_cluster_key,
+        "selector_cluster_rank": trade.selector_cluster_rank,
+        "selector_cluster_rank_score": _float(trade.selector_cluster_rank_score),
+        "selector_selected_from_cluster": trade.selector_selected_from_cluster,
+        "selector_shadow_only": trade.selector_shadow_only,
+        "selector_live_like_eligible_before_cluster": trade.selector_live_like_eligible_before_cluster,
+        "selector_live_like_eligible_after_cluster": trade.selector_live_like_eligible_after_cluster,
+    }
+    compact = {key: value for key, value in payload.items() if value is not None}
+    return compact or None
+
+
 def _position_from_trade(
     trade: PaperTrade,
     game: MlbGame | None = None,
@@ -251,6 +276,9 @@ def _position_from_trade(
     exposure_payload = _position_exposure_payload(trade)
     if exposure_payload is not None:
         selected_rationale["exposure_taxonomy"] = exposure_payload
+    selector_payload = _position_selector_payload(trade)
+    if selector_payload is not None:
+        selected_rationale["selector"] = selector_payload
     return PositionSummary(
         time_entered=to_eastern_iso(trade.entry_time),
         time_entered_display=eastern_display(trade.entry_time),
@@ -278,6 +306,24 @@ def _position_from_trade(
         line_ladder_rank=trade.line_ladder_rank,
         line_ladder_distance_from_central=trade.line_ladder_distance_from_central,
         line_ladder_size=trade.line_ladder_size,
+        selector_policy_version=trade.selector_policy_version,
+        selector_mode=trade.selector_mode,
+        selector_status=trade.selector_status,
+        selector_decision=trade.selector_decision,
+        selector_rejection_reason=trade.selector_rejection_reason,
+        selector_threshold_profile=trade.selector_threshold_profile,
+        selector_min_net_ev=_float(trade.selector_min_net_ev),
+        selector_min_prob_edge=_float(trade.selector_min_prob_edge),
+        selector_min_data_quality=_float(trade.selector_min_data_quality),
+        selector_line_class_policy=trade.selector_line_class_policy,
+        selector_concept_cluster_key=trade.selector_concept_cluster_key,
+        selector_same_game_concept_cluster_key=trade.selector_same_game_concept_cluster_key,
+        selector_cluster_rank=trade.selector_cluster_rank,
+        selector_cluster_rank_score=_float(trade.selector_cluster_rank_score),
+        selector_selected_from_cluster=trade.selector_selected_from_cluster,
+        selector_shadow_only=trade.selector_shadow_only,
+        selector_live_like_eligible_before_cluster=trade.selector_live_like_eligible_before_cluster,
+        selector_live_like_eligible_after_cluster=trade.selector_live_like_eligible_after_cluster,
         display_title=fallback_labels.display_title,
         display_subtitle=fallback_labels.display_subtitle,
         raw_ticker_display=fallback_labels.raw_ticker_display,
@@ -981,6 +1027,21 @@ QUALITY_EV_DIAGNOSTIC_COMPACT_KEYS = (
     "counts_by_quality_bucket",
 )
 
+SELECTOR_DIAGNOSTIC_COMPACT_KEYS = (
+    "selector_policy_version",
+    "selector_mode",
+    "selector_candidates_considered",
+    "selector_pre_cluster_eligible",
+    "selector_selected_after_cluster",
+    "selector_rejected_by_family_scope_threshold",
+    "selector_rejected_by_line_class",
+    "selector_rejected_by_concept_cluster",
+    "selector_shadow_only_count",
+    "selector_by_family_scope",
+    "selector_by_line_class",
+    "selector_by_concept_cluster_sample",
+)
+
 
 def _prediction_summary_json_value(section: str, key: str):
     return ModelPredictionRun.summary[section][key]
@@ -995,6 +1056,7 @@ def _prediction_summary_compact_columns() -> list[object]:
         _prediction_summary_json_value("quality_ev_diagnostics", key).label(f"quality_ev_{key}")
         for key in QUALITY_EV_DIAGNOSTIC_COMPACT_KEYS
     )
+    columns.extend(ModelPredictionRun.summary[key].label(f"selector_{key}") for key in SELECTOR_DIAGNOSTIC_COMPACT_KEYS)
     columns.extend(
         [
             func.json_array_length(
@@ -1046,11 +1108,17 @@ def _compact_prediction_summary_from_row(row) -> dict[str, object] | None:
         value = row.get(row_key)
         if isinstance(value, int):
             quality_ev[target_key] = value
-    if not candidate and not quality_ev:
+    selector = {
+        key: row[f"selector_{key}"]
+        for key in SELECTOR_DIAGNOSTIC_COMPACT_KEYS
+        if row.get(f"selector_{key}") is not None
+    }
+    if not candidate and not quality_ev and not selector:
         return None
     return {
         "candidate_diagnostics": candidate,
         "quality_ev_diagnostics": quality_ev,
+        "selector": selector,
     }
 
 
@@ -1092,12 +1160,16 @@ def _compact_candidate_diagnostics(
         return {}
     candidate = run_summary.get("candidate_diagnostics")
     quality_ev = run_summary.get("quality_ev_diagnostics")
+    selector = run_summary.get("selector")
+    if not isinstance(selector, dict):
+        selector = {key: run_summary.get(key) for key in SELECTOR_DIAGNOSTIC_COMPACT_KEYS if key in run_summary}
     if include_details:
         return dict(
             _compact_payload(
                 {
                     "candidate_diagnostics": candidate or {},
                     "quality_ev_diagnostics": quality_ev or {},
+                    "selector": selector or {},
                 },
                 max_depth=5,
                 max_list_items=25,
@@ -1132,6 +1204,12 @@ def _compact_candidate_diagnostics(
                 result["quality_ev_diagnostics"][f"{key}_count"] = len(value)
             elif isinstance(quality_ev.get(f"{key}_count"), int):
                 result["quality_ev_diagnostics"][f"{key}_count"] = quality_ev[f"{key}_count"]
+    if isinstance(selector, dict) and selector:
+        result["selector"] = {
+            key: selector.get(key)
+            for key in SELECTOR_DIAGNOSTIC_COMPACT_KEYS
+            if key in selector
+        }
     return result
 
 

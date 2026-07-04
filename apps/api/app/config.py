@@ -70,6 +70,7 @@ class Settings(BaseSettings):
     paper_allow_multiple_f5_winner_outcomes: bool = Field(
         default=False, alias="PAPER_ALLOW_MULTIPLE_F5_WINNER_OUTCOMES"
     )
+    paper_selector_mode: Literal["legacy", "live_like"] = Field(default="live_like", alias="PAPER_SELECTOR_MODE")
     paper_max_open_positions: int = Field(default=12, alias="PAPER_MAX_OPEN_POSITIONS")
     paper_spread_trading_enabled: bool = Field(default=False, alias="PAPER_SPREAD_TRADING_ENABLED")
     paper_full_game_spread_trading_enabled: bool = Field(
