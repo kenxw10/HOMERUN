@@ -73,6 +73,12 @@ from app.services import (
     ws_market_data,
 )
 from app.services.contracts import contract_labels, selected_team_from_ticker
+from app.services.exposure_taxonomy import (
+    EXPOSURE_TAXONOMY_VERSION,
+    LINE_CLASSIFICATION_POLICY_VERSION,
+    exposure_taxonomy_for_candidate,
+    line_classification_for_ladder,
+)
 from app.services.http_json import HttpJsonError
 from app.services.kalshi import KalshiAPIError, KalshiClient, derive_orderbook_prices
 from app.services.kalshi_mlb_resolver import (
@@ -16847,8 +16853,10 @@ def test_trade_caps_allow_configured_multiple_total_lines(monkeypatch) -> None:
             session.commit()
 
             result = candidates.generate_candidates(session)
-            decisions = [candidate.decision for candidate in session.scalars(select(ModelCandidate))]
+            candidate_rows = list(session.scalars(select(ModelCandidate).order_by(ModelCandidate.line_value.asc())))
+            decisions = [candidate.decision for candidate in candidate_rows]
             trades = list(session.scalars(select(PaperTrade)))
+            summary = dashboard.dashboard_summary_from_db(session, include_pre_observation=True)
     finally:
         get_settings.cache_clear()
 
@@ -16860,6 +16868,23 @@ def test_trade_caps_allow_configured_multiple_total_lines(monkeypatch) -> None:
     assert decisions.count("paper_trade") == 2
     assert decisions.count("no_trade_line_selection_not_best") == 1
     assert len(trades) == 2
+    assert result["line_classification_counts"] == {"near_alternate": 2, "central": 1}
+    assert [candidate.line_class for candidate in candidate_rows] == [
+        "near_alternate",
+        "central",
+        "near_alternate",
+    ]
+    assert candidate_rows[0].economic_exposure_label == "OVER 7.5 FULL GAME TOTAL"
+    assert candidate_rows[0].concept_cluster_key == "total_over"
+    assert candidate_rows[0].scoring_rationale["exposure_taxonomy"]["line_class"] == "near_alternate"
+    assert candidate_rows[0].scoring_rationale["exposure_taxonomy"]["line_ladder_size"] == 3
+    assert "raw_contract_text" not in candidate_rows[0].scoring_rationale["exposure_taxonomy"]
+    assert all(trade.economic_exposure_family == "total" for trade in trades)
+    assert all(trade.line_class in {"central", "near_alternate"} for trade in trades)
+    assert all(trade.exposure_taxonomy_version == EXPOSURE_TAXONOMY_VERSION for trade in trades)
+    assert summary.positions[0].market == summary.positions[0].economic_exposure_label
+    assert summary.positions[0].contract_mechanics_label is not None
+    assert summary.positions[0].selected_position_rationale["exposure_taxonomy"]["concept_cluster_key"] == "total_over"
 
 
 def test_model_predictions_today_filters_by_prediction_run_target_date(monkeypatch) -> None:
@@ -19968,6 +19993,128 @@ def test_total_no_label_displays_under_equivalent() -> None:
 
     assert labels.actual_contract_display == "NO ON OVER 8 FULL GAME"
     assert labels.normalized_equivalent_display == "UNDER 8 FULL GAME EQUIVALENT"
+
+
+def test_exposure_taxonomy_normalizes_no_total_to_under_concept() -> None:
+    game = MlbGame(
+        id=42,
+        external_game_id="total-exposure-1",
+        home_team="Pittsburgh Pirates",
+        away_team="Seattle Mariners",
+        home_abbreviation="PIT",
+        away_abbreviation="SEA",
+        scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+        status="scheduled",
+    )
+
+    taxonomy = exposure_taxonomy_for_candidate(
+        game=game,
+        market_family="full_game_total",
+        selection_code=None,
+        line_value=Decimal("8.5000"),
+        over_under_side="over",
+        contract_side="no",
+        contract_mechanics_label="NO ON OVER 8.5 FULL GAME",
+    )
+
+    assert taxonomy.economic_exposure_label == "UNDER 8.5 FULL GAME TOTAL"
+    assert taxonomy.economic_exposure_family == "total"
+    assert taxonomy.economic_exposure_scope == "full_game"
+    assert taxonomy.economic_exposure_direction == "under"
+    assert taxonomy.economic_exposure_line == Decimal("8.5000")
+    assert taxonomy.contract_mechanics_label == "NO ON OVER 8.5 FULL GAME"
+    assert taxonomy.concept_cluster_key == "total_under"
+    assert taxonomy.same_game_concept_cluster_key == "mlb_game:42:total_under"
+    assert taxonomy.exposure_taxonomy_version == EXPOSURE_TAXONOMY_VERSION
+
+
+def test_exposure_taxonomy_uses_verified_spread_no_complement() -> None:
+    game = MlbGame(
+        id=43,
+        external_game_id="spread-exposure-1",
+        home_team="Pittsburgh Pirates",
+        away_team="Seattle Mariners",
+        home_abbreviation="PIT",
+        away_abbreviation="SEA",
+        scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+        status="scheduled",
+    )
+    market = KalshiMarket(
+        kalshi_market_id="KX-SPREAD-EXPOSURE",
+        ticker="KXMLBSPREAD-26JUL011900SEAPIT-PIT-1.5",
+        title="Pittsburgh Pirates spread -1.5 vs Seattle Mariners",
+        no_subtitle="Seattle Mariners +1.5",
+        rules="If Pittsburgh wins by more than 1.5 runs, this market resolves to Yes.",
+        status="open",
+        market_family="full_game_spread",
+        market_type="full_game_spread",
+        line_value=Decimal("-1.5000"),
+        selection_code="PIT",
+        inning_scope="full_game",
+        settlement_rule_status="paper_supported",
+    )
+    verification = verify_spread_market(game=game, family_key="full_game_spread", market=market)
+    assert verification.audit_status == "trusted_audit_only"
+
+    taxonomy = exposure_taxonomy_for_candidate(
+        game=game,
+        market_family="full_game_spread",
+        selection_code="PIT",
+        line_value=Decimal("-1.5000"),
+        over_under_side=None,
+        contract_side="no",
+        contract_mechanics_label="NO ON PIT -1.5 FULL GAME",
+        spread_verification=verification,
+    )
+
+    assert taxonomy.economic_exposure_label == "SEA +1.5 FULL GAME SPREAD"
+    assert taxonomy.economic_exposure_family == "spread"
+    assert taxonomy.economic_exposure_direction == "cover"
+    assert taxonomy.economic_exposure_team == "SEA"
+    assert taxonomy.economic_exposure_line == Decimal("1.5000")
+    assert taxonomy.concept_cluster_key == "spread_cover"
+    assert taxonomy.same_game_concept_cluster_key == "mlb_game:43:spread_cover:sea"
+
+
+def test_line_classification_uses_current_kalshi_ladder_only() -> None:
+    central = line_classification_for_ladder(
+        market_family="full_game_total",
+        line_value=Decimal("8.5000"),
+        ladder_lines=[Decimal("7.5000"), Decimal("8.5000"), Decimal("9.5000")],
+    )
+    tail = line_classification_for_ladder(
+        market_family="full_game_total",
+        line_value=Decimal("11.5000"),
+        ladder_lines=[
+            Decimal("5.5000"),
+            Decimal("6.5000"),
+            Decimal("7.5000"),
+            Decimal("8.5000"),
+            Decimal("9.5000"),
+            Decimal("10.5000"),
+            Decimal("11.5000"),
+        ],
+    )
+    shallow = line_classification_for_ladder(
+        market_family="full_game_total",
+        line_value=Decimal("8.5000"),
+        ladder_lines=[Decimal("8.5000"), Decimal("9.5000")],
+    )
+    winner = line_classification_for_ladder(
+        market_family="full_game_winner",
+        line_value=None,
+        ladder_lines=[],
+    )
+
+    assert central.line_class == "central"
+    assert central.line_ladder_rank == 2
+    assert central.line_ladder_distance_from_central == 0
+    assert tail.line_class == "tail"
+    assert tail.line_ladder_size == 7
+    assert shallow.line_class == "unclassified"
+    assert shallow.line_class_reason == "insufficient_kalshi_ladder_depth"
+    assert winner.line_class == "not_applicable"
+    assert central.line_classification_policy_version == LINE_CLASSIFICATION_POLICY_VERSION
 
 
 def _add_scope_market(
