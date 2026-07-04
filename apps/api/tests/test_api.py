@@ -421,6 +421,15 @@ def test_probability_adapters_preserve_winner_tie_semantics() -> None:
             exposure_team=None,
         )
     )
+    first_five_no_tie = probability_adapters.score_probability_adapter(
+        _adapter_context(
+            "first_five_winner",
+            contract_side="no",
+            selection_code="TIE",
+            exposure_direction="either_team_win",
+            exposure_team=None,
+        )
+    )
 
     assert full_no.diagnostics["winner_team"] == "SEA"
     assert full_no.diagnostics["tie_policy"] == "excluded_full_game"
@@ -428,6 +437,9 @@ def test_probability_adapters_preserve_winner_tie_semantics() -> None:
     assert first_five_no.diagnostics["tie_policy"] == "tie_included_in_no_contract"
     assert first_five_tie.diagnostics["winner_team"] == "TIE"
     assert first_five_tie.diagnostics["tie_policy"] == "tie_contract_diagnostics_only"
+    assert first_five_no_tie.diagnostics["winner_team"] is None
+    assert first_five_no_tie.diagnostics["tie_policy"] == "no_on_tie_means_either_team_wins"
+    assert first_five_no_tie.probability_raw == Decimal("1.000000") - first_five_tie.probability_raw
 
 
 def test_probability_adapters_do_not_invent_ambiguous_spread_complements() -> None:

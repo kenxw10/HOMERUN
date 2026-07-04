@@ -353,10 +353,10 @@ def _winner_probability(
             return (away_win + tie).quantize(Decimal("0.000001")), tie, {"winner_team": team, "tie_policy": "tie_included_in_no_contract"}
         if team == away_code:
             return (home_win + tie).quantize(Decimal("0.000001")), tie, {"winner_team": team, "tie_policy": "tie_included_in_no_contract"}
-    if direction in {"tie", "draw"} or _selected_team(context) == "TIE":
-        return tie, tie, {"winner_team": "TIE", "tie_policy": "tie_contract_diagnostics_only"}
     if direction == "either_team_win":
         return (home_win + away_win).quantize(Decimal("0.000001")), tie, {"winner_team": None, "tie_policy": "no_on_tie_means_either_team_wins"}
+    if direction in {"tie", "draw"} or _selected_team(context) == "TIE":
+        return tie, tie, {"winner_team": "TIE", "tie_policy": "tie_contract_diagnostics_only"}
     return Decimal("0.500000"), tie, {"adapter_error": "missing_first_five_winner_semantics"}
 
 
