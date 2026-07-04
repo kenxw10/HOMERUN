@@ -1154,7 +1154,7 @@ PR4a is a paper accounting/audit hardening PR. It adds a migration and compact d
 
 After deployment:
 
-1. Run `alembic upgrade head` and confirm migration `0018_pr4a_settlement_accounting_audit.py` applied.
+1. Run `alembic upgrade head` and confirm migration `0018_pr4a_settlement_audit.py` / revision `0018_pr4a_settlement_audit` applied.
 2. Run settlement for a completed target date:
 
 ```powershell
