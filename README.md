@@ -344,6 +344,12 @@ Candidate sweeps now persist compact, versioned probability adapter metadata on 
 
 PR3u is diagnostics and policy metadata only. It does not implement PR3v calibration training, does not change PR3t selector behavior, does not change EV thresholds/risk caps/settlement, and does not make candidate sweeps run heavy feature ingestion.
 
+## PR3v Family-Specific Calibration Governance
+
+PR3v turns the PR3u calibration hooks into compact family/scope governance units for full-game and first-five totals, winners, and spreads. Each unit can train, calibrate, stage a challenger, and become eligible for guarded promotion independently, so one strong family is not blocked by another family's weaker samples.
+
+Family calibrations remain paper-only governance artifacts. They are stored in existing compact governance JSON metadata, adapter errors are classified and excluded from training, and adapters report whether they used an active family calibration or the existing shared/uncalibrated fallback. PR3v does not change selector behavior, EV thresholds, risk caps, settlement, cron cadence, source ingestion, live execution, or candidate-sweep cache-only behavior.
+
 ## Deployment
 
 - Railway backend setup: see `docs/RAILWAY_SETUP.md`.

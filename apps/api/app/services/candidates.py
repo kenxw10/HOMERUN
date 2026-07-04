@@ -373,6 +373,8 @@ def _probability_adapter_summary(candidates: list[ModelCandidate]) -> dict[str, 
     adapter_counts: dict[str, int] = {}
     hook_counts: dict[str, int] = {}
     family_counts: dict[str, int] = {}
+    error_reason_counts: dict[str, int] = {}
+    error_family_counts: dict[str, int] = {}
     missing_count = 0
     error_count = 0
     for candidate in candidates:
@@ -390,8 +392,13 @@ def _probability_adapter_summary(candidates: list[ModelCandidate]) -> dict[str, 
             family_counts[family] = family_counts.get(family, 0) + 1
         metadata = candidate.probability_adapter_metadata if isinstance(candidate.probability_adapter_metadata, dict) else {}
         diagnostics = metadata.get("diagnostics") if isinstance(metadata.get("diagnostics"), dict) else {}
-        if diagnostics.get("adapter_error"):
+        adapter_error = diagnostics.get("adapter_error")
+        if adapter_error:
             error_count += 1
+            reason = str(adapter_error)
+            error_reason_counts[reason] = error_reason_counts.get(reason, 0) + 1
+            error_family = str(family or candidate.market_family or candidate.market_type or "unknown")
+            error_family_counts[error_family] = error_family_counts.get(error_family, 0) + 1
     return {
         "probability_adapter_policy_version": PROBABILITY_ADAPTER_POLICY_VERSION,
         "probability_adapter_counts": adapter_counts,
@@ -399,6 +406,9 @@ def _probability_adapter_summary(candidates: list[ModelCandidate]) -> dict[str, 
         "probability_adapter_family_counts": family_counts,
         "probability_adapter_missing_count": missing_count,
         "probability_adapter_error_count": error_count,
+        "probability_adapter_error_reason_counts": error_reason_counts,
+        "probability_adapter_error_family_counts": error_family_counts,
+        "probability_adapter_errors_excluded_from_governance_training": True,
     }
 
 

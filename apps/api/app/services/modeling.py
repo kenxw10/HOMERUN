@@ -9,7 +9,7 @@ import time
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import Date, cast, func, select
+from sqlalchemy import Date, and_, cast, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
@@ -43,8 +43,33 @@ BASELINE_PARAMETER_VERSION_TAG = "mature_mlb_run_distribution_v2_baseline"
 MODEL_FAMILY = "mlb_all_supported_families"
 MAX_RUNS = 18
 GOVERNANCE_CLEAN_TRAINING_POLICY = "pr3p_clean_governance_training_v1"
+FAMILY_SCOPE_GOVERNANCE_POLICY = "pr3v_family_scope_governance_v1"
 GOVERNANCE_CLEAN_TRAINING_ZONE = ZoneInfo("America/New_York")
 logger = logging.getLogger(__name__)
+GOVERNANCE_FAMILY_SCOPE_UNITS = (
+    FULL_GAME_TOTAL,
+    FIRST_FIVE_TOTAL,
+    FULL_GAME_WINNER,
+    FIRST_FIVE_WINNER,
+    FULL_GAME_SPREAD,
+    FIRST_FIVE_SPREAD,
+)
+CALIBRATION_HOOK_BY_GOVERNANCE_UNIT = {
+    FULL_GAME_TOTAL: "calibration_hook_full_game_total",
+    FIRST_FIVE_TOTAL: "calibration_hook_first_five_total",
+    FULL_GAME_WINNER: "calibration_hook_full_game_winner",
+    FIRST_FIVE_WINNER: "calibration_hook_first_five_winner",
+    FULL_GAME_SPREAD: "calibration_hook_full_game_spread",
+    FIRST_FIVE_SPREAD: "calibration_hook_first_five_spread",
+}
+ADAPTER_VERSION_BY_GOVERNANCE_UNIT = {
+    FULL_GAME_TOTAL: "full_game_total_adapter_v1",
+    FIRST_FIVE_TOTAL: "first_five_total_adapter_v1",
+    FULL_GAME_WINNER: "full_game_winner_adapter_v1",
+    FIRST_FIVE_WINNER: "first_five_winner_adapter_v1",
+    FULL_GAME_SPREAD: "full_game_spread_adapter_v1",
+    FIRST_FIVE_SPREAD: "first_five_spread_adapter_v1",
+}
 DEFAULT_MODEL_PARAMETERS: dict[str, object] = {
     "league_average_full_game_runs": 4.35,
     "home_field_runs": 0.18,
@@ -73,6 +98,9 @@ DEFAULT_MODEL_PARAMETERS: dict[str, object] = {
     "calibration_shrink_low_quality": 0.35,
     "calibration_shrink_high_quality": 0.20,
     "market_family_probability_offsets": {},
+    "family_scope_probability_offsets": {},
+    "family_scope_calibrations": {},
+    "family_scope_calibration_policy_version": FAMILY_SCOPE_GOVERNANCE_POLICY,
     "feature_module_weights_version": "family_weighted_v2",
     "spread_push_policy": "no_trade_when_push_possible",
     "total_push_policy": "no_trade_when_push_possible",
@@ -83,12 +111,24 @@ GOVERNANCE_PARAMETER_REGISTRY: dict[str, list[dict[str, object]]] = {
         {
             "name": "market_family_probability_offsets",
             "storage": "model_parameter_versions.parameters",
-            "status": "autonomous_bounded_challenger",
+            "status": "legacy_shared_offsets_recorded_no_global_pr3v_promotion",
             "guardrails": [
                 "MODEL_MIN_SAMPLES_TRAIN",
                 "MODEL_MIN_SAMPLES_PROMOTE",
                 "MODEL_PROMOTION_MIN_LOGLOSS_IMPROVEMENT",
                 "MODEL_PROMOTION_MAX_ECE",
+            ],
+        },
+        {
+            "name": "family_scope_probability_offsets",
+            "storage": "model_parameter_versions.parameters.family_scope_probability_offsets",
+            "status": "autonomous_family_scope_challenger",
+            "guardrails": [
+                "MODEL_GOVERNANCE_FAMILY_MIN_SAMPLES_TRAIN",
+                "MODEL_GOVERNANCE_FAMILY_MIN_SAMPLES_PROMOTE",
+                "MODEL_PROMOTION_MIN_LOGLOSS_IMPROVEMENT",
+                "MODEL_PROMOTION_MAX_ECE",
+                "adapter_errors_excluded",
             ],
         },
         {
@@ -179,6 +219,15 @@ class GovernanceCandidateSample:
     market_family: str | None
     time_bucket: str | None
     outcome: str | None
+    contract_side: str | None = None
+    probability_adapter_key: str | None = None
+    probability_adapter_version: str | None = None
+    probability_adapter_policy_version: str | None = None
+    probability_adapter_family: str | None = None
+    probability_adapter_scope: str | None = None
+    probability_adapter_calibration_hook: str | None = None
+    probability_adapter_calibration_version: str | None = None
+    probability_adapter_metadata: dict[str, object] | None = None
 
 
 CandidateSampleLike = ModelCandidate | GovernanceCandidateSample
@@ -267,6 +316,8 @@ def get_or_create_active_parameter_version(session: Session) -> ModelParameterVe
 
 def active_parameter_payload(session: Session) -> dict[str, object]:
     version = get_or_create_active_parameter_version(session)
+    parameters = dict(version.parameters or {})
+    family_calibrations = _family_scope_calibrations(parameters)
     return {
         "version_tag": version.version_tag,
         "model_family": version.model_family,
@@ -277,6 +328,21 @@ def active_parameter_payload(session: Session) -> dict[str, object]:
         "promoted_at": version.promoted_at.isoformat() if version.promoted_at else None,
         "parameters": version.parameters,
         "metrics": version.metrics,
+        "family_scope_governance_enabled": True,
+        "family_scope_calibration_policy_version": parameters.get(
+            "family_scope_calibration_policy_version",
+            FAMILY_SCOPE_GOVERNANCE_POLICY,
+        ),
+        "active_family_scope_calibrations": family_calibrations,
+        "active_family_scope_calibration_versions": {
+            unit: entry.get("calibration_version")
+            for unit, entry in family_calibrations.items()
+            if entry.get("role") in {"active", "champion"} or entry.get("promotion_status") == "promoted"
+        },
+        "shared_baseline_calibration": {
+            "market_family_probability_offsets_present": bool(parameters.get("market_family_probability_offsets")),
+            "calibration_status": "shared_or_uncalibrated",
+        },
     }
 
 
@@ -650,6 +716,21 @@ def _probability_from_distribution(
     return probability, push_probability
 
 
+def _active_family_scope_calibration(
+    parameters: dict[str, object] | None,
+    market_type: str,
+) -> dict[str, object] | None:
+    calibrations = (parameters or {}).get("family_scope_calibrations") if parameters else None
+    if not isinstance(calibrations, dict):
+        return None
+    entry = calibrations.get(market_type)
+    if not isinstance(entry, dict):
+        return None
+    if entry.get("promotion_status") != "promoted" and entry.get("role") not in {"active", "champion"}:
+        return None
+    return entry
+
+
 def _calibrate_probability(
     raw_probability: Decimal,
     data_quality: Decimal,
@@ -666,7 +747,11 @@ def _calibrate_probability(
     if isinstance(offsets, dict):
         calibrated += _decimal(offsets.get("__global__"), Decimal("0"))
         calibrated += _decimal(offsets.get(market_type), Decimal("0"))
-    status = "trained_parameterized" if parameters.get("trained_from_samples") else "baseline_parameterized"
+    status = (
+        "trained_parameterized"
+        if parameters.get("trained_from_samples")
+        else "baseline_parameterized"
+    )
     return _bounded(calibrated, Decimal("0.020000"), Decimal("0.980000")).quantize(Decimal("0.000001")), status
 
 
@@ -863,6 +948,15 @@ def _resolved_mature_candidate_sample_statement(paper_trading_epoch_id: int | No
             ModelCandidate.market_family,
             ModelCandidate.time_bucket,
             ModelCandidate.outcome,
+            ModelCandidate.contract_side,
+            ModelCandidate.probability_adapter_key,
+            ModelCandidate.probability_adapter_version,
+            ModelCandidate.probability_adapter_policy_version,
+            ModelCandidate.probability_adapter_family,
+            ModelCandidate.probability_adapter_scope,
+            ModelCandidate.probability_adapter_calibration_hook,
+            ModelCandidate.probability_adapter_calibration_version,
+            ModelCandidate.probability_adapter_metadata,
             MlbGame.scheduled_start,
         )
         .select_from(ModelCandidate)
@@ -892,6 +986,17 @@ def _resolved_mature_candidate_samples(
                 market_family=row.market_family,
                 time_bucket=row.time_bucket,
                 outcome=row.outcome,
+                contract_side=row.contract_side,
+                probability_adapter_key=row.probability_adapter_key,
+                probability_adapter_version=row.probability_adapter_version,
+                probability_adapter_policy_version=row.probability_adapter_policy_version,
+                probability_adapter_family=row.probability_adapter_family,
+                probability_adapter_scope=row.probability_adapter_scope,
+                probability_adapter_calibration_hook=row.probability_adapter_calibration_hook,
+                probability_adapter_calibration_version=row.probability_adapter_calibration_version,
+                probability_adapter_metadata=(
+                    row.probability_adapter_metadata if isinstance(row.probability_adapter_metadata, dict) else None
+                ),
             )
         )
     return samples
@@ -1084,6 +1189,403 @@ def _governance_training_policy_payload(
     }
 
 
+def _family_scope_minimums(settings=None) -> dict[str, int]:
+    settings = settings or get_settings()
+    return {
+        "minimum_samples_train": int(settings.model_governance_family_min_samples_train),
+        "minimum_samples_calibrate": int(settings.model_governance_family_min_samples_calibrate),
+        "minimum_samples_promote": int(settings.model_governance_family_min_samples_promote),
+    }
+
+
+def _governance_family_scope_key(candidate: CandidateSampleLike) -> str | None:
+    adapter_family = getattr(candidate, "probability_adapter_family", None)
+    if adapter_family in GOVERNANCE_FAMILY_SCOPE_UNITS:
+        return str(adapter_family)
+    hook = getattr(candidate, "probability_adapter_calibration_hook", None)
+    for unit, expected_hook in CALIBRATION_HOOK_BY_GOVERNANCE_UNIT.items():
+        if hook == expected_hook:
+            return unit
+    market_family = candidate.market_family
+    if market_family in GOVERNANCE_FAMILY_SCOPE_UNITS:
+        return str(market_family)
+    return None
+
+
+def _probability_adapter_error_reason(candidate: GovernanceCandidateSample) -> str | None:
+    return _probability_adapter_error_reason_from_fields(
+        candidate.probability_adapter_key,
+        candidate.probability_adapter_version,
+        candidate.probability_adapter_family,
+        candidate.probability_adapter_calibration_hook,
+        candidate.contract_side,
+        candidate.probability_adapter_metadata,
+    )
+
+
+def _probability_adapter_error_reason_from_fields(
+    adapter_key: str | None,
+    adapter_version: str | None,
+    adapter_family: str | None,
+    calibration_hook: str | None,
+    contract_side: str | None,
+    adapter_metadata: dict[str, object] | None,
+) -> str | None:
+    metadata = adapter_metadata if isinstance(adapter_metadata, dict) else {}
+    diagnostics = metadata.get("diagnostics") if isinstance(metadata.get("diagnostics"), dict) else {}
+    reason = diagnostics.get("adapter_error")
+    if reason:
+        return str(reason)
+    if adapter_key == "unsupported_probability_adapter":
+        return "unsupported_probability_adapter"
+    adapter_values = [
+        adapter_key,
+        adapter_version,
+        adapter_family,
+        calibration_hook,
+    ]
+    if not any(adapter_values):
+        return "missing_probability_adapter_metadata"
+    if not all(adapter_values):
+        return "incomplete_probability_adapter_metadata"
+    if str(contract_side or "").lower() not in {"yes", "no"}:
+        return "missing_contract_side_for_family_calibration"
+    return None
+
+
+def _adapter_missing_for_family_governance(candidate: GovernanceCandidateSample) -> bool:
+    return not (
+        candidate.probability_adapter_key
+        and candidate.probability_adapter_version
+        and candidate.probability_adapter_family
+        and candidate.probability_adapter_calibration_hook
+    )
+
+
+def _reason_counts(reasons: list[str | None]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for reason in reasons:
+        if not reason:
+            continue
+        counts[reason] = counts.get(reason, 0) + 1
+    return counts
+
+
+def _family_scope_offsets(parameters: dict[str, object] | None) -> dict[str, dict[str, Decimal]]:
+    offsets = (parameters or {}).get("family_scope_probability_offsets") if parameters else None
+    if not isinstance(offsets, dict):
+        return {}
+    parsed: dict[str, dict[str, Decimal]] = {}
+    for key, value in offsets.items():
+        unit = str(key)
+        if isinstance(value, dict):
+            side_offsets = {
+                str(side).lower(): _decimal(offset, Decimal("0")).quantize(Decimal("0.000001"))
+                for side, offset in value.items()
+                if str(side).lower() in {"yes", "no"}
+            }
+        else:
+            side_offsets = {"yes": _decimal(value, Decimal("0")).quantize(Decimal("0.000001"))}
+        if side_offsets:
+            parsed[unit] = side_offsets
+    return parsed
+
+
+def _family_scope_calibrations(parameters: dict[str, object] | None) -> dict[str, dict[str, object]]:
+    calibrations = (parameters or {}).get("family_scope_calibrations") if parameters else None
+    if not isinstance(calibrations, dict):
+        return {}
+    return {str(key): dict(value) for key, value in calibrations.items() if isinstance(value, dict)}
+
+
+def _fit_family_scope_probability_offsets(candidates: list[GovernanceCandidateSample]) -> dict[str, Decimal]:
+    rows_by_side: dict[str, list[tuple[Decimal, Decimal]]] = {}
+    for candidate in candidates:
+        outcome = _candidate_outcome_value(candidate)
+        probability = _candidate_probability(candidate)
+        side = str(candidate.contract_side or "").lower()
+        if outcome is None or probability is None or side not in {"yes", "no"}:
+            continue
+        rows_by_side.setdefault(side, []).append((probability, Decimal(outcome)))
+    offsets: dict[str, Decimal] = {}
+    for side, rows in rows_by_side.items():
+        avg_error = sum(outcome - probability for probability, outcome in rows) / Decimal(len(rows))
+        offsets[side] = _bounded(avg_error, Decimal("-0.050000"), Decimal("0.050000")).quantize(Decimal("0.000001"))
+    return offsets
+
+
+def _active_family_scope_calibration_summary(
+    parameters: dict[str, object] | None,
+    unit: str,
+) -> dict[str, object]:
+    entry = _active_family_scope_calibration(parameters, unit)
+    if entry is None:
+        return {
+            "active_calibration_version": None,
+            "active_role": None,
+            "affects_model_output": False,
+            "calibration_status": "shared_or_uncalibrated",
+        }
+    return {
+        "active_calibration_version": entry.get("calibration_version"),
+        "active_role": entry.get("role") or "active",
+        "last_promoted_at": entry.get("last_promoted_at"),
+        "affects_model_output": True,
+        "calibration_status": "family_scope_active",
+    }
+
+
+def _base_family_scope_unit_summary(
+    unit: str,
+    *,
+    raw_candidates: list[GovernanceCandidateSample],
+    clean_candidates: list[GovernanceCandidateSample],
+    active_parameters: dict[str, object] | None,
+    minimums: dict[str, int],
+) -> dict[str, object]:
+    raw_unit = [candidate for candidate in raw_candidates if _governance_family_scope_key(candidate) == unit]
+    clean_unit = [candidate for candidate in clean_candidates if _governance_family_scope_key(candidate) == unit]
+    adapter_error_reasons = [_probability_adapter_error_reason(candidate) for candidate in clean_unit]
+    adapter_error_reason_counts = _reason_counts(adapter_error_reasons)
+    adapter_error_count = sum(adapter_error_reason_counts.values())
+    adapter_missing_count = sum(1 for candidate in clean_unit if _adapter_missing_for_family_governance(candidate))
+    trainable_unit = [
+        candidate
+        for candidate, error_reason in zip(clean_unit, adapter_error_reasons, strict=False)
+        if error_reason is None
+    ]
+    train_rows, holdout_rows = _chronological_split(trainable_unit)
+    status = "skipped_not_enough_family_samples"
+    promotion_status = "not_eligible"
+    reason = (
+        f"INSUFFICIENT_FAMILY_SCOPE_SAMPLES:{len(trainable_unit)}/{minimums['minimum_samples_train']}"
+        if len(trainable_unit) < minimums["minimum_samples_train"]
+        else "family_scope_ready_for_training"
+    )
+    return {
+        "governance_family_scope_key": unit,
+        "status": status,
+        "reason": reason,
+        "calibration_hook": CALIBRATION_HOOK_BY_GOVERNANCE_UNIT[unit],
+        "adapter_version": ADAPTER_VERSION_BY_GOVERNANCE_UNIT[unit],
+        "probability_adapter_key": f"{unit}_probability_adapter",
+        "probability_adapter_policy_version": "pr3u_family_scope_probability_adapters_v1",
+        "governance_policy_version": FAMILY_SCOPE_GOVERNANCE_POLICY,
+        "clean_training_policy_version": GOVERNANCE_CLEAN_TRAINING_POLICY,
+        "raw_resolved_mature_samples": len(raw_unit),
+        "clean_resolved_mature_samples": len(clean_unit),
+        "pre_clean_excluded_samples": len(raw_unit) - len(clean_unit),
+        "trainable_clean_samples": len(trainable_unit),
+        "train_sample_count": len(train_rows),
+        "holdout_sample_count": len(holdout_rows),
+        **minimums,
+        "adapter_error_count": adapter_error_count,
+        "adapter_error_reason_counts": adapter_error_reason_counts,
+        "excluded_error_count": adapter_error_count,
+        "adapter_missing_count": adapter_missing_count,
+        "errored_candidates_excluded_from_training": adapter_error_count > 0,
+        "promotion_status": promotion_status,
+        "promotion_reason": reason,
+        "challenger_version": None,
+        "calibration_version": None,
+        "calibration_metrics": {},
+        "key_metrics": {},
+        "last_trained_at": None,
+        **_active_family_scope_calibration_summary(active_parameters, unit),
+    }
+
+
+def _family_scope_governance_units(
+    *,
+    raw_candidates: list[GovernanceCandidateSample],
+    clean_candidates: list[GovernanceCandidateSample],
+    active_parameters: dict[str, object] | None,
+    settings=None,
+) -> dict[str, dict[str, object]]:
+    minimums = _family_scope_minimums(settings)
+    return {
+        unit: _base_family_scope_unit_summary(
+            unit,
+            raw_candidates=raw_candidates,
+            clean_candidates=clean_candidates,
+            active_parameters=active_parameters,
+            minimums=minimums,
+        )
+        for unit in GOVERNANCE_FAMILY_SCOPE_UNITS
+    }
+
+
+def _family_scope_unit_filter(unit: str):
+    return or_(
+        ModelCandidate.probability_adapter_family == unit,
+        ModelCandidate.probability_adapter_calibration_hook == CALIBRATION_HOOK_BY_GOVERNANCE_UNIT[unit],
+        and_(
+            ModelCandidate.probability_adapter_family.is_(None),
+            ModelCandidate.probability_adapter_calibration_hook.is_(None),
+            ModelCandidate.market_family == unit,
+        ),
+    )
+
+
+def _current_family_scope_adapter_error_counts(
+    session: Session,
+    *,
+    unit: str,
+    paper_trading_epoch_id: int | None,
+    clean_window: dict[str, object],
+) -> tuple[dict[str, int], int]:
+    filters = (
+        _family_scope_unit_filter(unit),
+        ModelCandidate.target_date >= clean_window["start_date_et"],
+        ModelCandidate.evaluated_at >= clean_window["start_at"],
+    )
+    statement = (
+        select(
+            ModelCandidate.probability_adapter_key,
+            ModelCandidate.probability_adapter_version,
+            ModelCandidate.probability_adapter_family,
+            ModelCandidate.probability_adapter_calibration_hook,
+            ModelCandidate.contract_side,
+            ModelCandidate.probability_adapter_metadata,
+            ModelCandidate.target_date,
+            MlbGame.scheduled_start,
+        )
+        .select_from(ModelCandidate)
+        .join(MlbGame, ModelCandidate.mlb_game_id == MlbGame.id)
+        .where(*_resolved_mature_candidate_filters(paper_trading_epoch_id), *filters)
+    )
+    if _can_count_candidate_game_date_in_sql(session):
+        statement = statement.where(ModelCandidate.target_date == _candidate_game_target_date_expression())
+
+    reason_counts: dict[str, int] = {}
+    missing_count = 0
+    for row in session.execute(statement):
+        if not _can_count_candidate_game_date_in_sql(session) and not _target_date_matches_scheduled_start(
+            row.target_date,
+            row.scheduled_start,
+        ):
+            continue
+        if not (
+            row.probability_adapter_key
+            and row.probability_adapter_version
+            and row.probability_adapter_family
+            and row.probability_adapter_calibration_hook
+        ):
+            missing_count += 1
+        reason = _probability_adapter_error_reason_from_fields(
+            row.probability_adapter_key,
+            row.probability_adapter_version,
+            row.probability_adapter_family,
+            row.probability_adapter_calibration_hook,
+            row.contract_side,
+            row.probability_adapter_metadata if isinstance(row.probability_adapter_metadata, dict) else None,
+        )
+        if reason:
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+    return reason_counts, missing_count
+
+
+def _split_counts(sample_count: int) -> tuple[int, int]:
+    if sample_count < 2:
+        return sample_count, 0
+    train_count = max(1, int(sample_count * 0.7))
+    return train_count, sample_count - train_count
+
+
+def _family_scope_governance_units_from_counts(
+    session: Session,
+    *,
+    paper_trading_epoch_id: int | None,
+    clean_window: dict[str, object],
+    active_parameters: dict[str, object] | None,
+    settings=None,
+) -> dict[str, dict[str, object]]:
+    settings = settings or get_settings()
+    minimums = _family_scope_minimums(settings)
+    units: dict[str, dict[str, object]] = {}
+    for unit in GOVERNANCE_FAMILY_SCOPE_UNITS:
+        family_filter = _family_scope_unit_filter(unit)
+        raw_count = _count_resolved_mature_candidates(session, paper_trading_epoch_id, family_filter)
+        clean_count = _count_resolved_mature_candidates(
+            session,
+            paper_trading_epoch_id,
+            family_filter,
+            ModelCandidate.target_date >= clean_window["start_date_et"],
+            ModelCandidate.evaluated_at >= clean_window["start_at"],
+        )
+        adapter_error_reason_counts, adapter_missing_count = _current_family_scope_adapter_error_counts(
+            session,
+            unit=unit,
+            paper_trading_epoch_id=paper_trading_epoch_id,
+            clean_window=clean_window,
+        )
+        adapter_error_count = sum(adapter_error_reason_counts.values())
+        trainable_clean_count = max(0, clean_count - adapter_error_count)
+        train_count, holdout_count = _split_counts(trainable_clean_count)
+        status = (
+            "ready_for_training"
+            if trainable_clean_count >= minimums["minimum_samples_train"]
+            else "skipped_not_enough_family_samples"
+        )
+        reason = (
+            f"INSUFFICIENT_FAMILY_SCOPE_SAMPLES:{trainable_clean_count}/{minimums['minimum_samples_train']}"
+            if trainable_clean_count < minimums["minimum_samples_train"]
+            else "family_scope_ready_for_training"
+        )
+        units[unit] = {
+            "governance_family_scope_key": unit,
+            "status": status,
+            "reason": reason,
+            "calibration_hook": CALIBRATION_HOOK_BY_GOVERNANCE_UNIT[unit],
+            "adapter_version": ADAPTER_VERSION_BY_GOVERNANCE_UNIT[unit],
+            "probability_adapter_key": f"{unit}_probability_adapter",
+            "probability_adapter_policy_version": "pr3u_family_scope_probability_adapters_v1",
+            "governance_policy_version": FAMILY_SCOPE_GOVERNANCE_POLICY,
+            "clean_training_policy_version": GOVERNANCE_CLEAN_TRAINING_POLICY,
+            "raw_resolved_mature_samples": raw_count,
+            "clean_resolved_mature_samples": clean_count,
+            "pre_clean_excluded_samples": max(0, raw_count - clean_count),
+            "trainable_clean_samples": trainable_clean_count,
+            "train_sample_count": train_count,
+            "holdout_sample_count": holdout_count,
+            **minimums,
+            "adapter_error_count": adapter_error_count,
+            "adapter_error_reason_counts": adapter_error_reason_counts,
+            "excluded_error_count": adapter_error_count,
+            "adapter_missing_count": adapter_missing_count,
+            "errored_candidates_excluded_from_training": adapter_error_count > 0,
+            "promotion_status": "not_eligible",
+            "promotion_reason": reason,
+            "challenger_version": None,
+            "calibration_version": None,
+            "calibration_metrics": {},
+            "key_metrics": {},
+            "last_trained_at": None,
+            **_active_family_scope_calibration_summary(active_parameters, unit),
+        }
+    return units
+
+
+CURRENT_FAMILY_SCOPE_UNIT_FIELDS = {
+    "status",
+    "reason",
+    "raw_resolved_mature_samples",
+    "clean_resolved_mature_samples",
+    "pre_clean_excluded_samples",
+    "trainable_clean_samples",
+    "train_sample_count",
+    "holdout_sample_count",
+    "minimum_samples_train",
+    "minimum_samples_calibrate",
+    "minimum_samples_promote",
+    "adapter_error_count",
+    "adapter_error_reason_counts",
+    "excluded_error_count",
+    "adapter_missing_count",
+    "errored_candidates_excluded_from_training",
+}
+
+
 def _governance_rss_mb() -> float | None:
     try:
         import psutil  # type: ignore[import-not-found]
@@ -1162,20 +1664,29 @@ def governance_sample_summary(session: Session, paper_trading_epoch_id: int | No
     }
 
 
-def _candidate_probability(candidate: CandidateSampleLike, offsets: dict[str, Decimal] | None = None) -> Decimal | None:
+FamilyOffsetValue = Decimal | dict[str, Decimal]
+
+
+def _candidate_probability(candidate: CandidateSampleLike, offsets: dict[str, FamilyOffsetValue] | None = None) -> Decimal | None:
     probability = candidate.probability_calibrated or candidate.model_probability or candidate.probability
     if probability is None:
         return None
     adjusted = probability
     if offsets:
-        adjusted += offsets.get(candidate.market_family or "unknown", Decimal("0"))
-        adjusted += offsets.get("__global__", Decimal("0"))
+        global_offset = offsets.get("__global__", Decimal("0"))
+        if isinstance(global_offset, Decimal):
+            adjusted += global_offset
+        family_offset = offsets.get(candidate.market_family or "unknown")
+        if isinstance(family_offset, dict):
+            adjusted += family_offset.get(str(getattr(candidate, "contract_side", "") or "").lower(), Decimal("0"))
+        elif isinstance(family_offset, Decimal):
+            adjusted += family_offset
     return _bounded(adjusted, Decimal("0.000001"), Decimal("0.999999")).quantize(Decimal("0.000001"))
 
 
 def _metrics(
     candidates: list[GovernanceCandidateSample],
-    offsets: dict[str, Decimal] | None = None,
+    offsets: dict[str, FamilyOffsetValue] | None = None,
 ) -> dict[str, object]:
     rows: list[tuple[float, int, str | None, str | None]] = []
     for candidate in candidates:
@@ -1296,6 +1807,181 @@ def _clean_challenger_parameter_seed(
         "parameter_seed_policy": "reset_to_default_parameters_pre_clean_active_ignored",
         "parameter_seed_clean_policy_matched": False,
     }
+
+
+def _json_family_scope_offsets(offsets: dict[str, dict[str, Decimal]]) -> dict[str, dict[str, float]]:
+    return {
+        key: {side: float(value) for side, value in side_offsets.items()}
+        for key, side_offsets in offsets.items()
+    }
+
+
+def _train_family_scope_challengers(
+    session: Session,
+    *,
+    active_parameters: ModelParameterVersion,
+    training: TrainingRun,
+    started: datetime,
+    clean_window: dict[str, object],
+    clean_candidates: list[GovernanceCandidateSample],
+    family_units: dict[str, dict[str, object]],
+    clean_policy_metrics: dict[str, object],
+    paper_trading_epoch_id: int,
+    settings,
+) -> tuple[dict[str, dict[str, object]], list[str], ModelParameterVersion | None]:
+    promoted_units: list[str] = []
+    latest_promoted: ModelParameterVersion | None = None
+    parameter_seed, parameter_seed_metrics = _clean_challenger_parameter_seed(active_parameters, clean_window)
+    current_parameters = dict(parameter_seed)
+    minimums = _family_scope_minimums(settings)
+
+    for unit in GOVERNANCE_FAMILY_SCOPE_UNITS:
+        summary = dict(family_units[unit])
+        trainable_rows = [
+            candidate
+            for candidate in clean_candidates
+            if _governance_family_scope_key(candidate) == unit and _probability_adapter_error_reason(candidate) is None
+        ]
+        train_rows, holdout_rows = _chronological_split(trainable_rows)
+        evaluation_rows = holdout_rows or trainable_rows
+        summary.update(
+            {
+                "train_sample_count": len(train_rows),
+                "holdout_sample_count": len(holdout_rows),
+            }
+        )
+        if len(trainable_rows) < minimums["minimum_samples_train"]:
+            family_units[unit] = summary
+            continue
+
+        family_offset = _fit_family_scope_probability_offsets(train_rows)
+        family_offsets = _family_scope_offsets(current_parameters)
+        existing_unit_offsets = family_offsets.get(unit, {})
+        combined_unit_offsets = {
+            **existing_unit_offsets,
+            **{
+                side: (existing_unit_offsets.get(side, Decimal("0")) + offset).quantize(Decimal("0.000001"))
+                for side, offset in family_offset.items()
+            },
+        }
+        combined_family_offsets = {
+            **family_offsets,
+            unit: combined_unit_offsets,
+        }
+        baseline_metrics = _metrics(evaluation_rows)
+        challenger_metrics = _metrics(evaluation_rows, {unit: family_offset})
+        baseline_logloss = baseline_metrics.get("log_loss")
+        challenger_logloss = challenger_metrics.get("log_loss")
+        challenger_ece = challenger_metrics.get("expected_calibration_error")
+        improvement = None
+        if isinstance(baseline_logloss, float) and isinstance(challenger_logloss, float):
+            improvement = baseline_logloss - challenger_logloss
+        calibration_version = f"{FAMILY_SCOPE_GOVERNANCE_POLICY}_{unit}_{training.id}"
+        can_promote = (
+            len(trainable_rows) >= minimums["minimum_samples_promote"]
+            and improvement is not None
+            and improvement >= float(settings.model_promotion_min_logloss_improvement)
+            and isinstance(challenger_ece, float)
+            and challenger_ece <= float(settings.model_promotion_max_ece)
+        )
+        promotion_status = "promoted" if can_promote else "trained_not_promoted"
+        promotion_reason = (
+            "FAMILY_SCOPE_CHALLENGER_PROMOTED"
+            if can_promote
+            else "FAMILY_SCOPE_CHALLENGER_DID_NOT_CLEAR_PROMOTION_GUARDRAILS"
+        )
+        family_calibrations = _family_scope_calibrations(current_parameters)
+        family_calibrations[unit] = {
+            "governance_family_scope_key": unit,
+            "probability_adapter_key": f"{unit}_probability_adapter",
+            "probability_adapter_version": ADAPTER_VERSION_BY_GOVERNANCE_UNIT[unit],
+            "probability_adapter_policy_version": "pr3u_family_scope_probability_adapters_v1",
+            "calibration_hook": CALIBRATION_HOOK_BY_GOVERNANCE_UNIT[unit],
+            "calibration_version": calibration_version,
+            "calibration_policy_version": FAMILY_SCOPE_GOVERNANCE_POLICY,
+            "clean_training_policy_version": clean_window["policy"],
+            "clean_training_start_at": clean_window["start_at_utc"],
+            "train_sample_count": len(train_rows),
+            "holdout_sample_count": len(holdout_rows),
+            "calibration_metrics": challenger_metrics,
+            "promotion_status": promotion_status,
+            "role": "active" if can_promote else "challenger",
+            "last_trained_at": started.isoformat(),
+            "last_promoted_at": started.isoformat() if can_promote else None,
+            "affects_model_output": can_promote,
+        }
+        challenger_parameters = {
+            **current_parameters,
+            "family_scope_probability_offsets": _json_family_scope_offsets(combined_family_offsets),
+            "family_scope_calibrations": family_calibrations,
+            "family_scope_calibration_policy_version": FAMILY_SCOPE_GOVERNANCE_POLICY,
+            "trained_from_samples": True,
+        }
+        challenger = ModelParameterVersion(
+            version_tag=f"mature_mlb_run_distribution_v2_{unit}_family_challenger_{training.id}",
+            model_family=MODEL_FAMILY,
+            role="challenger",
+            status=promotion_status,
+            is_active=False,
+            created_reason=f"PR3v family/scope challenger for {unit}.",
+            trained_at=started,
+            source_training_run_id=training.id,
+            parameters=challenger_parameters,
+            metrics={
+                "governance_policy_version": FAMILY_SCOPE_GOVERNANCE_POLICY,
+                "governance_family_scope_key": unit,
+                "probability_adapter_key": f"{unit}_probability_adapter",
+                "probability_adapter_version": ADAPTER_VERSION_BY_GOVERNANCE_UNIT[unit],
+                "probability_adapter_policy_version": "pr3u_family_scope_probability_adapters_v1",
+                "calibration_hook": CALIBRATION_HOOK_BY_GOVERNANCE_UNIT[unit],
+                "calibration_version": calibration_version,
+                "train_sample_count": len(train_rows),
+                "holdout_sample_count": len(holdout_rows),
+                "baseline_holdout": baseline_metrics,
+                "challenger_holdout": challenger_metrics,
+                "family_scope_probability_offset": {side: float(offset) for side, offset in family_offset.items()},
+                "family_scope_probability_offsets": _json_family_scope_offsets(combined_family_offsets),
+                "promotion_status": promotion_status,
+                "promotion_reason": promotion_reason,
+                "paper_trading_epoch_id": paper_trading_epoch_id,
+                **parameter_seed_metrics,
+                **clean_policy_metrics,
+                **minimums,
+            },
+        )
+        session.add(challenger)
+        session.flush()
+        if can_promote:
+            _activate_parameter_version(session, challenger, started)
+            current_parameters = dict(challenger.parameters)
+            promoted_units.append(unit)
+            latest_promoted = challenger
+        summary.update(
+            {
+                "status": "trained",
+                "reason": promotion_reason,
+                "promotion_status": promotion_status,
+                "promotion_reason": promotion_reason,
+                "challenger_version": challenger.version_tag,
+                "calibration_version": calibration_version,
+                "calibration_metrics": challenger_metrics,
+                "key_metrics": {
+                    "baseline_log_loss": baseline_logloss,
+                    "challenger_log_loss": challenger_logloss,
+                    "logloss_improvement": improvement,
+                    "expected_calibration_error": challenger_ece,
+                },
+                "last_trained_at": started.isoformat(),
+                "last_promoted_at": started.isoformat() if can_promote else None,
+                "active_calibration_version": calibration_version if can_promote else summary.get("active_calibration_version"),
+                "active_role": "active" if can_promote else summary.get("active_role"),
+                "affects_model_output": can_promote or bool(summary.get("affects_model_output")),
+                "calibration_status": "family_scope_active" if can_promote else summary.get("calibration_status"),
+            }
+        )
+        family_units[unit] = summary
+
+    return family_units, promoted_units, latest_promoted
 
 
 def _metadata_epoch_id(metadata: dict[str, object] | None) -> int | None:
@@ -1471,7 +2157,14 @@ def run_model_governance(
     phase_started, phase_rss = _governance_phase_start()
     candidates, clean_exclusion_counts = _apply_clean_training_filter(raw_candidates, clean_window)
     raw_sample_count = len(raw_candidates)
-    sample_count = len(candidates)
+    adapter_error_reason_counts = _reason_counts(
+        [_probability_adapter_error_reason(candidate) for candidate in candidates]
+    )
+    adapter_error_excluded_count = sum(adapter_error_reason_counts.values())
+    governance_training_candidates = [
+        candidate for candidate in candidates if _probability_adapter_error_reason(candidate) is None
+    ]
+    sample_count = len(governance_training_candidates)
     train_min = settings.model_min_samples_train
     calibrate_min = settings.model_min_samples_calibrate
     promote_min = settings.model_min_samples_promote
@@ -1480,19 +2173,26 @@ def run_model_governance(
         "apply_clean_training_filter",
         phase_started,
         phase_rss,
-        clean_sample_count=sample_count,
-        pre_clean_excluded_samples=raw_sample_count - sample_count,
+        clean_sample_count=len(candidates),
+        adapter_error_excluded_count=adapter_error_excluded_count,
+        pre_clean_excluded_samples=raw_sample_count - len(candidates),
     )
 
     phase_started, phase_rss = _governance_phase_start()
-    train_rows, holdout_rows = _chronological_split(candidates)
-    metrics = _metrics(candidates)
+    train_rows, holdout_rows = _chronological_split(governance_training_candidates)
+    metrics = _metrics(governance_training_candidates)
     holdout_metrics = _metrics(holdout_rows) if holdout_rows else metrics
     clean_policy_metrics = _governance_training_policy_payload(
         clean_window,
         raw_sample_count=raw_sample_count,
-        clean_sample_count=sample_count,
+        clean_sample_count=len(candidates),
         excluded_counts=clean_exclusion_counts,
+    )
+    family_scope_units = _family_scope_governance_units(
+        raw_candidates=raw_candidates,
+        clean_candidates=candidates,
+        active_parameters=active_parameters.parameters,
+        settings=settings,
     )
     _record_governance_phase(
         phase_metrics,
@@ -1501,6 +2201,7 @@ def run_model_governance(
         phase_rss,
         train_sample_count=len(train_rows),
         holdout_sample_count=len(holdout_rows),
+        family_scope_unit_count=len(family_scope_units),
     )
 
     phase_started, phase_rss = _governance_phase_start()
@@ -1516,8 +2217,14 @@ def run_model_governance(
             "active_parameter_version": active_parameters.version_tag,
             "paper_trading_epoch_id": paper_trading_epoch_id,
             **clean_policy_metrics,
+            "adapter_error_count": adapter_error_excluded_count,
+            "adapter_error_reason_counts": adapter_error_reason_counts,
+            "adapter_errors_excluded": adapter_error_excluded_count,
             "minimum_samples_train": train_min,
             "minimum_samples_promote": promote_min,
+            "family_scope_governance_enabled": True,
+            "family_scope_governance_policy": FAMILY_SCOPE_GOVERNANCE_POLICY,
+            "family_scope_units": family_scope_units,
             "split_policy": "chronological_holdout",
             "excluded_feature_versions": [
                 "market_family_wire_v1_pre_full_model",
@@ -1543,8 +2250,11 @@ def run_model_governance(
             "unsupported_mapping": "excluded",
             "paper_trading_epoch_id": paper_trading_epoch_id,
             **clean_policy_metrics,
+            "adapter_errors": "excluded",
+            "adapter_error_count": adapter_error_excluded_count,
+            "adapter_error_reason_counts": adapter_error_reason_counts,
         },
-        candidate_ids=[candidate.id for candidate in candidates if candidate.id is not None],
+        candidate_ids=[candidate.id for candidate in governance_training_candidates if candidate.id is not None],
     )
     session.add(dataset)
     calibration = CalibrationRun(
@@ -1558,6 +2268,12 @@ def run_model_governance(
             "minimum_samples_for_isotonic": settings.model_min_samples_for_isotonic,
             "paper_trading_epoch_id": paper_trading_epoch_id,
             **clean_policy_metrics,
+            "adapter_error_count": adapter_error_excluded_count,
+            "adapter_error_reason_counts": adapter_error_reason_counts,
+            "adapter_errors_excluded": adapter_error_excluded_count,
+            "family_scope_governance_enabled": True,
+            "family_scope_governance_policy": FAMILY_SCOPE_GOVERNANCE_POLICY,
+            "family_scope_units": family_scope_units,
             "calibration_policy": "bounded family/global offsets; isotonic requires higher sample threshold",
         },
     )
@@ -1568,7 +2284,8 @@ def run_model_governance(
         status = "skipped_insufficient_samples"
         reason = (
             f"INSUFFICIENT_MATURE_RESOLVED_SAMPLES_CLEAN_WINDOW:{sample_count}/{train_min};"
-            f"RAW_RESOLVED_MATURE_SAMPLES:{raw_sample_count}"
+            f"RAW_RESOLVED_MATURE_SAMPLES:{raw_sample_count};"
+            f"ADAPTER_ERROR_EXCLUDED:{adapter_error_excluded_count}"
         )
         promoted = False
     else:
@@ -1582,7 +2299,7 @@ def run_model_governance(
             "training_sample_count": len(train_rows),
             "holdout_sample_count": len(holdout_rows),
         }
-        challenger_metrics = _metrics(holdout_rows or candidates, offsets)
+        challenger_metrics = _metrics(holdout_rows or governance_training_candidates, offsets)
         challenger = ModelParameterVersion(
             version_tag=f"mature_mlb_run_distribution_v2_challenger_{training.id}",
             model_family=MODEL_FAMILY,
@@ -1603,6 +2320,9 @@ def run_model_governance(
                 "paper_trading_epoch_id": paper_trading_epoch_id,
                 **parameter_seed_metrics,
                 **clean_policy_metrics,
+                "adapter_error_count": adapter_error_excluded_count,
+                "adapter_error_reason_counts": adapter_error_reason_counts,
+                "adapter_errors_excluded": adapter_error_excluded_count,
             },
         )
         session.add(challenger)
@@ -1632,13 +2352,14 @@ def run_model_governance(
         improvement = None
         if isinstance(baseline_logloss, float) and isinstance(challenger_logloss, float):
             improvement = baseline_logloss - challenger_logloss
-        can_promote = (
+        global_guardrails_passed = (
             sample_count >= promote_min
             and improvement is not None
             and improvement >= float(settings.model_promotion_min_logloss_improvement)
             and isinstance(challenger_ece, float)
             and challenger_ece <= float(settings.model_promotion_max_ece)
         )
+        can_promote = False
         if can_promote:
             _activate_parameter_version(session, challenger, started)
             status = "promoted"
@@ -1646,8 +2367,29 @@ def run_model_governance(
             promoted = True
         else:
             status = "trained_not_promoted"
-            reason = "CHALLENGER_DID_NOT_CLEAR_PROMOTION_GUARDRAILS"
+            reason = (
+                "GLOBAL_SHARED_PROMOTION_DISABLED_BY_PR3V_FAMILY_SCOPE_GOVERNANCE"
+                if global_guardrails_passed
+                else "CHALLENGER_DID_NOT_CLEAR_PROMOTION_GUARDRAILS"
+            )
             promoted = False
+
+    family_scope_units, family_scope_promoted_units, family_scope_active_parameters = _train_family_scope_challengers(
+        session,
+        active_parameters=active_parameters,
+        training=training,
+        started=started,
+        clean_window=clean_window,
+        clean_candidates=candidates,
+        family_units=family_scope_units,
+        clean_policy_metrics=clean_policy_metrics,
+        paper_trading_epoch_id=paper_trading_epoch_id,
+        settings=settings,
+    )
+    if family_scope_promoted_units:
+        status = "family_scope_promoted"
+        reason = "FAMILY_SCOPE_CHALLENGER_PROMOTED"
+        promoted = True
 
     _record_governance_phase(
         phase_metrics,
@@ -1657,6 +2399,10 @@ def run_model_governance(
         training_run_id=training.id,
         calibration_staged_count=1,
         challenger_staged_count=1 if challenger else 0,
+        family_scope_challenger_staged_count=sum(
+            1 for unit in family_scope_units.values() if unit.get("challenger_version")
+        ),
+        family_scope_promoted_count=len(family_scope_promoted_units),
         threshold_staged_count=1 if threshold_version else 0,
     )
 
@@ -1667,6 +2413,13 @@ def run_model_governance(
         "reason": reason,
         "holdout_metrics": holdout_metrics,
         "challenger_parameter_version": challenger.version_tag if challenger else None,
+        "adapter_error_count": adapter_error_excluded_count,
+        "adapter_error_reason_counts": adapter_error_reason_counts,
+        "adapter_errors_excluded": adapter_error_excluded_count,
+        "family_scope_governance_enabled": True,
+        "family_scope_governance_policy": FAMILY_SCOPE_GOVERNANCE_POLICY,
+        "family_scope_units": family_scope_units,
+        "family_scope_promoted_units": family_scope_promoted_units,
         "governance_phase_metrics": list(phase_metrics),
     }
     calibration.metrics = {
@@ -1675,6 +2428,13 @@ def run_model_governance(
         "method_selected": "platt_sigmoid" if sample_count >= calibrate_min else "none",
         "isotonic_allowed": sample_count >= settings.model_min_samples_for_isotonic,
         "paper_trading_epoch_id": paper_trading_epoch_id,
+        "adapter_error_count": adapter_error_excluded_count,
+        "adapter_error_reason_counts": adapter_error_reason_counts,
+        "adapter_errors_excluded": adapter_error_excluded_count,
+        "family_scope_governance_enabled": True,
+        "family_scope_governance_policy": FAMILY_SCOPE_GOVERNANCE_POLICY,
+        "family_scope_units": family_scope_units,
+        "family_scope_promoted_units": family_scope_promoted_units,
         "governance_phase_metrics": list(phase_metrics),
     }
     event = ModelGovernanceEvent(
@@ -1684,11 +2444,21 @@ def run_model_governance(
         details={
             "reason": reason,
             "sample_count": sample_count,
+            "adapter_error_count": adapter_error_excluded_count,
+            "adapter_error_reason_counts": adapter_error_reason_counts,
+            "adapter_errors_excluded": adapter_error_excluded_count,
             "active_model_version": active.version_tag,
             "active_parameter_version": (
-                challenger.version_tag if promoted and challenger else active_parameters.version_tag
+                family_scope_active_parameters.version_tag
+                if family_scope_active_parameters
+                else challenger.version_tag
+                if promoted and challenger
+                else active_parameters.version_tag
             ),
             "challenger_parameter_version": challenger.version_tag if challenger else None,
+            "family_scope_governance_policy": FAMILY_SCOPE_GOVERNANCE_POLICY,
+            "family_scope_units": family_scope_units,
+            "family_scope_promoted_units": family_scope_promoted_units,
             "paper_trading_epoch_id": paper_trading_epoch_id,
             "promoted": promoted,
             "metrics": metrics,
@@ -1714,9 +2484,12 @@ def run_model_governance(
         "resolved_samples": sample_count,
         "resolved_mature_samples": sample_count,
         "raw_resolved_mature_samples": raw_sample_count,
-        "clean_resolved_mature_samples": sample_count,
-        "pre_clean_excluded_samples": raw_sample_count - sample_count,
+        "clean_resolved_mature_samples": len(candidates),
+        "pre_clean_excluded_samples": raw_sample_count - len(candidates),
         "clean_filter_exclusion_counts": clean_exclusion_counts,
+        "adapter_error_count": adapter_error_excluded_count,
+        "adapter_error_reason_counts": adapter_error_reason_counts,
+        "adapter_errors_excluded": adapter_error_excluded_count,
         "governance_training_policy": clean_window["policy"],
         "clean_training_start_at": clean_window["start_at_utc"],
         "clean_training_start_at_et": clean_window["start_at_et"],
@@ -1724,9 +2497,17 @@ def run_model_governance(
         "minimum_samples_train": train_min,
         "minimum_samples_calibrate": calibrate_min,
         "minimum_samples_promote": promote_min,
+        "family_scope_governance_enabled": True,
+        "family_scope_governance_policy": FAMILY_SCOPE_GOVERNANCE_POLICY,
+        "family_scope_units": family_scope_units,
+        "family_scope_promoted_units": family_scope_promoted_units,
         "active_model_version": active.version_tag,
         "active_parameter_version": (
-            challenger.version_tag if promoted and challenger else active_parameters.version_tag
+            family_scope_active_parameters.version_tag
+            if family_scope_active_parameters
+            else challenger.version_tag
+            if promoted and challenger
+            else active_parameters.version_tag
         ),
         "challenger_parameter_version": challenger.version_tag if challenger else None,
         "paper_trading_epoch_id": paper_trading_epoch_id,
@@ -1759,6 +2540,45 @@ def governance_status(
     last_training, last_calibration, last_threshold = latest_governance_artifacts(session, paper_trading_epoch_id)
     sample_summary = governance_sample_summary(session, paper_trading_epoch_id)
     ignored_artifacts = _governance_ignored_artifacts(session, paper_trading_epoch_id, clean_window)
+    family_scope_units = _family_scope_governance_units_from_counts(
+        session,
+        paper_trading_epoch_id=paper_trading_epoch_id,
+        clean_window=clean_window,
+        active_parameters=active_parameters.parameters if active_parameters else None,
+        settings=get_settings(),
+    )
+    if last_training and isinstance(last_training.metrics, dict):
+        persisted_units = last_training.metrics.get("family_scope_units")
+        if isinstance(persisted_units, dict):
+            for unit, persisted in persisted_units.items():
+                if unit in family_scope_units and isinstance(persisted, dict):
+                    current_unit = family_scope_units[unit]
+                    current_fields = {
+                        key: current_unit[key]
+                        for key in CURRENT_FAMILY_SCOPE_UNIT_FIELDS
+                        if key in current_unit
+                    }
+                    if persisted.get("challenger_version") or persisted.get("last_trained_at"):
+                        current_fields.pop("status", None)
+                        current_fields.pop("reason", None)
+                    family_scope_units[unit] = {
+                        **current_unit,
+                        **persisted,
+                        **_active_family_scope_calibration_summary(
+                            active_parameters.parameters if active_parameters else None,
+                            unit,
+                        ),
+                        **current_fields,
+                    }
+    aggregate_adapter_error_reason_counts: dict[str, int] = {}
+    for unit in family_scope_units.values():
+        reason_counts = unit.get("adapter_error_reason_counts")
+        if not isinstance(reason_counts, dict):
+            continue
+        for reason, count in reason_counts.items():
+            aggregate_adapter_error_reason_counts[str(reason)] = aggregate_adapter_error_reason_counts.get(
+                str(reason), 0
+            ) + int(count or 0)
     mature_count = session.scalar(
         select(func.count(ModelCandidate.id))
         .where(ModelCandidate.paper_trading_epoch_id == paper_trading_epoch_id)
@@ -1771,10 +2591,20 @@ def governance_status(
         "active_calibration_version": active_parameters.version_tag if active_parameters else None,
         "paper_trading_epoch_id": paper_trading_epoch_id,
         "feature_version": FEATURE_VERSION,
+        "governance_policy_version": FAMILY_SCOPE_GOVERNANCE_POLICY,
         "governance_training_policy": clean_window["policy"],
         "clean_training_start_at": clean_window["start_at_utc"],
         "clean_training_start_at_et": clean_window["start_at_et"],
         "clean_training_start_date_et": clean_window["start_date_et_iso"],
+        "family_scope_governance_enabled": True,
+        "family_scope_units": family_scope_units,
+        "family_scope_unit_count": len(family_scope_units),
+        "active_family_scope_calibrations": _family_scope_calibrations(
+            active_parameters.parameters if active_parameters else None
+        ),
+        "adapter_error_count": sum(int(unit.get("adapter_error_count") or 0) for unit in family_scope_units.values()),
+        "adapter_error_reason_counts": aggregate_adapter_error_reason_counts,
+        "adapter_errors_excluded_from_training": True,
         "calibration_status": last_calibration.status if last_calibration else "not_run",
         "last_training_run": last_training.started_at.isoformat() if last_training else None,
         "last_calibration_run": last_calibration.started_at.isoformat() if last_calibration else None,
@@ -1791,7 +2621,7 @@ def governance_status(
         "governance_parameter_registry": (
             governance_parameter_registry() if include_details else governance_parameter_registry_summary()
         ),
-        "notes": "PR3p clean governance trains and promotes only from active-epoch samples after the clean cutoff.",
+        "notes": "PR3v clean governance separates calibration/challenger status by PR3u family/scope adapter.",
     }
 
 
@@ -1801,17 +2631,26 @@ def latest_training_summary(session: Session) -> dict[str, object]:
     parameter = session.scalar(select(ModelParameterVersion).order_by(ModelParameterVersion.updated_at.desc()))
     if training is None:
         return {"status": "not_run", "training_run": None}
+    training_metrics = training.metrics if isinstance(training.metrics, dict) else {}
+    calibration_metrics = calibration.metrics if calibration and isinstance(calibration.metrics, dict) else {}
     return {
         "status": training.status,
         "training_run_id": training.id,
         "started_at": training.started_at.isoformat(),
         "completed_at": training.completed_at.isoformat() if training.completed_at else None,
         "candidate_count": training.candidate_count,
+        "governance_policy_version": training_metrics.get("family_scope_governance_policy")
+        or training_metrics.get("governance_policy_version")
+        or FAMILY_SCOPE_GOVERNANCE_POLICY,
+        "family_scope_governance_enabled": bool(training_metrics.get("family_scope_governance_enabled")),
+        "family_scope_units": training_metrics.get("family_scope_units", {}),
+        "family_scope_promoted_units": training_metrics.get("family_scope_promoted_units", []),
         "metrics": training.metrics,
         "latest_calibration": {
             "id": calibration.id if calibration else None,
             "status": calibration.status if calibration else None,
             "method": calibration.method if calibration else None,
+            "family_scope_units": calibration_metrics.get("family_scope_units", {}),
             "metrics": calibration.metrics if calibration else None,
         },
         "latest_parameter_version": parameter.version_tag if parameter else None,

@@ -20,6 +20,7 @@ from app.services.modeling import (
     MATURE_MODEL_TAG,
     ModelScore,
     RunExpectations,
+    _active_family_scope_calibration,
     _bounded,
     _calibrate_probability,
     _decimal,
@@ -208,6 +209,26 @@ def _score_family_adapter(
             market_type=context.market_type,
             parameters=parameters,
         )
+    active_family_calibration = _active_family_scope_calibration(parameters, context.market_type)
+    family_calibration_version = (
+        str(active_family_calibration.get("calibration_version"))
+        if isinstance(active_family_calibration, dict) and active_family_calibration.get("calibration_version")
+        else PROBABILITY_ADAPTER_CALIBRATION_VERSION
+    )
+    family_calibration_hook_status = (
+        "family_scope_active" if active_family_calibration is not None else "metadata_only_pending_pr3v"
+    )
+    family_calibration_mode = (
+        "family_scope_active" if active_family_calibration is not None else "shared_or_uncalibrated_until_pr3v"
+    )
+    family_scope_offset = _family_scope_contract_side_offset(parameters, context.market_type, context.contract_side)
+    if active_family_calibration is not None:
+        calibrated_probability = _bounded(
+            calibrated_probability + family_scope_offset,
+            Decimal("0.020000"),
+            Decimal("0.980000"),
+        ).quantize(Decimal("0.000001"))
+        calibration_status = "family_scope_active"
     training_eligible, training_exclusion_reason = _training_eligibility(
         context.features,
         context.market_type,
@@ -238,8 +259,10 @@ def _score_family_adapter(
         "feature_version": FEATURE_VERSION,
         "family_kind": family_kind,
         "scope_policy": scope_policy,
-        "calibration_mode": "shared_or_uncalibrated_until_pr3v",
+        "calibration_mode": family_calibration_mode,
         "calibration_status": calibration_status,
+        "family_scope_calibration": active_family_calibration or {},
+        "family_scope_contract_side_offset": float(family_scope_offset),
         "uses_market_price": False,
     }
     return ProbabilityAdapterResult(
@@ -258,12 +281,31 @@ def _score_family_adapter(
         adapter_scope=adapter.scope,
         adapter_rationale=f"{adapter.scope} {family_kind} probability adapter using mature run distribution v2",
         calibration_hook=CALIBRATION_HOOK_BY_FAMILY[context.market_type],
-        calibration_version=PROBABILITY_ADAPTER_CALIBRATION_VERSION,
-        calibration_hook_status="metadata_only_pending_pr3v",
+        calibration_version=family_calibration_version,
+        calibration_hook_status=family_calibration_hook_status,
         feature_policy_version=PROBABILITY_ADAPTER_FEATURE_POLICY_VERSION,
         model_policy_metadata=model_policy_metadata,
-        diagnostics=diagnostics,
+        diagnostics={
+            **diagnostics,
+            "family_scope_contract_side_offset": float(family_scope_offset),
+            "family_scope_calibration_applied_after_contract_side": active_family_calibration is not None,
+        },
     )
+
+
+def _family_scope_contract_side_offset(
+    parameters: dict[str, object],
+    market_type: str,
+    contract_side: str,
+) -> Decimal:
+    offsets = parameters.get("family_scope_probability_offsets")
+    if not isinstance(offsets, dict):
+        return Decimal("0.000000")
+    family_offsets = offsets.get(market_type)
+    side = contract_side.lower()
+    if isinstance(family_offsets, dict):
+        return _decimal(family_offsets.get(side), Decimal("0")).quantize(Decimal("0.000001"))
+    return Decimal("0.000000")
 
 
 def _probabilities_from_base_score(base_score: ModelScore, contract_side: str) -> tuple[Decimal, Decimal, str]:

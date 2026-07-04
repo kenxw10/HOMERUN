@@ -831,3 +831,13 @@ Every future PR must update this section with:
 - Calibration hooks are metadata-only placeholders for PR3v. PR3u does not add calibration training, alter governance promotion, change model coefficients, change EV thresholds, or lower quality gates.
 - A nullable `model_candidates` migration stores PR3u adapter fields for newly scored candidates. PaperTrade storage was not changed because the PR3u contract is candidate/prediction diagnostics, not settlement or trade lifecycle behavior.
 - Existing PR3t selector flow, full-game spread trusted-audit gate, cache-only candidate sweeps, risk caps, settlement, cron schedules, source ingestion, WebSocket behavior, dashboard portfolio series, live execution, credentials, sportsbook/team-total/umpire scope, and MVE scope remain unchanged.
+
+### PR3v - Family-Specific Challenger and Calibration Governance
+
+- Governance now separates clean mature resolved samples into six family/scope units: `full_game_total`, `first_five_total`, `full_game_winner`, `first_five_winner`, `full_game_spread`, and `first_five_spread`.
+- PR3u calibration hooks feed PR3v governance. Each unit reports compact raw, clean, pre-clean-excluded, train, and holdout sample counts plus threshold status, adapter error counts, challenger status, and active calibration metadata.
+- Family/scope calibration offsets and challenger metadata are stored in existing model parameter/training/calibration JSON metrics. No new migration is required for PR3v because PR3u already added nullable candidate adapter columns.
+- Adapter errors are classified by reason/family and excluded from governance training so malformed adapter outputs cannot silently influence calibration or promotion.
+- Promotion is guarded per family/scope. A passing `full_game_total` challenger can activate only that unit's family calibration without promoting global/shared parameters or changing other units.
+- If no active family calibration exists, adapters keep the explicit shared/uncalibrated fallback status. If an active family calibration exists, adapter metadata reports the family calibration version/status.
+- Safety and selection behavior are unchanged: no live orders, no sportsbook/Odds API data, no team totals, no umpire inputs, no source-ingestion or cron change, no PR3t selector bypass, no settlement/risk-cap change, and candidate sweeps remain heavy-source cache-only.
