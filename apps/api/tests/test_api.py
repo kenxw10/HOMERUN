@@ -9168,6 +9168,7 @@ def _add_governance_candidate(
     outcome: str = "win",
     market_family: str = "full_game_winner",
     probability: Decimal = Decimal("0.550000"),
+    contract_side: str = "yes",
     adapter_error: str | None = None,
     include_adapter_metadata: bool = True,
 ) -> ModelCandidate:
@@ -9203,6 +9204,7 @@ def _add_governance_candidate(
         feature_version=features.FEATURE_VERSION,
         training_eligible=True,
         market_family=market_family,
+        contract_side=contract_side,
         probability_adapter_key=adapter_key if include_adapter_metadata else None,
         probability_adapter_version=adapter_version if include_adapter_metadata else None,
         probability_adapter_policy_version=(
@@ -9640,10 +9642,64 @@ def test_pr3v_missing_adapter_metadata_is_counted_and_excluded(monkeypatch) -> N
     assert dataset.sample_count == 2
 
 
+def test_pr3v_family_governance_stores_contract_side_offsets(monkeypatch) -> None:
+    monkeypatch.setenv("MODEL_MIN_SAMPLES_TRAIN", "2")
+    monkeypatch.setenv("MODEL_MIN_SAMPLES_CALIBRATE", "2")
+    monkeypatch.setenv("MODEL_MIN_SAMPLES_PROMOTE", "99")
+    monkeypatch.setenv("MODEL_GOVERNANCE_FAMILY_MIN_SAMPLES_TRAIN", "2")
+    monkeypatch.setenv("MODEL_GOVERNANCE_FAMILY_MIN_SAMPLES_CALIBRATE", "2")
+    monkeypatch.setenv("MODEL_GOVERNANCE_FAMILY_MIN_SAMPLES_PROMOTE", "99")
+    monkeypatch.setenv("MODEL_GOVERNANCE_CLEAN_START_AT", "2026-07-02T00:00:00-04:00")
+    get_settings.cache_clear()
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        epoch_id = _active_epoch_id(session)
+        game = MlbGame(
+            external_game_id="pr3v-side-aware-offsets",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 2, 23, 0, tzinfo=UTC),
+            status="Final",
+        )
+        session.add(game)
+        session.flush()
+        for index in range(1, 4):
+            _add_governance_candidate(
+                session,
+                epoch_id=epoch_id,
+                game_id=game.id,
+                target_date=date(2026, 7, 2),
+                evaluated_at=datetime(2026, 7, 2, 16, index, tzinfo=UTC),
+                resolved_at=datetime(2026, 7, 3, 4, index, tzinfo=UTC),
+                outcome="win",
+                market_family="full_game_total",
+                probability=Decimal("0.400000"),
+                contract_side="no",
+            )
+        session.commit()
+
+        result = run_model_governance(session, now=datetime(2026, 7, 3, 12, 0, tzinfo=UTC))
+        challenger = session.scalar(
+            select(ModelParameterVersion)
+            .where(ModelParameterVersion.version_tag == result["family_scope_units"]["full_game_total"]["challenger_version"])
+        )
+
+    assert challenger is not None
+    family_offsets = challenger.parameters["family_scope_probability_offsets"]["full_game_total"]
+    assert "no" in family_offsets
+    assert "yes" not in family_offsets
+    assert Decimal(str(family_offsets["no"])) > Decimal("0")
+    assert result["family_scope_units"]["full_game_total"]["calibration_metrics"]["sample_count"] > 0
+
+
 def test_pr3v_active_family_calibration_is_used_by_adapter_metadata() -> None:
     parameters = {
         **modeling.DEFAULT_MODEL_PARAMETERS,
-        "family_scope_probability_offsets": {"full_game_total": 0.02},
+        "family_scope_probability_offsets": {"full_game_total": {"yes": 0.02}},
         "family_scope_calibrations": {
             "full_game_total": {
                 "governance_family_scope_key": "full_game_total",
@@ -9669,6 +9725,55 @@ def test_pr3v_active_family_calibration_is_used_by_adapter_metadata() -> None:
     assert result.calibration_version == "pr3v_family_scope_governance_v1_full_game_total_7"
     assert result.calibration_hook_status == "family_scope_active"
     assert result.model_policy_metadata["calibration_mode"] == "family_scope_active"
+
+
+def test_pr3v_family_calibration_applies_after_contract_side_orientation() -> None:
+    active_parameters = {
+        **modeling.DEFAULT_MODEL_PARAMETERS,
+        "family_scope_probability_offsets": {"full_game_total": {"no": 0.02}},
+        "family_scope_calibrations": {
+            "full_game_total": {
+                "governance_family_scope_key": "full_game_total",
+                "calibration_version": "pr3v_family_scope_governance_v1_full_game_total_no_7",
+                "promotion_status": "promoted",
+                "role": "active",
+            }
+        },
+        "family_scope_calibration_policy_version": modeling.FAMILY_SCOPE_GOVERNANCE_POLICY,
+        "trained_from_samples": True,
+    }
+    baseline_parameters = {
+        **active_parameters,
+        "family_scope_probability_offsets": {},
+        "family_scope_calibrations": {},
+    }
+
+    baseline = probability_adapters.score_probability_adapter(
+        _adapter_context(
+            "full_game_total",
+            contract_side="no",
+            over_under_side="over",
+            exposure_direction="under",
+            parameters=baseline_parameters,
+        )
+    )
+    calibrated = probability_adapters.score_probability_adapter(
+        _adapter_context(
+            "full_game_total",
+            contract_side="no",
+            over_under_side="over",
+            exposure_direction="under",
+            parameters=active_parameters,
+        )
+    )
+
+    assert calibrated.calibration_status == "family_scope_active"
+    assert calibrated.calibration_version == "pr3v_family_scope_governance_v1_full_game_total_no_7"
+    assert calibrated.probability_calibrated == (baseline.probability_calibrated + Decimal("0.020000")).quantize(
+        Decimal("0.000001")
+    )
+    assert calibrated.model_policy_metadata["family_scope_contract_side_offset"] == 0.02
+    assert calibrated.diagnostics["family_scope_calibration_applied_after_contract_side"] is True
 
 
 def test_pr3v_governance_status_remains_compact(monkeypatch) -> None:

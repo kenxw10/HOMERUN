@@ -219,6 +219,7 @@ class GovernanceCandidateSample:
     market_family: str | None
     time_bucket: str | None
     outcome: str | None
+    contract_side: str | None = None
     probability_adapter_key: str | None = None
     probability_adapter_version: str | None = None
     probability_adapter_policy_version: str | None = None
@@ -746,14 +747,8 @@ def _calibrate_probability(
     if isinstance(offsets, dict):
         calibrated += _decimal(offsets.get("__global__"), Decimal("0"))
         calibrated += _decimal(offsets.get(market_type), Decimal("0"))
-    family_scope_offsets = parameters.get("family_scope_probability_offsets")
-    family_scope_entry = _active_family_scope_calibration(parameters, market_type)
-    if isinstance(family_scope_offsets, dict) and family_scope_entry is not None:
-        calibrated += _decimal(family_scope_offsets.get(market_type), Decimal("0"))
     status = (
-        "family_scope_active"
-        if family_scope_entry is not None
-        else "trained_parameterized"
+        "trained_parameterized"
         if parameters.get("trained_from_samples")
         else "baseline_parameterized"
     )
@@ -953,6 +948,7 @@ def _resolved_mature_candidate_sample_statement(paper_trading_epoch_id: int | No
             ModelCandidate.market_family,
             ModelCandidate.time_bucket,
             ModelCandidate.outcome,
+            ModelCandidate.contract_side,
             ModelCandidate.probability_adapter_key,
             ModelCandidate.probability_adapter_version,
             ModelCandidate.probability_adapter_policy_version,
@@ -990,6 +986,7 @@ def _resolved_mature_candidate_samples(
                 market_family=row.market_family,
                 time_bucket=row.time_bucket,
                 outcome=row.outcome,
+                contract_side=row.contract_side,
                 probability_adapter_key=row.probability_adapter_key,
                 probability_adapter_version=row.probability_adapter_version,
                 probability_adapter_policy_version=row.probability_adapter_policy_version,
@@ -1221,6 +1218,7 @@ def _probability_adapter_error_reason(candidate: GovernanceCandidateSample) -> s
         candidate.probability_adapter_version,
         candidate.probability_adapter_family,
         candidate.probability_adapter_calibration_hook,
+        candidate.contract_side,
         candidate.probability_adapter_metadata,
     )
 
@@ -1230,6 +1228,7 @@ def _probability_adapter_error_reason_from_fields(
     adapter_version: str | None,
     adapter_family: str | None,
     calibration_hook: str | None,
+    contract_side: str | None,
     adapter_metadata: dict[str, object] | None,
 ) -> str | None:
     metadata = adapter_metadata if isinstance(adapter_metadata, dict) else {}
@@ -1249,6 +1248,8 @@ def _probability_adapter_error_reason_from_fields(
         return "missing_probability_adapter_metadata"
     if not all(adapter_values):
         return "incomplete_probability_adapter_metadata"
+    if str(contract_side or "").lower() not in {"yes", "no"}:
+        return "missing_contract_side_for_family_calibration"
     return None
 
 
@@ -1270,14 +1271,24 @@ def _reason_counts(reasons: list[str | None]) -> dict[str, int]:
     return counts
 
 
-def _family_scope_offsets(parameters: dict[str, object] | None) -> dict[str, Decimal]:
+def _family_scope_offsets(parameters: dict[str, object] | None) -> dict[str, dict[str, Decimal]]:
     offsets = (parameters or {}).get("family_scope_probability_offsets") if parameters else None
     if not isinstance(offsets, dict):
         return {}
-    return {
-        str(key): _decimal(value, Decimal("0")).quantize(Decimal("0.000001"))
-        for key, value in offsets.items()
-    }
+    parsed: dict[str, dict[str, Decimal]] = {}
+    for key, value in offsets.items():
+        unit = str(key)
+        if isinstance(value, dict):
+            side_offsets = {
+                str(side).lower(): _decimal(offset, Decimal("0")).quantize(Decimal("0.000001"))
+                for side, offset in value.items()
+                if str(side).lower() in {"yes", "no"}
+            }
+        else:
+            side_offsets = {"yes": _decimal(value, Decimal("0")).quantize(Decimal("0.000001"))}
+        if side_offsets:
+            parsed[unit] = side_offsets
+    return parsed
 
 
 def _family_scope_calibrations(parameters: dict[str, object] | None) -> dict[str, dict[str, object]]:
@@ -1287,18 +1298,20 @@ def _family_scope_calibrations(parameters: dict[str, object] | None) -> dict[str
     return {str(key): dict(value) for key, value in calibrations.items() if isinstance(value, dict)}
 
 
-def _fit_family_scope_probability_offset(candidates: list[GovernanceCandidateSample]) -> Decimal:
-    rows: list[tuple[Decimal, Decimal]] = []
+def _fit_family_scope_probability_offsets(candidates: list[GovernanceCandidateSample]) -> dict[str, Decimal]:
+    rows_by_side: dict[str, list[tuple[Decimal, Decimal]]] = {}
     for candidate in candidates:
         outcome = _candidate_outcome_value(candidate)
         probability = _candidate_probability(candidate)
-        if outcome is None or probability is None:
+        side = str(candidate.contract_side or "").lower()
+        if outcome is None or probability is None or side not in {"yes", "no"}:
             continue
-        rows.append((probability, Decimal(outcome)))
-    if not rows:
-        return Decimal("0.000000")
-    avg_error = sum(outcome - probability for probability, outcome in rows) / Decimal(len(rows))
-    return _bounded(avg_error, Decimal("-0.050000"), Decimal("0.050000")).quantize(Decimal("0.000001"))
+        rows_by_side.setdefault(side, []).append((probability, Decimal(outcome)))
+    offsets: dict[str, Decimal] = {}
+    for side, rows in rows_by_side.items():
+        avg_error = sum(outcome - probability for probability, outcome in rows) / Decimal(len(rows))
+        offsets[side] = _bounded(avg_error, Decimal("-0.050000"), Decimal("0.050000")).quantize(Decimal("0.000001"))
+    return offsets
 
 
 def _active_family_scope_calibration_summary(
@@ -1432,6 +1445,7 @@ def _current_family_scope_adapter_error_counts(
             ModelCandidate.probability_adapter_version,
             ModelCandidate.probability_adapter_family,
             ModelCandidate.probability_adapter_calibration_hook,
+            ModelCandidate.contract_side,
             ModelCandidate.probability_adapter_metadata,
             ModelCandidate.target_date,
             MlbGame.scheduled_start,
@@ -1463,6 +1477,7 @@ def _current_family_scope_adapter_error_counts(
             row.probability_adapter_version,
             row.probability_adapter_family,
             row.probability_adapter_calibration_hook,
+            row.contract_side,
             row.probability_adapter_metadata if isinstance(row.probability_adapter_metadata, dict) else None,
         )
         if reason:
@@ -1649,20 +1664,29 @@ def governance_sample_summary(session: Session, paper_trading_epoch_id: int | No
     }
 
 
-def _candidate_probability(candidate: CandidateSampleLike, offsets: dict[str, Decimal] | None = None) -> Decimal | None:
+FamilyOffsetValue = Decimal | dict[str, Decimal]
+
+
+def _candidate_probability(candidate: CandidateSampleLike, offsets: dict[str, FamilyOffsetValue] | None = None) -> Decimal | None:
     probability = candidate.probability_calibrated or candidate.model_probability or candidate.probability
     if probability is None:
         return None
     adjusted = probability
     if offsets:
-        adjusted += offsets.get(candidate.market_family or "unknown", Decimal("0"))
-        adjusted += offsets.get("__global__", Decimal("0"))
+        global_offset = offsets.get("__global__", Decimal("0"))
+        if isinstance(global_offset, Decimal):
+            adjusted += global_offset
+        family_offset = offsets.get(candidate.market_family or "unknown")
+        if isinstance(family_offset, dict):
+            adjusted += family_offset.get(str(getattr(candidate, "contract_side", "") or "").lower(), Decimal("0"))
+        elif isinstance(family_offset, Decimal):
+            adjusted += family_offset
     return _bounded(adjusted, Decimal("0.000001"), Decimal("0.999999")).quantize(Decimal("0.000001"))
 
 
 def _metrics(
     candidates: list[GovernanceCandidateSample],
-    offsets: dict[str, Decimal] | None = None,
+    offsets: dict[str, FamilyOffsetValue] | None = None,
 ) -> dict[str, object]:
     rows: list[tuple[float, int, str | None, str | None]] = []
     for candidate in candidates:
@@ -1785,8 +1809,11 @@ def _clean_challenger_parameter_seed(
     }
 
 
-def _json_offsets(offsets: dict[str, Decimal]) -> dict[str, float]:
-    return {key: float(value) for key, value in offsets.items()}
+def _json_family_scope_offsets(offsets: dict[str, dict[str, Decimal]]) -> dict[str, dict[str, float]]:
+    return {
+        key: {side: float(value) for side, value in side_offsets.items()}
+        for key, side_offsets in offsets.items()
+    }
 
 
 def _train_family_scope_challengers(
@@ -1827,11 +1854,19 @@ def _train_family_scope_challengers(
             family_units[unit] = summary
             continue
 
-        family_offset = _fit_family_scope_probability_offset(train_rows)
+        family_offset = _fit_family_scope_probability_offsets(train_rows)
         family_offsets = _family_scope_offsets(current_parameters)
+        existing_unit_offsets = family_offsets.get(unit, {})
+        combined_unit_offsets = {
+            **existing_unit_offsets,
+            **{
+                side: (existing_unit_offsets.get(side, Decimal("0")) + offset).quantize(Decimal("0.000001"))
+                for side, offset in family_offset.items()
+            },
+        }
         combined_family_offsets = {
             **family_offsets,
-            unit: (family_offsets.get(unit, Decimal("0")) + family_offset).quantize(Decimal("0.000001")),
+            unit: combined_unit_offsets,
         }
         baseline_metrics = _metrics(evaluation_rows)
         challenger_metrics = _metrics(evaluation_rows, {unit: family_offset})
@@ -1879,7 +1914,7 @@ def _train_family_scope_challengers(
         }
         challenger_parameters = {
             **current_parameters,
-            "family_scope_probability_offsets": _json_offsets(combined_family_offsets),
+            "family_scope_probability_offsets": _json_family_scope_offsets(combined_family_offsets),
             "family_scope_calibrations": family_calibrations,
             "family_scope_calibration_policy_version": FAMILY_SCOPE_GOVERNANCE_POLICY,
             "trained_from_samples": True,
@@ -1906,8 +1941,8 @@ def _train_family_scope_challengers(
                 "holdout_sample_count": len(holdout_rows),
                 "baseline_holdout": baseline_metrics,
                 "challenger_holdout": challenger_metrics,
-                "family_scope_probability_offset": float(family_offset),
-                "family_scope_probability_offsets": _json_offsets(combined_family_offsets),
+                "family_scope_probability_offset": {side: float(offset) for side, offset in family_offset.items()},
+                "family_scope_probability_offsets": _json_family_scope_offsets(combined_family_offsets),
                 "promotion_status": promotion_status,
                 "promotion_reason": promotion_reason,
                 "paper_trading_epoch_id": paper_trading_epoch_id,
