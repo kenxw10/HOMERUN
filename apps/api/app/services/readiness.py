@@ -458,6 +458,17 @@ def _component(name: str, status: str, evidence: dict[str, object]) -> dict[str,
     return {"component": name, "status": status, "evidence": evidence}
 
 
+def _governance_evidence_available(governance: dict[str, object]) -> bool:
+    if governance.get("last_training_run") or governance.get("last_calibration_run"):
+        return True
+    evidence_counts = (
+        governance.get("raw_resolved_mature_samples"),
+        governance.get("clean_resolved_mature_samples"),
+        governance.get("clean_training_eligible_count"),
+    )
+    return any(int(value or 0) > 0 for value in evidence_counts)
+
+
 def _validated_components(
     candidate_pipeline: dict[str, object],
     settlement_audit: dict[str, object],
@@ -490,11 +501,17 @@ def _validated_components(
         ),
         _component(
             "pr3v_family_scope_governance",
-            "available" if governance.get("family_scope_governance_enabled") else UNKNOWN_EVIDENCE,
+            "available" if _governance_evidence_available(governance) else UNKNOWN_EVIDENCE,
             {
                 "policy_version": governance.get("governance_policy_version"),
+                "capability_enabled": bool(governance.get("family_scope_governance_enabled")),
+                "last_governance_status": governance.get("status"),
                 "family_scope_unit_count": governance.get("family_scope_unit_count"),
+                "raw_resolved_mature_samples": governance.get("raw_resolved_mature_samples"),
                 "clean_resolved_mature_samples": governance.get("clean_resolved_mature_samples"),
+                "clean_training_eligible_count": governance.get("clean_training_eligible_count"),
+                "last_training_run": governance.get("last_training_run"),
+                "last_calibration_run": governance.get("last_calibration_run"),
             },
         ),
         _component(

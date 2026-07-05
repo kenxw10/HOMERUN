@@ -2396,6 +2396,25 @@ def test_readiness_allows_demo_credentials_for_paper_observation(monkeypatch) ->
     assert gate["kalshi_env"] == "demo"
 
 
+def test_readiness_requires_governance_evidence_before_available() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        get_or_create_active_paper_epoch(session, starting_balance=Decimal("500.00"))
+        session.commit()
+        pack = readiness.readiness_audit_pack(session)
+
+    component = next(
+        item for item in pack["validated_components"] if item["component"] == "pr3v_family_scope_governance"
+    )
+    assert component["status"] == "unknown_due_missing_evidence"
+    assert component["evidence"]["capability_enabled"] is True
+    assert component["evidence"]["last_governance_status"] == "not_run"
+    assert component["evidence"]["family_scope_unit_count"] > 0
+    assert component["evidence"]["clean_resolved_mature_samples"] == 0
+
+
 def test_readiness_audit_pack_is_read_only_and_compact() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
