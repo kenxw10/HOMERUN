@@ -265,6 +265,7 @@ class ModelStatus(BaseModel):
 
 class DashboardSummary(BaseModel):
     active_epoch: ActiveEpochSummary | None = None
+    readiness: dict[str, object] = Field(default_factory=dict)
     portfolio_series: list[PortfolioPoint]
     portfolio_series_source: str | None = None
     portfolio_series_point_count: int = 0
@@ -350,6 +351,7 @@ class SystemStatus(BaseModel):
     backend: BackendStatus
     database: DatabaseStatus
     config: ConfigStatus
+    readiness: dict[str, object] = Field(default_factory=dict)
 
 
 class GameSummary(BaseModel):

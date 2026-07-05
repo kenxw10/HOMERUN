@@ -62,6 +62,7 @@ from app.services.risk_governance import (
     DRAWDOWN_POLICY_VERSION,
     RISK_GOVERNANCE_FIELD_NAMES,
 )
+from app.services.readiness import compact_readiness_summary, readiness_audit_pack
 from app.services.modeling import (
     active_parameter_payload,
     governance_status,
@@ -228,6 +229,7 @@ def dashboard_summary(
 def system_status() -> SystemStatus:
     db_status = database_status()
     credentials_state = "set_redacted" if settings.kalshi_credentials_configured else "not_set"
+    readiness = compact_readiness_summary(readiness_audit_pack(None))
     source_status: dict[str, object] = {
         "feature_sync_enable_network_sources": settings.feature_sync_enable_network_sources,
         "public_sources_enabled": settings.feature_sync_enable_network_sources,
@@ -251,6 +253,7 @@ def system_status() -> SystemStatus:
             with session_factory() as session:
                 full_source_status = source_status_report(session)
                 compact_source_status = compact_source_status_payload(full_source_status)
+                readiness = compact_readiness_summary(readiness_audit_pack(session))
                 config_fields = {
                     key: full_source_status[key]
                     for key in (
@@ -312,7 +315,23 @@ def system_status() -> SystemStatus:
             public_sources_enabled=settings.feature_sync_enable_network_sources,
             source_status=source_status,
         ),
+        readiness=readiness,
     )
+
+
+@app.get("/v1/readiness/audit-pack")
+def readiness_audit_pack_endpoint() -> dict[str, object]:
+    if not database_status()["ready"]:
+        return readiness_audit_pack(None)
+    try:
+        session_factory = get_session_factory()
+        with session_factory() as session:
+            return readiness_audit_pack(session)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Readiness audit pack unavailable: {exc.__class__.__name__}",
+        ) from exc
 
 
 def _db_session_or_503():
