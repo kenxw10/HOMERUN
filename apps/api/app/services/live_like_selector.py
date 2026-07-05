@@ -16,9 +16,10 @@ from app.services.contracts import (
 )
 
 SELECTOR_POLICY_VERSION = "pr3t_live_like_selector_v1"
-SELECTOR_LINE_CLASS_POLICY_VERSION = "pr3t_line_class_selector_v1"
+SELECTOR_LINE_CLASS_POLICY_VERSION = "pr4c_total_tail_selector_v1"
 
 LINE_MARKET_FAMILIES = {FULL_GAME_SPREAD, FULL_GAME_TOTAL, FIRST_FIVE_SPREAD, FIRST_FIVE_TOTAL}
+TOTAL_MARKET_FAMILIES = {FULL_GAME_TOTAL, FIRST_FIVE_TOTAL}
 
 FAMILY_SCOPE_THRESHOLDS: dict[str, tuple[Decimal, Decimal]] = {
     FULL_GAME_WINNER: (Decimal("0.05"), Decimal("0.03")),
@@ -79,6 +80,8 @@ def selector_threshold(candidate: ModelCandidate, price: Decimal | None, setting
     min_quality = settings.paper_observation_min_data_quality
     line_class = _line_class(candidate)
     is_line_market = family in LINE_MARKET_FAMILIES
+    is_total_market = family in TOTAL_MARKET_FAMILIES
+    low_price = price is not None and price < settings.paper_low_price_threshold
     shadow_only = False
     line_policy = "normal"
 
@@ -87,24 +90,41 @@ def selector_threshold(candidate: ModelCandidate, price: Decimal | None, setting
         min_edge += Decimal("0.01")
         line_policy = "near_alternate_plus_0.02_ev_0.01_edge"
     elif line_class == "deep_alternate":
-        min_ev += Decimal("0.04")
-        min_edge += Decimal("0.02")
-        line_policy = "deep_alternate_plus_0.04_ev_0.02_edge"
+        if is_total_market and low_price:
+            min_ev = max(min_ev, settings.paper_total_deep_alt_low_price_min_net_ev)
+            min_edge = max(min_edge, settings.paper_total_deep_alt_low_price_min_prob_edge)
+            line_policy = "pr4c_total_deep_alternate_low_price_strict_threshold"
+        elif is_total_market:
+            min_ev = max(min_ev, settings.paper_total_deep_alt_min_net_ev)
+            min_edge = max(min_edge, settings.paper_total_deep_alt_min_prob_edge)
+            line_policy = "pr4c_total_deep_alternate_strict_threshold"
+        else:
+            min_ev += Decimal("0.04")
+            min_edge += Decimal("0.02")
+            line_policy = "deep_alternate_plus_0.04_ev_0.02_edge"
     elif line_class == "tail":
-        min_ev = max(min_ev, Decimal("0.12"))
-        min_edge = max(min_edge, Decimal("0.08"))
-        line_policy = "tail_exceptional_or_shadow"
+        if is_total_market:
+            min_ev = max(min_ev, settings.paper_total_tail_min_net_ev)
+            min_edge = max(min_edge, settings.paper_total_tail_min_prob_edge)
+            line_policy = "pr4c_total_tail_exceptional_strict_threshold"
+        else:
+            min_ev = max(min_ev, Decimal("0.12"))
+            min_edge = max(min_edge, Decimal("0.08"))
+            line_policy = "tail_exceptional_or_shadow"
     elif line_class == "unclassified" and is_line_market:
         shadow_only = True
         line_policy = "unclassified_line_shadow_only"
 
-    low_price = price is not None and price < settings.paper_low_price_threshold
     if low_price:
         min_ev = max(min_ev, settings.paper_low_price_min_net_ev)
         min_edge = max(min_edge, settings.paper_low_price_min_prob_edge)
-        line_policy = f"{line_policy}+low_price_strict"
+        if "low_price" not in line_policy:
+            line_policy = f"{line_policy}+low_price_strict"
 
-    profile = f"{family}:{line_class}:{'low_price' if low_price else 'standard'}"
+    profile_suffix = ""
+    if is_total_market and line_class in {"deep_alternate", "tail"}:
+        profile_suffix = ":pr4c"
+    profile = f"{family}:{line_class}:{'low_price' if low_price else 'standard'}{profile_suffix}"
     return SelectorThreshold(
         profile=profile,
         min_net_ev=_quantized(min_ev),

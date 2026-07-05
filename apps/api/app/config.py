@@ -110,8 +110,42 @@ class Settings(BaseSettings):
     )
     paper_probability_hardening_enabled: bool = Field(default=True, alias="PAPER_PROBABILITY_HARDENING_ENABLED")
     paper_probability_hardening_policy_version: str = Field(
-        default="pr3w_tail_alternate_probability_hardening_v1",
+        default="pr4c_one_way_conservative_total_tail_hardening_v1",
         alias="PAPER_PROBABILITY_HARDENING_POLICY_VERSION",
+    )
+    paper_total_tail_max_raw_adapter_lift_abs: Decimal = Field(
+        default=Decimal("0.05"),
+        alias="PAPER_TOTAL_TAIL_MAX_RAW_ADAPTER_LIFT_ABS",
+    )
+    paper_total_deep_alt_max_raw_adapter_lift_abs: Decimal = Field(
+        default=Decimal("0.05"),
+        alias="PAPER_TOTAL_DEEP_ALT_MAX_RAW_ADAPTER_LIFT_ABS",
+    )
+    paper_total_tail_max_raw_adapter_multiplier: Decimal = Field(
+        default=Decimal("1.50"),
+        alias="PAPER_TOTAL_TAIL_MAX_RAW_ADAPTER_MULTIPLIER",
+    )
+    paper_total_deep_alt_max_raw_adapter_multiplier: Decimal = Field(
+        default=Decimal("1.75"),
+        alias="PAPER_TOTAL_DEEP_ALT_MAX_RAW_ADAPTER_MULTIPLIER",
+    )
+    paper_total_tail_min_net_ev: Decimal = Field(default=Decimal("0.20"), alias="PAPER_TOTAL_TAIL_MIN_NET_EV")
+    paper_total_tail_min_prob_edge: Decimal = Field(default=Decimal("0.12"), alias="PAPER_TOTAL_TAIL_MIN_PROB_EDGE")
+    paper_total_deep_alt_min_net_ev: Decimal = Field(
+        default=Decimal("0.14"),
+        alias="PAPER_TOTAL_DEEP_ALT_MIN_NET_EV",
+    )
+    paper_total_deep_alt_min_prob_edge: Decimal = Field(
+        default=Decimal("0.09"),
+        alias="PAPER_TOTAL_DEEP_ALT_MIN_PROB_EDGE",
+    )
+    paper_total_deep_alt_low_price_min_net_ev: Decimal = Field(
+        default=Decimal("0.16"),
+        alias="PAPER_TOTAL_DEEP_ALT_LOW_PRICE_MIN_NET_EV",
+    )
+    paper_total_deep_alt_low_price_min_prob_edge: Decimal = Field(
+        default=Decimal("0.10"),
+        alias="PAPER_TOTAL_DEEP_ALT_LOW_PRICE_MIN_PROB_EDGE",
     )
     paper_risk_governance_enabled: bool = Field(default=True, alias="PAPER_RISK_GOVERNANCE_ENABLED")
     paper_risk_governance_policy_version: str = Field(
@@ -285,6 +319,16 @@ class Settings(BaseSettings):
         "paper_low_price_threshold",
         "paper_low_price_min_net_ev",
         "paper_low_price_min_prob_edge",
+        "paper_total_tail_max_raw_adapter_lift_abs",
+        "paper_total_deep_alt_max_raw_adapter_lift_abs",
+        "paper_total_tail_max_raw_adapter_multiplier",
+        "paper_total_deep_alt_max_raw_adapter_multiplier",
+        "paper_total_tail_min_net_ev",
+        "paper_total_tail_min_prob_edge",
+        "paper_total_deep_alt_min_net_ev",
+        "paper_total_deep_alt_min_prob_edge",
+        "paper_total_deep_alt_low_price_min_net_ev",
+        "paper_total_deep_alt_low_price_min_prob_edge",
         "paper_min_post_cap_notional",
         "paper_min_data_quality",
         "paper_observation_min_data_quality",

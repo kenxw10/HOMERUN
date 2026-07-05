@@ -1253,6 +1253,59 @@ Expected:
 
 If a production settlement job is stuck in `running` beyond the stale threshold, including a row from an archived epoch, the next settlement start should mark it `failed_stale` and attach a compact warning with `stale_running_job_recovered`. Dashboard and readiness summaries should show the stale/operational warning even when a newer settlement job for another target date has succeeded.
 
+## PR4c One-Way Conservative Total-Tail Hardening Validation
+
+PR4c is a paper selection hardening PR for extreme total lines. It must not change live execution, settlement formulas, cron cadence, source ingestion, market discovery, WebSocket behavior, credentials, sportsbook/Odds API scope, team totals, umpire factors, or MVE/multivariate markets.
+
+Run current ET context first:
+
+```powershell
+$base = "https://homerun-production-2551.up.railway.app"
+$headers = @{"X-API-Key"="YOUR_KEY"}
+$system = Invoke-RestMethod "$base/v1/system/status"
+$system.config | Select-Object paper_trading,live_trading_enabled,execution_kill_switch,kalshi_env,kalshi_credentials | Format-List
+$system.config.source_status | ConvertTo-Json -Depth 20
+```
+
+Expected: paper trading true, live trading false, kill switch true, demo Kalshi, no production credentials, and `paper_probability_hardening_policy_version=pr4c_one_way_conservative_total_tail_hardening_v1`.
+
+Run a dry-run candidate sweep only:
+
+```powershell
+$targetDate = "YYYY-MM-DD"
+$label = "pr4c_total_tail_validation_" + (Get-Date -Format "yyyyMMdd_HHmmss")
+$dry = Invoke-RestMethod -Method Post -Headers $headers "$base/v1/jobs/run/candidate-sweep?target_date=$targetDate&min_time_to_start_minutes=0&max_time_to_start_minutes=1800&sweep_label=$label&dry_run_candidates_only=true"
+$engine = $dry.result.result.paper_candidate_engine
+if (-not $engine) { $engine = $dry.result.result.candidate_engine }
+$engine | Select-Object target_date,dry_run_candidates_only,probability_hardening_policy_version,selector_policy_version,paper_trades_created,zero_trade_reason | Format-List
+$engine.probability_hardening_status_counts
+$engine.probability_hardening_reason_counts
+```
+
+Expected:
+
+- `dry_run_candidates_only=true` and `paper_trades_created=0`.
+- Total `tail` and `deep_alternate` candidates do not have `probability_after_hardening` greater than `probability_before_hardening`.
+- Total `tail` and `deep_alternate` candidates with `probability_raw_adapter` do not exceed the PR4c raw-adapter guardrail.
+- Selector threshold profiles for total deep/tail rows include `:pr4c`.
+- Total tails show minimum EV/edge thresholds of at least `0.20` / `0.12`.
+- Low-price total deep alternates show minimum EV/edge thresholds of at least `0.16` / `0.10`.
+- Existing open paper trades may still show old PR3w metadata and should not be treated as validation failure.
+
+Check compact predictions/candidates if needed:
+
+```powershell
+Invoke-RestMethod -Headers $headers "$base/v1/model/predictions?date=$targetDate" |
+  ConvertTo-Json -Depth 60 |
+  Select-String "pr4c|probability_hardening|raw_adapter|selector_threshold_profile|selector_min_net_ev|selector_min_prob_edge"
+
+Invoke-RestMethod "$base/v1/dashboard/summary" |
+  ConvertTo-Json -Depth 40 |
+  Select-String "blocked_for_live|paper_observation|probability_hardening_policy_version|pr4c|pr3w|raw_payload|features|orderbook_raw"
+```
+
+Expected: compact PR4c scalar metadata is visible for newly scored candidates, dashboard/readiness remain compact, and live readiness remains `blocked_for_live`.
+
 ## Required Context Updates
 
 Every PR must update `PROJECT_CONTEXT.md`.

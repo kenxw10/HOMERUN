@@ -402,6 +402,14 @@ The Railway Settlement Catchup service uses `python -m app.jobs.runner --job set
 
 No migration or environment change is required. PR4b.1 does not change settlement formulas, settlement idempotency, candidate selection, EV thresholds, risk caps, model math, cron schedules, source ingestion, market discovery, WebSocket behavior, credentials, sportsbook/team-total/umpire scope, or live execution.
 
+## PR4c One-Way Conservative Total-Tail Hardening
+
+PR4c makes the default probability hardening policy `pr4c_one_way_conservative_total_tail_hardening_v1`. For full-game and first-five total `deep_alternate` / `tail` lines, hardening can reduce or preserve the selection probability but cannot increase it above the before-hardening probability.
+
+When raw adapter probability exists, PR4c caps total deep/tail selection probabilities relative to that raw adapter value. Tails remain observable for governance/backtesting, but paper selection now requires stricter total-tail and low-price deep-alternate EV/edge thresholds.
+
+Existing open paper positions are not rewritten. PR4c adds no migration and does not change settlement, cron schedules, source ingestion, market discovery, WebSocket behavior, live execution, credentials, sportsbook/Odds API scope, team totals, umpire factors, or MVE/multivariate markets.
+
 ## Deployment
 
 - Railway backend setup: see `docs/RAILWAY_SETUP.md`.

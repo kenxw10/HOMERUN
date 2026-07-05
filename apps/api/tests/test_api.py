@@ -771,6 +771,8 @@ def _hardening_candidate(
     line: str = "8.5000",
     direction: str = "over",
     probability: str = "0.550000",
+    raw_probability: str | None = None,
+    missing_raw_adapter: bool = False,
     line_class: str = "central",
     rank: int = 2,
     distance: int = 0,
@@ -791,7 +793,7 @@ def _hardening_candidate(
         market_type=family,
         contract_side="yes",
         probability=Decimal(probability),
-        probability_raw=Decimal(probability),
+        probability_raw=None if missing_raw_adapter else Decimal(raw_probability) if raw_probability is not None else Decimal(probability),
         probability_calibrated=Decimal(probability),
         data_quality=Decimal("1.0000"),
         line_value=line_decimal,
@@ -805,6 +807,8 @@ def _hardening_candidate(
         line_ladder_rank=rank,
         line_ladder_distance_from_central=distance,
         line_ladder_size=size,
+        calibration_status="baseline_parameterized",
+        probability_adapter_calibration_version="shared_parameter_offsets_pre_pr3v",
     )
 
 
@@ -843,13 +847,136 @@ def test_probability_hardening_dampens_alternate_and_tail_lines() -> None:
     assert central.probability_after_hardening == Decimal("0.550000")
     assert central.probability_hardening_applied is False
     assert near.probability_after_hardening == Decimal("0.505000")
-    assert deep.probability_after_hardening == Decimal("0.475000")
-    assert tail.probability_after_hardening == Decimal("0.475000")
+    assert deep.probability_after_hardening == Decimal("0.450000")
+    assert deep.probability_hardening_reason == "total_deep_alternate_one_way_cap_applied"
+    assert tail.probability_after_hardening == Decimal("0.400000")
+    assert tail.probability_hardening_reason == "total_tail_one_way_cap_applied"
     assert tail.probability_hardening_shadow_only is True
     assert tail.probability_hardening_block_recommendation is True
-    assert summary["probability_hardening_applied_count"] == 3
-    assert summary["probability_hardening_by_line_class"]["tail"]["available"] == 1
+    assert summary["probability_hardening_applied_count"] == 1
+    assert summary["probability_hardening_by_line_class"]["tail"]["one_way_capped"] == 1
     _assert_pr3w_required_fields_populated(tail)
+
+
+def test_pr4c_total_tail_one_way_and_raw_adapter_guardrail() -> None:
+    central = _hardening_candidate(104, line="8.5000", probability="0.599248", line_class="central", rank=6)
+    tail = _hardening_candidate(
+        105,
+        line="13.5000",
+        probability="0.257191",
+        raw_probability="0.126447",
+        line_class="tail",
+        rank=11,
+        distance=5,
+        size=11,
+    )
+
+    probability_hardening.apply_probability_hardening([central, tail], enabled=True)
+
+    assert tail.probability_after_hardening <= tail.probability_before_hardening
+    assert tail.probability_after_hardening == Decimal("0.176447")
+    assert tail.probability_after_hardening != Decimal("0.428220")
+    assert tail.probability_hardening_reason == "total_tail_raw_adapter_guardrail_applied"
+    assert tail.probability_hardening_status == "total_tail_baseline_calibration_guardrail_applied"
+    assert tail.probability_hardening_shadow_only is True
+    assert tail.probability_hardening_block_recommendation is True
+    assert tail.probability_hardening_line_class_policy == probability_hardening.PROBABILITY_HARDENING_LINE_CLASS_POLICY
+
+
+def test_pr4c_first_five_total_deep_alternate_raw_adapter_guardrail_and_selector(monkeypatch) -> None:
+    monkeypatch.setenv("PAPER_SELECTOR_MODE", "live_like")
+    get_settings.cache_clear()
+    settings = get_settings()
+    central = _hardening_candidate(
+        106,
+        family="first_five_total",
+        line="4.5000",
+        direction="under",
+        probability="0.370000",
+        line_class="central",
+        rank=4,
+    )
+    deep = _hardening_candidate(
+        107,
+        family="first_five_total",
+        line="1.5000",
+        direction="under",
+        probability="0.207157",
+        raw_probability="0.049473",
+        line_class="deep_alternate",
+        rank=1,
+        distance=3,
+        size=7,
+    )
+
+    try:
+        probability_hardening.apply_probability_hardening([central, deep], enabled=True)
+        deep.net_expected_value = Decimal("0.108006")
+        deep.probability_edge = Decimal("0.118006")
+        selected, counts, summary = live_like_selector.apply_live_like_selector(
+            candidates=[deep],
+            intents=[_selector_intent(deep, price="0.1300")],
+            settings=settings,
+        )
+    finally:
+        get_settings.cache_clear()
+
+    assert deep.probability_after_hardening <= deep.probability_before_hardening
+    assert deep.probability_after_hardening == Decimal("0.086578")
+    assert deep.probability_hardening_reason == "total_deep_alternate_raw_adapter_guardrail_applied"
+    assert deep.selector_threshold_profile == "first_five_total:deep_alternate:low_price:pr4c"
+    assert deep.selector_min_net_ev == Decimal("0.160000")
+    assert deep.selector_min_prob_edge == Decimal("0.100000")
+    assert deep.selector_line_class_policy == "pr4c_total_deep_alternate_low_price_strict_threshold"
+    assert deep.selector_decision == "no_trade_selector_line_class_threshold"
+    assert counts == {"no_trade_selector_line_class_threshold": 1}
+    assert selected == []
+    assert summary["selector_selected_after_cluster"] == 0
+
+
+def test_pr4c_missing_raw_adapter_total_tail_is_shadow_only() -> None:
+    central = _hardening_candidate(108, line="8.5000", probability="0.599248", line_class="central", rank=6)
+    tail = _hardening_candidate(
+        109,
+        line="13.5000",
+        probability="0.257191",
+        missing_raw_adapter=True,
+        line_class="tail",
+        rank=11,
+        distance=5,
+        size=11,
+    )
+
+    probability_hardening.apply_probability_hardening([central, tail], enabled=True)
+
+    assert tail.probability_after_hardening == tail.probability_before_hardening
+    assert tail.probability_hardening_status == "missing_raw_adapter"
+    assert tail.probability_hardening_error_reason == "missing_raw_adapter"
+    assert tail.probability_hardening_reason == "total_tail_one_way_cap_applied"
+    assert tail.probability_hardening_shadow_only is True
+    assert tail.probability_hardening_block_recommendation is True
+
+
+def test_pr3w_legacy_policy_name_keeps_historical_anchor_lift() -> None:
+    central = _hardening_candidate(1090, line="8.5000", probability="0.550000", line_class="central", rank=3)
+    tail = _hardening_candidate(
+        1091,
+        line="11.5000",
+        probability="0.400000",
+        line_class="tail",
+        rank=6,
+        distance=3,
+        size=7,
+    )
+
+    probability_hardening.apply_probability_hardening(
+        [central, tail],
+        enabled=True,
+        policy_version=probability_hardening.LEGACY_PR3W_PROBABILITY_HARDENING_POLICY_VERSION,
+    )
+
+    assert tail.probability_after_hardening == Decimal("0.475000")
+    assert tail.probability_hardening_line_class_policy == probability_hardening.LEGACY_PR3W_LINE_CLASS_POLICY
 
 
 def test_probability_hardening_blocks_monotonicity_failures() -> None:
@@ -882,10 +1009,20 @@ def test_probability_hardening_exceptional_tail_can_pass_existing_selector(monke
     monkeypatch.setenv("PAPER_SELECTOR_MODE", "live_like")
     get_settings.cache_clear()
     settings = get_settings()
-    central = _hardening_candidate(130, line="8.5000", probability="0.800000", line_class="central", rank=3)
+    central = _hardening_candidate(
+        130,
+        family="full_game_spread",
+        direction="cover",
+        line="-1.5000",
+        probability="0.800000",
+        line_class="central",
+        rank=3,
+    )
     tail = _hardening_candidate(
         131,
-        line="11.5000",
+        family="full_game_spread",
+        direction="cover",
+        line="-4.5000",
         probability="0.720000",
         line_class="tail",
         rank=6,
@@ -1237,7 +1374,7 @@ def test_live_like_selector_enforces_line_class_and_low_price_policy(monkeypatch
     near = _selector_candidate(11, family="full_game_total", ev="0.070000", edge="0.049000", line_class="near_alternate")
     deep = _selector_candidate(12, family="full_game_total", ev="0.090000", edge="0.059000", line_class="deep_alternate")
     tail = _selector_candidate(13, family="full_game_total", ev="0.110000", edge="0.090000", line_class="tail")
-    exceptional_tail = _selector_candidate(14, family="full_game_total", ev="0.130000", edge="0.090000", line_class="tail")
+    exceptional_tail = _selector_candidate(14, family="full_game_total", ev="0.210000", edge="0.130000", line_class="tail")
     unclassified = _selector_candidate(15, family="full_game_total", ev="0.200000", edge="0.200000", line_class="unclassified")
     low_price_tail = _selector_candidate(16, family="full_game_total", ev="0.110000", edge="0.070000", line_class="tail")
 
@@ -1259,12 +1396,50 @@ def test_live_like_selector_enforces_line_class_and_low_price_policy(monkeypatch
     assert near.selector_decision == "no_trade_selector_line_class_threshold"
     assert deep.selector_decision == "no_trade_selector_line_class_threshold"
     assert tail.selector_decision == "no_trade_tail_shadow_only"
+    assert tail.selector_threshold_profile == "full_game_total:tail:standard:pr4c"
+    assert tail.selector_min_net_ev == Decimal("0.200000")
+    assert tail.selector_min_prob_edge == Decimal("0.120000")
+    assert tail.selector_line_class_policy == "pr4c_total_tail_exceptional_strict_threshold"
+    assert deep.selector_threshold_profile == "full_game_total:deep_alternate:standard:pr4c"
+    assert deep.selector_min_net_ev == Decimal("0.140000")
+    assert deep.selector_min_prob_edge == Decimal("0.090000")
+    assert deep.selector_line_class_policy == "pr4c_total_deep_alternate_strict_threshold"
     assert unclassified.selector_decision == "no_trade_unclassified_line_shadow_only"
     assert low_price_tail.selector_decision == "no_trade_tail_shadow_only"
-    assert low_price_tail.selector_line_class_policy.endswith("+low_price_strict")
+    assert low_price_tail.selector_line_class_policy == "pr4c_total_tail_exceptional_strict_threshold+low_price_strict"
     assert counts["no_trade_tail_shadow_only"] == 2
     assert summary["selector_rejected_by_line_class"] == 5
     assert summary["selector_shadow_only_count"] == 3
+
+
+def test_pr4c_selector_leaves_central_near_and_winner_thresholds_unchanged(monkeypatch) -> None:
+    monkeypatch.setenv("PAPER_MIN_NET_EV", "0.01")
+    monkeypatch.setenv("PAPER_MIN_PROB_EDGE", "0.01")
+    get_settings.cache_clear()
+    settings = get_settings()
+    central = _selector_candidate(17, family="full_game_total", line_class="central")
+    near = _selector_candidate(18, family="full_game_total", line_class="near_alternate")
+    winner = _selector_candidate(19, family="full_game_winner")
+
+    try:
+        central_threshold = live_like_selector.selector_threshold(central, Decimal("0.4000"), settings)
+        near_threshold = live_like_selector.selector_threshold(near, Decimal("0.4000"), settings)
+        winner_threshold = live_like_selector.selector_threshold(winner, Decimal("0.4000"), settings)
+    finally:
+        get_settings.cache_clear()
+
+    assert central_threshold.profile == "full_game_total:central:standard"
+    assert central_threshold.min_net_ev == Decimal("0.060000")
+    assert central_threshold.min_prob_edge == Decimal("0.040000")
+    assert central_threshold.line_class_policy == "normal"
+    assert near_threshold.profile == "full_game_total:near_alternate:standard"
+    assert near_threshold.min_net_ev == Decimal("0.080000")
+    assert near_threshold.min_prob_edge == Decimal("0.050000")
+    assert near_threshold.line_class_policy == "near_alternate_plus_0.02_ev_0.01_edge"
+    assert winner_threshold.profile == "full_game_winner:not_applicable:standard"
+    assert winner_threshold.min_net_ev == Decimal("0.050000")
+    assert winner_threshold.min_prob_edge == Decimal("0.030000")
+    assert winner_threshold.line_class_policy == "normal"
 
 
 def test_live_like_selector_selects_best_same_game_concept_cluster(monkeypatch) -> None:
@@ -3666,8 +3841,10 @@ def test_generate_candidates_populates_probability_hardening_for_total_ladder(mo
     assert result["probability_hardening_missing_count"] == 0
     assert result["candidate_probability_hardening_field_counts"]["probability_hardening_policy_version"] == 7
     assert result["candidate_probability_hardening_field_counts"]["probability_after_hardening"] == 7
-    assert result["probability_hardening_by_line_class"]["tail"]["available"] == 2
-    assert result["probability_hardening_by_line_class"]["deep_alternate"]["available"] == 2
+    assert result["probability_hardening_by_line_class"]["tail"]["available"] == 1
+    assert result["probability_hardening_by_line_class"]["tail"]["one_way_capped"] == 1
+    assert result["probability_hardening_by_line_class"]["deep_alternate"]["available"] == 1
+    assert result["probability_hardening_by_line_class"]["deep_alternate"]["one_way_capped"] == 1
     assert result["probability_hardening_by_line_class"]["near_alternate"]["available"] == 2
     for candidate in candidate_rows:
         _assert_pr3s_required_fields_populated(candidate)
