@@ -9931,6 +9931,64 @@ def test_settlement_sync_uses_bounded_target_date_batches() -> None:
     assert [trade.status for trade in target_trades] == ["settled", "settled", "settled"]
 
 
+def test_settlement_candidate_label_cap_prioritizes_unresolved_rows() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        epoch_id = _active_epoch_id(session)
+        game = MlbGame(
+            external_game_id="bounded-labels",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+            status="Final",
+            home_score=5,
+            away_score=3,
+        )
+        session.add(game)
+        session.flush()
+        candidates = []
+        for i in range(3):
+            trade, candidate, _market, _position = _add_settlement_trade(
+                session,
+                epoch_id=epoch_id,
+                game=game,
+                ticker=f"KXMLBGAME-26JUL011900SEAPIT-LABEL{i}-PIT",
+                family="full_game_winner",
+                selection="PIT",
+            )
+            session.flush()
+            session.delete(trade)
+            candidates.append(candidate)
+        session.commit()
+
+        first_result = settle_paper_trades(
+            session,
+            date(2026, 7, 1),
+            now=datetime(2026, 7, 2, 4, 0, tzinfo=UTC),
+            candidate_label_batch_limit=2,
+        )
+        second_result = settle_paper_trades(
+            session,
+            date(2026, 7, 1),
+            now=datetime(2026, 7, 2, 4, 5, tzinfo=UTC),
+            candidate_label_batch_limit=2,
+        )
+        for candidate in candidates:
+            session.refresh(candidate)
+
+    assert first_result["candidate_labels_checked"] == 2
+    assert first_result["candidate_labels_created"] == 2
+    assert first_result["candidate_labels_limited_by_batch_cap"] is True
+    assert second_result["candidate_labels_checked"] == 2
+    assert second_result["candidate_labels_created"] == 1
+    assert second_result["candidate_labels_already_set"] == 1
+    assert [candidate.outcome for candidate in candidates] == ["win", "win", "win"]
+
+
 def test_settlement_audit_backfill_respects_batch_cap() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)

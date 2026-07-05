@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import case, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.models import KalshiMarket, MarketMapping, MlbGame, ModelCandidate, PaperTrade, Position, Settlement
@@ -662,8 +662,9 @@ def settle_paper_trades(
         start, end = bounds
         candidate_query = candidate_query.where(MlbGame.scheduled_start >= start).where(MlbGame.scheduled_start < end)
 
+    unresolved_candidate_order = case((ModelCandidate.outcome.is_(None), 0), else_=1)
     candidate_rows_raw = session.execute(
-        candidate_query.order_by(ModelCandidate.id.asc()).limit(candidate_label_batch_limit + 1)
+        candidate_query.order_by(unresolved_candidate_order, ModelCandidate.id.asc()).limit(candidate_label_batch_limit + 1)
     ).all()
     candidate_labels_limited = len(candidate_rows_raw) > candidate_label_batch_limit
     candidate_rows = candidate_rows_raw[:candidate_label_batch_limit]
