@@ -196,21 +196,28 @@ def finalize_probability_hardening_recommendation(
     *,
     exceptional_min_net_ev: Decimal,
     exceptional_min_prob_edge: Decimal,
+    pr4c_total_tail_min_net_ev: Decimal | None = None,
+    pr4c_total_tail_min_prob_edge: Decimal | None = None,
 ) -> None:
     if not candidate.probability_hardening_enabled:
         return
     line_class = candidate.probability_hardening_line_class
     status = candidate.probability_hardening_status
-    exceptional = (
-        candidate.net_expected_value is not None
-        and candidate.probability_edge is not None
-        and candidate.net_expected_value >= exceptional_min_net_ev
-        and candidate.probability_edge >= exceptional_min_prob_edge
-    )
     pr4c_total_tail = (
         _is_pr4c_policy(str(candidate.probability_hardening_policy_version or ""))
         and _family(candidate) in TOTAL_FAMILIES
         and line_class == "tail"
+    )
+    required_net_ev = exceptional_min_net_ev
+    required_prob_edge = exceptional_min_prob_edge
+    if pr4c_total_tail:
+        required_net_ev = max(required_net_ev, pr4c_total_tail_min_net_ev or required_net_ev)
+        required_prob_edge = max(required_prob_edge, pr4c_total_tail_min_prob_edge or required_prob_edge)
+    exceptional = (
+        candidate.net_expected_value is not None
+        and candidate.probability_edge is not None
+        and candidate.net_expected_value >= required_net_ev
+        and candidate.probability_edge >= required_prob_edge
     )
     if line_class == "tail" and status in {"failed", "missing_raw_adapter", "error"}:
         candidate.probability_hardening_shadow_only = True

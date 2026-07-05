@@ -3520,6 +3520,8 @@ def generate_candidates(
             candidate,
             exceptional_min_net_ev=exceptional_tail_net_ev,
             exceptional_min_prob_edge=exceptional_tail_probability_edge,
+            pr4c_total_tail_min_net_ev=settings.paper_total_tail_min_net_ev,
+            pr4c_total_tail_min_prob_edge=settings.paper_total_tail_min_prob_edge,
         )
 
         mapping = context["mapping"]

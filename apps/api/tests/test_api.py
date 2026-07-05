@@ -994,6 +994,48 @@ def test_pr4c_guardrails_preserve_failed_hardening_status() -> None:
     assert tail.probability_hardening_block_recommendation is True
 
 
+def test_pr4c_total_tail_requires_selector_threshold_before_unblocking() -> None:
+    central = _hardening_candidate(1094, line="8.5000", probability="0.599248", line_class="central", rank=6)
+    tail = _hardening_candidate(
+        1095,
+        line="13.5000",
+        probability="0.257191",
+        raw_probability="0.126447",
+        line_class="tail",
+        rank=11,
+        distance=5,
+        size=11,
+    )
+
+    probability_hardening.apply_probability_hardening([central, tail], enabled=True)
+    tail.net_expected_value = Decimal("0.130000")
+    tail.probability_edge = Decimal("0.090000")
+    probability_hardening.finalize_probability_hardening_recommendation(
+        tail,
+        exceptional_min_net_ev=Decimal("0.120000"),
+        exceptional_min_prob_edge=Decimal("0.080000"),
+        pr4c_total_tail_min_net_ev=Decimal("0.200000"),
+        pr4c_total_tail_min_prob_edge=Decimal("0.120000"),
+    )
+
+    assert tail.probability_hardening_shadow_only is True
+    assert tail.probability_hardening_block_recommendation is True
+
+    tail.net_expected_value = Decimal("0.200000")
+    tail.probability_edge = Decimal("0.120000")
+    probability_hardening.finalize_probability_hardening_recommendation(
+        tail,
+        exceptional_min_net_ev=Decimal("0.120000"),
+        exceptional_min_prob_edge=Decimal("0.080000"),
+        pr4c_total_tail_min_net_ev=Decimal("0.200000"),
+        pr4c_total_tail_min_prob_edge=Decimal("0.120000"),
+    )
+
+    assert tail.probability_hardening_shadow_only is False
+    assert tail.probability_hardening_block_recommendation is False
+    assert tail.probability_hardening_reason == "total_tail_exceptional_threshold_met"
+
+
 def test_pr3w_legacy_policy_name_keeps_historical_anchor_lift() -> None:
     central = _hardening_candidate(1090, line="8.5000", probability="0.550000", line_class="central", rank=3)
     tail = _hardening_candidate(
