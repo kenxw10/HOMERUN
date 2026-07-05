@@ -2848,6 +2848,24 @@ def generate_candidates(
             "probability_adapter_policy_version": PROBABILITY_ADAPTER_POLICY_VERSION,
             "paper_probability_hardening_enabled": settings.paper_probability_hardening_enabled,
             "paper_probability_hardening_policy_version": settings.paper_probability_hardening_policy_version,
+            "paper_total_tail_max_raw_adapter_lift_abs": float(settings.paper_total_tail_max_raw_adapter_lift_abs),
+            "paper_total_deep_alt_max_raw_adapter_lift_abs": float(
+                settings.paper_total_deep_alt_max_raw_adapter_lift_abs
+            ),
+            "paper_total_tail_max_raw_adapter_multiplier": float(settings.paper_total_tail_max_raw_adapter_multiplier),
+            "paper_total_deep_alt_max_raw_adapter_multiplier": float(
+                settings.paper_total_deep_alt_max_raw_adapter_multiplier
+            ),
+            "paper_total_tail_min_net_ev": float(settings.paper_total_tail_min_net_ev),
+            "paper_total_tail_min_prob_edge": float(settings.paper_total_tail_min_prob_edge),
+            "paper_total_deep_alt_min_net_ev": float(settings.paper_total_deep_alt_min_net_ev),
+            "paper_total_deep_alt_min_prob_edge": float(settings.paper_total_deep_alt_min_prob_edge),
+            "paper_total_deep_alt_low_price_min_net_ev": float(
+                settings.paper_total_deep_alt_low_price_min_net_ev
+            ),
+            "paper_total_deep_alt_low_price_min_prob_edge": float(
+                settings.paper_total_deep_alt_low_price_min_prob_edge
+            ),
             "paper_risk_governance_enabled": settings.paper_risk_governance_enabled,
             "paper_risk_governance_policy_version": risk_governance_policy_version(settings),
             "paper_drawdown_halt_enabled": settings.paper_drawdown_halt_enabled,
@@ -3439,6 +3457,10 @@ def generate_candidates(
         evaluated_candidates,
         enabled=settings.paper_probability_hardening_enabled,
         policy_version=settings.paper_probability_hardening_policy_version,
+        total_tail_max_raw_adapter_lift_abs=settings.paper_total_tail_max_raw_adapter_lift_abs,
+        total_deep_alt_max_raw_adapter_lift_abs=settings.paper_total_deep_alt_max_raw_adapter_lift_abs,
+        total_tail_max_raw_adapter_multiplier=settings.paper_total_tail_max_raw_adapter_multiplier,
+        total_deep_alt_max_raw_adapter_multiplier=settings.paper_total_deep_alt_max_raw_adapter_multiplier,
     )
     trade_intents = []
     exceptional_tail_net_ev = max(settings.paper_min_net_ev, Decimal("0.12"))
@@ -3498,6 +3520,8 @@ def generate_candidates(
             candidate,
             exceptional_min_net_ev=exceptional_tail_net_ev,
             exceptional_min_prob_edge=exceptional_tail_probability_edge,
+            pr4c_total_tail_min_net_ev=settings.paper_total_tail_min_net_ev,
+            pr4c_total_tail_min_prob_edge=settings.paper_total_tail_min_prob_edge,
         )
 
         mapping = context["mapping"]
@@ -4075,6 +4099,20 @@ def generate_candidates(
         "probability_adapter_policy_version": PROBABILITY_ADAPTER_POLICY_VERSION,
         "probability_hardening_policy_version": settings.paper_probability_hardening_policy_version,
         "probability_hardening_enabled": settings.paper_probability_hardening_enabled,
+        "paper_total_tail_max_raw_adapter_lift_abs": float(settings.paper_total_tail_max_raw_adapter_lift_abs),
+        "paper_total_deep_alt_max_raw_adapter_lift_abs": float(settings.paper_total_deep_alt_max_raw_adapter_lift_abs),
+        "paper_total_tail_max_raw_adapter_multiplier": float(settings.paper_total_tail_max_raw_adapter_multiplier),
+        "paper_total_deep_alt_max_raw_adapter_multiplier": float(
+            settings.paper_total_deep_alt_max_raw_adapter_multiplier
+        ),
+        "paper_total_tail_min_net_ev": float(settings.paper_total_tail_min_net_ev),
+        "paper_total_tail_min_prob_edge": float(settings.paper_total_tail_min_prob_edge),
+        "paper_total_deep_alt_min_net_ev": float(settings.paper_total_deep_alt_min_net_ev),
+        "paper_total_deep_alt_min_prob_edge": float(settings.paper_total_deep_alt_min_prob_edge),
+        "paper_total_deep_alt_low_price_min_net_ev": float(settings.paper_total_deep_alt_low_price_min_net_ev),
+        "paper_total_deep_alt_low_price_min_prob_edge": float(
+            settings.paper_total_deep_alt_low_price_min_prob_edge
+        ),
         "risk_governance_policy_version": risk_governance_policy_version(settings),
         "risk_governance_enabled": settings.paper_risk_governance_enabled,
         "candidate_exposure_field_counts": candidate_exposure_field_counts,
@@ -4177,6 +4215,20 @@ def generate_candidates(
         "probability_adapter_policy_version": PROBABILITY_ADAPTER_POLICY_VERSION,
         "probability_hardening_policy_version": settings.paper_probability_hardening_policy_version,
         "probability_hardening_enabled": settings.paper_probability_hardening_enabled,
+        "paper_total_tail_max_raw_adapter_lift_abs": float(settings.paper_total_tail_max_raw_adapter_lift_abs),
+        "paper_total_deep_alt_max_raw_adapter_lift_abs": float(settings.paper_total_deep_alt_max_raw_adapter_lift_abs),
+        "paper_total_tail_max_raw_adapter_multiplier": float(settings.paper_total_tail_max_raw_adapter_multiplier),
+        "paper_total_deep_alt_max_raw_adapter_multiplier": float(
+            settings.paper_total_deep_alt_max_raw_adapter_multiplier
+        ),
+        "paper_total_tail_min_net_ev": float(settings.paper_total_tail_min_net_ev),
+        "paper_total_tail_min_prob_edge": float(settings.paper_total_tail_min_prob_edge),
+        "paper_total_deep_alt_min_net_ev": float(settings.paper_total_deep_alt_min_net_ev),
+        "paper_total_deep_alt_min_prob_edge": float(settings.paper_total_deep_alt_min_prob_edge),
+        "paper_total_deep_alt_low_price_min_net_ev": float(settings.paper_total_deep_alt_low_price_min_net_ev),
+        "paper_total_deep_alt_low_price_min_prob_edge": float(
+            settings.paper_total_deep_alt_low_price_min_prob_edge
+        ),
         "risk_governance_policy_version": risk_governance_policy_version(settings),
         "risk_governance_enabled": settings.paper_risk_governance_enabled,
         "candidate_exposure_field_counts": candidate_exposure_field_counts,

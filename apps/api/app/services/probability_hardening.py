@@ -6,8 +6,10 @@ from typing import Any, Iterable
 from app.models import ModelCandidate
 from app.services.contracts import FIRST_FIVE_SPREAD, FIRST_FIVE_TOTAL, FULL_GAME_SPREAD, FULL_GAME_TOTAL
 
-PROBABILITY_HARDENING_POLICY_VERSION = "pr3w_tail_alternate_probability_hardening_v1"
-PROBABILITY_HARDENING_LINE_CLASS_POLICY = "pr3w_line_class_edge_dampening_v1"
+LEGACY_PR3W_PROBABILITY_HARDENING_POLICY_VERSION = "pr3w_tail_alternate_probability_hardening_v1"
+LEGACY_PR3W_LINE_CLASS_POLICY = "pr3w_line_class_edge_dampening_v1"
+PROBABILITY_HARDENING_POLICY_VERSION = "pr4c_one_way_conservative_total_tail_hardening_v1"
+PROBABILITY_HARDENING_LINE_CLASS_POLICY = "pr4c_one_way_conservative_total_tail_hardening_v1"
 
 LINE_MARKET_FAMILIES = {FULL_GAME_SPREAD, FULL_GAME_TOTAL, FIRST_FIVE_SPREAD, FIRST_FIVE_TOTAL}
 TOTAL_FAMILIES = {FULL_GAME_TOTAL, FIRST_FIVE_TOTAL}
@@ -26,6 +28,10 @@ COMPLEMENT_TOLERANCE = Decimal("0.080000")
 DEFAULT_ANCHOR_PROBABILITY = Decimal("0.500000")
 MIN_PROBABILITY = Decimal("0.010000")
 MAX_PROBABILITY = Decimal("0.990000")
+DEFAULT_TOTAL_TAIL_MAX_RAW_ADAPTER_LIFT_ABS = Decimal("0.05")
+DEFAULT_TOTAL_DEEP_ALT_MAX_RAW_ADAPTER_LIFT_ABS = Decimal("0.05")
+DEFAULT_TOTAL_TAIL_MAX_RAW_ADAPTER_MULTIPLIER = Decimal("1.50")
+DEFAULT_TOTAL_DEEP_ALT_MAX_RAW_ADAPTER_MULTIPLIER = Decimal("1.75")
 
 PROBABILITY_HARDENING_CANDIDATE_FIELDS = (
     "probability_hardening_policy_version",
@@ -59,11 +65,17 @@ def apply_probability_hardening(
     *,
     enabled: bool,
     policy_version: str = PROBABILITY_HARDENING_POLICY_VERSION,
+    total_tail_max_raw_adapter_lift_abs: Decimal = DEFAULT_TOTAL_TAIL_MAX_RAW_ADAPTER_LIFT_ABS,
+    total_deep_alt_max_raw_adapter_lift_abs: Decimal = DEFAULT_TOTAL_DEEP_ALT_MAX_RAW_ADAPTER_LIFT_ABS,
+    total_tail_max_raw_adapter_multiplier: Decimal = DEFAULT_TOTAL_TAIL_MAX_RAW_ADAPTER_MULTIPLIER,
+    total_deep_alt_max_raw_adapter_multiplier: Decimal = DEFAULT_TOTAL_DEEP_ALT_MAX_RAW_ADAPTER_MULTIPLIER,
 ) -> None:
     rows = list(candidates)
     monotonicity = _monotonicity_status_by_candidate(rows)
     consistency = _consistency_status_by_candidate(rows)
     anchors = _central_anchor_by_group(rows)
+    line_class_policy = _line_class_policy_for_policy(policy_version)
+    pr4c_enabled = _is_pr4c_policy(policy_version)
 
     for candidate in rows:
         before = _probability(candidate.probability_calibrated) or _probability(candidate.probability)
@@ -125,7 +137,31 @@ def apply_probability_hardening(
 
         after = before
         if before is not None and enabled and family in LINE_MARKET_FAMILIES:
-            after = _harden_probability(before, anchor_probability, factor)
+            anchor_hardened = _harden_probability(before, anchor_probability, factor)
+            after = anchor_hardened
+            if pr4c_enabled and _is_total_extreme_line(family, line_class):
+                after, guardrail_reason, guardrail_status, guardrail_error, guardrail_shadow = (
+                    _apply_pr4c_total_extreme_guardrails(
+                        candidate=candidate,
+                        before=before,
+                        anchor_hardened=anchor_hardened,
+                        raw_adapter=raw_adapter,
+                        line_class=line_class,
+                        tail_abs_lift=total_tail_max_raw_adapter_lift_abs,
+                        deep_alt_abs_lift=total_deep_alt_max_raw_adapter_lift_abs,
+                        tail_multiplier=total_tail_max_raw_adapter_multiplier,
+                        deep_alt_multiplier=total_deep_alt_max_raw_adapter_multiplier,
+                    )
+                )
+                if guardrail_reason:
+                    reason = guardrail_reason if status != "failed" else reason
+                if guardrail_status and status != "failed":
+                    status = guardrail_status
+                if guardrail_error and status != "failed":
+                    error_reason = guardrail_error
+                if guardrail_shadow:
+                    shadow_only = True
+                    block_recommendation = True
         applied = before is not None and after is not None and after != before
 
         candidate.probability_hardening_policy_version = policy_version
@@ -140,7 +176,7 @@ def apply_probability_hardening(
         candidate.probability_hardening_reason = reason
         candidate.probability_hardening_status = status
         candidate.probability_hardening_line_class = line_class
-        candidate.probability_hardening_line_class_policy = PROBABILITY_HARDENING_LINE_CLASS_POLICY
+        candidate.probability_hardening_line_class_policy = line_class_policy
         candidate.probability_hardening_consistency_status = consistency_status
         candidate.probability_hardening_monotonicity_status = monotonicity_status
         candidate.probability_hardening_ladder_role = anchor_role
@@ -160,24 +196,47 @@ def finalize_probability_hardening_recommendation(
     *,
     exceptional_min_net_ev: Decimal,
     exceptional_min_prob_edge: Decimal,
+    pr4c_total_tail_min_net_ev: Decimal | None = None,
+    pr4c_total_tail_min_prob_edge: Decimal | None = None,
 ) -> None:
     if not candidate.probability_hardening_enabled:
         return
     line_class = candidate.probability_hardening_line_class
     status = candidate.probability_hardening_status
+    pr4c_total_tail = (
+        _is_pr4c_policy(str(candidate.probability_hardening_policy_version or ""))
+        and _family(candidate) in TOTAL_FAMILIES
+        and line_class == "tail"
+    )
+    required_net_ev = exceptional_min_net_ev
+    required_prob_edge = exceptional_min_prob_edge
+    if pr4c_total_tail:
+        required_net_ev = max(required_net_ev, pr4c_total_tail_min_net_ev or required_net_ev)
+        required_prob_edge = max(required_prob_edge, pr4c_total_tail_min_prob_edge or required_prob_edge)
     exceptional = (
         candidate.net_expected_value is not None
         and candidate.probability_edge is not None
-        and candidate.net_expected_value >= exceptional_min_net_ev
-        and candidate.probability_edge >= exceptional_min_prob_edge
+        and candidate.net_expected_value >= required_net_ev
+        and candidate.probability_edge >= required_prob_edge
     )
-    if line_class == "tail" and status != "failed" and exceptional:
+    if line_class == "tail" and status in {"failed", "missing_raw_adapter", "error"}:
+        candidate.probability_hardening_shadow_only = True
+        candidate.probability_hardening_block_recommendation = True
+    elif line_class == "tail" and exceptional:
         candidate.probability_hardening_shadow_only = False
         candidate.probability_hardening_block_recommendation = False
-        candidate.probability_hardening_reason = "tail_line_exceptional_edge_after_hardening"
+        candidate.probability_hardening_reason = (
+            "total_tail_exceptional_threshold_met" if pr4c_total_tail else "tail_line_exceptional_edge_after_hardening"
+        )
     elif line_class == "tail":
         candidate.probability_hardening_shadow_only = True
         candidate.probability_hardening_block_recommendation = True
+        if pr4c_total_tail and candidate.probability_hardening_reason not in {
+            "total_tail_raw_adapter_guardrail_applied",
+            "total_tail_one_way_cap_applied",
+            "total_tail_missing_raw_adapter",
+        }:
+            candidate.probability_hardening_reason = "total_tail_exceptional_threshold_not_met"
     elif line_class == "unclassified" and candidate.probability_hardening_status != "insufficient_ladder":
         candidate.probability_hardening_shadow_only = True
         candidate.probability_hardening_block_recommendation = True
@@ -269,7 +328,7 @@ def probability_hardening_summary(
     return {
         "probability_hardening_policy_version": policy_version,
         "probability_hardening_enabled": enabled,
-        "probability_hardening_line_class_policy": PROBABILITY_HARDENING_LINE_CLASS_POLICY,
+        "probability_hardening_line_class_policy": _line_class_policy_for_policy(policy_version),
         "probability_hardening_applied_count": applied_count,
         "probability_hardening_shadow_only_count": shadow_count,
         "probability_hardening_block_recommendation_count": block_count,
@@ -415,6 +474,81 @@ def _harden_probability(before: Decimal, anchor: Decimal, factor: Decimal) -> De
         return before.quantize(Decimal("0.000001"))
     hardened = anchor + ((before - anchor) * factor)
     return min(max(hardened, MIN_PROBABILITY), MAX_PROBABILITY).quantize(Decimal("0.000001"))
+
+
+def _is_pr4c_policy(policy_version: str | None) -> bool:
+    return (policy_version or PROBABILITY_HARDENING_POLICY_VERSION) == PROBABILITY_HARDENING_POLICY_VERSION
+
+
+def _line_class_policy_for_policy(policy_version: str | None) -> str:
+    return LEGACY_PR3W_LINE_CLASS_POLICY if policy_version == LEGACY_PR3W_PROBABILITY_HARDENING_POLICY_VERSION else PROBABILITY_HARDENING_LINE_CLASS_POLICY
+
+
+def _is_total_extreme_line(family: str | None, line_class: str) -> bool:
+    return family in TOTAL_FAMILIES and line_class in {"deep_alternate", "tail"}
+
+
+def _apply_pr4c_total_extreme_guardrails(
+    *,
+    candidate: ModelCandidate,
+    before: Decimal,
+    anchor_hardened: Decimal,
+    raw_adapter: Decimal | None,
+    line_class: str,
+    tail_abs_lift: Decimal,
+    deep_alt_abs_lift: Decimal,
+    tail_multiplier: Decimal,
+    deep_alt_multiplier: Decimal,
+) -> tuple[Decimal, str | None, str | None, str | None, bool]:
+    prefix = "total_tail" if line_class == "tail" else "total_deep_alternate"
+    after = min(anchor_hardened, before).quantize(Decimal("0.000001"))
+    reason = f"{prefix}_one_way_cap_applied" if anchor_hardened > before else None
+    status = "one_way_capped" if reason else None
+    error_reason: str | None = None
+    shadow_only = False
+
+    if raw_adapter is None:
+        error_reason = "missing_raw_adapter"
+        status = "missing_raw_adapter"
+        if reason is None:
+            reason = f"{prefix}_missing_raw_adapter"
+        if line_class == "tail":
+            shadow_only = True
+        return after, reason, status, error_reason, shadow_only
+
+    cap = _raw_adapter_guardrail_cap(
+        raw_adapter,
+        abs_lift=tail_abs_lift if line_class == "tail" else deep_alt_abs_lift,
+        multiplier=tail_multiplier if line_class == "tail" else deep_alt_multiplier,
+    )
+    if after > cap:
+        after = cap
+        reason = f"{prefix}_raw_adapter_guardrail_applied"
+        status = (
+            f"{prefix}_baseline_calibration_guardrail_applied"
+            if _uses_baseline_or_shared_calibration(candidate)
+            else "raw_adapter_guardrailed"
+        )
+    return after, reason, status, error_reason, shadow_only
+
+
+def _raw_adapter_guardrail_cap(raw_adapter: Decimal, *, abs_lift: Decimal, multiplier: Decimal) -> Decimal:
+    cap = min(raw_adapter + _nonnegative_decimal(abs_lift), raw_adapter * max(_nonnegative_decimal(multiplier), Decimal("1")))
+    return min(max(cap, MIN_PROBABILITY), MAX_PROBABILITY).quantize(Decimal("0.000001"))
+
+
+def _uses_baseline_or_shared_calibration(candidate: ModelCandidate) -> bool:
+    calibration_status = str(candidate.calibration_status or "").lower()
+    calibration_version = str(candidate.probability_adapter_calibration_version or "").lower()
+    return (
+        "baseline" in calibration_status
+        or "pre_pr3v" in calibration_version
+        or "shared_parameter_offsets" in calibration_version
+    )
+
+
+def _nonnegative_decimal(value: Decimal) -> Decimal:
+    return max(_decimal(value) or Decimal("0"), Decimal("0"))
 
 
 def _line_group_key(candidate: ModelCandidate) -> tuple[object, ...] | None:

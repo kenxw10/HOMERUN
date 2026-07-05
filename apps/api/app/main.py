@@ -235,6 +235,22 @@ def system_status() -> SystemStatus:
         "public_sources_enabled": settings.feature_sync_enable_network_sources,
         "mlb_stats_base_url": settings.mlb_stats_base_url,
         "open_meteo_base_url": settings.open_meteo_base_url,
+        "paper_probability_hardening_enabled": settings.paper_probability_hardening_enabled,
+        "paper_probability_hardening_policy_version": settings.paper_probability_hardening_policy_version,
+        "paper_total_tail_max_raw_adapter_lift_abs": float(settings.paper_total_tail_max_raw_adapter_lift_abs),
+        "paper_total_deep_alt_max_raw_adapter_lift_abs": float(settings.paper_total_deep_alt_max_raw_adapter_lift_abs),
+        "paper_total_tail_max_raw_adapter_multiplier": float(settings.paper_total_tail_max_raw_adapter_multiplier),
+        "paper_total_deep_alt_max_raw_adapter_multiplier": float(
+            settings.paper_total_deep_alt_max_raw_adapter_multiplier
+        ),
+        "paper_total_tail_min_net_ev": float(settings.paper_total_tail_min_net_ev),
+        "paper_total_tail_min_prob_edge": float(settings.paper_total_tail_min_prob_edge),
+        "paper_total_deep_alt_min_net_ev": float(settings.paper_total_deep_alt_min_net_ev),
+        "paper_total_deep_alt_min_prob_edge": float(settings.paper_total_deep_alt_min_prob_edge),
+        "paper_total_deep_alt_low_price_min_net_ev": float(settings.paper_total_deep_alt_low_price_min_net_ev),
+        "paper_total_deep_alt_low_price_min_prob_edge": float(
+            settings.paper_total_deep_alt_low_price_min_prob_edge
+        ),
         "paper_risk_governance_enabled": settings.paper_risk_governance_enabled,
         "paper_risk_governance_policy_version": settings.paper_risk_governance_policy_version,
         "paper_drawdown_halt_enabled": settings.paper_drawdown_halt_enabled,
@@ -279,6 +295,30 @@ def system_status() -> SystemStatus:
                     if key in full_source_status
                 }
                 risk_config_fields = {
+                    "paper_probability_hardening_enabled": settings.paper_probability_hardening_enabled,
+                    "paper_probability_hardening_policy_version": settings.paper_probability_hardening_policy_version,
+                    "paper_total_tail_max_raw_adapter_lift_abs": float(
+                        settings.paper_total_tail_max_raw_adapter_lift_abs
+                    ),
+                    "paper_total_deep_alt_max_raw_adapter_lift_abs": float(
+                        settings.paper_total_deep_alt_max_raw_adapter_lift_abs
+                    ),
+                    "paper_total_tail_max_raw_adapter_multiplier": float(
+                        settings.paper_total_tail_max_raw_adapter_multiplier
+                    ),
+                    "paper_total_deep_alt_max_raw_adapter_multiplier": float(
+                        settings.paper_total_deep_alt_max_raw_adapter_multiplier
+                    ),
+                    "paper_total_tail_min_net_ev": float(settings.paper_total_tail_min_net_ev),
+                    "paper_total_tail_min_prob_edge": float(settings.paper_total_tail_min_prob_edge),
+                    "paper_total_deep_alt_min_net_ev": float(settings.paper_total_deep_alt_min_net_ev),
+                    "paper_total_deep_alt_min_prob_edge": float(settings.paper_total_deep_alt_min_prob_edge),
+                    "paper_total_deep_alt_low_price_min_net_ev": float(
+                        settings.paper_total_deep_alt_low_price_min_net_ev
+                    ),
+                    "paper_total_deep_alt_low_price_min_prob_edge": float(
+                        settings.paper_total_deep_alt_low_price_min_prob_edge
+                    ),
                     "paper_risk_governance_enabled": settings.paper_risk_governance_enabled,
                     "paper_risk_governance_policy_version": settings.paper_risk_governance_policy_version,
                     "paper_drawdown_halt_enabled": settings.paper_drawdown_halt_enabled,
