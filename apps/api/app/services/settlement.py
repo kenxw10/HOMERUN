@@ -623,7 +623,7 @@ def _settled_audit_amounts(
     )
     if fee_adjustment is None:
         fee_adjustment = trade.fee_paid
-    if (payout is None or fee_adjustment is None) and outcome in {"win", "loss", "void"}:
+    if (payout is None or fee_adjustment is None) and outcome in {"win", "loss", "push", "void"}:
         reconstructed_payout, _realized, _exit_price, reconstructed_fee = _settlement_amounts(trade, outcome)
         payout = payout if payout is not None else reconstructed_payout
         fee_adjustment = fee_adjustment if fee_adjustment is not None else reconstructed_fee
