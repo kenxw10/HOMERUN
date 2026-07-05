@@ -14,11 +14,18 @@ from app.time_utils import utc_now
 
 @dataclass(frozen=True)
 class PortfolioTotals:
+    starting_balance: Decimal
     cash_balance: Decimal
     portfolio_value: Decimal
+    current_equity: Decimal
     open_cost: Decimal
     open_mark_value: Decimal
+    open_unrealized_pnl: Decimal
+    open_fees_estimated: Decimal
     realized_pnl: Decimal
+    settled_fees_paid: Decimal
+    open_trade_count: int
+    settled_trade_count: int
 
 
 def _money(value: Decimal) -> Decimal:
@@ -62,7 +69,10 @@ def calculate_paper_portfolio(
     realized = sum(
         (trade.realized_pnl or Decimal("0")) for trade in trades if trade.status != "open"
     ) or Decimal("0")
+    settled_fees = sum(paper_trade_fee(trade) for trade in trades if trade.status != "open") or Decimal("0")
+    settled_count = sum(1 for trade in trades if trade.status != "open")
     open_trades = [trade for trade in trades if trade.status == "open"]
+    open_fees = sum(paper_trade_fee(trade) for trade in open_trades) or Decimal("0")
     open_cost = sum(
         (trade.entry_price * Decimal(trade.quantity)) + paper_trade_fee(trade) for trade in open_trades
     ) or Decimal("0")
@@ -70,14 +80,22 @@ def calculate_paper_portfolio(
         (trade.current_price if trade.current_price is not None else trade.entry_price) * Decimal(trade.quantity)
         for trade in open_trades
     ) or Decimal("0")
+    open_unrealized = open_mark - open_cost
     cash = starting_balance + realized - open_cost
     portfolio = cash + open_mark
     return PortfolioTotals(
+        starting_balance=_money(starting_balance),
         cash_balance=_money(cash),
         portfolio_value=_money(portfolio),
+        current_equity=_money(portfolio),
         open_cost=_money(open_cost),
+        open_fees_estimated=_money(open_fees),
         open_mark_value=_money(open_mark),
+        open_unrealized_pnl=_money(open_unrealized),
         realized_pnl=_money(realized),
+        settled_fees_paid=_money(settled_fees),
+        open_trade_count=len(open_trades),
+        settled_trade_count=settled_count,
     )
 
 

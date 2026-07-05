@@ -74,6 +74,7 @@ from app.services import (
     probability_hardening,
     pybaseball_client,
     risk_governance,
+    settlement,
     ws_market_data,
 )
 from app.services.contracts import contract_labels, selected_team_from_ticker
@@ -1109,7 +1110,7 @@ def test_risk_governance_family_open_cap_counts_selected_trades(monkeypatch) -> 
         _assert_pr3x_required_fields_populated(row)
 
 
-def test_risk_governance_drawdown_halt_blocks_new_paper_trades(monkeypatch) -> None:
+def test_risk_governance_drawdown_halt_is_diagnostic_in_paper_observation(monkeypatch) -> None:
     get_settings.cache_clear()
     settings = get_settings()
     now = datetime(2026, 7, 2, 16, 0, tzinfo=UTC)
@@ -1143,6 +1144,18 @@ def test_risk_governance_drawdown_halt_blocks_new_paper_trades(monkeypatch) -> N
         candidate.gate_final_trade_eligible = True
         candidate.gate_diagnostics = {"gate_caps_ok": True, "gate_final_trade_eligible": True}
         session.add(candidate)
+        session.add(
+            PaperTrade(
+                paper_trading_epoch_id=epoch.id,
+                market_ticker="RISK-DRAWDOWN-OPEN",
+                contract_side="yes",
+                entry_price=Decimal("0.5000"),
+                current_price=Decimal("0.0000"),
+                quantity=400,
+                entry_time=now - timedelta(hours=1),
+                status="open",
+            )
+        )
         session.flush()
         intent = SimpleNamespace(
             candidate=candidate,
@@ -1163,15 +1176,18 @@ def test_risk_governance_drawdown_halt_blocks_new_paper_trades(monkeypatch) -> N
             day_end=now + timedelta(days=1),
         )
 
-    assert selected == []
-    assert counts["no_trade_risk_drawdown_halt"] == 1
-    assert summary["risk_drawdown_summary"]["status"] == "halted"
-    assert candidate.risk_governance_decision == "rejected_by_drawdown_halt"
-    assert candidate.risk_governance_drawdown_status == "halted"
-    assert candidate.gate_caps_ok is False
-    assert candidate.gate_final_trade_eligible is False
-    assert candidate.gate_diagnostics["gate_risk_governance_ok"] is False
-    assert candidate.gate_diagnostics["gate_final_trade_eligible"] is False
+    assert selected == [intent]
+    assert counts.get("no_trade_risk_drawdown_halt", 0) == 0
+    assert summary["risk_drawdown_summary"]["status"] == "would_have_halted"
+    assert summary["risk_drawdown_summary"]["drawdown_would_have_halted"] is True
+    assert summary["risk_drawdown_summary"]["drawdown_halt_enforced"] is False
+    assert summary["risk_drawdown_summary"]["drawdown_observation_mode"] is True
+    assert candidate.risk_governance_decision == "approved_for_paper_trade"
+    assert candidate.risk_governance_drawdown_status == "would_have_halted"
+    assert candidate.gate_caps_ok is True
+    assert candidate.gate_final_trade_eligible is True
+    assert candidate.gate_diagnostics["gate_risk_governance_ok"] is True
+    assert candidate.gate_diagnostics["gate_final_trade_eligible"] is True
     _assert_pr3x_required_fields_populated(candidate)
 
 
@@ -2729,6 +2745,12 @@ def test_generate_candidates_time_window_filters_games(monkeypatch) -> None:
     assert all_candidates[0].selector_selected_from_cluster is True
     assert all_trades[0].selector_policy_version == live_like_selector.SELECTOR_POLICY_VERSION
     assert all_trades[0].selector_selected_from_cluster is True
+    assert all_trades[0].probability_adapter_key == all_candidates[0].probability_adapter_key
+    assert all_trades[0].probability_adapter_key is not None
+    assert all_trades[0].probability_adapter_version == all_candidates[0].probability_adapter_version
+    assert all_trades[0].probability_hardening_policy_version == all_candidates[0].probability_hardening_policy_version
+    assert all_trades[0].probability_after_hardening == all_candidates[0].probability_after_hardening
+    assert all_trades[0].calibration_status == all_candidates[0].calibration_status
 
 
 def test_generate_candidates_time_window_returns_skipped_when_empty(monkeypatch) -> None:
@@ -8477,6 +8499,41 @@ def test_resolver_uses_event_ticker_time_and_team_codes_for_validation() -> None
     assert match.metadata["ticker_team_codes_match"] is True
 
 
+def test_settlement_formula_does_not_default_unknown_total_side_to_under() -> None:
+    missing_side_formula = settlement._settlement_formula(
+        market_type="full_game_total",
+        contract_side="yes",
+        line_value=Decimal("8.0000"),
+        selection_code=None,
+        over_under_side=None,
+        inning_scope=None,
+    )
+    invalid_side_formula = settlement._settlement_formula(
+        market_type="first_five_total",
+        contract_side="no",
+        line_value=Decimal("4.5000"),
+        selection_code=None,
+        over_under_side="total",
+        inning_scope="first_five",
+    )
+    over_formula = settlement._settlement_formula(
+        market_type="full_game_total",
+        contract_side="yes",
+        line_value=Decimal("8.0000"),
+        selection_code=None,
+        over_under_side="over",
+        inning_scope=None,
+    )
+
+    assert missing_side_formula == "full_game: total settlement formula unavailable because over/under side is unknown; side=yes"
+    assert (
+        invalid_side_formula
+        == "first_five: total settlement formula unavailable because over/under side is unknown; side=no"
+    )
+    assert "total_runs > 8" in over_formula
+    assert "total_runs <" not in over_formula
+
+
 def test_paper_settlement_sync_settles_wins_losses_and_is_idempotent() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
@@ -8598,15 +8655,332 @@ def test_paper_settlement_sync_settles_wins_losses_and_is_idempotent() -> None:
     assert second_result["candidate_labels_already_set"] == 3
     assert result["settled"] == 2
     assert second_result["settled"] == 0
+    assert second_result["already_settled"] == 2
     assert len(settlements) == 2
     assert len(snapshots) == 1
     assert second_result["snapshot_id"] == result["snapshot_id"]
     assert [trade.outcome for trade in trades] == ["win", "loss"]
     assert [trade.realized_pnl for trade in trades] == [Decimal("1.20"), Decimal("-0.90")]
+    assert {trade.settlement_status for trade in trades} == {"settled"}
+    assert {trade.settlement_formula_version for trade in trades} == {"pr4a_settlement_formula_v1"}
+    assert {trade.settlement_source for trade in trades} == {"mlb_stats_api_final_score"}
+    assert all(trade.settlement_audit_key for trade in trades)
+    assert all(trade.settlement_idempotency_key == trade.settlement_audit_key for trade in trades)
+    assert all(trade.settlement_source_game_id == "settle-1" for trade in trades)
+    assert all(trade.settlement_source_market_ticker == trade.market_ticker for trade in trades)
+    assert all(
+        trade.settlement_checked_at is not None and trade.settlement_checked_at.replace(tzinfo=UTC) == settled_at
+        for trade in trades
+    )
+    assert all(
+        trade.settlement_resolved_at is not None and trade.settlement_resolved_at.replace(tzinfo=UTC) == settled_at
+        for trade in trades
+    )
+    assert all(trade.settlement_formula and "full_game" in trade.settlement_formula for trade in trades)
     assert no_trade is not None
     assert no_trade.outcome == "win"
     assert no_trade.outcome_source == "mlb_results_sync"
     assert no_trade.market_type == "full_game_winner"
+
+
+def test_paper_settlement_sync_backfills_already_settled_trade_audit_fields() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    settled_at = datetime(2026, 7, 2, 4, 0, tzinfo=UTC)
+    rerun_at = datetime(2026, 7, 3, 4, 0, tzinfo=UTC)
+
+    with Session(engine) as session:
+        epoch_id = _active_epoch_id(session)
+        game = MlbGame(
+            external_game_id="settle-backfill-1",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+            status="Final",
+            home_score=5,
+            away_score=3,
+        )
+        market = KalshiMarket(
+            kalshi_market_id="KX-SETTLE-BACKFILL",
+            ticker="KXMLBGAME-26JUL011900SEAPIT-PIT",
+            title="Will Pittsburgh win?",
+            status="closed",
+        )
+        session.add_all([game, market])
+        session.flush()
+        mapping = MarketMapping(
+            mlb_game_id=game.id,
+            kalshi_market_id=market.id,
+            mapping_status="confirmed",
+            confidence=Decimal("0.9700"),
+        )
+        session.add(mapping)
+        session.flush()
+        candidate = ModelCandidate(
+            paper_trading_epoch_id=epoch_id,
+            mlb_game_id=game.id,
+            kalshi_market_id=market.id,
+            mapping_id=mapping.id,
+            evaluated_at=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
+            features={},
+            decision="paper_trade",
+            market_type="full_game_winner",
+            outcome="win",
+            outcome_source="mlb_results_sync",
+            resolved_at=settled_at,
+        )
+        session.add(candidate)
+        session.flush()
+        trade = PaperTrade(
+            paper_trading_epoch_id=epoch_id,
+            candidate_id=candidate.id,
+            market_ticker=market.ticker,
+            contract_side="yes",
+            entry_price=Decimal("0.4000"),
+            current_price=Decimal("1.0000"),
+            quantity=2,
+            entry_time=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
+            exit_price=Decimal("1.0000"),
+            exit_time=settled_at,
+            status="settled",
+            outcome="win",
+            resolution="WIN",
+            realized_pnl=Decimal("1.20"),
+            fee_paid=Decimal("0.00"),
+            settled_at=settled_at,
+        )
+        session.add(trade)
+        session.flush()
+        session.add(
+            Settlement(
+                paper_trade_id=trade.id,
+                settled_at=settled_at,
+                resolution="WIN",
+                outcome="win",
+                payout=Decimal("2.00"),
+                fee_paid=Decimal("0.00"),
+                realized_pnl=Decimal("1.20"),
+            )
+        )
+        session.commit()
+
+        result = settle_paper_trades(session, date(2026, 7, 1), now=rerun_at)
+        refreshed = session.get(PaperTrade, trade.id)
+        settlements = list(session.scalars(select(Settlement)))
+
+    assert result["checked"] == 1
+    assert result["already_settled"] == 1
+    assert result["already_settled_audit_backfilled"] == 1
+    assert result["settled"] == 0
+    assert len(settlements) == 1
+    assert refreshed is not None
+    assert refreshed.settlement_status == "settled"
+    assert refreshed.settlement_outcome == "win"
+    assert refreshed.settlement_audit_key
+    assert refreshed.settlement_idempotency_key == refreshed.settlement_audit_key
+    assert refreshed.settlement_formula_version == "pr4a_settlement_formula_v1"
+    assert refreshed.settlement_formula and "full_game" in refreshed.settlement_formula
+    assert refreshed.settlement_source == "mlb_stats_api_final_score"
+    assert refreshed.settlement_source_game_id == "settle-backfill-1"
+    assert refreshed.settlement_payout == Decimal("2.00")
+    assert refreshed.settlement_fee_adjustment == Decimal("0.00")
+    assert refreshed.settlement_checked_at is not None and refreshed.settlement_checked_at.replace(tzinfo=UTC) == rerun_at
+    assert refreshed.settlement_resolved_at is not None and refreshed.settlement_resolved_at.replace(tzinfo=UTC) == settled_at
+
+
+def test_paper_settlement_sync_reconstructs_backfill_payout_without_settlement_row() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    settled_at = datetime(2026, 7, 2, 4, 0, tzinfo=UTC)
+    rerun_at = datetime(2026, 7, 3, 4, 0, tzinfo=UTC)
+
+    with Session(engine) as session:
+        epoch_id = _active_epoch_id(session)
+        game = MlbGame(
+            external_game_id="settle-backfill-no-row",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+            status="Final",
+            home_score=5,
+            away_score=3,
+        )
+        market = KalshiMarket(
+            kalshi_market_id="KX-SETTLE-BACKFILL-NO-ROW",
+            ticker="KXMLBGAME-26JUL011900SEAPIT-PIT",
+            title="Will Pittsburgh win?",
+            status="closed",
+        )
+        session.add_all([game, market])
+        session.flush()
+        mapping = MarketMapping(
+            mlb_game_id=game.id,
+            kalshi_market_id=market.id,
+            mapping_status="confirmed",
+            confidence=Decimal("0.9700"),
+        )
+        session.add(mapping)
+        session.flush()
+        candidate = ModelCandidate(
+            paper_trading_epoch_id=epoch_id,
+            mlb_game_id=game.id,
+            kalshi_market_id=market.id,
+            mapping_id=mapping.id,
+            evaluated_at=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
+            features={},
+            decision="paper_trade",
+            market_type="full_game_winner",
+            outcome="win",
+            outcome_source="mlb_results_sync",
+            resolved_at=settled_at,
+        )
+        session.add(candidate)
+        session.flush()
+        trade = PaperTrade(
+            paper_trading_epoch_id=epoch_id,
+            candidate_id=candidate.id,
+            market_ticker=market.ticker,
+            contract_side="yes",
+            entry_price=Decimal("0.4000"),
+            current_price=Decimal("1.0000"),
+            quantity=2,
+            entry_time=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
+            exit_price=Decimal("1.0000"),
+            exit_time=settled_at,
+            status="settled",
+            outcome="win",
+            resolution="WIN",
+            realized_pnl=Decimal("1.20"),
+            fee_paid=Decimal("0.00"),
+            settled_at=settled_at,
+        )
+        session.add(trade)
+        session.commit()
+
+        result = settle_paper_trades(session, date(2026, 7, 1), now=rerun_at)
+        refreshed = session.get(PaperTrade, trade.id)
+        settlements = list(session.scalars(select(Settlement)))
+
+    assert result["checked"] == 1
+    assert result["already_settled"] == 1
+    assert result["already_settled_audit_backfilled"] == 1
+    assert result["settled"] == 0
+    assert len(settlements) == 0
+    assert refreshed is not None
+    assert refreshed.settlement_status == "settled"
+    assert refreshed.settlement_outcome == "win"
+    assert refreshed.settlement_audit_key
+    assert refreshed.settlement_idempotency_key == refreshed.settlement_audit_key
+    assert refreshed.settlement_payout == Decimal("2.00")
+    assert refreshed.settlement_fee_adjustment == Decimal("0.00")
+    assert refreshed.settlement_checked_at is not None and refreshed.settlement_checked_at.replace(tzinfo=UTC) == rerun_at
+    assert refreshed.settlement_resolved_at is not None and refreshed.settlement_resolved_at.replace(tzinfo=UTC) == settled_at
+
+
+def test_paper_settlement_sync_reconstructs_backfill_push_payout_without_settlement_row() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    settled_at = datetime(2026, 7, 2, 4, 0, tzinfo=UTC)
+    rerun_at = datetime(2026, 7, 3, 4, 0, tzinfo=UTC)
+
+    with Session(engine) as session:
+        epoch_id = _active_epoch_id(session)
+        game = MlbGame(
+            external_game_id="settle-backfill-push",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+            status="Final",
+            home_score=5,
+            away_score=3,
+        )
+        market = KalshiMarket(
+            kalshi_market_id="KX-SETTLE-BACKFILL-PUSH",
+            ticker="KXMLBTOTAL-26JUL011900SEAPIT-8",
+            title="Will the game total be over 8?",
+            status="closed",
+            line_value=Decimal("8.0000"),
+            over_under_side="over",
+        )
+        session.add_all([game, market])
+        session.flush()
+        mapping = MarketMapping(
+            mlb_game_id=game.id,
+            kalshi_market_id=market.id,
+            mapping_status="confirmed",
+            confidence=Decimal("0.9700"),
+            market_type="full_game_total",
+            line_value=Decimal("8.0000"),
+            over_under_side="over",
+        )
+        session.add(mapping)
+        session.flush()
+        candidate = ModelCandidate(
+            paper_trading_epoch_id=epoch_id,
+            mlb_game_id=game.id,
+            kalshi_market_id=market.id,
+            mapping_id=mapping.id,
+            evaluated_at=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
+            features={},
+            decision="paper_trade",
+            market_type="full_game_total",
+            line_value=Decimal("8.0000"),
+            over_under_side="over",
+            outcome="push",
+            outcome_source="mlb_results_sync",
+            resolved_at=settled_at,
+        )
+        session.add(candidate)
+        session.flush()
+        trade = PaperTrade(
+            paper_trading_epoch_id=epoch_id,
+            candidate_id=candidate.id,
+            market_ticker=market.ticker,
+            contract_side="yes",
+            entry_price=Decimal("0.4000"),
+            current_price=Decimal("0.4000"),
+            quantity=2,
+            entry_time=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
+            exit_price=Decimal("0.4000"),
+            exit_time=settled_at,
+            status="settled",
+            outcome="push",
+            resolution="PUSH",
+            realized_pnl=Decimal("0.00"),
+            fee_paid=Decimal("0.00"),
+            settled_at=settled_at,
+            market_family="full_game_total",
+            line_value=Decimal("8.0000"),
+            over_under_side="over",
+        )
+        session.add(trade)
+        session.commit()
+
+        result = settle_paper_trades(session, date(2026, 7, 1), now=rerun_at)
+        refreshed = session.get(PaperTrade, trade.id)
+        settlements = list(session.scalars(select(Settlement)))
+
+    assert result["checked"] == 1
+    assert result["already_settled"] == 1
+    assert result["already_settled_audit_backfilled"] == 1
+    assert result["settled"] == 0
+    assert len(settlements) == 0
+    assert refreshed is not None
+    assert refreshed.settlement_status == "settled"
+    assert refreshed.settlement_outcome == "push"
+    assert refreshed.settlement_audit_key
+    assert refreshed.settlement_idempotency_key == refreshed.settlement_audit_key
+    assert refreshed.settlement_formula and "push when equal" in refreshed.settlement_formula
+    assert refreshed.settlement_payout == Decimal("0.80")
+    assert refreshed.settlement_fee_adjustment == Decimal("0.00")
+    assert refreshed.settlement_checked_at is not None and refreshed.settlement_checked_at.replace(tzinfo=UTC) == rerun_at
+    assert refreshed.settlement_resolved_at is not None and refreshed.settlement_resolved_at.replace(tzinfo=UTC) == settled_at
 
 
 def test_contract_labels_normalize_no_on_first_five_tie_as_either_team_wins() -> None:

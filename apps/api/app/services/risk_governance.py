@@ -22,6 +22,8 @@ from app.services.portfolio import calculate_paper_portfolio
 from app.time_utils import ensure_aware_utc
 
 RISK_GOVERNANCE_POLICY_VERSION = "pr3x_paper_risk_governance_v1"
+DRAWDOWN_POLICY_VERSION = "pr4a_paper_observation_drawdown_policy_v1"
+DRAWDOWN_LIVE_HALT_THRESHOLD_ABS = Decimal("150.00")
 
 RISK_GOVERNANCE_FIELD_NAMES: tuple[str, ...] = (
     "risk_governance_policy_version",
@@ -259,23 +261,34 @@ def drawdown_summary(session: Session, epoch: PaperTradingEpoch, settings: Setti
     current = calculate_paper_portfolio(session, epoch=epoch)
     current_value = _decimal(current.portfolio_value, starting_balance)
     high_water = max(starting_balance, _decimal(max_snapshot_value, starting_balance), current_value)
-    drawdown_abs = max(high_water - current_value, Decimal("0"))
-    drawdown_pct = Decimal("0") if high_water <= 0 else drawdown_abs / high_water
-    halted = bool(
-        settings.paper_drawdown_halt_enabled
-        and (
-            drawdown_abs >= settings.paper_drawdown_halt_threshold_abs
-            or drawdown_pct >= settings.paper_drawdown_halt_threshold_pct
-        )
-    )
+    high_water_drawdown_abs = max(high_water - current_value, Decimal("0"))
+    high_water_drawdown_pct = Decimal("0") if high_water <= 0 else high_water_drawdown_abs / high_water
+    drawdown_abs = max(starting_balance - current_value, Decimal("0"))
+    drawdown_pct = Decimal("0") if starting_balance <= 0 else drawdown_abs / starting_balance
+    halt_level = starting_balance - DRAWDOWN_LIVE_HALT_THRESHOLD_ABS
+    observation_mode = bool(settings.paper_trading and not settings.live_trading_enabled)
+    would_have_halted = bool(drawdown_abs >= DRAWDOWN_LIVE_HALT_THRESHOLD_ABS)
+    halt_enforced = bool(settings.paper_drawdown_halt_enabled and would_have_halted and not observation_mode)
+    status = "halted" if halt_enforced else "would_have_halted" if would_have_halted else "clear"
     return {
         "enabled": bool(settings.paper_drawdown_halt_enabled),
-        "status": "halted" if halted else "clear",
+        "status": status,
+        "drawdown_policy_version": DRAWDOWN_POLICY_VERSION,
+        "drawdown_observation_mode": observation_mode,
+        "drawdown_basis": "starting_bankroll_minus_current_equity",
+        "drawdown_halt_enforced": halt_enforced,
+        "drawdown_would_have_halted": would_have_halted,
+        "drawdown_live_halt_threshold_abs": float(DRAWDOWN_LIVE_HALT_THRESHOLD_ABS),
+        "drawdown_live_halt_basis": "starting_bankroll_minus_150",
+        "drawdown_starting_bankroll": float(starting_balance),
+        "drawdown_halt_level": float(halt_level),
         "starting_balance": float(starting_balance),
         "high_water_mark": float(high_water),
         "current_portfolio_value": float(current_value),
         "drawdown_abs": float(drawdown_abs),
         "drawdown_pct": float(drawdown_pct),
+        "high_water_drawdown_abs": float(high_water_drawdown_abs),
+        "high_water_drawdown_pct": float(high_water_drawdown_pct),
         "threshold_abs": float(settings.paper_drawdown_halt_threshold_abs),
         "threshold_pct": float(settings.paper_drawdown_halt_threshold_pct),
     }
@@ -526,7 +539,7 @@ def apply_risk_governance(
                 "risk_governance_family_cap_status",
                 "blocked",
             )
-        elif drawdown["status"] == "halted":
+        elif drawdown.get("drawdown_halt_enforced"):
             reject(
                 "rejected_by_drawdown_halt",
                 "no_trade_risk_drawdown_halt",

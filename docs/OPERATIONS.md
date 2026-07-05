@@ -89,7 +89,7 @@ The jobs currently cover:
 - Strict paper trade caps by slate, game, market family, open-position count, correlated game/family exposure, and aggregate bankroll risk. Defaults are 8 trades per slate, 4 per family, 12 open positions, 20% daily new risk, 25% open risk, 10% family risk, 15% scope risk, and 8% sub-20c low-price bucket risk.
 - PR3k adds stricter paper selection controls: first-five `TIE` is diagnostics-only, sub-10c prices are blocked, 10c-under-20c prices need stronger EV/edge and have low-price slate/sweep caps, each sweep opens at most 3 new trades by default, early sweeps reserve later slots, same-side exposure is capped by default, and risk-cap-reduced positions must still meet minimum size.
 - PR3s records compact exposure-taxonomy metadata on candidates and paper trades so operators can distinguish economic exposure from Kalshi YES/NO contract mechanics. These labels and line classes are display/diagnostic fields only and must not be used as a hidden replacement for existing paper trade caps, settlement, model math, or source-ingestion rules.
-- PR3x adds a paper-only risk-governance pass after the live-like selector and before legacy caps/sizing. It enforces family, concept-cluster, same-game, alternate-line, low-price/tail, and drawdown-halt controls while preserving all scored candidates for diagnostics and governance. It blocks new paper trades only; it does not close positions or change settlement.
+- PR3x adds a paper-only risk-governance pass after the live-like selector and before legacy caps/sizing. It enforces family, concept-cluster, same-game, alternate-line, and low-price/tail controls while preserving all scored candidates for diagnostics and governance. PR4a makes paper-observation drawdown report-only: drawdown metadata can say `would_have_halted`, but `drawdown_halt_enforced=false` and no new paper trade is blocked by drawdown while `PAPER_TRADING=true` and `LIVE_TRADING_ENABLED=false`.
 - Spread markets are diagnostics-only unless `PAPER_SPREAD_TRADING_ENABLED=true`. Do not enable spread paper trading until side-aware spread parsing and settlement have been manually verified against the Kalshi UI.
 
 They do not cover scheduled automation or live execution.
@@ -176,6 +176,8 @@ Protected manual endpoints mirror the cron jobs:
 - `GET /v1/model/starter-status?date=YYYY-MM-DD`
 
 The dashboard shows the last setup, candidate sweep, price refresh, settlement, governance, WebSocket/REST status, and the last candidate sweep window. A windowed sweep with no games in range should return `status=skipped_no_games_in_window`, count excluded games, and still be a successful no-work run rather than an error. Candidate-sweep results should report `feature_sync_mode=cache_only`, `feature_sync_skipped=true`, and `cached_features` diagnostics. If target-date mature feature snapshots are missing, the sweep should complete cleanly with `no_candidates_missing_feature_snapshots` instead of starting source ingestion or failing the job.
+
+PR4a settlement/accounting audit hardening keeps paper settlement idempotent and reconstructable. Every settled or skipped checked paper trade should retain compact settlement fields on `paper_trades`: audit key, formula version/formula, MLB source, source game id, source ticker, checked/resolved timestamps, settlement status/outcome, skip/error reason, idempotency key, payout, and fee adjustment. Re-running settlement for the same date should report `already_settled`, preserve the same audit key, and avoid duplicate settlement rows or duplicate realized P/L. Dashboard summary should expose active-epoch accounting fields including current equity, settled P/L, unrealized open P/L, paid/estimated fees, open cost, open mark value, and PR4a drawdown policy fields. The future live halt policy is metadata only: hard halt level is starting bankroll minus `$150`, new entries only, and no live execution is added.
 
 PR3m pregame context refresh uses only official MLB Stats API calls: target-date schedule with `probablePitcher(note)`, per-game live feed probable pitchers and lineups, boxscore starter/lineup data, and pitcher game-log stats for known starter IDs. Live feed/boxscore identities are preferred over stale schedule probables when both exist. It does not call pybaseball, FanGraphs, Statcast/Savant, Open-Meteo, full `sync_mlb_features`, sportsbook APIs, team totals, or umpire logic. If official MLB sources do not identify a starter or lineup, the status remains missing or partial with a reason; no neutral starter or fake lineup is inserted.
 
@@ -1131,7 +1133,7 @@ Expected candidate-sweep result:
 - `risk_governance_policy_version=pr3x_paper_risk_governance_v1`
 - `risk_candidates_considered`, `risk_approved_before_caps`, `risk_approved_after_caps`, and risk rejection counts are present
 - `candidate_risk_governance_field_counts.risk_governance_policy_version` equals the evaluated candidate count
-- `risk_drawdown_summary.status` is present and is normally `clear` unless the active epoch has breached the configured drawdown halt
+- `risk_drawdown_summary.status` is present and is normally `clear`; after PR4a, paper observation may report `would_have_halted` but should keep `drawdown_halt_enforced=false` and should not produce `no_trade_risk_drawdown_halt`
 
 Expected prediction rows:
 
@@ -1144,7 +1146,39 @@ Expected dashboard/system checks:
 - `/v1/system/status` reports the PR3x risk-governance config fields without secrets.
 - Open and closed position tables remain compact and only show PR3x rationale for selected paper trades.
 
-PR3x must not change live execution, cron schedules, source ingestion, model math, EV thresholds, settlement, WebSocket behavior, market discovery, production credentials, sportsbook/Odds API scope, team totals, umpire factors, or MVE/multivariate markets.
+PR3x/PR4a must not change live execution, cron schedules, source ingestion, model math, EV thresholds, active family/cap controls, WebSocket behavior, market discovery, production credentials, sportsbook/Odds API scope, team totals, umpire factors, or MVE/multivariate markets.
+
+## PR4a Settlement and Accounting Audit Validation
+
+PR4a is a paper accounting/audit hardening PR. It adds a migration and compact dashboard fields, but it must not place live orders, change candidate selection thresholds, change model probability math, run heavy source ingestion from candidate-sweep, or relax the full-game spread trusted-audit gate.
+
+After deployment:
+
+1. Run `alembic upgrade head` and confirm migration `0018_pr4a_settlement_audit.py` / revision `0018_pr4a_settlement_audit` applied.
+2. Run settlement for a completed target date:
+
+```powershell
+$base = "https://homerun-production-2551.up.railway.app"
+$headers = @{"X-API-Key"="YOUR_KEY"}
+$targetDate = "YYYY-MM-DD"
+$first = Invoke-RestMethod -Method Post -Headers $headers "$base/v1/jobs/run/settlement?target_date=$targetDate"
+$second = Invoke-RestMethod -Method Post -Headers $headers "$base/v1/jobs/run/settlement?target_date=$targetDate"
+```
+
+Expected settlement behavior:
+
+- First run settles only supported, ready paper trades.
+- Second run reports `already_settled` for previously settled trades and `settled=0` for those same rows.
+- No duplicate `settlements` rows or duplicate realized P/L are created.
+- Checked settled/skipped trades retain `settlement_audit_key`, `settlement_idempotency_key`, `settlement_formula_version`, `settlement_formula`, `settlement_source`, source game/ticker fields, checked/resolved timestamps, status/outcome, and skip/error reason where applicable.
+- Full-game spread rows still settle only when cached trusted audit metadata is present; untrusted rows stay open with spread audit skip reasons.
+
+Expected dashboard/system behavior:
+
+- `/v1/dashboard/summary` exposes current equity, settled P/L, unrealized open P/L, paid/estimated fees, open cost, open mark value, open and settled trade counts, and PR4a drawdown policy fields.
+- Position rows include compact settlement/model/risk/exposure audit rationale when those fields exist.
+- `/v1/system/status` remains secret-safe and reports paper mode, live trading disabled, kill switch enabled, demo Kalshi, and PR4a drawdown policy metadata.
+- In paper observation, drawdown should be diagnostic only: `drawdown_would_have_halted` may be true, but `drawdown_halt_enforced=false`, and candidate-sweep should not create `no_trade_risk_drawdown_halt`.
 
 ## Required Context Updates
 
