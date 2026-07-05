@@ -382,7 +382,7 @@ Dashboard summary accounting exposes active-epoch starting balance/current equit
 
 PR4a changes drawdown behavior for the current paper-observation posture. With `PAPER_TRADING=true` and `LIVE_TRADING_ENABLED=false`, drawdown is diagnostic/report-only: candidates can record `drawdown_would_have_halted=true`, but `drawdown_halt_enforced=false` and no `no_trade_risk_drawdown_halt` block is applied. Future live-readiness metadata uses `starting_bankroll_minus_150` as the hard halt level for new entries only; this PR does not add live order execution.
 
-PR4a adds nullable `paper_trades` columns with migration `0018_pr4a_settlement_accounting_audit.py`.
+PR4a adds nullable `paper_trades` columns with migration `0018_pr4a_settlement_audit.py` / revision `0018_pr4a_settlement_audit`.
 
 ## Deployment
 
