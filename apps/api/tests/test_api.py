@@ -10184,6 +10184,162 @@ def test_settlement_candidate_label_cap_prioritizes_unresolved_rows() -> None:
     assert [candidate.outcome for candidate in candidates] == ["win", "win", "win"]
 
 
+def test_settlement_candidate_label_cap_prioritizes_processable_rows_over_skips() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        epoch_id = _active_epoch_id(session)
+        scheduled_game = MlbGame(
+            external_game_id="bounded-labels-scheduled-skip",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+            status="Scheduled",
+        )
+        final_game = MlbGame(
+            external_game_id="bounded-labels-final-processable",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 1, 23, 30, tzinfo=UTC),
+            status="Final",
+            home_score=5,
+            away_score=3,
+        )
+        session.add_all([scheduled_game, final_game])
+        session.flush()
+
+        _scheduled_trade, scheduled_candidate, _market, _position = _add_settlement_trade(
+            session,
+            epoch_id=epoch_id,
+            game=scheduled_game,
+            ticker="KXMLBGAME-26JUL011900SEAPIT-LABELSKIP-SCHEDULED-PIT",
+            family="full_game_winner",
+            selection="PIT",
+        )
+        _missing_line_trade, missing_line_candidate, _market, _position = _add_settlement_trade(
+            session,
+            epoch_id=epoch_id,
+            game=final_game,
+            ticker="KXMLBTOTAL-26JUL011930SEAPIT-LABELSKIP-MISSINGLINE-OVER",
+            family="full_game_total",
+            total_side="over",
+        )
+        valid_candidates = []
+        candidate_only_trades = [_scheduled_trade, _missing_line_trade]
+        for i in range(2):
+            trade, candidate, _market, _position = _add_settlement_trade(
+                session,
+                epoch_id=epoch_id,
+                game=final_game,
+                ticker=f"KXMLBGAME-26JUL011930SEAPIT-LABELPROCESS{i}-PIT",
+                family="full_game_winner",
+                selection="PIT",
+            )
+            valid_candidates.append(candidate)
+            candidate_only_trades.append(trade)
+        session.flush()
+        for trade in candidate_only_trades:
+            session.delete(trade)
+        session.commit()
+
+        result = settle_paper_trades(
+            session,
+            date(2026, 7, 1),
+            now=datetime(2026, 7, 2, 4, 0, tzinfo=UTC),
+            candidate_label_batch_limit=2,
+        )
+        session.refresh(scheduled_candidate)
+        session.refresh(missing_line_candidate)
+        for candidate in valid_candidates:
+            session.refresh(candidate)
+
+    assert result["candidate_labels_checked"] == 2
+    assert result["candidate_labels_created"] == 2
+    assert result["candidate_labels_limited_by_batch_cap"] is True
+    assert scheduled_candidate.outcome is None
+    assert missing_line_candidate.outcome is None
+    assert [candidate.outcome for candidate in valid_candidates] == ["win", "win"]
+
+
+def test_settlement_open_trade_cap_prioritizes_settleable_rows_over_unfinal() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        epoch_id = _active_epoch_id(session)
+        scheduled_game = MlbGame(
+            external_game_id="bounded-trades-scheduled-skip",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+            status="Scheduled",
+        )
+        final_game = MlbGame(
+            external_game_id="bounded-trades-final-processable",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 1, 23, 30, tzinfo=UTC),
+            status="Final",
+            home_score=5,
+            away_score=3,
+        )
+        session.add_all([scheduled_game, final_game])
+        session.flush()
+
+        scheduled_trade, _scheduled_candidate, _market, _position = _add_settlement_trade(
+            session,
+            epoch_id=epoch_id,
+            game=scheduled_game,
+            ticker="KXMLBGAME-26JUL011900SEAPIT-TRADESKIP-SCHEDULED-PIT",
+            family="full_game_winner",
+            selection="PIT",
+        )
+        missing_line_trade, _missing_line_candidate, _market, _position = _add_settlement_trade(
+            session,
+            epoch_id=epoch_id,
+            game=final_game,
+            ticker="KXMLBTOTAL-26JUL011930SEAPIT-TRADESKIP-MISSINGLINE-OVER",
+            family="full_game_total",
+            total_side="over",
+        )
+        settleable_trade, _candidate, _market, _position = _add_settlement_trade(
+            session,
+            epoch_id=epoch_id,
+            game=final_game,
+            ticker="KXMLBGAME-26JUL011930SEAPIT-TRADEPROCESS-PIT",
+            family="full_game_winner",
+            selection="PIT",
+        )
+        session.commit()
+
+        result = settle_paper_trades(
+            session,
+            date(2026, 7, 1),
+            now=datetime(2026, 7, 2, 4, 0, tzinfo=UTC),
+            open_trade_batch_limit=1,
+        )
+        session.refresh(scheduled_trade)
+        session.refresh(missing_line_trade)
+        session.refresh(settleable_trade)
+
+    assert result["checked"] == 1
+    assert result["settled"] == 1
+    assert result["open_trade_settlement_limited_by_batch_cap"] is True
+    assert scheduled_trade.status == "open"
+    assert missing_line_trade.status == "open"
+    assert settleable_trade.status == "settled"
+    assert settleable_trade.outcome == "win"
+
+
 def test_settlement_audit_backfill_respects_batch_cap() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)

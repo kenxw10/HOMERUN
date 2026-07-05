@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 
-from sqlalchemy import case, func, or_, select
+from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.models import KalshiMarket, MarketMapping, MlbGame, ModelCandidate, PaperTrade, Position, Settlement
@@ -136,6 +136,102 @@ def _target_bounds(target_date: date | None) -> tuple[datetime, datetime] | None
     local_start = datetime.combine(target_date, time.min, tzinfo=get_dashboard_zone())
     start = ensure_aware_utc(local_start)
     return start, start + timedelta(days=1)
+
+
+def _settlement_readiness_order(market_type_expr: object) -> object:
+    status = func.lower(func.coalesce(MlbGame.status, ""))
+    terminal_status = or_(
+        *[status.like(f"%{token}%") for token in (*FINAL_STATUS_TOKENS, *VOID_STATUS_TOKENS)]
+    )
+    return case(
+        (terminal_status, 0),
+        (market_type_expr.in_(tuple(FIRST_FIVE_MARKET_TYPES)), 1),
+        else_=2,
+    )
+
+
+def _supported_market_order(market_type_expr: object) -> object:
+    return case((market_type_expr.in_(tuple(PAPER_SUPPORTED_MARKET_FAMILIES)), 0), else_=1)
+
+
+def _settlement_metadata_order(
+    market_type_expr: object,
+    line_value_expr: object,
+    over_under_side_expr: object,
+) -> object:
+    return case(
+        (and_(market_type_expr.in_((FULL_GAME_SPREAD, FIRST_FIVE_SPREAD)), line_value_expr.is_(None)), 1),
+        (
+            and_(
+                market_type_expr.in_((FULL_GAME_TOTAL, FIRST_FIVE_TOTAL)),
+                or_(line_value_expr.is_(None), ~over_under_side_expr.in_(("over", "under"))),
+            ),
+            1,
+        ),
+        else_=0,
+    )
+
+
+def _candidate_settlement_ordering() -> tuple[object, ...]:
+    market_type_expr = func.lower(
+        func.coalesce(
+            ModelCandidate.market_type,
+            MarketMapping.market_type,
+            KalshiMarket.market_type,
+            KalshiMarket.market_family,
+            "",
+        )
+    )
+    line_value_expr = func.coalesce(ModelCandidate.line_value, MarketMapping.line_value, KalshiMarket.line_value)
+    over_under_side_expr = func.lower(
+        func.coalesce(
+            ModelCandidate.over_under_side,
+            MarketMapping.over_under_side,
+            KalshiMarket.over_under_side,
+            "",
+        )
+    )
+    return (
+        _settlement_readiness_order(market_type_expr),
+        _supported_market_order(market_type_expr),
+        _settlement_metadata_order(market_type_expr, line_value_expr, over_under_side_expr),
+        case((ModelCandidate.outcome.is_(None), 0), else_=1),
+        ModelCandidate.id.asc(),
+    )
+
+
+def _open_trade_settlement_ordering() -> tuple[object, ...]:
+    market_type_expr = func.lower(
+        func.coalesce(
+            PaperTrade.market_family,
+            ModelCandidate.market_type,
+            MarketMapping.market_type,
+            KalshiMarket.market_type,
+            KalshiMarket.market_family,
+            "",
+        )
+    )
+    line_value_expr = func.coalesce(
+        PaperTrade.line_value,
+        ModelCandidate.line_value,
+        MarketMapping.line_value,
+        KalshiMarket.line_value,
+    )
+    over_under_side_expr = func.lower(
+        func.coalesce(
+            PaperTrade.over_under_side,
+            ModelCandidate.over_under_side,
+            MarketMapping.over_under_side,
+            KalshiMarket.over_under_side,
+            "",
+        )
+    )
+    return (
+        _settlement_readiness_order(market_type_expr),
+        _supported_market_order(market_type_expr),
+        _settlement_metadata_order(market_type_expr, line_value_expr, over_under_side_expr),
+        PaperTrade.id.asc(),
+    )
 
 
 def _status_kind(status: str) -> str:
@@ -662,9 +758,8 @@ def settle_paper_trades(
         start, end = bounds
         candidate_query = candidate_query.where(MlbGame.scheduled_start >= start).where(MlbGame.scheduled_start < end)
 
-    unresolved_candidate_order = case((ModelCandidate.outcome.is_(None), 0), else_=1)
     candidate_rows_raw = session.execute(
-        candidate_query.order_by(unresolved_candidate_order, ModelCandidate.id.asc()).limit(candidate_label_batch_limit + 1)
+        candidate_query.order_by(*_candidate_settlement_ordering()).limit(candidate_label_batch_limit + 1)
     ).all()
     candidate_labels_limited = len(candidate_rows_raw) > candidate_label_batch_limit
     candidate_rows = candidate_rows_raw[:candidate_label_batch_limit]
@@ -683,7 +778,7 @@ def settle_paper_trades(
         start, end = bounds
         query = query.where(MlbGame.scheduled_start >= start).where(MlbGame.scheduled_start < end)
 
-    rows_raw = session.execute(query.order_by(PaperTrade.id.asc()).limit(open_trade_batch_limit + 1)).all()
+    rows_raw = session.execute(query.order_by(*_open_trade_settlement_ordering()).limit(open_trade_batch_limit + 1)).all()
     open_trades_limited = len(rows_raw) > open_trade_batch_limit
     rows = rows_raw[:open_trade_batch_limit]
     already_settled_count = _settled_trade_count_for_target(
