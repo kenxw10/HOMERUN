@@ -584,6 +584,8 @@ def _settled_trades_missing_audit(
                 PaperTrade.settlement_formula.is_(None),
                 PaperTrade.settlement_status.is_(None),
                 PaperTrade.settlement_idempotency_key.is_(None),
+                PaperTrade.settlement_payout.is_(None),
+                PaperTrade.settlement_fee_adjustment.is_(None),
             )
         )
         .order_by(PaperTrade.id.asc())
@@ -601,6 +603,31 @@ def _settled_audit_status(trade: PaperTrade) -> str:
     if trade.status == "void" or trade.outcome == "void":
         return "void"
     return "settled"
+
+
+def _settled_audit_amounts(
+    trade: PaperTrade,
+    *,
+    existing_settlement: Settlement | None,
+    outcome: str | None,
+) -> tuple[Decimal | None, Decimal | None]:
+    payout = (
+        existing_settlement.payout
+        if existing_settlement is not None and existing_settlement.payout is not None
+        else trade.settlement_payout
+    )
+    fee_adjustment = (
+        existing_settlement.fee_paid
+        if existing_settlement is not None and existing_settlement.fee_paid is not None
+        else trade.settlement_fee_adjustment
+    )
+    if fee_adjustment is None:
+        fee_adjustment = trade.fee_paid
+    if (payout is None or fee_adjustment is None) and outcome in {"win", "loss", "void"}:
+        reconstructed_payout, _realized, _exit_price, reconstructed_fee = _settlement_amounts(trade, outcome)
+        payout = payout if payout is not None else reconstructed_payout
+        fee_adjustment = fee_adjustment if fee_adjustment is not None else reconstructed_fee
+    return payout, fee_adjustment
 
 
 def settle_paper_trades(
@@ -718,6 +745,12 @@ def settle_paper_trades(
             inning_scope=inning_scope,
             verification=verification,
         )
+        outcome_value = trade.outcome or (existing_settlement.outcome if existing_settlement else None)
+        payout, fee_adjustment = _settled_audit_amounts(
+            trade,
+            existing_settlement=existing_settlement,
+            outcome=outcome_value,
+        )
         _apply_trade_settlement_audit(
             trade,
             game=game,
@@ -726,9 +759,9 @@ def settle_paper_trades(
             resolved_at=trade.settled_at or (existing_settlement.settled_at if existing_settlement else None),
             status=_settled_audit_status(trade),
             formula=formula,
-            outcome=trade.outcome or (existing_settlement.outcome if existing_settlement else None),
-            payout=existing_settlement.payout if existing_settlement else trade.settlement_payout,
-            fee_adjustment=existing_settlement.fee_paid if existing_settlement else trade.fee_paid,
+            outcome=outcome_value,
+            payout=payout,
+            fee_adjustment=fee_adjustment,
         )
         session.add(trade)
         result["already_settled_audit_backfilled"] = int(result["already_settled_audit_backfilled"]) + 1
