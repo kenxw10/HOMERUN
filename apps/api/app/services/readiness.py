@@ -559,6 +559,7 @@ def _operator_checklist() -> list[dict[str, object]]:
 def _safety_gates() -> tuple[dict[str, object], bool]:
     settings = get_settings()
     credentials_configured = settings.kalshi_credentials_configured
+    production_credentials_configured = settings.kalshi_env == "production" and credentials_configured
     gates = {
         "paper_trading_enabled": {"status": _status(settings.paper_trading), "value": settings.paper_trading},
         "live_trading_disabled": {
@@ -571,8 +572,10 @@ def _safety_gates() -> tuple[dict[str, object], bool]:
         },
         "kalshi_demo_environment": {"status": _status(settings.kalshi_env == "demo"), "value": settings.kalshi_env},
         "production_credentials_absent": {
-            "status": _status(not credentials_configured),
-            "value": not credentials_configured,
+            "status": _status(not production_credentials_configured),
+            "value": not production_credentials_configured,
+            "credentials_configured": credentials_configured,
+            "kalshi_env": settings.kalshi_env,
         },
         "websocket_market_data_disabled_by_default": {
             "status": _status(not settings.websocket_market_data_enabled),

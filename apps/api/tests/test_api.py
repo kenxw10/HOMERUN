@@ -2376,6 +2376,26 @@ def test_system_status_redacts_secrets_and_allows_missing_database() -> None:
     assert "KALSHI_API_KEY" not in str(payload)
 
 
+def test_readiness_allows_demo_credentials_for_paper_observation(monkeypatch) -> None:
+    monkeypatch.setenv("KALSHI_ENV", "demo")
+    monkeypatch.setenv("KALSHI_API_KEY", "demo-key")
+    monkeypatch.setenv("KALSHI_API_SECRET", "demo-secret")
+    monkeypatch.setenv("PAPER_TRADING", "true")
+    monkeypatch.setenv("LIVE_TRADING_ENABLED", "false")
+    monkeypatch.setenv("EXECUTION_KILL_SWITCH", "true")
+    get_settings.cache_clear()
+
+    pack = readiness.readiness_audit_pack(None)
+    gate = pack["safety_gates"]["production_credentials_absent"]
+
+    assert pack["paper_observation_status"] == "paper_observation_ready"
+    assert pack["bot_mode"]["kalshi_credentials"] == "set_redacted"
+    assert gate["status"] == "pass"
+    assert gate["value"] is True
+    assert gate["credentials_configured"] is True
+    assert gate["kalshi_env"] == "demo"
+
+
 def test_readiness_audit_pack_is_read_only_and_compact() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
