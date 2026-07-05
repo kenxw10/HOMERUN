@@ -948,11 +948,48 @@ def test_pr4c_missing_raw_adapter_total_tail_is_shadow_only() -> None:
     )
 
     probability_hardening.apply_probability_hardening([central, tail], enabled=True)
+    tail.net_expected_value = Decimal("0.500000")
+    tail.probability_edge = Decimal("0.500000")
+    probability_hardening.finalize_probability_hardening_recommendation(
+        tail,
+        exceptional_min_net_ev=Decimal("0.120000"),
+        exceptional_min_prob_edge=Decimal("0.080000"),
+    )
 
     assert tail.probability_after_hardening == tail.probability_before_hardening
     assert tail.probability_hardening_status == "missing_raw_adapter"
     assert tail.probability_hardening_error_reason == "missing_raw_adapter"
     assert tail.probability_hardening_reason == "total_tail_one_way_cap_applied"
+    assert tail.probability_hardening_shadow_only is True
+    assert tail.probability_hardening_block_recommendation is True
+
+
+def test_pr4c_guardrails_preserve_failed_hardening_status() -> None:
+    central = _hardening_candidate(1092, line="8.5000", probability="0.200000", line_class="central", rank=6)
+    tail = _hardening_candidate(
+        1093,
+        line="13.5000",
+        probability="0.257191",
+        raw_probability="0.126447",
+        line_class="tail",
+        rank=11,
+        distance=5,
+        size=11,
+    )
+
+    probability_hardening.apply_probability_hardening([central, tail], enabled=True)
+    tail.net_expected_value = Decimal("0.500000")
+    tail.probability_edge = Decimal("0.500000")
+    probability_hardening.finalize_probability_hardening_recommendation(
+        tail,
+        exceptional_min_net_ev=Decimal("0.120000"),
+        exceptional_min_prob_edge=Decimal("0.080000"),
+    )
+
+    assert tail.probability_after_hardening == Decimal("0.176447")
+    assert tail.probability_hardening_status == "failed"
+    assert tail.probability_hardening_reason == "line_probability_monotonicity_failed"
+    assert tail.probability_hardening_error_reason == "ladder_probability_non_monotonic"
     assert tail.probability_hardening_shadow_only is True
     assert tail.probability_hardening_block_recommendation is True
 

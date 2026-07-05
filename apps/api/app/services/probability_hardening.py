@@ -154,10 +154,10 @@ def apply_probability_hardening(
                     )
                 )
                 if guardrail_reason:
-                    reason = guardrail_reason
-                if guardrail_status:
+                    reason = guardrail_reason if status != "failed" else reason
+                if guardrail_status and status != "failed":
                     status = guardrail_status
-                if guardrail_error:
+                if guardrail_error and status != "failed":
                     error_reason = guardrail_error
                 if guardrail_shadow:
                     shadow_only = True
@@ -212,7 +212,10 @@ def finalize_probability_hardening_recommendation(
         and _family(candidate) in TOTAL_FAMILIES
         and line_class == "tail"
     )
-    if line_class == "tail" and status != "failed" and exceptional:
+    if line_class == "tail" and status in {"failed", "missing_raw_adapter", "error"}:
+        candidate.probability_hardening_shadow_only = True
+        candidate.probability_hardening_block_recommendation = True
+    elif line_class == "tail" and exceptional:
         candidate.probability_hardening_shadow_only = False
         candidate.probability_hardening_block_recommendation = False
         candidate.probability_hardening_reason = (
