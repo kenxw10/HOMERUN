@@ -1208,6 +1208,43 @@ Expected readiness behavior:
 - `operator_checklist` is present and requires a separate explicit live-readiness design PR before any live order path.
 - `/v1/system/status` and `/v1/dashboard/summary` expose only compact readiness summaries. They should not include raw payloads, feature blobs, scoring rationale, orderbook data, or full job results.
 
+## PR4b.1 Settlement Job Memory and Stale-Run Hardening Validation
+
+PR4b.1 is an operational hardening PR. It must not change live trading, candidate selection, EV thresholds, risk caps, model math, settlement formulas, source ingestion, market discovery, WebSocket behavior, credentials, sportsbook/Odds API scope, team totals, umpire factors, or MVE/multivariate markets.
+
+After deployment, run a current-date status check first:
+
+```powershell
+$base = "https://homerun-production-2551.up.railway.app"
+$headers = @{"X-API-Key"="YOUR_KEY"}
+$systemBefore = Invoke-RestMethod "$base/v1/system/status"
+$dashboardBefore = Invoke-RestMethod "$base/v1/dashboard/summary"
+$systemBefore.readiness | Format-List
+$dashboardBefore.readiness | Format-List
+```
+
+Expected: readiness remains compact, live readiness remains blocked for live, and no raw job result, raw payload, scoring rationale, feature blob, or orderbook payload is returned.
+
+Run settlement for a completed target date twice:
+
+```powershell
+$targetDate = "YYYY-MM-DD"
+$first = Invoke-RestMethod -Method Post -Headers $headers "$base/v1/jobs/run/settlement?target_date=$targetDate"
+$second = Invoke-RestMethod -Method Post -Headers $headers "$base/v1/jobs/run/settlement?target_date=$targetDate"
+$first.result.settlement | Format-List
+$second.result.settlement | Format-List
+```
+
+Expected:
+
+- The first run succeeds or cleanly skips unsupported/not-ready rows.
+- The second run is idempotent: already-settled rows are reported without duplicate settlement rows or duplicate realized P/L.
+- Settlement results include `settlement_memory_policy_version=pr4b1_bounded_settlement_query_v1`.
+- Batch warnings are explicit when caps are reached: `candidate_labels_limited_by_batch_cap`, `open_trade_settlement_limited_by_batch_cap`, and `audit_backfill_limited_by_batch_cap`.
+- `/v1/system/status` and `/v1/dashboard/summary` show `latest_settlement_job_status` and settlement warning booleans without exposing raw job payloads.
+
+If a production settlement job is stuck in `running` beyond the stale threshold, the next settlement start should mark it `failed_stale` and attach a compact warning with `stale_running_job_recovered`. Dashboard and readiness summaries should show the stale/operational warning until a fresh settlement run succeeds.
+
 ## Required Context Updates
 
 Every PR must update `PROJECT_CONTEXT.md`.

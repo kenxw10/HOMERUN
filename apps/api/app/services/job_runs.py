@@ -26,7 +26,7 @@ from app.services.portfolio import create_balance_snapshot
 from app.services.position_refresh import refresh_open_position_prices
 from app.services.settlement import settle_paper_trades
 from app.services.spread_audit import run_spread_audit
-from app.time_utils import ensure_aware_utc, today_eastern, utc_now
+from app.time_utils import ensure_aware_utc, today_eastern, to_eastern_iso, utc_now
 
 JOB_NAMES = {
     "daily-setup",
@@ -39,6 +39,11 @@ JOB_NAMES = {
 }
 DATE_INSENSITIVE_LOCK_JOBS = {"price-refresh"}
 TODAY_DEFAULT_LOCK_JOBS = {"daily-setup", "candidate-sweep", "settlement", "full-paper-cycle", "spread-audit"}
+SETTLEMENT_JOB_STATUS_POLICY_VERSION = "pr4b1_settlement_job_status_hardening_v1"
+SETTLEMENT_STALE_RUNNING_THRESHOLD_MINUTES = 30
+SETTLEMENT_RUNNING_STATUS_RECOVERY_ENABLED = True
+SETTLEMENT_STALE_RECOVERY_STATUS = "failed_stale"
+SETTLEMENT_OPERATIONAL_WARNING_STATUSES = {"failed", "failed_stale", "stale_failed", "timed_out", "recoverable_failure"}
 
 
 def _job_lock_key(job_name: str, target_date: date | None) -> str:
@@ -295,6 +300,140 @@ def _duration_seconds(started_at) -> int:
     return max(0, int((utc_now() - ensure_aware_utc(started_at)).total_seconds()))
 
 
+def _job_age_minutes(started_at, now=None) -> int:
+    current = now or utc_now()
+    return max(0, int((ensure_aware_utc(current) - ensure_aware_utc(started_at)).total_seconds() // 60))
+
+
+def mark_stale_settlement_jobs(
+    session: Session,
+    *,
+    epoch_id: int | None = None,
+    threshold_minutes: int = SETTLEMENT_STALE_RUNNING_THRESHOLD_MINUTES,
+    now=None,
+) -> list[dict[str, object]]:
+    current = now or utc_now()
+    cutoff = current - timedelta(minutes=threshold_minutes)
+    query = (
+        select(JobRun)
+        .where(JobRun.job_name == "settlement")
+        .where(JobRun.status == "running")
+        .where(JobRun.started_at < cutoff)
+        .order_by(JobRun.started_at.asc(), JobRun.id.asc())
+    )
+    if epoch_id is not None:
+        query = query.where(JobRun.paper_trading_epoch_id == epoch_id)
+    recovered: list[dict[str, object]] = []
+    for run in session.scalars(query):
+        age_minutes = _job_age_minutes(run.started_at, current)
+        warning = {
+            "code": "stale_running_job_recovered",
+            "job_run_id": run.id,
+            "job_name": run.job_name,
+            "previous_status": "running",
+            "status": SETTLEMENT_STALE_RECOVERY_STATUS,
+            "started_at": to_eastern_iso(run.started_at),
+            "stale_age_minutes": age_minutes,
+            "threshold_minutes": threshold_minutes,
+            "recovery_action": "marked_failed_stale",
+            "policy_version": SETTLEMENT_JOB_STATUS_POLICY_VERSION,
+        }
+        run.status = SETTLEMENT_STALE_RECOVERY_STATUS
+        run.completed_at = current
+        run.heartbeat_at = current
+        run.duration_seconds = max(0, int((ensure_aware_utc(current) - ensure_aware_utc(run.started_at)).total_seconds()))
+        run.errors = [
+            *list(run.errors or []),
+            {
+                "message": "Settlement job exceeded stale-running threshold and was marked failed_stale.",
+                "type": "SettlementJobStaleTimeout",
+                **warning,
+            },
+        ]
+        run.warnings = [*list(run.warnings or []), warning]
+        run.result = {
+            **dict(run.result or {}),
+            "status": SETTLEMENT_STALE_RECOVERY_STATUS,
+            "settlement_job_status_policy_version": SETTLEMENT_JOB_STATUS_POLICY_VERSION,
+            "settlement_stale_running_threshold_minutes": threshold_minutes,
+            "settlement_running_status_recovery_enabled": SETTLEMENT_RUNNING_STATUS_RECOVERY_ENABLED,
+            "stale_running_job_recovered": True,
+            "stale_settlement_job_age_minutes": age_minutes,
+            "stale_settlement_job_recovery_action": "marked_failed_stale",
+        }
+        session.add(run)
+        recovered.append(warning)
+    session.flush()
+    return recovered
+
+
+def settlement_job_status_summary(
+    session: Session,
+    *,
+    epoch_id: int | None = None,
+    threshold_minutes: int = SETTLEMENT_STALE_RUNNING_THRESHOLD_MINUTES,
+    now=None,
+) -> dict[str, object]:
+    current = now or utc_now()
+    query = (
+        select(
+            JobRun.id,
+            JobRun.status,
+            JobRun.started_at,
+            JobRun.completed_at,
+            JobRun.duration_seconds,
+            JobRun.target_date,
+        )
+        .where(JobRun.job_name == "settlement")
+    )
+    if epoch_id is not None:
+        query = query.where(JobRun.paper_trading_epoch_id == epoch_id)
+    query = query.order_by(JobRun.started_at.desc(), JobRun.id.desc()).limit(1)
+    row = session.execute(query).first()
+    base: dict[str, object] = {
+        "settlement_job_status_policy_version": SETTLEMENT_JOB_STATUS_POLICY_VERSION,
+        "settlement_stale_running_threshold_minutes": threshold_minutes,
+        "settlement_running_status_recovery_enabled": SETTLEMENT_RUNNING_STATUS_RECOVERY_ENABLED,
+        "stale_settlement_job_warning": False,
+        "settlement_job_operational_warning": False,
+        "stale_settlement_job_recovery_action": None,
+    }
+    if row is None:
+        return {**base, "latest_settlement_job_status": "not_run", "latest_settlement_job": {"status": "not_run"}}
+
+    age_minutes = _job_age_minutes(row.started_at, current)
+    stale_running = row.status == "running" and age_minutes >= threshold_minutes
+    latest_status = "stale_running" if stale_running else row.status
+    stale_warning = stale_running or row.status in {SETTLEMENT_STALE_RECOVERY_STATUS, "stale_failed", "timed_out"}
+    operational_warning = stale_warning or row.status in SETTLEMENT_OPERATIONAL_WARNING_STATUSES
+    recovery_action = (
+        "mark_failed_stale_on_next_settlement_start"
+        if stale_running
+        else "marked_failed_stale"
+        if row.status == SETTLEMENT_STALE_RECOVERY_STATUS
+        else None
+    )
+    latest = {
+        "job_run_id": row.id,
+        "status": latest_status,
+        "stored_status": row.status,
+        "started_at": to_eastern_iso(row.started_at),
+        "completed_at": to_eastern_iso(row.completed_at),
+        "duration_seconds": row.duration_seconds,
+        "target_date": row.target_date.isoformat() if row.target_date else None,
+    }
+    return {
+        **base,
+        "latest_settlement_job": latest,
+        "latest_settlement_job_status": latest_status,
+        "stale_settlement_job_warning": stale_warning,
+        "settlement_job_operational_warning": operational_warning,
+        "stale_settlement_job_started_at": latest["started_at"] if stale_warning else None,
+        "stale_settlement_job_age_minutes": age_minutes if stale_warning else None,
+        "stale_settlement_job_recovery_action": recovery_action,
+    }
+
+
 def mark_stale_running_jobs(session: Session, *, max_runtime_minutes: int = 60) -> int:
     cutoff = utc_now() - timedelta(minutes=max_runtime_minutes)
     stale_runs = list(
@@ -327,7 +466,13 @@ def acquire_job_lock(
         raise ValueError(f"Unknown job: {job_name}")
     epoch = get_or_create_active_paper_epoch(session)
     target_date = _effective_job_target_date(job_name, target_date)
-    mark_stale_running_jobs(session, max_runtime_minutes=max_runtime_minutes)
+    recovered_settlement_jobs = (
+        mark_stale_settlement_jobs(session, epoch_id=epoch.id)
+        if job_name == "settlement"
+        else []
+    )
+    if job_name != "settlement":
+        mark_stale_running_jobs(session, max_runtime_minutes=max_runtime_minutes)
     lock_key = _job_lock_key(job_name, target_date)
 
     def skipped_for_existing(existing: JobRun) -> tuple[JobRun, bool]:
@@ -346,7 +491,7 @@ def acquire_job_lock(
             result={"skipped_reason": "skipped_existing_run", "existing_run_id": existing.id},
             steps=[],
             errors=[],
-            warnings=[],
+            warnings=recovered_settlement_jobs,
             idempotency_key=lock_key,
         )
         session.add(skipped)
@@ -376,7 +521,7 @@ def acquire_job_lock(
         steps=[],
         result={},
         errors=[],
-        warnings=[],
+        warnings=recovered_settlement_jobs,
         idempotency_key=lock_key,
     )
     session.add(run)
@@ -665,5 +810,6 @@ def run_job(
         "duration_seconds": run.duration_seconds,
         "steps": run.steps or [],
         "result": run.result or {},
+        "warnings": run.warnings or [],
         "errors": errors if run.status == "failed" else [],
     }

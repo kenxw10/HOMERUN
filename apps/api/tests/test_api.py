@@ -2011,6 +2011,128 @@ def test_dashboard_job_status_fetches_latest_per_job_without_global_truncation()
     assert debug_summary.job_status["full-paper-cycle"].result == {"cycle": "present"}
 
 
+def test_dashboard_and_readiness_report_stale_running_settlement_job() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    stale_started = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+
+    with Session(engine) as session:
+        active = get_or_create_active_paper_epoch(session, starting_balance=Decimal("500.00"))
+        session.add(
+            JobRun(
+                job_name="settlement",
+                job_type="paper_ops",
+                paper_trading_epoch_id=active.id,
+                status="running",
+                started_at=stale_started,
+                target_date=date(2026, 7, 4),
+                result={"large": "x" * 1000},
+            )
+        )
+        session.commit()
+
+        summary = dashboard.dashboard_summary_from_db(session)
+        pack = readiness.readiness_audit_pack(session)
+
+    settlement_status = summary.job_status["settlement"]
+    assert settlement_status.status == "stale_running"
+    assert settlement_status.result["settlement_job_status_policy_version"] == (
+        job_runs.SETTLEMENT_JOB_STATUS_POLICY_VERSION
+    )
+    assert settlement_status.result["stale_settlement_job_warning"] is True
+    assert settlement_status.result["settlement_job_operational_warning"] is True
+    assert pack["settlement_audit"]["latest_settlement_job_status"] == "stale_running"
+    assert pack["operational_warnings"]["settlement_job_stale_warning"] is True
+    assert pack["paper_observation_status"] == "paper_observation_ready"
+    assert pack["live_readiness_status"] == "blocked_for_live"
+    compact = readiness.compact_readiness_summary(pack)
+    assert compact["settlement_job_stale_warning"] is True
+    assert "large" not in json.dumps(settlement_status.result)
+    assert "raw_payload" not in json.dumps(pack)
+    assert "job_result" not in json.dumps(pack)
+
+
+def test_recent_running_settlement_job_is_not_marked_stale() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        active = get_or_create_active_paper_epoch(session, starting_balance=Decimal("500.00"))
+        session.add(
+            JobRun(
+                job_name="settlement",
+                job_type="paper_ops",
+                paper_trading_epoch_id=active.id,
+                status="running",
+                started_at=datetime.now(UTC),
+                target_date=date(2026, 7, 5),
+            )
+        )
+        session.commit()
+
+        summary = dashboard.dashboard_summary_from_db(session)
+        pack = readiness.readiness_audit_pack(session)
+
+    settlement_status = summary.job_status["settlement"]
+    assert settlement_status.status == "running"
+    assert settlement_status.result["stale_settlement_job_warning"] is False
+    assert pack["settlement_audit"]["latest_settlement_job_status"] == "running"
+    assert pack["operational_warnings"]["settlement_job_stale_warning"] is False
+
+
+def test_settlement_job_start_recovers_stale_running_job(monkeypatch) -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    stale_started = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+    target = date(2026, 7, 5)
+
+    monkeypatch.setattr(
+        job_runs,
+        "sync_results",
+        lambda _session, day: {
+            "target_dates": [day.isoformat()],
+            "games_updated": 0,
+            "missing_games": 0,
+            "final_games": 0,
+        },
+    )
+
+    with Session(engine) as session:
+        active = get_or_create_active_paper_epoch(session, starting_balance=Decimal("500.00"))
+        stale = JobRun(
+            job_name="settlement",
+            job_type="paper_ops",
+            paper_trading_epoch_id=active.id,
+            status="running",
+            started_at=stale_started,
+            target_date=date(2026, 7, 4),
+            result={"status": "running"},
+        )
+        session.add(stale)
+        session.commit()
+
+        result = job_runs.run_job(session, job_name="settlement", target_date=target)
+        recovered = session.get(JobRun, stale.id)
+        runs = list(
+            session.scalars(select(JobRun).where(JobRun.job_name == "settlement").order_by(JobRun.id.asc()))
+        )
+
+    assert result["status"] == "succeeded"
+    assert result["warnings"]
+    assert result["warnings"][0]["code"] == "stale_running_job_recovered"
+    assert recovered is not None
+    assert recovered.status == job_runs.SETTLEMENT_STALE_RECOVERY_STATUS
+    assert recovered.completed_at is not None
+    assert recovered.duration_seconds is not None
+    assert recovered.result["stale_running_job_recovered"] is True
+    assert recovered.result["settlement_job_status_policy_version"] == job_runs.SETTLEMENT_JOB_STATUS_POLICY_VERSION
+    assert len(runs) == 2
+    assert runs[-1].status == "succeeded"
+    assert result["result"]["settlement"]["settlement_memory_policy_version"] == (
+        settlement.SETTLEMENT_MEMORY_POLICY_VERSION
+    )
+
+
 def test_dashboard_summary_compacts_heavy_job_payloads_by_default() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
@@ -2698,6 +2820,59 @@ def test_readiness_endpoint_and_summaries_expose_compact_status(monkeypatch) -> 
     assert dashboard_readiness["policy_version"] == readiness.READINESS_POLICY_VERSION
     assert dashboard_readiness["live_readiness_status"] == "blocked_for_live"
     assert "candidate_pipeline" not in dashboard_readiness
+
+
+def test_system_status_reports_stale_settlement_job_warning(monkeypatch) -> None:
+    engine = create_engine(
+        "sqlite+pysqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    SessionLocal = sessionmaker(bind=engine)
+    with SessionLocal() as session:
+        active = get_or_create_active_paper_epoch(session, starting_balance=Decimal("500.00"))
+        session.add(
+            JobRun(
+                job_name="settlement",
+                job_type="paper_ops",
+                paper_trading_epoch_id=active.id,
+                status="running",
+                started_at=datetime(2026, 1, 1, 12, 0, tzinfo=UTC),
+                target_date=date(2026, 7, 4),
+                result={"raw_payload": {"large": "x" * 1000}},
+            )
+        )
+        session.commit()
+
+    monkeypatch.setattr(
+        main_module,
+        "database_status",
+        lambda: {"ready": True, "configured": True, "dialect": "sqlite", "message": "ok"},
+    )
+    monkeypatch.setattr(main_module, "get_session_factory", lambda: SessionLocal)
+    monkeypatch.setattr(
+        main_module,
+        "source_status_report",
+        lambda _session: {
+            "feature_sync_enable_network_sources": True,
+            "public_sources_enabled": True,
+            "validation_status": "ok",
+            "latest_errors": [],
+            "last_feature_sync_status": {},
+            "source_health": [],
+        },
+    )
+
+    response = client.get("/v1/system/status")
+
+    assert response.status_code == 200
+    readiness_payload = response.json()["readiness"]
+    assert readiness_payload["latest_settlement_job_status"] == "stale_running"
+    assert readiness_payload["settlement_job_stale_warning"] is True
+    assert readiness_payload["settlement_job_operational_warning"] is True
+    assert readiness_payload["live_readiness_status"] == "blocked_for_live"
+    assert "raw_payload" not in json.dumps(readiness_payload)
 
 
 def test_system_status_preserves_source_config_when_database_ready(monkeypatch) -> None:
@@ -8982,6 +9157,10 @@ def test_paper_settlement_sync_settles_wins_losses_and_is_idempotent() -> None:
         snapshots = list(session.scalars(select(BalanceSnapshot)))
 
     assert selected_team_from_ticker("KXMLBGAME-26JUL011900SEAPIT-PIT") == "PIT"
+    assert result["settlement_memory_policy_version"] == settlement.SETTLEMENT_MEMORY_POLICY_VERSION
+    assert result["candidate_labels_limited_by_batch_cap"] is False
+    assert result["audit_backfill_limited_by_batch_cap"] is False
+    assert result["open_trade_settlement_limited_by_batch_cap"] is False
     assert result["candidate_labels_checked"] == 3
     assert result["candidate_labels_created"] == 3
     assert second_result["candidate_labels_created"] == 0
@@ -9677,6 +9856,139 @@ def _add_settlement_trade(
         )
         session.add(position)
     return trade, candidate, market, position
+
+
+def test_settlement_sync_uses_bounded_target_date_batches() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        epoch_id = _active_epoch_id(session)
+        old_game = MlbGame(
+            external_game_id="bounded-old",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 6, 1, 23, 0, tzinfo=UTC),
+            status="Final",
+            home_score=5,
+            away_score=3,
+        )
+        target_game = MlbGame(
+            external_game_id="bounded-target",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+            status="Final",
+            home_score=5,
+            away_score=3,
+        )
+        session.add_all([old_game, target_game])
+        session.flush()
+        old_trades = [
+            _add_settlement_trade(
+                session,
+                epoch_id=epoch_id,
+                game=old_game,
+                ticker=f"KXMLBGAME-26JUN011900SEAPIT-OLD{i}-PIT",
+                family="full_game_winner",
+                selection="PIT",
+            )[0]
+            for i in range(3)
+        ]
+        target_trades = [
+            _add_settlement_trade(
+                session,
+                epoch_id=epoch_id,
+                game=target_game,
+                ticker=f"KXMLBGAME-26JUL011900SEAPIT-TARGET{i}-PIT",
+                family="full_game_winner",
+                selection="PIT",
+            )[0]
+            for i in range(3)
+        ]
+        session.commit()
+
+        result = settle_paper_trades(
+            session,
+            date(2026, 7, 1),
+            now=datetime(2026, 7, 2, 4, 0, tzinfo=UTC),
+            candidate_label_batch_limit=2,
+            open_trade_batch_limit=10,
+        )
+        for trade in [*old_trades, *target_trades]:
+            session.refresh(trade)
+
+    assert result["settlement_memory_policy_version"] == settlement.SETTLEMENT_MEMORY_POLICY_VERSION
+    assert result["candidate_labels_checked"] == 2
+    assert result["candidate_labels_limited_by_batch_cap"] is True
+    assert result["open_trade_settlement_limited_by_batch_cap"] is False
+    assert result["settled"] == 3
+    assert [trade.status for trade in old_trades] == ["open", "open", "open"]
+    assert [trade.status for trade in target_trades] == ["settled", "settled", "settled"]
+
+
+def test_settlement_audit_backfill_respects_batch_cap() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    settled_at = datetime(2026, 7, 2, 4, 0, tzinfo=UTC)
+
+    with Session(engine) as session:
+        epoch_id = _active_epoch_id(session)
+        game = MlbGame(
+            external_game_id="audit-backfill-cap",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+            status="Final",
+            home_score=5,
+            away_score=3,
+        )
+        session.add(game)
+        session.flush()
+        trades = [
+            _add_settlement_trade(
+                session,
+                epoch_id=epoch_id,
+                game=game,
+                ticker=f"KXMLBGAME-26JUL011900SEAPIT-BACKFILL{i}-PIT",
+                family="full_game_winner",
+                selection="PIT",
+                current_price=Decimal("1.0000"),
+            )[0]
+            for i in range(3)
+        ]
+        for trade in trades:
+            trade.status = "settled"
+            trade.outcome = "win"
+            trade.resolution = "WIN"
+            trade.exit_price = Decimal("1.0000")
+            trade.exit_time = settled_at
+            trade.settled_at = settled_at
+            trade.realized_pnl = Decimal("0.55")
+            trade.fee_paid = Decimal("0.00")
+            session.add(trade)
+        session.commit()
+
+        result = settle_paper_trades(
+            session,
+            date(2026, 7, 1),
+            now=datetime(2026, 7, 3, 4, 0, tzinfo=UTC),
+            audit_backfill_batch_limit=2,
+        )
+        refreshed = list(session.scalars(select(PaperTrade).order_by(PaperTrade.id.asc())))
+
+    assert result["already_settled"] == 3
+    assert result["audit_backfill_candidates_checked"] == 2
+    assert result["audit_backfill_rows_updated"] == 2
+    assert result["already_settled_audit_backfilled"] == 2
+    assert result["audit_backfill_limited_by_batch_cap"] is True
+    assert len([trade for trade in refreshed if trade.settlement_audit_key]) == 2
 
 
 def test_first_five_total_settles_before_full_game_final_and_is_idempotent() -> None:
