@@ -74,6 +74,7 @@ from app.services import (
     probability_hardening,
     pybaseball_client,
     risk_governance,
+    settlement,
     ws_market_data,
 )
 from app.services.contracts import contract_labels, selected_team_from_ticker
@@ -8496,6 +8497,41 @@ def test_resolver_uses_event_ticker_time_and_team_codes_for_validation() -> None
     assert match.metadata["time_delta_minutes"] == 0
     assert match.metadata["team_match_score"] == 1.0
     assert match.metadata["ticker_team_codes_match"] is True
+
+
+def test_settlement_formula_does_not_default_unknown_total_side_to_under() -> None:
+    missing_side_formula = settlement._settlement_formula(
+        market_type="full_game_total",
+        contract_side="yes",
+        line_value=Decimal("8.0000"),
+        selection_code=None,
+        over_under_side=None,
+        inning_scope=None,
+    )
+    invalid_side_formula = settlement._settlement_formula(
+        market_type="first_five_total",
+        contract_side="no",
+        line_value=Decimal("4.5000"),
+        selection_code=None,
+        over_under_side="total",
+        inning_scope="first_five",
+    )
+    over_formula = settlement._settlement_formula(
+        market_type="full_game_total",
+        contract_side="yes",
+        line_value=Decimal("8.0000"),
+        selection_code=None,
+        over_under_side="over",
+        inning_scope=None,
+    )
+
+    assert missing_side_formula == "full_game: total settlement formula unavailable because over/under side is unknown; side=yes"
+    assert (
+        invalid_side_formula
+        == "first_five: total settlement formula unavailable because over/under side is unknown; side=no"
+    )
+    assert "total_runs > 8" in over_formula
+    assert "total_runs <" not in over_formula
 
 
 def test_paper_settlement_sync_settles_wins_losses_and_is_idempotent() -> None:

@@ -74,6 +74,8 @@ def _settlement_formula(
             return f"{scope}: yes wins when first-five score is tied; no wins when either team leads; side={side}"
         return f"{scope}: yes wins when {selected} has more runs than opponent; no wins otherwise; side={side}"
     if market_type in {FULL_GAME_TOTAL, FIRST_FIVE_TOTAL}:
+        if over_under_side not in {"over", "under"}:
+            return f"{scope}: total settlement formula unavailable because over/under side is unknown; side={side}"
         comparator = ">" if over_under_side == "over" else "<"
         return f"{scope}: yes wins when total_runs {comparator} {_line_text(line_value)}; push when equal; side={side}"
     if market_type == FULL_GAME_SPREAD and verification is not None and verification.settlement_formula:
