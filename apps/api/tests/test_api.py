@@ -2415,6 +2415,42 @@ def test_readiness_requires_governance_evidence_before_available() -> None:
     assert component["evidence"]["clean_resolved_mature_samples"] == 0
 
 
+def test_readiness_requires_complete_terminal_settlement_audit_fields() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    now = datetime(2026, 7, 4, 16, 0, tzinfo=UTC)
+
+    with Session(engine) as session:
+        epoch = get_or_create_active_paper_epoch(session, starting_balance=Decimal("500.00"))
+        session.add(
+            PaperTrade(
+                paper_trading_epoch_id=epoch.id,
+                market_ticker="KXMLBGAME-INCOMPLETE-AUDIT",
+                contract_side="yes",
+                entry_price=Decimal("0.5000"),
+                current_price=Decimal("1.0000"),
+                quantity=1,
+                entry_time=now - timedelta(hours=3),
+                status="settled",
+                outcome="win",
+                settled_at=now,
+                settlement_audit_key="settlement:incomplete:1",
+                settlement_formula_version=settlement.SETTLEMENT_FORMULA_VERSION,
+                settlement_idempotency_key="settlement:incomplete:1",
+            )
+        )
+        session.commit()
+        pack = readiness.readiness_audit_pack(session)
+
+    component = next(
+        item for item in pack["validated_components"] if item["component"] == "pr4a_settlement_accounting_audit"
+    )
+    assert pack["settlement_audit"]["checked_or_terminal_trade_count"] == 1
+    assert pack["settlement_audit"]["audit_metadata_trade_count"] == 0
+    assert pack["settlement_audit"]["missing_audit_metadata_trade_count"] == 1
+    assert component["status"] == "unknown_due_missing_evidence"
+
+
 def test_readiness_audit_pack_is_read_only_and_compact() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)

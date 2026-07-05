@@ -321,6 +321,18 @@ def _model_governance(session: Session | None, epoch: PaperTradingEpoch | None) 
     }
 
 
+def _settlement_audit_complete_clause() -> Any:
+    return and_(
+        PaperTrade.settlement_audit_key.is_not(None),
+        PaperTrade.settlement_formula_version.is_not(None),
+        PaperTrade.settlement_formula.is_not(None),
+        PaperTrade.settlement_status.is_not(None),
+        PaperTrade.settlement_idempotency_key.is_not(None),
+        PaperTrade.settlement_payout.is_not(None),
+        PaperTrade.settlement_fee_adjustment.is_not(None),
+    )
+
+
 def _settlement_audit(session: Session | None, epoch: PaperTradingEpoch | None) -> dict[str, object]:
     if session is None or epoch is None:
         return {
@@ -329,25 +341,21 @@ def _settlement_audit(session: Session | None, epoch: PaperTradingEpoch | None) 
         }
     trade_filter = PaperTrade.paper_trading_epoch_id == epoch.id
     settled_or_checked = PaperTrade.status.in_(("settled", "closed", "void")) | PaperTrade.settlement_checked_at.is_not(None)
+    complete_audit_clause = _settlement_audit_complete_clause()
     checked_count = _count(session, select(func.count(PaperTrade.id)).where(trade_filter).where(settled_or_checked))
     audit_count = _count(
         session,
         select(func.count(PaperTrade.id))
         .where(trade_filter)
-        .where(PaperTrade.settlement_audit_key.is_not(None))
-        .where(PaperTrade.settlement_formula_version.is_not(None))
-        .where(PaperTrade.settlement_idempotency_key.is_not(None)),
+        .where(settled_or_checked)
+        .where(complete_audit_clause),
     )
     missing_audit_count = _count(
         session,
         select(func.count(PaperTrade.id))
         .where(trade_filter)
         .where(settled_or_checked)
-        .where(
-            (PaperTrade.settlement_audit_key.is_(None))
-            | (PaperTrade.settlement_formula_version.is_(None))
-            | (PaperTrade.settlement_idempotency_key.is_(None))
-        ),
+        .where(~complete_audit_clause),
     )
     settlement_rows = _count(
         session,
