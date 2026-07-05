@@ -1571,6 +1571,13 @@ def _latest_job_status(
         )
         for row in compact_rows
     }
+    if "settlement" not in latest and settlement_status.get("stale_settlement_job_warning"):
+        latest["settlement"] = JobRunSummary(
+            job_name="settlement",
+            status=str(settlement_status.get("latest_settlement_job_status") or "stale_running"),
+            result_is_compact=True,
+            result={key: settlement_status.get(key) for key in settlement_result_keys if key in settlement_status},
+        )
 
     detailed_names = {row.job_name for row in compact_rows} if include_job_results else (detailed_job_names or set())
     detailed_ids = [row.id for row in compact_rows if row.job_name in detailed_names]

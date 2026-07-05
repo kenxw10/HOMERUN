@@ -375,6 +375,24 @@ def settlement_job_status_summary(
     now=None,
 ) -> dict[str, object]:
     current = now or utc_now()
+    cutoff = current - timedelta(minutes=threshold_minutes)
+    stale_query = (
+        select(
+            JobRun.id,
+            JobRun.status,
+            JobRun.started_at,
+            JobRun.completed_at,
+            JobRun.duration_seconds,
+            JobRun.target_date,
+            JobRun.paper_trading_epoch_id,
+        )
+        .where(JobRun.job_name == "settlement")
+        .where(JobRun.status == "running")
+        .where(JobRun.started_at < cutoff)
+        .order_by(JobRun.started_at.asc(), JobRun.id.asc())
+        .limit(1)
+    )
+    stale_row = session.execute(stale_query).first()
     query = (
         select(
             JobRun.id,
@@ -399,16 +417,37 @@ def settlement_job_status_summary(
         "stale_settlement_job_recovery_action": None,
     }
     if row is None:
-        return {**base, "latest_settlement_job_status": "not_run", "latest_settlement_job": {"status": "not_run"}}
+        stale_warning = stale_row is not None
+        latest_status = "stale_running" if stale_warning else "not_run"
+        return {
+            **base,
+            "latest_settlement_job_status": latest_status,
+            "latest_settlement_job": {"status": latest_status},
+            "stale_settlement_job_warning": stale_warning,
+            "settlement_job_operational_warning": stale_warning,
+            "stale_settlement_job_id": stale_row.id if stale_row is not None else None,
+            "stale_settlement_job_epoch_id": stale_row.paper_trading_epoch_id if stale_row is not None else None,
+            "stale_settlement_job_started_at": to_eastern_iso(stale_row.started_at) if stale_row is not None else None,
+            "stale_settlement_job_age_minutes": _job_age_minutes(stale_row.started_at, current)
+            if stale_row is not None
+            else None,
+            "stale_settlement_job_recovery_action": "mark_failed_stale_on_next_settlement_start"
+            if stale_row is not None
+            else None,
+        }
 
     age_minutes = _job_age_minutes(row.started_at, current)
     stale_running = row.status == "running" and age_minutes >= threshold_minutes
     latest_status = "stale_running" if stale_running else row.status
-    stale_warning = stale_running or row.status in {SETTLEMENT_STALE_RECOVERY_STATUS, "stale_failed", "timed_out"}
+    stale_warning = (
+        stale_row is not None
+        or stale_running
+        or row.status in {SETTLEMENT_STALE_RECOVERY_STATUS, "stale_failed", "timed_out"}
+    )
     operational_warning = stale_warning or row.status in SETTLEMENT_OPERATIONAL_WARNING_STATUSES
     recovery_action = (
         "mark_failed_stale_on_next_settlement_start"
-        if stale_running
+        if stale_row is not None or stale_running
         else "marked_failed_stale"
         if row.status == SETTLEMENT_STALE_RECOVERY_STATUS
         else None
@@ -428,8 +467,22 @@ def settlement_job_status_summary(
         "latest_settlement_job_status": latest_status,
         "stale_settlement_job_warning": stale_warning,
         "settlement_job_operational_warning": operational_warning,
-        "stale_settlement_job_started_at": latest["started_at"] if stale_warning else None,
-        "stale_settlement_job_age_minutes": age_minutes if stale_warning else None,
+        "stale_settlement_job_id": stale_row.id if stale_row is not None else row.id if stale_running else None,
+        "stale_settlement_job_epoch_id": stale_row.paper_trading_epoch_id if stale_row is not None else None,
+        "stale_settlement_job_started_at": (
+            to_eastern_iso(stale_row.started_at)
+            if stale_row is not None
+            else latest["started_at"]
+            if stale_running
+            else None
+        ),
+        "stale_settlement_job_age_minutes": (
+            _job_age_minutes(stale_row.started_at, current)
+            if stale_row is not None
+            else age_minutes
+            if stale_running
+            else None
+        ),
         "stale_settlement_job_recovery_action": recovery_action,
     }
 
@@ -466,11 +519,7 @@ def acquire_job_lock(
         raise ValueError(f"Unknown job: {job_name}")
     epoch = get_or_create_active_paper_epoch(session)
     target_date = _effective_job_target_date(job_name, target_date)
-    recovered_settlement_jobs = (
-        mark_stale_settlement_jobs(session, epoch_id=epoch.id)
-        if job_name == "settlement"
-        else []
-    )
+    recovered_settlement_jobs = mark_stale_settlement_jobs(session) if job_name == "settlement" else []
     if job_name != "settlement":
         mark_stale_running_jobs(session, max_runtime_minutes=max_runtime_minutes)
     lock_key = _job_lock_key(job_name, target_date)
@@ -759,7 +808,15 @@ def run_job(
     )
     if not acquired:
         session.commit()
-        return {"job_run_id": run.id, "status": run.status, **(run.result or {})}
+        return {
+            "job_run_id": run.id,
+            "job_name": run.job_name,
+            "target_date": run.target_date.isoformat() if run.target_date else None,
+            "status": run.status,
+            "duration_seconds": run.duration_seconds,
+            "warnings": run.warnings or [],
+            **(run.result or {}),
+        }
 
     run_id = run.id
     session.commit()

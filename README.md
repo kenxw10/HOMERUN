@@ -398,6 +398,8 @@ PR4b.1 keeps settlement operations bounded and recoverable. Settlement jobs stuc
 
 Settlement sync now processes target-date candidate labels, open trades, and already-settled audit backfills through bounded batches. The job result reports compact policy, limit, and warning fields such as `settlement_memory_policy_version`, `candidate_labels_limited_by_batch_cap`, `open_trade_settlement_limited_by_batch_cap`, and `audit_backfill_limited_by_batch_cap`.
 
+The Railway Settlement Catchup service uses `python -m app.jobs.runner --job settlement --target-date yesterday_et`. That runner emits JSON logs for cron startup, target ET/UTC window, lock/skipped status, stale recovery decisions, settlement query scope, batch caps, settlement counts, balance snapshot action, clean completion, and caught exceptions.
+
 No migration or environment change is required. PR4b.1 does not change settlement formulas, settlement idempotency, candidate selection, EV thresholds, risk caps, model math, cron schedules, source ingestion, market discovery, WebSocket behavior, credentials, sportsbook/team-total/umpire scope, or live execution.
 
 ## Deployment

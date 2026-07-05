@@ -1212,6 +1212,14 @@ Expected readiness behavior:
 
 PR4b.1 is an operational hardening PR. It must not change live trading, candidate selection, EV thresholds, risk caps, model math, settlement formulas, source ingestion, market discovery, WebSocket behavior, credentials, sportsbook/Odds API scope, team totals, umpire factors, or MVE/multivariate markets.
 
+Railway Settlement Catchup uses:
+
+```powershell
+python -m app.jobs.runner --job settlement --target-date yesterday_et
+```
+
+The command should emit JSON log events for `cron_startup`, `target_date_resolved`, `lock_status`, `stale_run_recovery_decision`, `settlement_query_scope`, `settlement_batch_status`, `settlement_counts`, `balance_snapshot_action`, `clean_completion`, and `caught_exception_failure` when an exception escapes.
+
 After deployment, run a current-date status check first:
 
 ```powershell
@@ -1243,7 +1251,7 @@ Expected:
 - Batch warnings are explicit when caps are reached: `candidate_labels_limited_by_batch_cap`, `open_trade_settlement_limited_by_batch_cap`, and `audit_backfill_limited_by_batch_cap`.
 - `/v1/system/status` and `/v1/dashboard/summary` show `latest_settlement_job_status` and settlement warning booleans without exposing raw job payloads.
 
-If a production settlement job is stuck in `running` beyond the stale threshold, the next settlement start should mark it `failed_stale` and attach a compact warning with `stale_running_job_recovered`. Dashboard and readiness summaries should show the stale/operational warning until a fresh settlement run succeeds.
+If a production settlement job is stuck in `running` beyond the stale threshold, including a row from an archived epoch, the next settlement start should mark it `failed_stale` and attach a compact warning with `stale_running_job_recovered`. Dashboard and readiness summaries should show the stale/operational warning even when a newer settlement job for another target date has succeeded.
 
 ## Required Context Updates
 

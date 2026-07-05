@@ -2080,6 +2080,51 @@ def test_recent_running_settlement_job_is_not_marked_stale() -> None:
     assert pack["operational_warnings"]["settlement_job_stale_warning"] is False
 
 
+def test_dashboard_warns_on_older_stale_settlement_job_when_latest_succeeded() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    stale_started = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+    succeeded_started = datetime.now(UTC)
+
+    with Session(engine) as session:
+        active = get_or_create_active_paper_epoch(session, starting_balance=Decimal("500.00"))
+        session.add_all(
+            [
+                JobRun(
+                    job_name="settlement",
+                    job_type="paper_ops",
+                    paper_trading_epoch_id=active.id,
+                    status="running",
+                    started_at=stale_started,
+                    target_date=date(2026, 7, 4),
+                    lock_key="settlement:2026-07-04",
+                ),
+                JobRun(
+                    job_name="settlement",
+                    job_type="paper_ops",
+                    paper_trading_epoch_id=active.id,
+                    status="succeeded",
+                    started_at=succeeded_started,
+                    completed_at=succeeded_started + timedelta(seconds=5),
+                    target_date=date(2026, 7, 5),
+                    lock_key="settlement:2026-07-05",
+                ),
+            ]
+        )
+        session.commit()
+
+        summary = dashboard.dashboard_summary_from_db(session)
+        pack = readiness.readiness_audit_pack(session)
+
+    settlement_status = summary.job_status["settlement"]
+    assert settlement_status.status == "succeeded"
+    assert settlement_status.result["latest_settlement_job_status"] == "succeeded"
+    assert settlement_status.result["stale_settlement_job_warning"] is True
+    assert settlement_status.result["settlement_job_operational_warning"] is True
+    assert pack["operational_warnings"]["settlement_job_stale_warning"] is True
+    assert pack["operational_warnings"]["latest_settlement_job_status"] == "succeeded"
+
+
 def test_settlement_job_start_recovers_stale_running_job(monkeypatch) -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
@@ -2131,6 +2176,70 @@ def test_settlement_job_start_recovers_stale_running_job(monkeypatch) -> None:
     assert result["result"]["settlement"]["settlement_memory_policy_version"] == (
         settlement.SETTLEMENT_MEMORY_POLICY_VERSION
     )
+
+
+def test_settlement_job_start_recovers_stale_lock_from_archived_epoch(monkeypatch) -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    stale_started = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+    target = date(2026, 7, 5)
+
+    monkeypatch.setattr(
+        job_runs,
+        "sync_results",
+        lambda _session, day: {
+            "target_dates": [day.isoformat()],
+            "games_updated": 0,
+            "missing_games": 0,
+            "final_games": 0,
+        },
+    )
+
+    with Session(engine) as session:
+        archived = PaperTradingEpoch(
+            epoch_key="archived-pr4b1",
+            display_name="Archived PR4b.1",
+            status="archived",
+            mode="paper",
+            starting_balance=Decimal("500.00"),
+            started_at=stale_started,
+            archived_at=stale_started + timedelta(days=1),
+        )
+        session.add(archived)
+        session.flush()
+        active = get_or_create_active_paper_epoch(session, starting_balance=Decimal("500.00"))
+        stale = JobRun(
+            job_name="settlement",
+            job_type="paper_ops",
+            paper_trading_epoch_id=archived.id,
+            status="running",
+            started_at=stale_started,
+            target_date=target,
+            lock_key="settlement:2026-07-05",
+            idempotency_key="settlement:2026-07-05",
+        )
+        session.add(stale)
+        session.commit()
+
+        before_summary = dashboard.dashboard_summary_from_db(session)
+        result = job_runs.run_job(session, job_name="settlement", target_date=target)
+        recovered = session.get(JobRun, stale.id)
+        active_run = session.scalar(
+            select(JobRun)
+            .where(JobRun.paper_trading_epoch_id == active.id)
+            .where(JobRun.job_name == "settlement")
+            .where(JobRun.status == "succeeded")
+        )
+
+    assert before_summary.job_status["settlement"].status == "stale_running"
+    assert before_summary.job_status["settlement"].result["stale_settlement_job_warning"] is True
+    assert result["status"] == "succeeded"
+    assert "skipped_reason" not in result
+    assert result["warnings"]
+    assert result["warnings"][0]["code"] == "stale_running_job_recovered"
+    assert recovered is not None
+    assert recovered.status == job_runs.SETTLEMENT_STALE_RECOVERY_STATUS
+    assert active_run is not None
 
 
 def test_dashboard_summary_compacts_heavy_job_payloads_by_default() -> None:
@@ -3773,6 +3882,92 @@ def test_job_runner_forwards_candidate_sweep_window_args(monkeypatch) -> None:
     assert captured["max_time_to_start_minutes"] == 180
     assert captured["sweep_label"] == "pregame_window"
     assert captured["dry_run_candidates_only"] is False
+
+
+def test_job_runner_logs_settlement_catchup_events(monkeypatch, capsys) -> None:
+    captured: dict[str, object] = {}
+
+    class DummySession:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+    def fake_run_job(session, **kwargs):
+        captured.update(kwargs)
+        return {
+            "job_run_id": 123,
+            "job_name": "settlement",
+            "target_date": "2026-07-04",
+            "status": "succeeded",
+            "duration_seconds": 8,
+            "warnings": [{"code": "stale_running_job_recovered", "job_run_id": 99}],
+            "result": {
+                "settlement": {
+                    "bounded_target_date": "2026-07-04",
+                    "bounded_active_epoch_id": 1,
+                    "settlement_candidate_label_batch_limit": 1000,
+                    "settlement_audit_backfill_batch_limit": 250,
+                    "settlement_open_trade_batch_limit": 500,
+                    "candidate_labels_checked": 3,
+                    "audit_backfill_candidates_checked": 1,
+                    "checked": 2,
+                    "settled": 1,
+                    "already_settled": 1,
+                    "already_settled_audit_backfilled": 1,
+                    "skipped_not_final": 0,
+                    "skipped_unsupported": 0,
+                    "skipped_parse_uncertain": 0,
+                    "skipped_invalid_selection": 0,
+                    "candidate_labels_limited_by_batch_cap": False,
+                    "audit_backfill_limited_by_batch_cap": False,
+                    "open_trade_settlement_limited_by_batch_cap": False,
+                    "warnings": [],
+                    "skip_reasons": {},
+                },
+                "balance_snapshot": {"snapshot_id": 77},
+            },
+        }
+
+    monkeypatch.setattr(job_runner, "get_session_factory", lambda: lambda: DummySession())
+    monkeypatch.setattr(job_runner, "run_job", fake_run_job)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "runner",
+            "--job",
+            "settlement",
+            "--target-date",
+            "2026-07-04",
+        ],
+    )
+
+    job_runner.main()
+
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    event_names = {event["event"] for event in events}
+    assert captured["job_name"] == "settlement"
+    assert captured["target_date"] == date(2026, 7, 4)
+    assert {
+        "cron_startup",
+        "target_date_resolved",
+        "lock_status",
+        "stale_run_recovery_decision",
+        "settlement_query_scope",
+        "settlement_batch_status",
+        "settlement_counts",
+        "balance_snapshot_action",
+        "clean_completion",
+    }.issubset(event_names)
+    batch_event = next(event for event in events if event["event"] == "settlement_batch_status")
+    assert batch_event["candidate_labels_checked"] == 3
+    assert batch_event["audit_backfill_limited_by_batch_cap"] is False
+    counts_event = next(event for event in events if event["event"] == "settlement_counts")
+    assert counts_event["settled"] == 1
+    snapshot_event = next(event for event in events if event["event"] == "balance_snapshot_action")
+    assert snapshot_event["snapshot_id"] == 77
 
 
 def test_generate_candidates_preserves_traded_candidate_snapshot(monkeypatch) -> None:
