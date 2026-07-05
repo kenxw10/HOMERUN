@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -73,6 +73,7 @@ from app.services import (
     probability_adapters,
     probability_hardening,
     pybaseball_client,
+    readiness,
     risk_governance,
     settlement,
     ws_market_data,
@@ -1439,6 +1440,10 @@ def test_dashboard_summary_shape_is_empty_and_safe() -> None:
     assert payload["model_status"]["candidate_count"] == 0
     assert payload["observation_filter"]["observation_start_date"] == "2026-07-02"
     assert payload["observation_filter"]["active"] is True
+    assert payload["readiness"]["policy_version"] == readiness.READINESS_POLICY_VERSION
+    assert payload["readiness"]["paper_observation_status"] == "paper_observation_ready"
+    assert payload["readiness"]["live_readiness_status"] == "blocked_for_live"
+    assert payload["readiness"]["live_enabled"] is False
 
 
 @pytest.mark.parametrize(
@@ -2364,7 +2369,260 @@ def test_system_status_redacts_secrets_and_allows_missing_database() -> None:
     assert payload["config"]["kalshi_market_data_source"] == "production_public_market_data"
     assert payload["config"]["kalshi_market_data_base_kind"] == "production_public_market_data"
     assert payload["config"]["kalshi_credentials"] == "not_set"
+    assert payload["readiness"]["policy_version"] == readiness.READINESS_POLICY_VERSION
+    assert payload["readiness"]["paper_observation_status"] == "paper_observation_ready"
+    assert payload["readiness"]["live_readiness_status"] == "blocked_for_live"
+    assert payload["readiness"]["live_enabled"] is False
     assert "KALSHI_API_KEY" not in str(payload)
+
+
+def test_readiness_audit_pack_is_read_only_and_compact() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    now = datetime(2026, 7, 4, 16, 0, tzinfo=UTC)
+
+    with Session(engine) as session:
+        epoch = get_or_create_active_paper_epoch(session, starting_balance=Decimal("500.00"))
+        session.add(
+            BalanceSnapshot(
+                paper_trading_epoch_id=epoch.id,
+                captured_at=now,
+                cash_balance=Decimal("500.00"),
+                portfolio_value=Decimal("500.00"),
+                source="paper",
+                snapshot_type="test",
+            )
+        )
+        candidate = ModelCandidate(
+            paper_trading_epoch_id=epoch.id,
+            evaluated_at=now,
+            features={},
+            decision="eligible_for_paper_trade",
+            target_date=date(2026, 7, 4),
+            market_family="full_game_total",
+            market_type="full_game_total",
+            inning_scope="full_game",
+            training_eligible=True,
+            economic_exposure_label="UNDER 7.5 RUNS",
+            economic_exposure_key="full_game_total:under:7.5",
+            economic_exposure_family="total",
+            economic_exposure_scope="full_game",
+            economic_exposure_direction="under",
+            contract_mechanics_label="NO ON OVER 7.5 RUNS",
+            concept_cluster_key="full_game_total:7.5",
+            same_game_concept_cluster_key="game-1:full_game_total",
+            line_class="central",
+            line_class_reason="closest_to_market_consensus",
+            exposure_taxonomy_version=EXPOSURE_TAXONOMY_VERSION,
+            line_classification_policy_version=LINE_CLASSIFICATION_POLICY_VERSION,
+            selector_policy_version=live_like_selector.SELECTOR_POLICY_VERSION,
+            selector_mode="live_like",
+            selector_status="approved",
+            selector_decision="selected_live_like",
+            selector_threshold_profile="full_game_total:central:standard",
+            selector_min_net_ev=Decimal("0.060000"),
+            selector_min_prob_edge=Decimal("0.040000"),
+            selector_min_data_quality=Decimal("0.5500"),
+            selector_line_class_policy="normal",
+            selector_live_like_eligible_before_cluster=True,
+            selector_live_like_eligible_after_cluster=True,
+            probability_adapter_key="full_game_total_adapter",
+            probability_adapter_version="full_game_total_adapter_v1",
+            probability_adapter_policy_version=probability_adapters.PROBABILITY_ADAPTER_POLICY_VERSION,
+            probability_adapter_family="full_game_total",
+            probability_adapter_scope="full_game",
+            probability_adapter_calibration_hook="calibration_hook_full_game_total",
+            probability_adapter_calibration_version="shared_parameter_offsets_pre_pr3v",
+            probability_adapter_feature_policy_version=probability_adapters.PROBABILITY_ADAPTER_FEATURE_POLICY_VERSION,
+            probability_hardening_policy_version=probability_hardening.PROBABILITY_HARDENING_POLICY_VERSION,
+            probability_hardening_enabled=True,
+            probability_raw_adapter=Decimal("0.600000"),
+            probability_before_hardening=Decimal("0.600000"),
+            probability_after_hardening=Decimal("0.600000"),
+            probability_hardening_status="available",
+            probability_hardening_line_class="central",
+            probability_hardening_line_class_policy=probability_hardening.PROBABILITY_HARDENING_LINE_CLASS_POLICY,
+            risk_governance_policy_version=risk_governance.RISK_GOVERNANCE_POLICY_VERSION,
+            risk_governance_enabled=True,
+            risk_governance_status="approved",
+            risk_governance_decision="approved_for_paper_trade",
+            risk_governance_rejection_reason="none",
+            risk_governance_family_status="enabled",
+            risk_governance_drawdown_status="clear",
+            risk_governance_approved_before_caps=True,
+            risk_governance_approved_after_caps=True,
+            risk_governance_blocked=False,
+        )
+        session.add(candidate)
+        session.flush()
+        session.add(
+            PaperTrade(
+                paper_trading_epoch_id=epoch.id,
+                candidate_id=candidate.id,
+                market_ticker="KXMLBGAME-READY-TOTAL",
+                contract_side="no",
+                entry_price=Decimal("0.4000"),
+                current_price=Decimal("0.4000"),
+                quantity=2,
+                entry_time=now,
+                status="settled",
+                realized_pnl=Decimal("1.20"),
+                fee_paid=Decimal("0.00"),
+                settled_at=now,
+                outcome="win",
+                settlement_audit_key="settlement:ready:1",
+                settlement_formula_version=settlement.SETTLEMENT_FORMULA_VERSION,
+                settlement_formula="full_game: yes wins when total_runs > 7.5; push when equal; side=no",
+                settlement_source="mlb_stats_api_final_score",
+                settlement_source_game_id="ready-game-1",
+                settlement_source_market_ticker="KXMLBGAME-READY-TOTAL",
+                settlement_checked_at=now,
+                settlement_resolved_at=now,
+                settlement_status="settled",
+                settlement_outcome="win",
+                settlement_idempotency_key="settlement:ready:1",
+                settlement_payout=Decimal("2.00"),
+                settlement_fee_adjustment=Decimal("0.00"),
+            )
+        )
+        session.add(
+            ModelPredictionRun(
+                paper_trading_epoch_id=epoch.id,
+                started_at=now,
+                completed_at=now + timedelta(seconds=4),
+                target_date=date(2026, 7, 4),
+                status="completed",
+                feature_version=modeling.FEATURE_VERSION,
+                candidates_evaluated=1,
+                trades_created=0,
+                trade_policy={},
+                summary={},
+            )
+        )
+        session.add(
+            JobRun(
+                paper_trading_epoch_id=epoch.id,
+                job_name="spread-audit",
+                job_type="paper_ops",
+                status="succeeded",
+                started_at=now,
+                completed_at=now + timedelta(seconds=2),
+                target_date=date(2026, 7, 4),
+                result={
+                    "spread_audit": {
+                        "checked": 1,
+                        "verified": 1,
+                        "trusted_audit_only_count": 1,
+                        "needs_review_count": 0,
+                        "unsafe_count": 0,
+                        "parse_error_count": 0,
+                        "settlement_text_unverified_count": 0,
+                        "push_behavior_uncertain_count": 0,
+                        "paper_trades_created": 0,
+                        "read_only": True,
+                        "items": [{"raw_payload": {"large": "x" * 100}}],
+                    }
+                },
+            )
+        )
+        session.commit()
+
+        before_counts = {
+            "epochs": session.scalar(select(func.count(PaperTradingEpoch.id))),
+            "candidates": session.scalar(select(func.count(ModelCandidate.id))),
+            "trades": session.scalar(select(func.count(PaperTrade.id))),
+            "jobs": session.scalar(select(func.count(JobRun.id))),
+        }
+        pack = readiness.readiness_audit_pack(session)
+        after_counts = {
+            "epochs": session.scalar(select(func.count(PaperTradingEpoch.id))),
+            "candidates": session.scalar(select(func.count(ModelCandidate.id))),
+            "trades": session.scalar(select(func.count(PaperTrade.id))),
+            "jobs": session.scalar(select(func.count(JobRun.id))),
+        }
+
+    assert after_counts == before_counts
+    assert pack["policy_version"] == readiness.READINESS_POLICY_VERSION
+    assert pack["paper_observation_status"] == "paper_observation_ready"
+    assert pack["live_readiness_status"] == "blocked_for_live"
+    assert pack["live_enabled"] is False
+    assert pack["operator_review_required"] is True
+    assert pack["candidate_pipeline"]["feature_sync_mode"] == "cache_only"
+    assert pack["candidate_pipeline"]["heavy_feature_sync_skipped"] is True
+    assert pack["candidate_pipeline"]["taxonomy_complete_count"] == 1
+    assert pack["settlement_audit"]["audit_metadata_trade_count"] == 1
+    assert pack["spread_audit"]["checked"] == 1
+    assert pack["readiness_decision"]["required_next_pr"] == "separate_explicit_live_readiness_design_pr"
+    compact_json = json.dumps(readiness.compact_readiness_summary(pack))
+    full_json = json.dumps(pack)
+    assert "raw_payload" not in compact_json
+    assert "scoring_rationale" not in full_json
+    assert "orderbook" not in full_json
+
+
+def test_readiness_endpoint_and_summaries_expose_compact_status(monkeypatch) -> None:
+    engine = create_engine(
+        "sqlite+pysqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    SessionLocal = sessionmaker(bind=engine)
+    with SessionLocal() as session:
+        get_or_create_active_paper_epoch(session, starting_balance=Decimal("500.00"))
+        session.commit()
+
+    monkeypatch.setattr(
+        main_module,
+        "database_status",
+        lambda: {"ready": True, "configured": True, "dialect": "sqlite", "message": "ok"},
+    )
+    monkeypatch.setattr(main_module, "get_session_factory", lambda: SessionLocal)
+    monkeypatch.setattr(
+        main_module,
+        "source_status_report",
+        lambda _session: {
+            "feature_sync_enable_network_sources": True,
+            "public_sources_enabled": True,
+            "validation_status": "ok",
+            "latest_errors": [],
+            "last_feature_sync_status": {},
+            "source_health": [],
+        },
+    )
+    monkeypatch.setattr(
+        dashboard,
+        "source_status_report",
+        lambda _session: {
+            "feature_sync_enable_network_sources": True,
+            "public_sources_enabled": True,
+            "validation_status": "ok",
+            "latest_errors": [],
+            "last_feature_sync_status": {},
+            "source_health": [],
+        },
+    )
+
+    endpoint_response = client.get("/v1/readiness/audit-pack")
+    system_response = client.get("/v1/system/status")
+    dashboard_response = client.get("/v1/dashboard/summary")
+
+    assert endpoint_response.status_code == 200
+    pack = endpoint_response.json()
+    assert pack["policy_version"] == readiness.READINESS_POLICY_VERSION
+    assert pack["live_readiness_status"] == "blocked_for_live"
+    assert pack["readiness_decision"]["live_enabled"] is False
+    assert "raw_payload" not in json.dumps(pack)
+
+    assert system_response.status_code == 200
+    assert system_response.json()["readiness"]["policy_version"] == readiness.READINESS_POLICY_VERSION
+    assert system_response.json()["readiness"]["live_blocker_count"] >= 1
+
+    assert dashboard_response.status_code == 200
+    dashboard_readiness = dashboard_response.json()["readiness"]
+    assert dashboard_readiness["policy_version"] == readiness.READINESS_POLICY_VERSION
+    assert dashboard_readiness["live_readiness_status"] == "blocked_for_live"
+    assert "candidate_pipeline" not in dashboard_readiness
 
 
 def test_system_status_preserves_source_config_when_database_ready(monkeypatch) -> None:

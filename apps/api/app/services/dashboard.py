@@ -50,6 +50,7 @@ from app.services.risk_governance import (
     RISK_GOVERNANCE_FIELD_NAMES,
     drawdown_summary,
 )
+from app.services.readiness import compact_readiness_summary, readiness_audit_pack
 from app.services.ws_market_data import ws_status_running_is_fresh
 from app.time_utils import eastern_display, ensure_aware_utc, get_dashboard_zone, to_eastern_iso, today_eastern, utc_now
 
@@ -70,6 +71,7 @@ def empty_dashboard_summary(closed_date: date | None = None) -> DashboardSummary
     selected_closed_date = closed_date or today_eastern()
     observation_start = _observation_start_at()
     return DashboardSummary(
+        readiness=compact_readiness_summary(readiness_audit_pack(None)),
         portfolio_series=[],
         performance=PerformanceMetrics(win_rate=None, roi=None, profit_loss=0.0, record="0-0-0"),
         positions=[],
@@ -2197,6 +2199,7 @@ def dashboard_summary_from_db(
     )
     summary.last_update = to_eastern_iso(utc_now())
     summary.last_update_display = eastern_display(utc_now())
+    summary.readiness = compact_readiness_summary(readiness_audit_pack(session))
     return summary
 
 

@@ -1180,6 +1180,34 @@ Expected dashboard/system behavior:
 - `/v1/system/status` remains secret-safe and reports paper mode, live trading disabled, kill switch enabled, demo Kalshi, and PR4a drawdown policy metadata.
 - In paper observation, drawdown should be diagnostic only: `drawdown_would_have_halted` may be true, but `drawdown_halt_enforced=false`, and candidate-sweep should not create `no_trade_risk_drawdown_halt`.
 
+## PR4b Final Live-Readiness Audit Pack Validation
+
+PR4b is a read-only audit pack. It must not enable live trading, place orders, change candidate selection, change EV thresholds, change risk caps, change settlement, run source ingestion, alter cron schedules, or add raw diagnostic payload bloat.
+
+After deployment:
+
+```powershell
+$base = "https://homerun-production-2551.up.railway.app"
+$readiness = Invoke-RestMethod "$base/v1/readiness/audit-pack"
+$system = Invoke-RestMethod "$base/v1/system/status"
+$dashboard = Invoke-RestMethod "$base/v1/dashboard/summary"
+$readiness.readiness_decision | Format-List
+$system.readiness | Format-List
+$dashboard.readiness | Format-List
+```
+
+Expected readiness behavior:
+
+- `policy_version=pr4b_final_readiness_audit_pack_v1`.
+- `paper_observation_status=paper_observation_ready` when the paper safety posture is healthy.
+- `live_readiness_status=blocked_for_live`, `live_enabled=false`, and `operator_review_required=true`.
+- `bot_mode` shows paper mode, live trading disabled, execution kill switch enabled, demo Kalshi, and credentials redacted or not set.
+- `safety_gates` fail closed if paper mode, demo env, live disabled, kill switch, or credential expectations are violated.
+- `validated_components` summarizes PR3s taxonomy, PR3t selector, PR3u adapters, PR3v governance, PR3w hardening, PR3x risk governance, PR4a settlement/accounting audit, and full-game spread audit evidence. Missing evidence should be explicit as `unknown_due_missing_evidence`, not silently passed.
+- `blockers_for_live` stays non-empty and lists hard live blockers.
+- `operator_checklist` is present and requires a separate explicit live-readiness design PR before any live order path.
+- `/v1/system/status` and `/v1/dashboard/summary` expose only compact readiness summaries. They should not include raw payloads, feature blobs, scoring rationale, orderbook data, or full job results.
+
 ## Required Context Updates
 
 Every PR must update `PROJECT_CONTEXT.md`.
