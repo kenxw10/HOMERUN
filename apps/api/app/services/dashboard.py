@@ -41,6 +41,7 @@ from app.schemas import (
 )
 from app.services.contracts import contract_labels, market_type_from_ticker
 from app.services.features import FEATURE_VERSION, source_status_report, starter_status_report
+from app.services.job_runs import settlement_job_status_summary
 from app.services.modeling import governance_status as model_governance_status
 from app.services.portfolio import calculate_paper_portfolio, paper_trade_fee
 from app.services.paper_epoch import resolve_epoch_filter
@@ -1533,10 +1534,27 @@ def _latest_job_status(
             .order_by(JobRun.job_name.asc())
         )
     )
+    settlement_status = settlement_job_status_summary(session, epoch_id=epoch.id)
+    settlement_job = settlement_status.get("latest_settlement_job")
+    settlement_job_id = settlement_job.get("job_run_id") if isinstance(settlement_job, dict) else None
+    settlement_result_keys = (
+        "settlement_job_status_policy_version",
+        "settlement_stale_running_threshold_minutes",
+        "settlement_running_status_recovery_enabled",
+        "latest_settlement_job_status",
+        "stale_settlement_job_warning",
+        "settlement_job_operational_warning",
+        "stale_settlement_job_age_minutes",
+        "stale_settlement_job_recovery_action",
+    )
     latest = {
         row.job_name: JobRunSummary(
             job_name=row.job_name,
-            status=row.status,
+            status=(
+                str(settlement_status.get("latest_settlement_job_status") or row.status)
+                if row.job_name == "settlement" and row.id == settlement_job_id
+                else row.status
+            ),
             started_at=to_eastern_iso(row.started_at),
             completed_at=to_eastern_iso(row.completed_at),
             duration_seconds=row.duration_seconds,
@@ -1545,10 +1563,21 @@ def _latest_job_status(
             step_count=None,
             warning_count=None,
             error_count=None,
-            result={},
+            result={
+                key: settlement_status.get(key)
+                for key in settlement_result_keys
+                if row.job_name == "settlement" and key in settlement_status
+            },
         )
         for row in compact_rows
     }
+    if "settlement" not in latest and settlement_status.get("stale_settlement_job_warning"):
+        latest["settlement"] = JobRunSummary(
+            job_name="settlement",
+            status=str(settlement_status.get("latest_settlement_job_status") or "stale_running"),
+            result_is_compact=True,
+            result={key: settlement_status.get(key) for key in settlement_result_keys if key in settlement_status},
+        )
 
     detailed_names = {row.job_name for row in compact_rows} if include_job_results else (detailed_job_names or set())
     detailed_ids = [row.id for row in compact_rows if row.job_name in detailed_names]
@@ -1561,9 +1590,16 @@ def _latest_job_status(
         )
     )
     for row in rows:
+        settlement_row = row.job_name == "settlement" and row.id == settlement_job_id
+        result = _compact_job_result(row.result, include_details=True)
+        if settlement_row:
+            result = {
+                **result,
+                **{key: settlement_status.get(key) for key in settlement_result_keys if key in settlement_status},
+            }
         latest[row.job_name] = JobRunSummary(
             job_name=row.job_name,
-            status=row.status,
+            status=str(settlement_status.get("latest_settlement_job_status") or row.status) if settlement_row else row.status,
             started_at=to_eastern_iso(row.started_at),
             completed_at=to_eastern_iso(row.completed_at),
             duration_seconds=row.duration_seconds,
@@ -1572,7 +1608,7 @@ def _latest_job_status(
             step_count=len(row.steps or []),
             warning_count=len(row.warnings or []),
             error_count=len(row.errors or []),
-            result=_compact_job_result(row.result, include_details=True),
+            result=result,
         )
     return latest
 

@@ -19,6 +19,7 @@ from app.models import (
     Settlement,
 )
 from app.services.exposure_taxonomy import EXPOSURE_TAXONOMY_VERSION, LINE_CLASSIFICATION_POLICY_VERSION
+from app.services.job_runs import settlement_job_status_summary
 from app.services.live_like_selector import SELECTOR_POLICY_VERSION
 from app.services.modeling import FAMILY_SCOPE_GOVERNANCE_POLICY, governance_status
 from app.services.portfolio import calculate_paper_portfolio
@@ -361,9 +362,19 @@ def _settlement_audit(session: Session | None, epoch: PaperTradingEpoch | None) 
         session,
         select(func.count(Settlement.id)).join(PaperTrade, Settlement.paper_trade_id == PaperTrade.id).where(trade_filter),
     )
+    settlement_job = settlement_job_status_summary(session, epoch_id=epoch.id)
     return {
         "status": "available" if audit_count else UNKNOWN_EVIDENCE,
-        "latest_settlement_job": _latest_job(session, epoch.id, "settlement"),
+        "latest_settlement_job": settlement_job.get("latest_settlement_job") or _latest_job(session, epoch.id, "settlement"),
+        "settlement_job_status_policy_version": settlement_job.get("settlement_job_status_policy_version"),
+        "settlement_stale_running_threshold_minutes": settlement_job.get("settlement_stale_running_threshold_minutes"),
+        "settlement_running_status_recovery_enabled": settlement_job.get("settlement_running_status_recovery_enabled"),
+        "latest_settlement_job_status": settlement_job.get("latest_settlement_job_status"),
+        "settlement_job_stale_warning": bool(settlement_job.get("stale_settlement_job_warning")),
+        "settlement_job_operational_warning": bool(settlement_job.get("settlement_job_operational_warning")),
+        "stale_settlement_job_started_at": settlement_job.get("stale_settlement_job_started_at"),
+        "stale_settlement_job_age_minutes": settlement_job.get("stale_settlement_job_age_minutes"),
+        "stale_settlement_job_recovery_action": settlement_job.get("stale_settlement_job_recovery_action"),
         "settlement_formula_version": SETTLEMENT_FORMULA_VERSION,
         "checked_or_terminal_trade_count": checked_count,
         "audit_metadata_trade_count": audit_count,
@@ -539,6 +550,9 @@ def _validated_components(
                 "settlement_formula_version": SETTLEMENT_FORMULA_VERSION,
                 "audit_metadata_trade_count": settlement_audit.get("audit_metadata_trade_count", 0),
                 "missing_audit_metadata_trade_count": settlement_audit.get("missing_audit_metadata_trade_count", 0),
+                "settlement_job_status_policy_version": settlement_audit.get("settlement_job_status_policy_version"),
+                "latest_settlement_job_status": settlement_audit.get("latest_settlement_job_status"),
+                "settlement_job_operational_warning": settlement_audit.get("settlement_job_operational_warning"),
             },
         ),
         _component(
@@ -658,6 +672,14 @@ def readiness_audit_pack(session: Session | None = None) -> dict[str, object]:
         "model_governance": governance,
         "candidate_pipeline": candidate_pipeline,
         "settlement_audit": settlement_audit,
+        "operational_warnings": {
+            "settlement_job_stale_warning": settlement_audit.get("settlement_job_stale_warning"),
+            "settlement_job_operational_warning": settlement_audit.get("settlement_job_operational_warning"),
+            "latest_settlement_job_status": settlement_audit.get("latest_settlement_job_status"),
+            "stale_settlement_job_started_at": settlement_audit.get("stale_settlement_job_started_at"),
+            "stale_settlement_job_age_minutes": settlement_audit.get("stale_settlement_job_age_minutes"),
+            "stale_settlement_job_recovery_action": settlement_audit.get("stale_settlement_job_recovery_action"),
+        },
         "spread_audit": spread_audit,
         "blockers_for_live": blockers,
         "operator_checklist": checklist,
@@ -695,4 +717,22 @@ def compact_readiness_summary(pack: dict[str, object]) -> dict[str, object]:
         "validated_component_status_counts": component_status_counts,
         "live_blocker_count": blocker_count,
         "operator_checklist_count": len(checklist) if isinstance(checklist, list) else 0,
+        "settlement_job_status_policy_version": (pack.get("settlement_audit") or {}).get(
+            "settlement_job_status_policy_version"
+        )
+        if isinstance(pack.get("settlement_audit"), dict)
+        else None,
+        "settlement_job_stale_warning": (pack.get("operational_warnings") or {}).get(
+            "settlement_job_stale_warning"
+        )
+        if isinstance(pack.get("operational_warnings"), dict)
+        else False,
+        "settlement_job_operational_warning": (pack.get("operational_warnings") or {}).get(
+            "settlement_job_operational_warning"
+        )
+        if isinstance(pack.get("operational_warnings"), dict)
+        else False,
+        "latest_settlement_job_status": (pack.get("operational_warnings") or {}).get("latest_settlement_job_status")
+        if isinstance(pack.get("operational_warnings"), dict)
+        else None,
     }

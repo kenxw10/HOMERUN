@@ -172,6 +172,8 @@ Recommended Railway cron services should be separate short-lived services, not t
 
 Railway cron schedules use UTC. Adjust these schedules when EDT changes to EST. Railway may skip a run if the previous execution is still active; PR3d job locks also skip overlap or mark stale runs failed before starting safely.
 
+For PR4b.1 and later, settlement cron services emit JSON log events for startup, target ET/UTC window, lock/skipped status, stale-run recovery, settlement query scope, batch caps/counts, balance snapshot action, completion, and caught exceptions. A stale settlement `running` row beyond the 30-minute threshold is recovered globally before a settlement cron is allowed to skip for `skipped_existing_run`.
+
 Optional long-running paper market-data service:
 
 ```powershell

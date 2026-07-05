@@ -392,6 +392,16 @@ PR4b adds read-only readiness policy `pr4b_final_readiness_audit_pack_v1` and `G
 
 PR4b does not enable live trading. `live_readiness_status` remains `blocked_for_live`, `live_enabled=false`, and `operator_review_required=true`; moving beyond paper observation requires a separate explicit live-readiness design PR. PR4b adds no migration and does not change candidate generation, EV thresholds, risk caps, model math, settlement behavior, cron schedules, source ingestion, market discovery, WebSocket behavior, credentials, sportsbook/team-total/umpire scope, or live execution.
 
+## PR4b.1 Settlement Job Memory and Stale-Run Hardening
+
+PR4b.1 keeps settlement operations bounded and recoverable. Settlement jobs stuck in `running` for more than 30 minutes are reported as `stale_running` in compact dashboard/readiness/system status output and are marked `failed_stale` before the next settlement job starts.
+
+Settlement sync now processes target-date candidate labels, open trades, and already-settled audit backfills through bounded batches. The job result reports compact policy, limit, and warning fields such as `settlement_memory_policy_version`, `candidate_labels_limited_by_batch_cap`, `open_trade_settlement_limited_by_batch_cap`, and `audit_backfill_limited_by_batch_cap`.
+
+The Railway Settlement Catchup service uses `python -m app.jobs.runner --job settlement --target-date yesterday_et`. That runner emits JSON logs for cron startup, target ET/UTC window, lock/skipped status, stale recovery decisions, settlement query scope, batch caps, settlement counts, balance snapshot action, clean completion, and caught exceptions.
+
+No migration or environment change is required. PR4b.1 does not change settlement formulas, settlement idempotency, candidate selection, EV thresholds, risk caps, model math, cron schedules, source ingestion, market discovery, WebSocket behavior, credentials, sportsbook/team-total/umpire scope, or live execution.
+
 ## Deployment
 
 - Railway backend setup: see `docs/RAILWAY_SETUP.md`.
