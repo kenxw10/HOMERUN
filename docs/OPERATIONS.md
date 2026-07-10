@@ -1306,6 +1306,31 @@ Invoke-RestMethod "$base/v1/dashboard/summary" |
 
 Expected: compact PR4c scalar metadata is visible for newly scored candidates, dashboard/readiness remain compact, and live readiness remains `blocked_for_live`.
 
+## PR4d Observation Diagnostics and Chart Padding Validation
+
+PR4d is a dashboard/readiness diagnostics and frontend chart-polish PR. It must not change live execution, settlement formulas, cron cadence, source ingestion, market discovery, WebSocket behavior, credentials, sportsbook/Odds API scope, team totals, umpire factors, MVE/multivariate markets, model math, selector thresholds, or risk caps.
+
+Check compact spread-audit freshness and position metadata:
+
+```powershell
+$base = "https://homerun-production-2551.up.railway.app"
+$headers = @{"X-API-Key"="YOUR_KEY"}
+$dashboard = Invoke-RestMethod "$base/v1/dashboard/summary"
+$system = Invoke-RestMethod "$base/v1/system/status"
+$dashboard.model_status.trade_policy.full_game_spread_latest_audit | Format-List
+$dashboard.positions | Select-Object -First 3 model_version,active_calibration_version,family_calibration_version,calibration_policy_version,risk_policy_version,economic_exposure_line_class,missing_version_metadata_reason | Format-List
+$dashboard.closed_positions | Select-Object -First 3 model_version,active_calibration_version,family_calibration_version,calibration_policy_version,risk_policy_version,economic_exposure_line_class,missing_version_metadata_reason | Format-List
+$system.readiness | Select-Object spread_audit_stale_warning,spread_audit_freshness_status,latest_spread_audit_target_date,spread_audit_age_hours | Format-List
+```
+
+Expected:
+
+- `full_game_spread_latest_audit` includes compact freshness fields such as `freshness_policy_version`, `freshness_status`, `spread_audit_stale_warning`, `age_hours`, and `recent_full_game_spread_activity_count`.
+- If the latest successful spread audit is stale, not for today ET while recent full-game-spread paper activity exists, failed, or missing, dashboard/readiness/system summaries expose a compact stale warning.
+- Position rows expose compact nullable version metadata aliases without raw payloads, full scoring rationale, feature blobs, orderbook data, or spread-audit item arrays.
+- The frontend portfolio chart keeps Today/1D/1W/1M/All and Value/P/L $/P/L % controls, but flat or tight bankroll ranges have visible y-axis breathing room.
+- No migration is required, and safety remains paper trading true, live trading false, kill switch true, demo Kalshi.
+
 ## Required Context Updates
 
 Every PR must update `PROJECT_CONTEXT.md`.

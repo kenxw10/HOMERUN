@@ -933,16 +933,48 @@ function chartXTicks(domain: ChartDomain, range: ChartRange) {
   }));
 }
 
+function chartMinYPadding(mode: ChartMode, min: number, max: number): number {
+  const scale = Math.max(Math.abs(min), Math.abs(max), 1);
+  if (mode === "P/L %") {
+    return Math.max(0.02, scale * 0.1);
+  }
+  if (mode === "P/L $") {
+    return Math.max(5, scale * 0.05);
+  }
+  return Math.max(10, scale * 0.015);
+}
+
+function chartYStep(mode: ChartMode, span: number): number {
+  if (mode === "P/L %") {
+    return span >= 0.2 ? 0.05 : span >= 0.05 ? 0.01 : 0.005;
+  }
+  if (mode === "P/L $") {
+    return span >= 100 ? 10 : span >= 20 ? 5 : 1;
+  }
+  return span >= 500 ? 50 : span >= 100 ? 10 : span >= 25 ? 5 : 1;
+}
+
+function chartYDomain(values: number[], mode: ChartMode) {
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const span = max - min;
+  const minimumPad = chartMinYPadding(mode, min, max);
+  const pad = span > 0 ? Math.max(span * 0.18, span < minimumPad * 2 ? minimumPad : 0) : minimumPad;
+  const paddedSpan = span + pad * 2;
+  const step = chartYStep(mode, paddedSpan || minimumPad * 2);
+  const decimals = mode === "P/L %" ? 4 : 2;
+  const yMin = Number((Math.floor((min - pad) / step) * step).toFixed(decimals));
+  const yMax = Number((Math.ceil((max + pad) / step) * step).toFixed(decimals));
+  return yMax > yMin ? { yMin, yMax } : { yMin: yMin - step, yMax: yMax + step };
+}
+
 function buildChart(series: ChartDataPoint[], mode: ChartMode, domain: ChartDomain, range: ChartRange) {
   const width = 1200;
   const height = 260;
   const padding = { top: 24, right: 28, bottom: 34, left: 54 };
   const values = series.map((point) => point.value);
-  const min = values.length ? Math.min(...values) : mode === "VALUE" ? 24 : -1;
-  const max = values.length ? Math.max(...values) : mode === "VALUE" ? 40 : 1;
-  const paddingValue = mode === "P/L %" ? 0.005 : mode === "P/L $" ? 1 : 2;
-  const yMin = Math.floor((min - paddingValue) / paddingValue) * paddingValue;
-  const yMax = Math.ceil((max + paddingValue) / paddingValue) * paddingValue;
+  const fallbackValues = mode === "VALUE" ? [24, 40] : [-1, 1];
+  const { yMin, yMax } = chartYDomain(values.length ? values : fallbackValues, mode);
   const yRange = yMax - yMin || 1;
   const plotLeft = padding.left;
   const plotRight = width - padding.right;
