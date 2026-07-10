@@ -172,6 +172,15 @@ class PositionSummary(BaseModel):
     probability_hardening_block_recommendation: bool | None = None
     probability_hardening_error_reason: str | None = None
     calibration_status: str | None = None
+    model_version: str | None = None
+    active_parameter_version: str | None = None
+    model_parameter_version: str | None = None
+    active_calibration_version: str | None = None
+    family_calibration_version: str | None = None
+    calibration_policy_version: str | None = None
+    risk_policy_version: str | None = None
+    economic_exposure_line_class: str | None = None
+    missing_version_metadata_reason: str | None = None
     settlement_audit_key: str | None = None
     settlement_formula_version: str | None = None
     settlement_formula: str | None = None

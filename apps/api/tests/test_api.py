@@ -76,6 +76,7 @@ from app.services import (
     readiness,
     risk_governance,
     settlement,
+    spread_audit_freshness,
     ws_market_data,
 )
 from app.services.contracts import contract_labels, selected_team_from_ticker
@@ -2563,6 +2564,73 @@ def test_dashboard_summary_compacts_heavy_job_payloads_by_default() -> None:
     assert debug_result["items"]["truncated"] is False
     assert "raw_payload" not in json.dumps(debug_result)
     assert "features" not in json.dumps(debug_result)
+
+
+def test_dashboard_spread_audit_freshness_warning_is_compact(monkeypatch) -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    now = datetime(2026, 7, 5, 16, 0, tzinfo=UTC)
+    old_completed_at = now - timedelta(hours=48)
+    monkeypatch.setattr(spread_audit_freshness, "utc_now", lambda: now)
+
+    with Session(engine) as session:
+        active = get_or_create_active_paper_epoch(session, starting_balance=Decimal("500.00"))
+        session.add(
+            JobRun(
+                job_name="spread-audit",
+                job_type="paper_ops",
+                paper_trading_epoch_id=active.id,
+                status="succeeded",
+                started_at=old_completed_at - timedelta(seconds=5),
+                completed_at=old_completed_at,
+                target_date=date(2026, 7, 3),
+                result={
+                    "spread_audit": {
+                        "checked": 4,
+                        "verified": 2,
+                        "trusted_audit_only_count": 2,
+                        "needs_review_count": 1,
+                        "unsafe_count": 0,
+                        "parse_error_count": 0,
+                        "settlement_text_unverified_count": 1,
+                        "push_behavior_uncertain_count": 0,
+                        "paper_trades_created": 0,
+                        "read_only": True,
+                        "items": [{"raw_payload": {"large": "x" * 1000}}],
+                    }
+                },
+            )
+        )
+        session.add(
+            PaperTrade(
+                paper_trading_epoch_id=active.id,
+                market_ticker="KXMLBSPREAD-RECENT-ACTIVITY",
+                contract_side="yes",
+                entry_price=Decimal("0.4000"),
+                current_price=Decimal("0.5000"),
+                quantity=1,
+                entry_time=now - timedelta(hours=2),
+                status="open",
+                market_family="full_game_spread",
+            )
+        )
+        session.commit()
+
+        summary = dashboard.dashboard_summary_from_db(session)
+        pack = readiness.readiness_audit_pack(session)
+        compact = readiness.compact_readiness_summary(pack)
+
+    latest_audit = summary.model_status.trade_policy["full_game_spread_latest_audit"]
+    assert latest_audit["checked"] == 4
+    assert latest_audit["freshness_policy_version"] == spread_audit_freshness.SPREAD_AUDIT_FRESHNESS_POLICY_VERSION
+    assert latest_audit["freshness_status"] == "stale_age"
+    assert latest_audit["spread_audit_stale_warning"] is True
+    assert latest_audit["recent_full_game_spread_activity_count"] == 1
+    assert "raw_payload" not in json.dumps(latest_audit)
+    assert pack["operational_warnings"]["spread_audit_stale_warning"] is True
+    assert pack["spread_audit"]["freshness_status"] == "stale_age"
+    assert compact["spread_audit_stale_warning"] is True
+    assert compact["spread_audit_freshness_status"] == "stale_age"
 
 
 def test_compact_dashboard_job_status_does_not_deserialize_job_json() -> None:
@@ -9209,6 +9277,126 @@ def test_dashboard_position_rationale_includes_loaded_spread_audit() -> None:
     assert rationale["spread_audit"]["audit_status"] == "trusted_audit_only"
     assert rationale["spread_audit"]["selection_code"] == "PIT"
     assert "raw_contract_text" not in rationale["spread_audit"]
+
+
+def test_dashboard_position_rows_expose_compact_version_metadata() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    opened_at = datetime(2026, 7, 2, 13, 0, tzinfo=UTC)
+    closed_at = datetime(2026, 7, 2, 23, 30, tzinfo=UTC)
+    calibration_version = f"{modeling.FAMILY_SCOPE_GOVERNANCE_POLICY}:full_game_total:global"
+
+    with Session(engine) as session:
+        epoch_id = _active_epoch_id(session)
+        game = MlbGame(
+            external_game_id="dashboard-version-metadata",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 2, 23, 0, tzinfo=UTC),
+            status="final",
+        )
+        market = KalshiMarket(
+            kalshi_market_id="KX-DASHBOARD-VERSION-METADATA",
+            ticker="KXMLBTOTAL-26JUL021900SEAPIT-OVER8.5",
+            title="Pittsburgh Pirates vs Seattle Mariners over 8.5",
+            status="closed",
+            market_family="full_game_total",
+            market_type="full_game_total",
+            line_value=Decimal("8.5000"),
+            over_under_side="over",
+            inning_scope="full_game",
+            settlement_rule_status="paper_supported",
+        )
+        session.add_all([game, market])
+        session.flush()
+        candidate = ModelCandidate(
+            paper_trading_epoch_id=epoch_id,
+            mlb_game_id=game.id,
+            kalshi_market_id=market.id,
+            evaluated_at=opened_at,
+            decision="selected_live_like",
+            features={},
+            market_type="full_game_total",
+            market_family="full_game_total",
+            model_version_tag=modeling.MATURE_MODEL_TAG,
+            probability_edge=Decimal("0.090000"),
+            net_expected_value=Decimal("0.140000"),
+            data_quality=Decimal("0.8200"),
+            scoring_rationale={"large": "omitted"},
+        )
+        session.add(candidate)
+        session.flush()
+        session.add(
+            PaperTrade(
+                paper_trading_epoch_id=epoch_id,
+                candidate_id=candidate.id,
+                market_ticker=market.ticker,
+                contract_side="yes",
+                entry_price=Decimal("0.4000"),
+                current_price=Decimal("1.0000"),
+                exit_price=Decimal("1.0000"),
+                quantity=2,
+                entry_time=opened_at,
+                exit_time=closed_at,
+                settled_at=closed_at,
+                status="settled",
+                realized_pnl=Decimal("1.20"),
+                market_family="full_game_total",
+                line_value=Decimal("8.5000"),
+                over_under_side="over",
+                inning_scope="full_game",
+                settlement_rule_status="paper_supported",
+                economic_exposure_label="OVER 8.5 RUNS",
+                economic_exposure_key="full_game_total:over:8.5",
+                economic_exposure_family="full_game_total",
+                economic_exposure_scope="full_game",
+                economic_exposure_direction="over",
+                economic_exposure_line=Decimal("8.5000"),
+                contract_mechanics_label="YES ON OVER 8.5",
+                concept_cluster_key="full_game_total:over",
+                same_game_concept_cluster_key="dashboard-version-metadata:full_game_total",
+                line_class="central",
+                probability_adapter_key="full_game_total_over",
+                probability_adapter_version="pr3u_probability_adapters_v1",
+                probability_adapter_policy_version=probability_adapters.PROBABILITY_ADAPTER_POLICY_VERSION,
+                probability_adapter_family="full_game_total",
+                probability_adapter_scope="full_game",
+                probability_adapter_calibration_hook="full_game_total",
+                probability_adapter_calibration_version=calibration_version,
+                probability_adapter_feature_policy_version="pr3u_probability_adapter_features_v1",
+                probability_hardening_policy_version=probability_hardening.PROBABILITY_HARDENING_POLICY_VERSION,
+                selector_policy_version=live_like_selector.SELECTOR_POLICY_VERSION,
+                risk_governance_policy_version=risk_governance.RISK_GOVERNANCE_POLICY_VERSION,
+                calibration_status="family_scope_calibrated",
+                settlement_audit_key="settlement:dashboard-version-metadata",
+                settlement_formula_version=settlement.SETTLEMENT_FORMULA_VERSION,
+                settlement_formula="full_game total: yes wins when total runs > 8.5; side=yes",
+                settlement_status="settled",
+                settlement_outcome="win",
+                settlement_idempotency_key="settlement:dashboard-version-metadata:yes",
+                settlement_payout=Decimal("2.00"),
+                settlement_fee_adjustment=Decimal("0.00"),
+            )
+        )
+        session.commit()
+
+        summary = dashboard.dashboard_summary_from_db(session, closed_date=date(2026, 7, 2))
+
+    position = summary.closed_positions[0]
+    payload = position.model_dump()
+    assert position.model_version == modeling.MATURE_MODEL_TAG
+    assert position.active_calibration_version == calibration_version
+    assert position.family_calibration_version == calibration_version
+    assert position.calibration_policy_version == modeling.FAMILY_SCOPE_GOVERNANCE_POLICY
+    assert position.risk_policy_version == risk_governance.RISK_GOVERNANCE_POLICY_VERSION
+    assert position.economic_exposure_line_class == "central"
+    assert position.missing_version_metadata_reason is None
+    assert position.settlement_formula_version == settlement.SETTLEMENT_FORMULA_VERSION
+    assert position.selected_position_rationale["version_metadata"]["family_calibration_version"] == calibration_version
+    assert "raw_payload" not in json.dumps(payload)
+    assert "large" not in json.dumps(position.selected_position_rationale)
 
 
 def test_dashboard_summary_filters_closed_positions_by_selected_date() -> None:
@@ -16434,6 +16622,7 @@ def test_source_status_report_does_not_fail_unattempted_statcast(monkeypatch) ->
 
 def test_source_status_report_ignores_pybaseball_player_mapping_misses(monkeypatch) -> None:
     monkeypatch.setenv("ADVANCED_PUBLIC_STATS_MAX_STALE_HOURS", "168")
+    monkeypatch.setattr(features, "utc_now", lambda: datetime(2026, 7, 2, 20, 0, tzinfo=UTC))
     get_settings.cache_clear()
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)

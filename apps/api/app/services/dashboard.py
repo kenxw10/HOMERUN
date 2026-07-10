@@ -42,7 +42,7 @@ from app.schemas import (
 from app.services.contracts import contract_labels, market_type_from_ticker
 from app.services.features import FEATURE_VERSION, source_status_report, starter_status_report
 from app.services.job_runs import settlement_job_status_summary
-from app.services.modeling import governance_status as model_governance_status
+from app.services.modeling import FAMILY_SCOPE_GOVERNANCE_POLICY, governance_status as model_governance_status
 from app.services.portfolio import calculate_paper_portfolio, paper_trade_fee
 from app.services.paper_epoch import resolve_epoch_filter
 from app.services.risk_governance import (
@@ -52,6 +52,7 @@ from app.services.risk_governance import (
     drawdown_summary,
 )
 from app.services.readiness import compact_readiness_summary, readiness_audit_pack
+from app.services.spread_audit_freshness import spread_audit_freshness_payload
 from app.services.ws_market_data import ws_status_running_is_fresh
 from app.time_utils import eastern_display, ensure_aware_utc, get_dashboard_zone, to_eastern_iso, today_eastern, utc_now
 
@@ -299,6 +300,38 @@ def _position_model_audit_payload(trade: PaperTrade) -> dict[str, object] | None
     return compact or None
 
 
+def _calibration_policy_version(calibration_version: str | None) -> str | None:
+    if calibration_version and calibration_version.startswith(FAMILY_SCOPE_GOVERNANCE_POLICY):
+        return FAMILY_SCOPE_GOVERNANCE_POLICY
+    return None
+
+
+def _position_version_metadata(trade: PaperTrade, candidate: ModelCandidate | None) -> dict[str, object | None]:
+    model_version = candidate.model_version_tag if candidate is not None else None
+    family_calibration_version = trade.probability_adapter_calibration_version
+    payload: dict[str, object | None] = {
+        "model_version": model_version,
+        "active_parameter_version": None,
+        "model_parameter_version": None,
+        "active_calibration_version": family_calibration_version,
+        "family_calibration_version": family_calibration_version,
+        "calibration_policy_version": _calibration_policy_version(family_calibration_version),
+        "risk_policy_version": trade.risk_governance_policy_version,
+        "economic_exposure_line_class": trade.line_class,
+    }
+    if model_version is None and family_calibration_version is None:
+        payload["missing_version_metadata_reason"] = "missing_model_and_calibration_version"
+    elif model_version is None:
+        payload["missing_version_metadata_reason"] = "missing_model_version"
+    elif family_calibration_version is None:
+        payload["missing_version_metadata_reason"] = "missing_family_calibration_version"
+    elif trade.risk_governance_policy_version is None:
+        payload["missing_version_metadata_reason"] = "missing_risk_policy_version"
+    else:
+        payload["missing_version_metadata_reason"] = None
+    return payload
+
+
 def _position_settlement_payload(trade: PaperTrade) -> dict[str, object] | None:
     payload = {
         "settlement_audit_key": trade.settlement_audit_key,
@@ -352,6 +385,10 @@ def _position_from_trade(
     mechanics_label = trade.contract_mechanics_label or trade.contract_display
     display = exposure_label or mechanics_label or trade.market_display or fallback_labels.contract_display
     selected_rationale = _position_rationale(candidate, trade) if candidate is not None else {}
+    version_metadata = _position_version_metadata(trade, candidate)
+    compact_version_metadata = {key: value for key, value in version_metadata.items() if value is not None}
+    if compact_version_metadata:
+        selected_rationale["version_metadata"] = compact_version_metadata
     exposure_payload = _position_exposure_payload(trade)
     if exposure_payload is not None:
         selected_rationale["exposure_taxonomy"] = exposure_payload
@@ -464,6 +501,15 @@ def _position_from_trade(
         probability_hardening_block_recommendation=trade.probability_hardening_block_recommendation,
         probability_hardening_error_reason=trade.probability_hardening_error_reason,
         calibration_status=trade.calibration_status,
+        model_version=version_metadata["model_version"],
+        active_parameter_version=version_metadata["active_parameter_version"],
+        model_parameter_version=version_metadata["model_parameter_version"],
+        active_calibration_version=version_metadata["active_calibration_version"],
+        family_calibration_version=version_metadata["family_calibration_version"],
+        calibration_policy_version=version_metadata["calibration_policy_version"],
+        risk_policy_version=version_metadata["risk_policy_version"],
+        economic_exposure_line_class=version_metadata["economic_exposure_line_class"],
+        missing_version_metadata_reason=version_metadata["missing_version_metadata_reason"],
         settlement_audit_key=trade.settlement_audit_key,
         settlement_formula_version=trade.settlement_formula_version,
         settlement_formula=trade.settlement_formula,
@@ -1638,12 +1684,27 @@ def _latest_spread_audit_counts(session: Session, epoch: PaperTradingEpoch) -> d
         .limit(1)
     ).mappings().first()
     if not row:
-        return {}
+        return spread_audit_freshness_payload(
+            session,
+            epoch,
+            job_status=None,
+            started_at=None,
+            completed_at=None,
+            target_date=None,
+        )
     compact: dict[str, object] = {
         "job_status": row["job_status"],
         "started_at": to_eastern_iso(row["started_at"]),
         "completed_at": to_eastern_iso(row["completed_at"]),
         "target_date": row["target_date"].isoformat() if row["target_date"] else None,
+        **spread_audit_freshness_payload(
+            session,
+            epoch,
+            job_status=row["job_status"],
+            started_at=row["started_at"],
+            completed_at=row["completed_at"],
+            target_date=row["target_date"],
+        ),
     }
     for key in (
         "checked",
@@ -1896,6 +1957,7 @@ def dashboard_summary_from_db(
                 ModelCandidate.probability_edge,
                 ModelCandidate.net_expected_value,
                 ModelCandidate.data_quality,
+                ModelCandidate.model_version_tag,
                 ModelCandidate.scoring_rationale,
             ),
             load_only(
@@ -1940,6 +2002,7 @@ def dashboard_summary_from_db(
                 ModelCandidate.probability_edge,
                 ModelCandidate.net_expected_value,
                 ModelCandidate.data_quality,
+                ModelCandidate.model_version_tag,
                 ModelCandidate.scoring_rationale,
             ),
             load_only(

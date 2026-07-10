@@ -32,6 +32,7 @@ from app.services.risk_governance import (
     risk_governance_policy_version,
 )
 from app.services.settlement import SETTLEMENT_FORMULA_VERSION
+from app.services.spread_audit_freshness import spread_audit_freshness_payload
 from app.time_utils import to_eastern_iso, utc_now
 
 READINESS_POLICY_VERSION = "pr4b_final_readiness_audit_pack_v1"
@@ -443,7 +444,18 @@ def _spread_audit(session: Session | None, epoch: PaperTradingEpoch | None) -> d
         .limit(1)
     ).mappings().first()
     if row is None:
-        return {"status": UNKNOWN_EVIDENCE, "latest_spread_audit_job": {"status": "not_run"}}
+        return {
+            "status": UNKNOWN_EVIDENCE,
+            "latest_spread_audit_job": {"status": "not_run"},
+            **spread_audit_freshness_payload(
+                session,
+                epoch,
+                job_status=None,
+                started_at=None,
+                completed_at=None,
+                target_date=None,
+            ),
+        }
     result: dict[str, object] = {
         "status": row["job_status"],
         "latest_spread_audit_job": {
@@ -452,6 +464,14 @@ def _spread_audit(session: Session | None, epoch: PaperTradingEpoch | None) -> d
             "completed_at": _iso(row["completed_at"]),
             "target_date": row["target_date"].isoformat() if row["target_date"] else None,
         },
+        **spread_audit_freshness_payload(
+            session,
+            epoch,
+            job_status=row["job_status"],
+            started_at=row["started_at"],
+            completed_at=row["completed_at"],
+            target_date=row["target_date"],
+        ),
     }
     for key in (
         "checked",
@@ -562,6 +582,13 @@ def _validated_components(
                 "checked": spread_audit.get("checked", 0),
                 "trusted_audit_only_count": spread_audit.get("trusted_audit_only_count", 0),
                 "read_only": spread_audit.get("read_only"),
+                "freshness_policy_version": spread_audit.get("freshness_policy_version"),
+                "freshness_status": spread_audit.get("freshness_status"),
+                "spread_audit_stale_warning": spread_audit.get("spread_audit_stale_warning"),
+                "age_hours": spread_audit.get("age_hours"),
+                "recent_full_game_spread_activity_count": spread_audit.get(
+                    "recent_full_game_spread_activity_count"
+                ),
             },
         ),
     ]
@@ -679,6 +706,14 @@ def readiness_audit_pack(session: Session | None = None) -> dict[str, object]:
             "stale_settlement_job_started_at": settlement_audit.get("stale_settlement_job_started_at"),
             "stale_settlement_job_age_minutes": settlement_audit.get("stale_settlement_job_age_minutes"),
             "stale_settlement_job_recovery_action": settlement_audit.get("stale_settlement_job_recovery_action"),
+            "spread_audit_stale_warning": spread_audit.get("spread_audit_stale_warning"),
+            "spread_audit_freshness_status": spread_audit.get("freshness_status"),
+            "latest_spread_audit_target_date": (
+                (spread_audit.get("latest_spread_audit_job") or {}).get("target_date")
+                if isinstance(spread_audit.get("latest_spread_audit_job"), dict)
+                else None
+            ),
+            "spread_audit_age_hours": spread_audit.get("age_hours"),
         },
         "spread_audit": spread_audit,
         "blockers_for_live": blockers,
@@ -733,6 +768,24 @@ def compact_readiness_summary(pack: dict[str, object]) -> dict[str, object]:
         if isinstance(pack.get("operational_warnings"), dict)
         else False,
         "latest_settlement_job_status": (pack.get("operational_warnings") or {}).get("latest_settlement_job_status")
+        if isinstance(pack.get("operational_warnings"), dict)
+        else None,
+        "spread_audit_stale_warning": (pack.get("operational_warnings") or {}).get(
+            "spread_audit_stale_warning"
+        )
+        if isinstance(pack.get("operational_warnings"), dict)
+        else False,
+        "spread_audit_freshness_status": (pack.get("operational_warnings") or {}).get(
+            "spread_audit_freshness_status"
+        )
+        if isinstance(pack.get("operational_warnings"), dict)
+        else None,
+        "latest_spread_audit_target_date": (pack.get("operational_warnings") or {}).get(
+            "latest_spread_audit_target_date"
+        )
+        if isinstance(pack.get("operational_warnings"), dict)
+        else None,
+        "spread_audit_age_hours": (pack.get("operational_warnings") or {}).get("spread_audit_age_hours")
         if isinstance(pack.get("operational_warnings"), dict)
         else None,
     }
