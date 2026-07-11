@@ -2633,6 +2633,61 @@ def test_dashboard_spread_audit_freshness_warning_is_compact(monkeypatch) -> Non
     assert compact["spread_audit_freshness_status"] == "stale_age"
 
 
+def _add_spread_audit_job_run(
+    session: Session,
+    *,
+    epoch_id: int,
+    started_at: datetime,
+    completed_at: datetime,
+    target_date: date,
+    checked: int,
+    coverage_status: str,
+    zero_checked_reason: str,
+    target_date_mapping_count: int,
+    in_window_mapping_count: int,
+    coverage_ratio: float | None,
+    status: str = "succeeded",
+) -> None:
+    session.add(
+        JobRun(
+            job_name="spread-audit",
+            job_type="paper_ops",
+            paper_trading_epoch_id=epoch_id,
+            status=status,
+            started_at=started_at,
+            completed_at=completed_at,
+            target_date=target_date,
+            result={
+                "spread_audit": {
+                    "status": "completed",
+                    "checked": checked,
+                    "verified": checked,
+                    "coverage_status": coverage_status,
+                    "zero_checked_reason": zero_checked_reason,
+                    "target_date_mapping_count": target_date_mapping_count,
+                    "target_date_distinct_market_count": target_date_mapping_count,
+                    "target_date_distinct_game_count": 1 if target_date_mapping_count else 0,
+                    "in_window_mapping_count": in_window_mapping_count,
+                    "skipped_before_min_window_count": max(target_date_mapping_count - in_window_mapping_count, 0),
+                    "skipped_after_max_window_count": 0,
+                    "coverage_ratio": coverage_ratio,
+                    "trusted_audit_only_count": checked,
+                    "needs_review_count": 0,
+                    "unsafe_count": 0,
+                    "parse_error_count": 0,
+                    "settlement_text_unverified_count": 0,
+                    "push_behavior_uncertain_count": 0,
+                    "paper_trades_created": 0,
+                    "mapping_mutations": 0,
+                    "settlement_rows_created": 0,
+                    "audit_only": True,
+                    "read_only": True,
+                }
+            },
+        )
+    )
+
+
 def test_spread_audit_freshness_keeps_current_day_covered_evidence(monkeypatch) -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
@@ -2641,51 +2696,31 @@ def test_spread_audit_freshness_keeps_current_day_covered_evidence(monkeypatch) 
 
     with Session(engine) as session:
         active = get_or_create_active_paper_epoch(session, starting_balance=Decimal("500.00"))
-        session.add_all(
-            [
-                JobRun(
-                    job_name="spread-audit",
-                    job_type="paper_ops",
-                    paper_trading_epoch_id=active.id,
-                    status="succeeded",
-                    started_at=now - timedelta(hours=2),
-                    completed_at=now - timedelta(hours=2, minutes=-1),
-                    target_date=date(2026, 7, 5),
-                    result={
-                        "spread_audit": {
-                            "checked": 4,
-                            "coverage_status": "covered",
-                            "zero_checked_reason": "not_applicable",
-                            "target_date_mapping_count": 4,
-                            "in_window_mapping_count": 4,
-                            "trusted_audit_only_count": 2,
-                            "paper_trades_created": 0,
-                            "read_only": True,
-                        }
-                    },
-                ),
-                JobRun(
-                    job_name="spread-audit",
-                    job_type="paper_ops",
-                    paper_trading_epoch_id=active.id,
-                    status="succeeded",
-                    started_at=now - timedelta(minutes=20),
-                    completed_at=now - timedelta(minutes=19),
-                    target_date=date(2026, 7, 5),
-                    result={
-                        "spread_audit": {
-                            "checked": 0,
-                            "coverage_status": "no_target_date_mappings",
-                            "zero_checked_reason": "no_target_date_mappings",
-                            "target_date_mapping_count": 0,
-                            "in_window_mapping_count": 0,
-                            "trusted_audit_only_count": 0,
-                            "paper_trades_created": 0,
-                            "read_only": True,
-                        }
-                    },
-                ),
-            ]
+        _add_spread_audit_job_run(
+            session,
+            epoch_id=active.id,
+            started_at=now - timedelta(hours=2),
+            completed_at=now - timedelta(hours=2, minutes=-1),
+            target_date=date(2026, 7, 5),
+            checked=4,
+            coverage_status="covered",
+            zero_checked_reason="not_applicable",
+            target_date_mapping_count=4,
+            in_window_mapping_count=4,
+            coverage_ratio=1.0,
+        )
+        _add_spread_audit_job_run(
+            session,
+            epoch_id=active.id,
+            started_at=now - timedelta(minutes=20),
+            completed_at=now - timedelta(minutes=19),
+            target_date=date(2026, 7, 5),
+            checked=0,
+            coverage_status="no_mappings_in_window",
+            zero_checked_reason="all_target_date_mappings_outside_window",
+            target_date_mapping_count=6,
+            in_window_mapping_count=0,
+            coverage_ratio=None,
         )
         session.commit()
 
@@ -2693,16 +2728,134 @@ def test_spread_audit_freshness_keeps_current_day_covered_evidence(monkeypatch) 
         pack = readiness.readiness_audit_pack(session)
 
     latest_audit = summary.model_status.trade_policy["full_game_spread_latest_audit"]
-    assert latest_audit["freshness_policy_version"] == "pr4e_spread_audit_coverage_freshness_v1"
+    assert latest_audit["freshness_policy_version"] == "pr4e1_spread_audit_coverage_freshness_v1"
     assert latest_audit["freshness_status"] == "fresh_covered"
     assert latest_audit["current_day_audit_run_count"] == 2
     assert latest_audit["current_day_covered_run_count"] == 1
     assert latest_audit["current_day_zero_checked_run_count"] == 1
     assert latest_audit["latest_run_checked"] == 0
-    assert latest_audit["latest_run_coverage_status"] == "no_target_date_mappings"
+    assert latest_audit["latest_run_coverage_status"] == "no_mappings_in_window"
+    assert latest_audit["latest_run_zero_checked_reason"] == "all_target_date_mappings_outside_window"
+    assert latest_audit["latest_run_target_date_mapping_count"] == 6
+    assert latest_audit["latest_run_in_window_mapping_count"] == 0
+    assert latest_audit["latest_covered_run_at"] is not None
     assert latest_audit["latest_covered_target_date"] == "2026-07-05"
     assert latest_audit["spread_audit_stale_warning"] is False
     assert pack["spread_audit"]["freshness_status"] == "fresh_covered"
+    assert pack["spread_audit"]["latest_run_coverage_status"] == "no_mappings_in_window"
+
+
+def test_pr4e1_freshness_reports_true_no_target_mappings_as_fresh(monkeypatch) -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    now = datetime(2026, 7, 5, 16, 0, tzinfo=UTC)
+    monkeypatch.setattr(spread_audit_freshness, "utc_now", lambda: now)
+
+    with Session(engine) as session:
+        active = get_or_create_active_paper_epoch(session, starting_balance=Decimal("500.00"))
+        _add_spread_audit_job_run(
+            session,
+            epoch_id=active.id,
+            started_at=now - timedelta(minutes=10),
+            completed_at=now - timedelta(minutes=9),
+            target_date=date(2026, 7, 5),
+            checked=0,
+            coverage_status="no_target_date_mappings",
+            zero_checked_reason="no_target_date_mappings",
+            target_date_mapping_count=0,
+            in_window_mapping_count=0,
+            coverage_ratio=None,
+        )
+        session.commit()
+
+        summary = dashboard.dashboard_summary_from_db(session)
+        pack = readiness.readiness_audit_pack(session)
+        compact = readiness.compact_readiness_summary(pack)
+
+    latest_audit = summary.model_status.trade_policy["full_game_spread_latest_audit"]
+    assert latest_audit["freshness_policy_version"] == "pr4e1_spread_audit_coverage_freshness_v1"
+    assert latest_audit["coverage_status"] == "no_target_date_mappings"
+    assert latest_audit.get("coverage_ratio") is None
+    assert latest_audit["freshness_status"] == "fresh_no_eligible_markets"
+    assert latest_audit["spread_audit_coverage_warning"] is False
+    assert latest_audit["spread_audit_stale_warning"] is False
+    assert pack["operational_warnings"]["spread_audit_coverage_warning"] is False
+    assert pack["operational_warnings"]["spread_audit_stale_warning"] is False
+    assert compact["spread_audit_freshness_status"] == "fresh_no_eligible_markets"
+
+
+@pytest.mark.parametrize(
+    (
+        "coverage_status",
+        "checked",
+        "target_date_mapping_count",
+        "in_window_mapping_count",
+        "zero_checked_reason",
+        "expected_freshness",
+    ),
+    [
+        (
+            "no_mappings_in_window",
+            0,
+            6,
+            0,
+            "all_target_date_mappings_outside_window",
+            "incomplete_zero_checked",
+        ),
+        (
+            "zero_checked_with_eligible_mappings",
+            0,
+            6,
+            6,
+            "eligible_mappings_but_none_checked",
+            "incomplete_zero_checked",
+        ),
+        ("partial_coverage", 3, 6, 6, "not_applicable", "incomplete_partial_coverage"),
+    ],
+)
+def test_pr4e1_freshness_flags_incomplete_current_day_coverage(
+    monkeypatch,
+    coverage_status: str,
+    checked: int,
+    target_date_mapping_count: int,
+    in_window_mapping_count: int,
+    zero_checked_reason: str,
+    expected_freshness: str,
+) -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    now = datetime(2026, 7, 5, 16, 0, tzinfo=UTC)
+    monkeypatch.setattr(spread_audit_freshness, "utc_now", lambda: now)
+    coverage_ratio = round(checked / in_window_mapping_count, 4) if in_window_mapping_count else None
+
+    with Session(engine) as session:
+        active = get_or_create_active_paper_epoch(session, starting_balance=Decimal("500.00"))
+        _add_spread_audit_job_run(
+            session,
+            epoch_id=active.id,
+            started_at=now - timedelta(minutes=15),
+            completed_at=now - timedelta(minutes=14),
+            target_date=date(2026, 7, 5),
+            checked=checked,
+            coverage_status=coverage_status,
+            zero_checked_reason=zero_checked_reason,
+            target_date_mapping_count=target_date_mapping_count,
+            in_window_mapping_count=in_window_mapping_count,
+            coverage_ratio=coverage_ratio,
+        )
+        session.commit()
+
+        summary = dashboard.dashboard_summary_from_db(session)
+        pack = readiness.readiness_audit_pack(session)
+
+    latest_audit = summary.model_status.trade_policy["full_game_spread_latest_audit"]
+    assert latest_audit["freshness_policy_version"] == "pr4e1_spread_audit_coverage_freshness_v1"
+    assert latest_audit["latest_run_coverage_status"] == coverage_status
+    assert latest_audit["freshness_status"] == expected_freshness
+    assert latest_audit["spread_audit_coverage_warning"] is True
+    assert latest_audit["spread_audit_stale_warning"] is True
+    assert pack["operational_warnings"]["spread_audit_coverage_warning"] is True
+    assert pack["operational_warnings"]["spread_audit_stale_warning"] is True
 
 
 def test_compact_dashboard_job_status_does_not_deserialize_job_json() -> None:
@@ -3323,6 +3476,90 @@ def test_readiness_endpoint_and_summaries_expose_compact_status(monkeypatch) -> 
     assert dashboard_readiness["policy_version"] == readiness.READINESS_POLICY_VERSION
     assert dashboard_readiness["live_readiness_status"] == "blocked_for_live"
     assert "candidate_pipeline" not in dashboard_readiness
+
+
+def test_pr4e1_compact_surfaces_report_no_mappings_in_window_warning(monkeypatch) -> None:
+    engine = create_engine(
+        "sqlite+pysqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    SessionLocal = sessionmaker(bind=engine)
+    now = datetime(2026, 7, 11, 17, 0, tzinfo=UTC)
+    monkeypatch.setattr(spread_audit_freshness, "utc_now", lambda: now)
+    with SessionLocal() as session:
+        active = get_or_create_active_paper_epoch(session, starting_balance=Decimal("500.00"))
+        _add_spread_audit_job_run(
+            session,
+            epoch_id=active.id,
+            started_at=now - timedelta(minutes=10),
+            completed_at=now - timedelta(minutes=9),
+            target_date=date(2026, 7, 11),
+            checked=0,
+            coverage_status="no_mappings_in_window",
+            zero_checked_reason="all_target_date_mappings_outside_window",
+            target_date_mapping_count=6,
+            in_window_mapping_count=0,
+            coverage_ratio=None,
+        )
+        session.commit()
+
+    source_status = {
+        "feature_sync_enable_network_sources": True,
+        "public_sources_enabled": True,
+        "validation_status": "ok",
+        "latest_errors": [],
+        "last_feature_sync_status": {},
+        "source_health": [],
+    }
+    monkeypatch.setattr(
+        main_module,
+        "database_status",
+        lambda: {"ready": True, "configured": True, "dialect": "sqlite", "message": "ok"},
+    )
+    monkeypatch.setattr(main_module, "get_session_factory", lambda: SessionLocal)
+    monkeypatch.setattr(main_module, "source_status_report", lambda _session: source_status)
+    monkeypatch.setattr(dashboard, "source_status_report", lambda _session: source_status)
+
+    dashboard_response = client.get("/v1/dashboard/summary")
+    readiness_response = client.get("/v1/readiness/audit-pack")
+    system_response = client.get("/v1/system/status")
+
+    assert dashboard_response.status_code == 200
+    dashboard_payload = dashboard_response.json()
+    latest_audit = dashboard_payload["model_status"]["trade_policy"]["full_game_spread_latest_audit"]
+    assert latest_audit["freshness_policy_version"] == "pr4e1_spread_audit_coverage_freshness_v1"
+    assert latest_audit["coverage_status"] == "no_mappings_in_window"
+    assert latest_audit.get("coverage_ratio") is None
+    assert latest_audit["zero_checked_reason"] == "all_target_date_mappings_outside_window"
+    assert latest_audit["freshness_status"] == "incomplete_zero_checked"
+    assert latest_audit["spread_audit_coverage_warning"] is True
+    assert latest_audit["spread_audit_stale_warning"] is True
+    assert latest_audit["latest_run_coverage_status"] == "no_mappings_in_window"
+    assert latest_audit["latest_run_target_date_mapping_count"] == 6
+    assert latest_audit["latest_run_in_window_mapping_count"] == 0
+    assert dashboard_payload["readiness"]["spread_audit_freshness_policy_version"] == (
+        "pr4e1_spread_audit_coverage_freshness_v1"
+    )
+
+    assert readiness_response.status_code == 200
+    readiness_payload = readiness_response.json()
+    assert readiness_payload["spread_audit"]["freshness_status"] == "incomplete_zero_checked"
+    assert readiness_payload["spread_audit"].get("coverage_ratio") is None
+    assert readiness_payload["operational_warnings"]["spread_audit_coverage_warning"] is True
+    assert readiness_payload["operational_warnings"]["spread_audit_stale_warning"] is True
+
+    assert system_response.status_code == 200
+    system_readiness = system_response.json()["readiness"]
+    assert system_readiness["spread_audit_freshness_policy_version"] == "pr4e1_spread_audit_coverage_freshness_v1"
+    assert system_readiness["spread_audit_freshness_status"] == "incomplete_zero_checked"
+    assert system_readiness["spread_audit_coverage_status"] == "no_mappings_in_window"
+    assert system_readiness["spread_audit_zero_checked_reason"] == "all_target_date_mappings_outside_window"
+    assert system_readiness["spread_audit_coverage_warning"] is True
+    assert system_readiness["spread_audit_stale_warning"] is True
+    assert "items" not in json.dumps(latest_audit)
+    assert "raw_payload" not in json.dumps(readiness_payload)
 
 
 def test_system_status_reports_stale_settlement_job_warning(monkeypatch) -> None:
@@ -4367,6 +4604,96 @@ def test_job_runner_logs_spread_audit_coverage_events(monkeypatch, capsys) -> No
     counts_event = next(event for event in events if event["event"] == "spread_audit_result_counts")
     assert counts_event["paper_trades_created"] == 0
     assert counts_event["mapping_mutations"] == 0
+    warning_event = next(event for event in events if event["event"] == "spread_audit_warning")
+    assert warning_event["coverage_warning"] is False
+
+
+@pytest.mark.parametrize(
+    ("coverage_status", "zero_checked_reason", "expected_warning"),
+    [
+        ("no_mappings_in_window", "all_target_date_mappings_outside_window", True),
+        ("no_target_date_mappings", "no_target_date_mappings", False),
+    ],
+)
+def test_job_runner_logs_spread_audit_warning_for_zero_window_states(
+    monkeypatch,
+    capsys,
+    coverage_status: str,
+    zero_checked_reason: str,
+    expected_warning: bool,
+) -> None:
+    class DummySession:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+    def fake_run_job(_session, **_kwargs):
+        return {
+            "job_run_id": 654,
+            "job_name": "spread-audit",
+            "target_date": "2026-07-05",
+            "status": "succeeded",
+            "duration_seconds": 2,
+            "warnings": [],
+            "result": {
+                "spread_audit": {
+                    "target_date": "2026-07-05",
+                    "target_date_mapping_count": 6 if coverage_status == "no_mappings_in_window" else 0,
+                    "target_date_distinct_market_count": 6 if coverage_status == "no_mappings_in_window" else 0,
+                    "target_date_distinct_game_count": 1 if coverage_status == "no_mappings_in_window" else 0,
+                    "in_window_mapping_count": 0,
+                    "checked": 0,
+                    "coverage_ratio": None,
+                    "coverage_status": coverage_status,
+                    "zero_checked_reason": zero_checked_reason,
+                    "skipped_before_min_window_count": 6 if coverage_status == "no_mappings_in_window" else 0,
+                    "skipped_after_max_window_count": 0,
+                    "verified": 0,
+                    "trusted_audit_only_count": 0,
+                    "needs_review_count": 0,
+                    "unsafe_count": 0,
+                    "parse_error_count": 0,
+                    "paper_trades_created": 0,
+                    "mapping_mutations": 0,
+                    "settlement_rows_created": 0,
+                    "audit_only": True,
+                    "read_only": True,
+                },
+            },
+        }
+
+    monkeypatch.setattr(job_runner, "get_session_factory", lambda: lambda: DummySession())
+    monkeypatch.setattr(job_runner, "run_job", fake_run_job)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "runner",
+            "--job",
+            "spread-audit",
+            "--target-date",
+            "2026-07-05",
+            "--min-time-to-start-minutes",
+            "45",
+            "--max-time-to-start-minutes",
+            "360",
+        ],
+    )
+
+    job_runner.main()
+
+    output = capsys.readouterr().out
+    events = [json.loads(line) for line in output.splitlines()]
+    warning_event = next(event for event in events if event["event"] == "spread_audit_warning")
+    coverage_event = next(event for event in events if event["event"] == "spread_audit_coverage")
+    assert warning_event["coverage_warning"] is expected_warning
+    assert warning_event["zero_checked_reason"] == zero_checked_reason
+    assert coverage_event["coverage_status"] == coverage_status
+    assert "items" not in output
+    assert "api_key" not in output.lower()
+    assert "headers" not in output.lower()
 
 
 def test_job_runner_logs_settlement_catchup_events(monkeypatch, capsys) -> None:
@@ -23797,7 +24124,7 @@ def test_spread_audit_reports_no_target_date_mapping_coverage(monkeypatch) -> No
     assert result["target_date_mapping_count"] == 0
     assert result["in_window_mapping_count"] == 0
     assert result["checked"] == 0
-    assert result["coverage_ratio"] == 0.0
+    assert result["coverage_ratio"] is None
     assert result["coverage_status"] == "no_target_date_mappings"
     assert result["zero_checked_reason"] == "no_target_date_mappings"
     assert result["audit_only"] is True
@@ -23831,6 +24158,7 @@ def test_spread_audit_reports_out_of_window_mapping_coverage(monkeypatch) -> Non
     assert result["target_date_mapping_count"] == 1
     assert result["in_window_mapping_count"] == 0
     assert result["checked"] == 0
+    assert result["coverage_ratio"] is None
     assert result["skipped_before_min_window_count"] == 1
     assert result["skipped_after_max_window_count"] == 0
     assert result["coverage_status"] == "no_mappings_in_window"

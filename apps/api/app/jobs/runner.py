@@ -191,7 +191,7 @@ def main() -> None:
             "spread_audit_warning",
             job=args.job,
             coverage_warning=spread_result.get("coverage_status")
-            in {"partial_coverage", "zero_checked_with_eligible_mappings", "unknown"},
+            in {"no_mappings_in_window", "partial_coverage", "zero_checked_with_eligible_mappings", "unknown"},
             zero_checked_reason=spread_result.get("zero_checked_reason"),
         )
 

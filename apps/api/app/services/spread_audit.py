@@ -323,7 +323,7 @@ def run_spread_audit(
         items.append(item)
 
     skipped_by_window = skipped_before_min_window_count + skipped_after_max_window_count
-    coverage_ratio = round(checked / in_window_mapping_count, 4) if in_window_mapping_count else 0.0
+    coverage_ratio = round(checked / in_window_mapping_count, 4) if in_window_mapping_count else None
     coverage_status = _coverage_status(
         target_date_mapping_count=target_date_mapping_count,
         in_window_mapping_count=in_window_mapping_count,

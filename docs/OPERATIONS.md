@@ -1331,9 +1331,9 @@ Expected:
 - The frontend portfolio chart keeps Today/1D/1W/1M/All and Value/P/L $/P/L % controls, but flat or tight bankroll ranges have visible y-axis breathing room.
 - No migration is required, and safety remains paper trading true, live trading false, kill switch true, demo Kalshi.
 
-## PR4e Spread-Audit Coverage Automation And Calibration Diagnostics
+## PR4e / PR4e.1 Spread-Audit Coverage Automation And Calibration Diagnostics
 
-PR4e is read-only/audit-only. It makes spread-audit runs coverage-aware, adds structured spread-audit runner logs, and exposes compact calibration-coverage plus rolling adapter-error diagnostics. It must not change live execution, settlement formulas, cron cadence for existing jobs, source ingestion, market discovery, WebSocket behavior, credentials, sportsbook/Odds API scope, team totals, umpire factors, MVE/multivariate markets, model math, selector thresholds, risk caps, first-five spread trading, or candidate-sweep cache-only behavior.
+PR4e is read-only/audit-only. It makes spread-audit runs coverage-aware, adds structured spread-audit runner logs, and exposes compact calibration-coverage plus rolling adapter-error diagnostics. PR4e.1 corrects zero-window freshness semantics with policy `pr4e1_spread_audit_coverage_freshness_v1`: true no-target-date-mapping evidence can be fresh, but target-date mappings that are merely outside the requested audit window are incomplete until a covered current-day run exists. These PRs must not change live execution, settlement formulas, cron cadence for existing jobs, source ingestion, market discovery, WebSocket behavior, credentials, sportsbook/Odds API scope, team totals, umpire factors, MVE/multivariate markets, model math, selector thresholds, risk caps, first-five spread trading, or candidate-sweep cache-only behavior.
 
 Recommended Railway spread-audit service command:
 
@@ -1352,33 +1352,107 @@ $Key = Read-Host -Prompt "PASTE YOUR HOMERUN API KEY HERE, THEN PRESS ENTER"
 $Headers = @{ "X-API-Key" = $Key }
 $Stamp = Get-Date -Format "yyyyMMdd-HHmmss"
 
-$AuditRun = Invoke-RestMethod -Method Post -Headers $Headers "$Base/v1/jobs/run/spread-audit?target_date=today_et&min_time_to_start_minutes=45&max_time_to_start_minutes=360"
+$RunResponse = Invoke-RestMethod -Method Post -Headers $Headers "$Base/v1/jobs/run/spread-audit?target_date=today_et&min_time_to_start_minutes=45&max_time_to_start_minutes=360"
 $Dashboard = Invoke-RestMethod -Headers $Headers "$Base/v1/dashboard/summary"
 $Governance = Invoke-RestMethod -Headers $Headers "$Base/v1/model/governance/status"
 $Readiness = Invoke-RestMethod -Headers $Headers "$Base/v1/readiness/audit-pack"
+$System = Invoke-RestMethod "$Base/v1/system/status"
 
+$RunResponse | ConvertTo-Json -Depth 20 | Out-File "pr4e1-spread-audit-run-$Stamp.json"
 $Dashboard | ConvertTo-Json -Depth 20 | Out-File "pr4e-dashboard-$Stamp.json"
 $Governance | ConvertTo-Json -Depth 20 | Out-File "pr4e-governance-$Stamp.json"
 $Readiness | ConvertTo-Json -Depth 20 | Out-File "pr4e-readiness-$Stamp.json"
+$System | ConvertTo-Json -Depth 20 | Out-File "pr4e1-system-$Stamp.json"
 
-$AuditRun.result.spread_audit | Select-Object target_date,target_date_mapping_count,in_window_mapping_count,checked,verified,trusted_audit_only_count,needs_review_count,coverage_ratio,coverage_status,zero_checked_reason,audit_only,read_only,paper_trades_created,mapping_mutations,settlement_rows_created | Format-List
-$Dashboard.model_status.trade_policy.full_game_spread_latest_audit | Select-Object freshness_policy_version,freshness_status,current_day_audit_run_count,current_day_covered_run_count,current_day_zero_checked_run_count,latest_run_checked,latest_run_coverage_status,latest_run_zero_checked_reason,spread_audit_coverage_warning,spread_audit_stale_warning | Format-List
+$SpreadAudit = $RunResponse.result.result.spread_audit
+if (-not $SpreadAudit) {
+    $SpreadAudit = $RunResponse.result.spread_audit
+}
+
+$WindowRows = @(
+    foreach ($Name in @("spread_audit_run")) {
+        [pscustomobject]@{
+            name = $Name
+            target_date_mapping_count = $SpreadAudit.target_date_mapping_count
+            in_window_mapping_count = $SpreadAudit.in_window_mapping_count
+            checked = $SpreadAudit.checked
+            coverage_ratio = $SpreadAudit.coverage_ratio
+            coverage_status = $SpreadAudit.coverage_status
+            zero_checked_reason = $SpreadAudit.zero_checked_reason
+            skipped_before_min_window_count = $SpreadAudit.skipped_before_min_window_count
+            skipped_after_max_window_count = $SpreadAudit.skipped_after_max_window_count
+        }
+    }
+)
+$WindowRows | Format-Table -AutoSize
+
+$LatestAudit = $Dashboard.model_status.trade_policy.full_game_spread_latest_audit
+$LatestRows = @(
+    foreach ($Name in @("dashboard", "readiness", "system")) {
+        if ($Name -eq "dashboard") {
+            $Source = $LatestAudit
+            $Freshness = $Source.freshness_status
+            $Coverage = $Source.coverage_status
+            $ZeroReason = $Source.zero_checked_reason
+            $CoverageWarning = $Source.spread_audit_coverage_warning
+            $StaleWarning = $Source.spread_audit_stale_warning
+            $Policy = $Source.freshness_policy_version
+        } elseif ($Name -eq "readiness") {
+            $Source = $Readiness.operational_warnings
+            $Freshness = $Source.spread_audit_freshness_status
+            $Coverage = $Source.spread_audit_coverage_status
+            $ZeroReason = $Source.spread_audit_zero_checked_reason
+            $CoverageWarning = $Source.spread_audit_coverage_warning
+            $StaleWarning = $Source.spread_audit_stale_warning
+            $Policy = $Readiness.spread_audit.freshness_policy_version
+        } else {
+            $Source = $System.readiness
+            $Freshness = $Source.spread_audit_freshness_status
+            $Coverage = $Source.spread_audit_coverage_status
+            $ZeroReason = $Source.spread_audit_zero_checked_reason
+            $CoverageWarning = $Source.spread_audit_coverage_warning
+            $StaleWarning = $Source.spread_audit_stale_warning
+            $Policy = $Source.spread_audit_freshness_policy_version
+        }
+        [pscustomobject]@{
+            source = $Name
+            policy = $Policy
+            freshness_status = $Freshness
+            coverage_status = $Coverage
+            zero_checked_reason = $ZeroReason
+            coverage_warning = $CoverageWarning
+            stale_warning = $StaleWarning
+        }
+    }
+)
+$LatestRows | Format-Table -AutoSize
+
+$SpreadAudit | Select-Object target_date,target_date_mapping_count,in_window_mapping_count,checked,verified,trusted_audit_only_count,needs_review_count,coverage_ratio,coverage_status,zero_checked_reason,audit_only,read_only,paper_trades_created,mapping_mutations,settlement_rows_created | Format-List
+$LatestAudit | Select-Object freshness_policy_version,freshness_status,current_day_audit_run_count,current_day_covered_run_count,current_day_zero_checked_run_count,latest_run_checked,latest_run_coverage_status,latest_run_zero_checked_reason,latest_run_target_date_mapping_count,latest_run_in_window_mapping_count,latest_covered_run_at,latest_covered_target_date,spread_audit_coverage_warning,spread_audit_stale_warning | Format-List
 $Governance.result.calibration_coverage_summary.status_counts | Format-List
 $Governance.result.rolling_adapter_error_diagnostics.windows.last_1d | Select-Object candidate_count,adapter_error_count,adapter_missing_count,reason_detail_status,truncated | Format-List
 $Readiness.operational_warnings | Select-Object spread_audit_freshness_status,spread_audit_coverage_status,spread_audit_zero_checked_reason,spread_audit_coverage_warning,spread_audit_stale_warning | Format-List
+
+$Headers = $null
+$Key = $null
+Remove-Variable Headers,Key -ErrorAction SilentlyContinue
 ```
 
 Expected:
 
 - `coverage_status` is `covered` when all in-window target-date mappings were checked.
-- If there are no target-date mappings, `coverage_status=no_target_date_mappings` and `freshness_status=fresh_no_eligible_markets`.
-- If all target-date mappings are outside the 45-360 minute audit window, `coverage_status=no_mappings_in_window` and `zero_checked_reason=all_target_date_mappings_outside_window`.
-- If a later zero-work run follows an earlier covered current-day run, dashboard/readiness freshness remains `fresh_covered` while latest-run zero-check fields remain visible.
+- No target-date mappings: `coverage_ratio` is null, `coverage_status=no_target_date_mappings`, `zero_checked_reason=no_target_date_mappings`, `freshness_status=fresh_no_eligible_markets`, and both spread-audit warnings are false.
+- Target-date mappings exist but all are outside the selected window and no covered current-day run exists: `coverage_ratio` is null, `coverage_status=no_mappings_in_window`, `zero_checked_reason=all_target_date_mappings_outside_window`, `freshness_status=incomplete_zero_checked`, `spread_audit_coverage_warning=true`, and `spread_audit_stale_warning=true`.
+- Eligible in-window mappings existed but none were checked: `freshness_status=incomplete_zero_checked`, `spread_audit_coverage_warning=true`, and `spread_audit_stale_warning=true`.
+- Partial coverage: `freshness_status=incomplete_partial_coverage`, `spread_audit_coverage_warning=true`, and `spread_audit_stale_warning=true`.
+- If a later zero-work run follows an earlier covered current-day run, dashboard/readiness freshness remains `fresh_covered`, the latest-run zero-work fields remain visible, `latest_covered_run_at` / `latest_covered_target_date` remain populated, and `spread_audit_stale_warning=false`.
 - `audit_only=true`, `read_only=true`, `paper_trades_created=0`, `mapping_mutations=0`, and `settlement_rows_created=0`.
 - `calibration_coverage_summary.units` includes all six units: `full_game_total`, `first_five_total`, `full_game_winner`, `first_five_winner`, `full_game_spread`, and `first_five_spread`.
 - Rolling adapter-error diagnostics include `last_1d`, `last_7d`, and `since_clean_cutoff` windows with bounded reason detail.
 - Candidate-sweep remains cache-only and does not call spread audit.
 - No migration is required, and safety remains paper trading true, live trading false, kill switch true, demo Kalshi.
+
+After PR4e.1 deploy, do not enable or declare the separate Railway spread-audit cron production-validated until the zero-window checks above pass. The recurring command and 10 AM / 2 PM / 6 PM ET cadence stay unchanged.
 
 ## Required Context Updates
 
