@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 import logging
 from math import exp, factorial, log
@@ -44,6 +44,9 @@ MODEL_FAMILY = "mlb_all_supported_families"
 MAX_RUNS = 18
 GOVERNANCE_CLEAN_TRAINING_POLICY = "pr3p_clean_governance_training_v1"
 FAMILY_SCOPE_GOVERNANCE_POLICY = "pr3v_family_scope_governance_v1"
+CALIBRATION_COVERAGE_POLICY_VERSION = "pr4e_calibration_coverage_diagnostics_v1"
+ROLLING_ADAPTER_ERROR_POLICY_VERSION = "pr4e_rolling_adapter_error_diagnostics_v1"
+ROLLING_ADAPTER_ERROR_ROW_LIMIT = 5000
 GOVERNANCE_CLEAN_TRAINING_ZONE = ZoneInfo("America/New_York")
 logger = logging.getLogger(__name__)
 GOVERNANCE_FAMILY_SCOPE_UNITS = (
@@ -1566,6 +1569,199 @@ def _family_scope_governance_units_from_counts(
     return units
 
 
+def _calibration_unit_coverage_status(unit: dict[str, object]) -> str:
+    if unit.get("active_calibration_version"):
+        return "family_calibrated"
+    if unit.get("calibration_version") or unit.get("challenger_version") or unit.get("last_trained_at"):
+        return "trained_not_promoted"
+    clean_samples = int(unit.get("clean_resolved_mature_samples") or 0)
+    trainable_samples = int(unit.get("trainable_clean_samples") or 0)
+    minimum_train = int(unit.get("minimum_samples_train") or 0)
+    if clean_samples == 0:
+        return "missing_evidence"
+    if minimum_train and trainable_samples < minimum_train:
+        return "not_eligible"
+    return "shared_parameter_fallback"
+
+
+def _calibration_unit_fallback_status(unit: dict[str, object], coverage_status: str) -> str:
+    if coverage_status == "family_calibrated":
+        return "active_family_calibration"
+    if coverage_status == "trained_not_promoted":
+        return "shared_parameters_until_promotion"
+    if coverage_status == "shared_parameter_fallback":
+        return "shared_parameters"
+    if coverage_status == "not_eligible":
+        return "not_eligible_insufficient_clean_samples"
+    return "missing_evidence"
+
+
+def _calibration_coverage_summary(family_scope_units: dict[str, dict[str, object]]) -> dict[str, object]:
+    units: dict[str, dict[str, object]] = {}
+    status_counts: dict[str, int] = {}
+    for unit in GOVERNANCE_FAMILY_SCOPE_UNITS:
+        source = family_scope_units.get(unit, {})
+        coverage_status = _calibration_unit_coverage_status(source)
+        status_counts[coverage_status] = status_counts.get(coverage_status, 0) + 1
+        units[unit] = {
+            "governance_family_scope_key": unit,
+            "active_family_calibration_present": bool(source.get("active_calibration_version")),
+            "active_calibration_version": source.get("active_calibration_version"),
+            "latest_challenger_version": source.get("challenger_version"),
+            "latest_calibration_version": source.get("calibration_version"),
+            "latest_promotion_status": source.get("promotion_status"),
+            "clean_resolved_mature_samples": int(source.get("clean_resolved_mature_samples") or 0),
+            "train_sample_count": int(source.get("train_sample_count") or 0),
+            "holdout_sample_count": int(source.get("holdout_sample_count") or 0),
+            "adapter_error_count": int(source.get("adapter_error_count") or 0),
+            "coverage_status": coverage_status,
+            "fallback_status": _calibration_unit_fallback_status(source, coverage_status),
+        }
+    return {
+        "policy_version": CALIBRATION_COVERAGE_POLICY_VERSION,
+        "unit_count": len(units),
+        "status_counts": status_counts,
+        "family_calibrated_count": status_counts.get("family_calibrated", 0),
+        "shared_parameter_fallback_count": status_counts.get("shared_parameter_fallback", 0),
+        "trained_not_promoted_count": status_counts.get("trained_not_promoted", 0),
+        "not_eligible_count": status_counts.get("not_eligible", 0),
+        "missing_evidence_count": status_counts.get("missing_evidence", 0),
+        "units": units,
+    }
+
+
+def _governance_family_scope_key_from_fields(
+    *,
+    adapter_family: str | None,
+    calibration_hook: str | None,
+    market_family: str | None,
+) -> str | None:
+    if adapter_family in GOVERNANCE_FAMILY_SCOPE_UNITS:
+        return str(adapter_family)
+    for unit, expected_hook in CALIBRATION_HOOK_BY_GOVERNANCE_UNIT.items():
+        if calibration_hook == expected_hook:
+            return unit
+    if market_family in GOVERNANCE_FAMILY_SCOPE_UNITS:
+        return str(market_family)
+    return None
+
+
+def _empty_adapter_error_unit(unit: str) -> dict[str, object]:
+    return {
+        "governance_family_scope_key": unit,
+        "candidate_count": 0,
+        "adapter_error_count": 0,
+        "adapter_missing_count": 0,
+        "adapter_error_reason_counts": {},
+    }
+
+
+def _rolling_adapter_error_window(
+    session: Session,
+    *,
+    paper_trading_epoch_id: int | None,
+    window_name: str,
+    starts_at: datetime,
+    ends_at: datetime,
+) -> dict[str, object]:
+    statement = (
+        select(
+            ModelCandidate.market_family,
+            ModelCandidate.probability_adapter_key,
+            ModelCandidate.probability_adapter_version,
+            ModelCandidate.probability_adapter_family,
+            ModelCandidate.probability_adapter_scope,
+            ModelCandidate.probability_adapter_calibration_hook,
+            ModelCandidate.contract_side,
+            ModelCandidate.probability_adapter_metadata,
+        )
+        .where(ModelCandidate.evaluated_at >= starts_at)
+        .where(ModelCandidate.evaluated_at <= ends_at)
+        .order_by(ModelCandidate.evaluated_at.desc(), ModelCandidate.id.desc())
+        .limit(ROLLING_ADAPTER_ERROR_ROW_LIMIT + 1)
+    )
+    if paper_trading_epoch_id is not None:
+        statement = statement.where(ModelCandidate.paper_trading_epoch_id == paper_trading_epoch_id)
+    rows = list(session.execute(statement))
+    truncated = len(rows) > ROLLING_ADAPTER_ERROR_ROW_LIMIT
+    rows = rows[:ROLLING_ADAPTER_ERROR_ROW_LIMIT]
+    units = {unit: _empty_adapter_error_unit(unit) for unit in GOVERNANCE_FAMILY_SCOPE_UNITS}
+    total_errors = 0
+    total_missing = 0
+    for row in rows:
+        unit = _governance_family_scope_key_from_fields(
+            adapter_family=row.probability_adapter_family,
+            calibration_hook=row.probability_adapter_calibration_hook,
+            market_family=row.market_family,
+        )
+        if unit is None:
+            continue
+        bucket = units[unit]
+        bucket["candidate_count"] = int(bucket["candidate_count"]) + 1
+        if not (
+            row.probability_adapter_key
+            and row.probability_adapter_version
+            and row.probability_adapter_family
+            and row.probability_adapter_calibration_hook
+        ):
+            bucket["adapter_missing_count"] = int(bucket["adapter_missing_count"]) + 1
+            total_missing += 1
+        reason = _probability_adapter_error_reason_from_fields(
+            row.probability_adapter_key,
+            row.probability_adapter_version,
+            row.probability_adapter_family,
+            row.probability_adapter_calibration_hook,
+            row.contract_side,
+            row.probability_adapter_metadata if isinstance(row.probability_adapter_metadata, dict) else None,
+        )
+        if reason:
+            reason_counts = bucket["adapter_error_reason_counts"]
+            if isinstance(reason_counts, dict):
+                reason_counts[reason] = int(reason_counts.get(reason) or 0) + 1
+            bucket["adapter_error_count"] = int(bucket["adapter_error_count"]) + 1
+            total_errors += 1
+    return {
+        "window": window_name,
+        "starts_at": ensure_aware_utc(starts_at).isoformat(),
+        "ends_at": ensure_aware_utc(ends_at).isoformat(),
+        "row_limit": ROLLING_ADAPTER_ERROR_ROW_LIMIT,
+        "truncated": truncated,
+        "candidate_count": sum(int(unit["candidate_count"]) for unit in units.values()),
+        "adapter_error_count": total_errors,
+        "adapter_missing_count": total_missing,
+        "reason_detail_status": "bounded_sample_limit_reached" if truncated else "available",
+        "units": units,
+    }
+
+
+def _rolling_adapter_error_diagnostics(
+    session: Session,
+    *,
+    paper_trading_epoch_id: int | None,
+    clean_window: dict[str, object],
+) -> dict[str, object]:
+    now = utc_now()
+    windows = {
+        "last_1d": now - timedelta(days=1),
+        "last_7d": now - timedelta(days=7),
+        "since_clean_cutoff": clean_window["start_at"],
+    }
+    return {
+        "policy_version": ROLLING_ADAPTER_ERROR_POLICY_VERSION,
+        "row_limit_per_window": ROLLING_ADAPTER_ERROR_ROW_LIMIT,
+        "windows": {
+            name: _rolling_adapter_error_window(
+                session,
+                paper_trading_epoch_id=paper_trading_epoch_id,
+                window_name=name,
+                starts_at=starts_at,
+                ends_at=now,
+            )
+            for name, starts_at in windows.items()
+        },
+    }
+
+
 CURRENT_FAMILY_SCOPE_UNIT_FIELDS = {
     "status",
     "reason",
@@ -2579,6 +2775,12 @@ def governance_status(
             aggregate_adapter_error_reason_counts[str(reason)] = aggregate_adapter_error_reason_counts.get(
                 str(reason), 0
             ) + int(count or 0)
+    calibration_coverage_summary = _calibration_coverage_summary(family_scope_units)
+    rolling_adapter_error_diagnostics = _rolling_adapter_error_diagnostics(
+        session,
+        paper_trading_epoch_id=paper_trading_epoch_id,
+        clean_window=clean_window,
+    )
     mature_count = session.scalar(
         select(func.count(ModelCandidate.id))
         .where(ModelCandidate.paper_trading_epoch_id == paper_trading_epoch_id)
@@ -2599,6 +2801,8 @@ def governance_status(
         "family_scope_governance_enabled": True,
         "family_scope_units": family_scope_units,
         "family_scope_unit_count": len(family_scope_units),
+        "calibration_coverage_summary": calibration_coverage_summary,
+        "rolling_adapter_error_diagnostics": rolling_adapter_error_diagnostics,
         "active_family_scope_calibrations": _family_scope_calibrations(
             active_parameters.parameters if active_parameters else None
         ),

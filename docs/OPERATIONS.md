@@ -1331,6 +1331,55 @@ Expected:
 - The frontend portfolio chart keeps Today/1D/1W/1M/All and Value/P/L $/P/L % controls, but flat or tight bankroll ranges have visible y-axis breathing room.
 - No migration is required, and safety remains paper trading true, live trading false, kill switch true, demo Kalshi.
 
+## PR4e Spread-Audit Coverage Automation And Calibration Diagnostics
+
+PR4e is read-only/audit-only. It makes spread-audit runs coverage-aware, adds structured spread-audit runner logs, and exposes compact calibration-coverage plus rolling adapter-error diagnostics. It must not change live execution, settlement formulas, cron cadence for existing jobs, source ingestion, market discovery, WebSocket behavior, credentials, sportsbook/Odds API scope, team totals, umpire factors, MVE/multivariate markets, model math, selector thresholds, risk caps, first-five spread trading, or candidate-sweep cache-only behavior.
+
+Recommended Railway spread-audit service command:
+
+```powershell
+python -m app.jobs.runner --job spread-audit --target-date today_et --min-time-to-start-minutes 45 --max-time-to-start-minutes 360
+```
+
+Recommended ET cadence: 10 AM, 2 PM, and 6 PM ET. During EDT, use UTC hours 14, 18, and 22. During EST, use UTC hours 15, 19, and 23. If Railway cannot express those three runs in one cron expression, create three identically configured short-lived services with the same command and separate UTC schedules.
+
+Production validation:
+
+```powershell
+$Base = "https://homerun-production-2551.up.railway.app"
+Write-Host "HOMERUN API KEY REQUIRED"
+$Key = Read-Host -Prompt "PASTE YOUR HOMERUN API KEY HERE, THEN PRESS ENTER"
+$Headers = @{ "X-API-Key" = $Key }
+$Stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+
+$AuditRun = Invoke-RestMethod -Method Post -Headers $Headers "$Base/v1/jobs/run/spread-audit?target_date=today_et&min_time_to_start_minutes=45&max_time_to_start_minutes=360"
+$Dashboard = Invoke-RestMethod -Headers $Headers "$Base/v1/dashboard/summary"
+$Governance = Invoke-RestMethod -Headers $Headers "$Base/v1/model/governance/status"
+$Readiness = Invoke-RestMethod -Headers $Headers "$Base/v1/readiness/audit-pack"
+
+$Dashboard | ConvertTo-Json -Depth 20 | Out-File "pr4e-dashboard-$Stamp.json"
+$Governance | ConvertTo-Json -Depth 20 | Out-File "pr4e-governance-$Stamp.json"
+$Readiness | ConvertTo-Json -Depth 20 | Out-File "pr4e-readiness-$Stamp.json"
+
+$AuditRun.result.spread_audit | Select-Object target_date,target_date_mapping_count,in_window_mapping_count,checked,verified,trusted_audit_only_count,needs_review_count,coverage_ratio,coverage_status,zero_checked_reason,audit_only,read_only,paper_trades_created,mapping_mutations,settlement_rows_created | Format-List
+$Dashboard.model_status.trade_policy.full_game_spread_latest_audit | Select-Object freshness_policy_version,freshness_status,current_day_audit_run_count,current_day_covered_run_count,current_day_zero_checked_run_count,latest_run_checked,latest_run_coverage_status,latest_run_zero_checked_reason,spread_audit_coverage_warning,spread_audit_stale_warning | Format-List
+$Governance.result.calibration_coverage_summary.status_counts | Format-List
+$Governance.result.rolling_adapter_error_diagnostics.windows.last_1d | Select-Object candidate_count,adapter_error_count,adapter_missing_count,reason_detail_status,truncated | Format-List
+$Readiness.operational_warnings | Select-Object spread_audit_freshness_status,spread_audit_coverage_status,spread_audit_zero_checked_reason,spread_audit_coverage_warning,spread_audit_stale_warning | Format-List
+```
+
+Expected:
+
+- `coverage_status` is `covered` when all in-window target-date mappings were checked.
+- If there are no target-date mappings, `coverage_status=no_target_date_mappings` and `freshness_status=fresh_no_eligible_markets`.
+- If all target-date mappings are outside the 45-360 minute audit window, `coverage_status=no_mappings_in_window` and `zero_checked_reason=all_target_date_mappings_outside_window`.
+- If a later zero-work run follows an earlier covered current-day run, dashboard/readiness freshness remains `fresh_covered` while latest-run zero-check fields remain visible.
+- `audit_only=true`, `read_only=true`, `paper_trades_created=0`, `mapping_mutations=0`, and `settlement_rows_created=0`.
+- `calibration_coverage_summary.units` includes all six units: `full_game_total`, `first_five_total`, `full_game_winner`, `first_five_winner`, `full_game_spread`, and `first_five_spread`.
+- Rolling adapter-error diagnostics include `last_1d`, `last_7d`, and `since_clean_cutoff` windows with bounded reason detail.
+- Candidate-sweep remains cache-only and does not call spread audit.
+- No migration is required, and safety remains paper trading true, live trading false, kill switch true, demo Kalshi.
+
 ## Required Context Updates
 
 Every PR must update `PROJECT_CONTEXT.md`.

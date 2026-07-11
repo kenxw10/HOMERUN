@@ -1669,6 +1669,15 @@ def _latest_spread_audit_counts(session: Session, epoch: PaperTradingEpoch) -> d
             JobRun.target_date,
             spread_audit_result["checked"].label("checked"),
             spread_audit_result["verified"].label("verified"),
+            spread_audit_result["target_date_mapping_count"].label("target_date_mapping_count"),
+            spread_audit_result["target_date_distinct_market_count"].label("target_date_distinct_market_count"),
+            spread_audit_result["target_date_distinct_game_count"].label("target_date_distinct_game_count"),
+            spread_audit_result["in_window_mapping_count"].label("in_window_mapping_count"),
+            spread_audit_result["skipped_before_min_window_count"].label("skipped_before_min_window_count"),
+            spread_audit_result["skipped_after_max_window_count"].label("skipped_after_max_window_count"),
+            spread_audit_result["coverage_ratio"].label("coverage_ratio"),
+            spread_audit_result["coverage_status"].label("coverage_status"),
+            spread_audit_result["zero_checked_reason"].label("zero_checked_reason"),
             spread_audit_result["trusted_audit_only_count"].label("trusted_audit_only_count"),
             spread_audit_result["needs_review_count"].label("needs_review_count"),
             spread_audit_result["unsafe_count"].label("unsafe_count"),
@@ -1676,7 +1685,10 @@ def _latest_spread_audit_counts(session: Session, epoch: PaperTradingEpoch) -> d
             spread_audit_result["settlement_text_unverified_count"].label("settlement_text_unverified_count"),
             spread_audit_result["push_behavior_uncertain_count"].label("push_behavior_uncertain_count"),
             spread_audit_result["paper_trades_created"].label("paper_trades_created"),
+            spread_audit_result["audit_only"].label("audit_only"),
             spread_audit_result["read_only"].label("read_only"),
+            spread_audit_result["mapping_mutations"].label("mapping_mutations"),
+            spread_audit_result["settlement_rows_created"].label("settlement_rows_created"),
         )
         .where(JobRun.job_name == "spread-audit")
         .where(JobRun.paper_trading_epoch_id == epoch.id)
@@ -1709,6 +1721,12 @@ def _latest_spread_audit_counts(session: Session, epoch: PaperTradingEpoch) -> d
     for key in (
         "checked",
         "verified",
+        "target_date_mapping_count",
+        "target_date_distinct_market_count",
+        "target_date_distinct_game_count",
+        "in_window_mapping_count",
+        "skipped_before_min_window_count",
+        "skipped_after_max_window_count",
         "trusted_audit_only_count",
         "needs_review_count",
         "unsafe_count",
@@ -1716,10 +1734,29 @@ def _latest_spread_audit_counts(session: Session, epoch: PaperTradingEpoch) -> d
         "settlement_text_unverified_count",
         "push_behavior_uncertain_count",
         "paper_trades_created",
+        "mapping_mutations",
+        "settlement_rows_created",
     ):
         value = _int_json_scalar(row[key])
         if value is not None:
             compact[key] = value
+    coverage_ratio = _json_scalar(row["coverage_ratio"])
+    if coverage_ratio is not None:
+        try:
+            compact["coverage_ratio"] = float(str(coverage_ratio).strip('"'))
+        except (TypeError, ValueError):
+            pass
+    for key in ("coverage_status", "zero_checked_reason"):
+        value = _json_scalar(row[key])
+        if value is not None:
+            compact[key] = str(value).strip('"')
+    audit_only = row["audit_only"]
+    if isinstance(audit_only, bool):
+        compact["audit_only"] = audit_only
+    elif isinstance(audit_only, int):
+        compact["audit_only"] = bool(audit_only)
+    elif isinstance(audit_only, str):
+        compact["audit_only"] = audit_only.strip('"').lower() == "true"
     read_only = row["read_only"]
     if isinstance(read_only, bool):
         compact["read_only"] = read_only
@@ -2263,6 +2300,8 @@ def dashboard_summary_from_db(
                 "adapter_errors_excluded_from_training",
                 True,
             ),
+            "calibration_coverage_summary": governance_summary.get("calibration_coverage_summary", {}),
+            "rolling_adapter_error_diagnostics": governance_summary.get("rolling_adapter_error_diagnostics", {}),
         },
         governance_status=str(governance_summary.get("last_governance_status") or "not_run"),
         trade_policy=trade_policy,
