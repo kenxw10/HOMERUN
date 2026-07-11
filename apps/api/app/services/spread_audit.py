@@ -135,6 +135,40 @@ def _status_counter_template() -> dict[str, int]:
     return {status: 0 for status in sorted(FULL_GAME_SPREAD_AUDIT_STATUSES)}
 
 
+def _coverage_status(
+    *,
+    target_date_mapping_count: int,
+    in_window_mapping_count: int,
+    checked: int,
+) -> str:
+    if target_date_mapping_count == 0:
+        return "no_target_date_mappings"
+    if in_window_mapping_count == 0:
+        return "no_mappings_in_window"
+    if checked == 0:
+        return "zero_checked_with_eligible_mappings"
+    if checked < in_window_mapping_count:
+        return "partial_coverage"
+    if checked == in_window_mapping_count:
+        return "covered"
+    return "unknown"
+
+
+def _zero_checked_reason(
+    *,
+    target_date_mapping_count: int,
+    in_window_mapping_count: int,
+    checked: int,
+) -> str:
+    if checked > 0:
+        return "not_applicable"
+    if target_date_mapping_count == 0:
+        return "no_target_date_mappings"
+    if in_window_mapping_count == 0:
+        return "all_target_date_mappings_outside_window"
+    return "eligible_mappings_but_none_checked"
+
+
 def _append_example(examples: dict[str, list[dict[str, object]]], reason: str, item: dict[str, object]) -> None:
     bucket = examples.setdefault(reason, [])
     if len(bucket) >= 3:
@@ -181,16 +215,23 @@ def run_spread_audit(
     items: list[dict[str, object]] = []
     examples_by_reason: dict[str, list[dict[str, object]]] = {}
     status_counts = _status_counter_template()
-    checked = verified = unverified = skipped_by_window = 0
+    checked = verified = unverified = 0
+    skipped_before_min_window_count = 0
+    skipped_after_max_window_count = 0
+    target_date_mapping_count = len(rows)
+    target_date_distinct_market_count = len({market.id for _, _, market in rows})
+    target_date_distinct_game_count = len({game.id for _, game, _ in rows})
+    in_window_mapping_count = 0
 
     for mapping, game, market in rows:
         minutes_to_start = int((ensure_aware_utc(game.scheduled_start) - now).total_seconds() / 60)
         if min_time_to_start_minutes is not None and minutes_to_start < min_time_to_start_minutes:
-            skipped_by_window += 1
+            skipped_before_min_window_count += 1
             continue
         if max_time_to_start_minutes is not None and minutes_to_start > max_time_to_start_minutes:
-            skipped_by_window += 1
+            skipped_after_max_window_count += 1
             continue
+        in_window_mapping_count += 1
 
         family = mapping.market_family or market.market_family or market.market_type or "unknown"
         family_counts = by_family.setdefault(family, {"checked": 0, "verified": 0, "unverified": 0})
@@ -281,15 +322,36 @@ def run_spread_audit(
             _append_example(examples_by_reason, reason, item)
         items.append(item)
 
+    skipped_by_window = skipped_before_min_window_count + skipped_after_max_window_count
+    coverage_ratio = round(checked / in_window_mapping_count, 4) if in_window_mapping_count else 0.0
+    coverage_status = _coverage_status(
+        target_date_mapping_count=target_date_mapping_count,
+        in_window_mapping_count=in_window_mapping_count,
+        checked=checked,
+    )
+    zero_checked_reason = _zero_checked_reason(
+        target_date_mapping_count=target_date_mapping_count,
+        in_window_mapping_count=in_window_mapping_count,
+        checked=checked,
+    )
     return {
         "status": "completed",
         "target_date": day.isoformat(),
         "min_time_to_start_minutes": min_time_to_start_minutes,
         "max_time_to_start_minutes": max_time_to_start_minutes,
+        "target_date_mapping_count": target_date_mapping_count,
+        "target_date_distinct_market_count": target_date_distinct_market_count,
+        "target_date_distinct_game_count": target_date_distinct_game_count,
+        "in_window_mapping_count": in_window_mapping_count,
         "checked": checked,
         "verified": verified,
         "unverified": unverified,
         "skipped_by_window": skipped_by_window,
+        "skipped_before_min_window_count": skipped_before_min_window_count,
+        "skipped_after_max_window_count": skipped_after_max_window_count,
+        "coverage_ratio": coverage_ratio,
+        "coverage_status": coverage_status,
+        "zero_checked_reason": zero_checked_reason,
         "by_family": by_family,
         "audit_scope": "full_game_spread",
         "audit_only": True,

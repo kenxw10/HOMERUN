@@ -148,6 +148,52 @@ def main() -> None:
             job=args.job,
             snapshot_id=balance_snapshot.get("snapshot_id"),
         )
+    if args.job == "spread-audit":
+        run_result = result.get("result") if isinstance(result.get("result"), dict) else {}
+        spread_result = run_result.get("spread_audit") if isinstance(run_result.get("spread_audit"), dict) else {}
+        _log_event(
+            "spread_audit_window",
+            job=args.job,
+            min_time_to_start_minutes=args.min_time_to_start_minutes,
+            max_time_to_start_minutes=args.max_time_to_start_minutes,
+            audit_target_date=spread_result.get("target_date"),
+            **_target_window_payload(target_date),
+        )
+        _log_event(
+            "spread_audit_coverage",
+            job=args.job,
+            target_date_mapping_count=spread_result.get("target_date_mapping_count"),
+            target_date_distinct_market_count=spread_result.get("target_date_distinct_market_count"),
+            target_date_distinct_game_count=spread_result.get("target_date_distinct_game_count"),
+            in_window_mapping_count=spread_result.get("in_window_mapping_count"),
+            checked=spread_result.get("checked"),
+            coverage_ratio=spread_result.get("coverage_ratio"),
+            coverage_status=spread_result.get("coverage_status"),
+            zero_checked_reason=spread_result.get("zero_checked_reason"),
+            skipped_before_min_window_count=spread_result.get("skipped_before_min_window_count"),
+            skipped_after_max_window_count=spread_result.get("skipped_after_max_window_count"),
+        )
+        _log_event(
+            "spread_audit_result_counts",
+            job=args.job,
+            verified=spread_result.get("verified"),
+            trusted_audit_only_count=spread_result.get("trusted_audit_only_count"),
+            needs_review_count=spread_result.get("needs_review_count"),
+            unsafe_count=spread_result.get("unsafe_count"),
+            parse_error_count=spread_result.get("parse_error_count"),
+            paper_trades_created=spread_result.get("paper_trades_created"),
+            mapping_mutations=spread_result.get("mapping_mutations"),
+            settlement_rows_created=spread_result.get("settlement_rows_created"),
+            audit_only=spread_result.get("audit_only"),
+            read_only=spread_result.get("read_only"),
+        )
+        _log_event(
+            "spread_audit_warning",
+            job=args.job,
+            coverage_warning=spread_result.get("coverage_status")
+            in {"partial_coverage", "zero_checked_with_eligible_mappings", "unknown"},
+            zero_checked_reason=spread_result.get("zero_checked_reason"),
+        )
 
     if result.get("status") == "failed":
         _log_event("job_failed", job=args.job, job_run_id=result.get("job_run_id"), errors=result.get("errors"))

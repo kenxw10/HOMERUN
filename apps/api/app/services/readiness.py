@@ -316,6 +316,8 @@ def _model_governance(session: Session | None, epoch: PaperTradingEpoch | None) 
         "clean_training_eligible_count": summary.get("clean_training_eligible_count"),
         "family_scope_governance_enabled": bool(summary.get("family_scope_governance_enabled")),
         "family_scope_unit_count": summary.get("family_scope_unit_count"),
+        "calibration_coverage_summary": summary.get("calibration_coverage_summary", {}),
+        "rolling_adapter_error_diagnostics": summary.get("rolling_adapter_error_diagnostics", {}),
         "adapter_error_count": summary.get("adapter_error_count", 0),
         "adapter_errors_excluded_from_training": summary.get("adapter_errors_excluded_from_training", True),
         "last_training_run": summary.get("last_training_run"),
@@ -429,6 +431,15 @@ def _spread_audit(session: Session | None, epoch: PaperTradingEpoch | None) -> d
             JobRun.target_date,
             spread_result["checked"].label("checked"),
             spread_result["verified"].label("verified"),
+            spread_result["target_date_mapping_count"].label("target_date_mapping_count"),
+            spread_result["target_date_distinct_market_count"].label("target_date_distinct_market_count"),
+            spread_result["target_date_distinct_game_count"].label("target_date_distinct_game_count"),
+            spread_result["in_window_mapping_count"].label("in_window_mapping_count"),
+            spread_result["skipped_before_min_window_count"].label("skipped_before_min_window_count"),
+            spread_result["skipped_after_max_window_count"].label("skipped_after_max_window_count"),
+            spread_result["coverage_ratio"].label("coverage_ratio"),
+            spread_result["coverage_status"].label("coverage_status"),
+            spread_result["zero_checked_reason"].label("zero_checked_reason"),
             spread_result["trusted_audit_only_count"].label("trusted_audit_only_count"),
             spread_result["needs_review_count"].label("needs_review_count"),
             spread_result["unsafe_count"].label("unsafe_count"),
@@ -436,7 +447,10 @@ def _spread_audit(session: Session | None, epoch: PaperTradingEpoch | None) -> d
             spread_result["settlement_text_unverified_count"].label("settlement_text_unverified_count"),
             spread_result["push_behavior_uncertain_count"].label("push_behavior_uncertain_count"),
             spread_result["paper_trades_created"].label("paper_trades_created"),
+            spread_result["audit_only"].label("audit_only"),
             spread_result["read_only"].label("read_only"),
+            spread_result["mapping_mutations"].label("mapping_mutations"),
+            spread_result["settlement_rows_created"].label("settlement_rows_created"),
         )
         .where(JobRun.paper_trading_epoch_id == epoch.id)
         .where(JobRun.job_name == "spread-audit")
@@ -476,6 +490,12 @@ def _spread_audit(session: Session | None, epoch: PaperTradingEpoch | None) -> d
     for key in (
         "checked",
         "verified",
+        "target_date_mapping_count",
+        "target_date_distinct_market_count",
+        "target_date_distinct_game_count",
+        "in_window_mapping_count",
+        "skipped_before_min_window_count",
+        "skipped_after_max_window_count",
         "trusted_audit_only_count",
         "needs_review_count",
         "unsafe_count",
@@ -483,10 +503,25 @@ def _spread_audit(session: Session | None, epoch: PaperTradingEpoch | None) -> d
         "settlement_text_unverified_count",
         "push_behavior_uncertain_count",
         "paper_trades_created",
+        "mapping_mutations",
+        "settlement_rows_created",
     ):
         value = _int_json(row[key])
         if value is not None:
             result[key] = value
+    coverage_ratio = row["coverage_ratio"]
+    if coverage_ratio is not None:
+        try:
+            result["coverage_ratio"] = float(str(coverage_ratio).strip('"'))
+        except (TypeError, ValueError):
+            pass
+    for key in ("coverage_status", "zero_checked_reason"):
+        value = row[key]
+        if value is not None:
+            result[key] = str(value).strip('"')
+    audit_only = _bool_json(row["audit_only"])
+    if audit_only is not None:
+        result["audit_only"] = audit_only
     read_only = _bool_json(row["read_only"])
     if read_only is not None:
         result["read_only"] = read_only
@@ -546,6 +581,11 @@ def _validated_components(
                 "capability_enabled": bool(governance.get("family_scope_governance_enabled")),
                 "last_governance_status": governance.get("status"),
                 "family_scope_unit_count": governance.get("family_scope_unit_count"),
+                "calibration_coverage_status_counts": (
+                    (governance.get("calibration_coverage_summary") or {}).get("status_counts", {})
+                    if isinstance(governance.get("calibration_coverage_summary"), dict)
+                    else {}
+                ),
                 "raw_resolved_mature_samples": governance.get("raw_resolved_mature_samples"),
                 "clean_resolved_mature_samples": governance.get("clean_resolved_mature_samples"),
                 "clean_training_eligible_count": governance.get("clean_training_eligible_count"),
@@ -580,10 +620,15 @@ def _validated_components(
             "available" if int(spread_audit.get("checked") or 0) > 0 else UNKNOWN_EVIDENCE,
             {
                 "checked": spread_audit.get("checked", 0),
+                "target_date_mapping_count": spread_audit.get("target_date_mapping_count", 0),
+                "in_window_mapping_count": spread_audit.get("in_window_mapping_count", 0),
+                "coverage_status": spread_audit.get("coverage_status"),
+                "zero_checked_reason": spread_audit.get("zero_checked_reason"),
                 "trusted_audit_only_count": spread_audit.get("trusted_audit_only_count", 0),
                 "read_only": spread_audit.get("read_only"),
                 "freshness_policy_version": spread_audit.get("freshness_policy_version"),
                 "freshness_status": spread_audit.get("freshness_status"),
+                "spread_audit_coverage_warning": spread_audit.get("spread_audit_coverage_warning"),
                 "spread_audit_stale_warning": spread_audit.get("spread_audit_stale_warning"),
                 "age_hours": spread_audit.get("age_hours"),
                 "recent_full_game_spread_activity_count": spread_audit.get(
@@ -707,7 +752,10 @@ def readiness_audit_pack(session: Session | None = None) -> dict[str, object]:
             "stale_settlement_job_age_minutes": settlement_audit.get("stale_settlement_job_age_minutes"),
             "stale_settlement_job_recovery_action": settlement_audit.get("stale_settlement_job_recovery_action"),
             "spread_audit_stale_warning": spread_audit.get("spread_audit_stale_warning"),
+            "spread_audit_coverage_warning": spread_audit.get("spread_audit_coverage_warning"),
             "spread_audit_freshness_status": spread_audit.get("freshness_status"),
+            "spread_audit_coverage_status": spread_audit.get("coverage_status"),
+            "spread_audit_zero_checked_reason": spread_audit.get("zero_checked_reason"),
             "latest_spread_audit_target_date": (
                 (spread_audit.get("latest_spread_audit_job") or {}).get("target_date")
                 if isinstance(spread_audit.get("latest_spread_audit_job"), dict)
@@ -741,6 +789,12 @@ def compact_readiness_summary(pack: dict[str, object]) -> dict[str, object]:
             component_status_counts[status] = component_status_counts.get(status, 0) + 1
     checklist = pack.get("operator_checklist")
     blocker_count = len(pack.get("blockers_for_live") or []) if isinstance(pack.get("blockers_for_live"), list) else 0
+    model_governance = pack.get("model_governance") if isinstance(pack.get("model_governance"), dict) else {}
+    calibration_coverage = (
+        model_governance.get("calibration_coverage_summary")
+        if isinstance(model_governance.get("calibration_coverage_summary"), dict)
+        else {}
+    )
     return {
         "policy_version": pack.get("policy_version"),
         "paper_observation_status": pack.get("paper_observation_status"),
@@ -752,6 +806,10 @@ def compact_readiness_summary(pack: dict[str, object]) -> dict[str, object]:
         "validated_component_status_counts": component_status_counts,
         "live_blocker_count": blocker_count,
         "operator_checklist_count": len(checklist) if isinstance(checklist, list) else 0,
+        "calibration_coverage_policy_version": calibration_coverage.get("policy_version"),
+        "calibration_coverage_status_counts": calibration_coverage.get("status_counts", {}),
+        "calibration_family_calibrated_count": calibration_coverage.get("family_calibrated_count", 0),
+        "calibration_missing_evidence_count": calibration_coverage.get("missing_evidence_count", 0),
         "settlement_job_status_policy_version": (pack.get("settlement_audit") or {}).get(
             "settlement_job_status_policy_version"
         )
@@ -775,8 +833,23 @@ def compact_readiness_summary(pack: dict[str, object]) -> dict[str, object]:
         )
         if isinstance(pack.get("operational_warnings"), dict)
         else False,
+        "spread_audit_coverage_warning": (pack.get("operational_warnings") or {}).get(
+            "spread_audit_coverage_warning"
+        )
+        if isinstance(pack.get("operational_warnings"), dict)
+        else False,
         "spread_audit_freshness_status": (pack.get("operational_warnings") or {}).get(
             "spread_audit_freshness_status"
+        )
+        if isinstance(pack.get("operational_warnings"), dict)
+        else None,
+        "spread_audit_coverage_status": (pack.get("operational_warnings") or {}).get(
+            "spread_audit_coverage_status"
+        )
+        if isinstance(pack.get("operational_warnings"), dict)
+        else None,
+        "spread_audit_zero_checked_reason": (pack.get("operational_warnings") or {}).get(
+            "spread_audit_zero_checked_reason"
         )
         if isinstance(pack.get("operational_warnings"), dict)
         else None,

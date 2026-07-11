@@ -148,7 +148,7 @@ Run these from the Railway backend service shell after migrations succeed:
 ```powershell
 python -m app.jobs.runner --job daily-setup --target-date today_et
 python -m app.jobs.runner --job candidate-sweep --target-date today_et --min-time-to-start-minutes 45 --max-time-to-start-minutes 180 --sweep-label rolling_pregame_window
-python -m app.jobs.runner --job spread-audit --target-date today_et --min-time-to-start-minutes 45 --max-time-to-start-minutes 180
+python -m app.jobs.runner --job spread-audit --target-date today_et --min-time-to-start-minutes 45 --max-time-to-start-minutes 360
 python -m app.jobs.runner --job price-refresh --target-date today_et
 python -m app.jobs.runner --job settlement --target-date yesterday_et
 python -m app.jobs.runner --job governance
@@ -157,7 +157,7 @@ python -m app.jobs.runner --job full-paper-cycle --target-date today_et
 
 These commands create database records for the dashboard and paper engine. They do not place live orders.
 
-The spread-audit command verifies spread parsing and settlement metadata from Kalshi raw text fields. It does not create paper trades. Do not add a Railway cron service for spread audit, enable `PAPER_SPREAD_TRADING_ENABLED`, or add any live execution service until the audit output has been manually validated against the Kalshi UI.
+The spread-audit command verifies spread parsing and settlement metadata from Kalshi raw text fields. It is audit-only/read-only and does not create paper trades, mutate mappings, or write settlement rows. PR4e allows this as a separate short-lived Railway cron service so coverage/freshness evidence stays current, but it does not enable `PAPER_SPREAD_TRADING_ENABLED`, first-five spread trading, or any live execution service.
 
 Recommended Railway cron services should be separate short-lived services, not the main web server. Times below show the intended ET cadence and the equivalent UTC cron during EDT:
 
@@ -165,6 +165,7 @@ Recommended Railway cron services should be separate short-lived services, not t
 | --- | --- | --- | --- |
 | `homerun-job-daily-setup` | `python -m app.jobs.runner --job daily-setup --target-date today_et` | 8:30 AM ET | `30 12 * * *` |
 | `homerun-job-candidate-sweep` | `python -m app.jobs.runner --job candidate-sweep --target-date today_et --min-time-to-start-minutes 45 --max-time-to-start-minutes 180 --sweep-label rolling_pregame_window` | every 30 minutes, 10:30 AM-10:00 PM ET | `30 14 * * *`; `0,30 15-23,0-1 * * *`; `0 2 * * *` |
+| `homerun-job-spread-audit` | `python -m app.jobs.runner --job spread-audit --target-date today_et --min-time-to-start-minutes 45 --max-time-to-start-minutes 360` | 10:00 AM, 2:00 PM, 6:00 PM ET | EDT: `0 14,18,22 * * *`; EST: `0 15,19,23 * * *` |
 | `homerun-job-price-refresh` | `python -m app.jobs.runner --job price-refresh --target-date today_et` | every 15 minutes, 11:00 AM-1:30 AM ET | `0,15,30,45 15-23,0-4 * * *`; `0,15,30 5 * * *` |
 | `homerun-job-settlement-today` | `python -m app.jobs.runner --job settlement --target-date today_et` | every 30 minutes, 2:30 PM-1:30 AM ET | `30 18 * * *`; `0,30 19-23,0-4 * * *`; `0,30 5 * * *` |
 | `homerun-job-settlement-yesterday-catchup` | `python -m app.jobs.runner --job settlement --target-date yesterday_et` | 8:30 AM ET | `30 12 * * *` |
@@ -172,7 +173,11 @@ Recommended Railway cron services should be separate short-lived services, not t
 
 Railway cron schedules use UTC. Adjust these schedules when EDT changes to EST. Railway may skip a run if the previous execution is still active; PR3d job locks also skip overlap or mark stale runs failed before starting safely.
 
+If Railway cannot represent the three spread-audit times in one cron expression, create three identically configured `homerun-job-spread-audit` services with the same start command and one UTC schedule each.
+
 For PR4b.1 and later, settlement cron services emit JSON log events for startup, target ET/UTC window, lock/skipped status, stale-run recovery, settlement query scope, batch caps/counts, balance snapshot action, completion, and caught exceptions. A stale settlement `running` row beyond the 30-minute threshold is recovered globally before a settlement cron is allowed to skip for `skipped_existing_run`.
+
+For PR4e and later, spread-audit cron services emit JSON log events for startup, target ET/UTC window, lock/skipped status, audit window, coverage counts/status, result counts, warning state, clean completion, and caught exceptions.
 
 Optional long-running paper market-data service:
 
