@@ -790,6 +790,7 @@ def compact_readiness_summary(pack: dict[str, object]) -> dict[str, object]:
     checklist = pack.get("operator_checklist")
     blocker_count = len(pack.get("blockers_for_live") or []) if isinstance(pack.get("blockers_for_live"), list) else 0
     model_governance = pack.get("model_governance") if isinstance(pack.get("model_governance"), dict) else {}
+    spread_audit = pack.get("spread_audit") if isinstance(pack.get("spread_audit"), dict) else {}
     calibration_coverage = (
         model_governance.get("calibration_coverage_summary")
         if isinstance(model_governance.get("calibration_coverage_summary"), dict)
@@ -828,6 +829,7 @@ def compact_readiness_summary(pack: dict[str, object]) -> dict[str, object]:
         "latest_settlement_job_status": (pack.get("operational_warnings") or {}).get("latest_settlement_job_status")
         if isinstance(pack.get("operational_warnings"), dict)
         else None,
+        "spread_audit_freshness_policy_version": spread_audit.get("freshness_policy_version"),
         "spread_audit_stale_warning": (pack.get("operational_warnings") or {}).get(
             "spread_audit_stale_warning"
         )

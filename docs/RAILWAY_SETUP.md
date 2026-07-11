@@ -157,7 +157,7 @@ python -m app.jobs.runner --job full-paper-cycle --target-date today_et
 
 These commands create database records for the dashboard and paper engine. They do not place live orders.
 
-The spread-audit command verifies spread parsing and settlement metadata from Kalshi raw text fields. It is audit-only/read-only and does not create paper trades, mutate mappings, or write settlement rows. PR4e allows this as a separate short-lived Railway cron service so coverage/freshness evidence stays current, but it does not enable `PAPER_SPREAD_TRADING_ENABLED`, first-five spread trading, or any live execution service.
+The spread-audit command verifies spread parsing and settlement metadata from Kalshi raw text fields. It is audit-only/read-only and does not create paper trades, mutate mappings, or write settlement rows. PR4e allows this as a separate short-lived Railway cron service so coverage/freshness evidence stays current, but it does not enable `PAPER_SPREAD_TRADING_ENABLED`, first-five spread trading, or any live execution service. Do not enable or declare the recurring spread-audit service production-validated until the PR4e.1 zero-window freshness checks in `docs/OPERATIONS.md` pass after deployment.
 
 Recommended Railway cron services should be separate short-lived services, not the main web server. Times below show the intended ET cadence and the equivalent UTC cron during EDT:
 
@@ -177,7 +177,7 @@ If Railway cannot represent the three spread-audit times in one cron expression,
 
 For PR4b.1 and later, settlement cron services emit JSON log events for startup, target ET/UTC window, lock/skipped status, stale-run recovery, settlement query scope, batch caps/counts, balance snapshot action, completion, and caught exceptions. A stale settlement `running` row beyond the 30-minute threshold is recovered globally before a settlement cron is allowed to skip for `skipped_existing_run`.
 
-For PR4e and later, spread-audit cron services emit JSON log events for startup, target ET/UTC window, lock/skipped status, audit window, coverage counts/status, result counts, warning state, clean completion, and caught exceptions.
+For PR4e.1 and later, spread-audit cron services emit JSON log events for startup, target ET/UTC window, lock/skipped status, audit window, coverage counts/status, result counts, warning state, clean completion, and caught exceptions. A single run whose target-date mappings are all outside the requested window emits a per-run coverage warning, but an earlier covered current-day run can still keep overall dashboard/readiness freshness at `fresh_covered`.
 
 Optional long-running paper market-data service:
 

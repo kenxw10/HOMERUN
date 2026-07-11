@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from app.models import JobRun, PaperTrade, PaperTradingEpoch
 from app.time_utils import ensure_aware_utc, utc_now
 
-SPREAD_AUDIT_FRESHNESS_POLICY_VERSION = "pr4e_spread_audit_coverage_freshness_v1"
+SPREAD_AUDIT_FRESHNESS_POLICY_VERSION = "pr4e1_spread_audit_coverage_freshness_v1"
 SPREAD_AUDIT_FRESHNESS_MAX_AGE_HOURS = 36
 SPREAD_AUDIT_RECENT_ACTIVITY_DAYS = 7
 SPREAD_AUDIT_CURRENT_RUN_LIMIT = 25
@@ -184,9 +184,9 @@ def spread_audit_freshness_payload(
         freshness_status = "latest_not_succeeded"
     else:
         coverage_status = _coverage_status_from_successful_row(latest_successful_current_row)
-        if coverage_status in {"no_target_date_mappings", "no_mappings_in_window"}:
+        if coverage_status == "no_target_date_mappings":
             freshness_status = "fresh_no_eligible_markets"
-        elif coverage_status == "zero_checked_with_eligible_mappings":
+        elif coverage_status in {"no_mappings_in_window", "zero_checked_with_eligible_mappings"}:
             freshness_status = "incomplete_zero_checked"
         elif coverage_status == "partial_coverage":
             freshness_status = "incomplete_partial_coverage"
