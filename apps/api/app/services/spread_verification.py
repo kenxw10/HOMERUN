@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
 import re
 from typing import Any
@@ -9,7 +9,12 @@ from app.models import KalshiMarket, MarketMapping, MlbGame
 from app.services.contracts import FIRST_FIVE_SPREAD, FULL_GAME_SPREAD
 
 SPREAD_FAMILIES = {FULL_GAME_SPREAD, FIRST_FIVE_SPREAD}
+FULL_GAME_SPREAD_TICKER_PREFIX = "KXMLBSPREAD-"
 FIRST_FIVE_SPREAD_TICKER_PREFIX = "KXMLBF5SPREAD-"
+SPREAD_TICKER_PREFIX_BY_FAMILY = {
+    FULL_GAME_SPREAD: FULL_GAME_SPREAD_TICKER_PREFIX,
+    FIRST_FIVE_SPREAD: FIRST_FIVE_SPREAD_TICKER_PREFIX,
+}
 SPREAD_AUDIT_STATUSES = {
     "trusted_audit_only",
     "needs_review",
@@ -388,12 +393,19 @@ def _no_text_source(no_text: str | None, yes_text: str | None, rules_text: str |
 
 
 def _binary_market_confirmed(payload: dict[str, Any], market: KalshiMarket | None, family_key: str) -> bool:
-    if family_key not in SPREAD_FAMILIES:
+    expected_prefix = SPREAD_TICKER_PREFIX_BY_FAMILY.get(family_key)
+    if expected_prefix is None:
         return False
     ticker = str(payload.get("ticker") or (market.ticker if market is not None else "") or "").upper()
-    if not ticker:
-        return market is not None
-    return ticker.startswith("KXMLBSPREAD-") or ticker.startswith("KXMLBF5SPREAD-")
+    return bool(ticker) and ticker.startswith(expected_prefix)
+
+
+def recognized_spread_ticker_family(ticker: str | None) -> str | None:
+    normalized = str(ticker or "").upper()
+    for family_key, prefix in SPREAD_TICKER_PREFIX_BY_FAMILY.items():
+        if normalized.startswith(prefix):
+            return family_key
+    return None
 
 
 def _first_five_scope_evidence(payload: dict[str, Any], market: KalshiMarket | None = None) -> bool:
@@ -473,6 +485,8 @@ def _reason_status(reason_codes: list[str]) -> str:
         ("parse_error", "first_five_contract_parse_error"),
         ("missing_line", "missing_line"),
         ("parse_error", "rules_text_unparseable"),
+        ("unsafe", "spread_family_ticker_conflict"),
+        ("unsafe", "spread_family_metadata_conflict"),
         ("unsafe", "explicit_no_text_conflicts_with_binary_complement"),
         ("unsafe", "title_rules_team_conflict"),
         ("ambiguous_team_selection", "team_selection_not_verified"),
@@ -514,6 +528,41 @@ def _combined_text(entries: list[tuple[str, str]]) -> str | None:
 
 def _scope(family_key: str) -> str:
     return "first_five" if family_key == FIRST_FIVE_SPREAD else "full_game"
+
+
+def enforce_spread_family_consistency(
+    verification: SpreadVerification,
+    *,
+    expected_family: str,
+    ticker: str | None,
+) -> SpreadVerification:
+    """Prevent a recognized canonical ticker from being trusted for another family."""
+    if expected_family not in SPREAD_FAMILIES:
+        return verification
+
+    reason_codes = list(verification.reason_codes or [])
+    recognized_family = recognized_spread_ticker_family(ticker)
+    conflicts: list[str] = []
+    if recognized_family is not None and recognized_family != expected_family:
+        conflicts.append("spread_family_ticker_conflict")
+    if verification.family_key != expected_family or verification.inning_scope != _scope(expected_family):
+        conflicts.append("spread_family_metadata_conflict")
+    if not conflicts:
+        return verification
+
+    for reason in conflicts:
+        if reason not in reason_codes:
+            reason_codes.append(reason)
+    return replace(
+        verification,
+        family_key=expected_family,
+        parser_status=UNVERIFIED_STATUS,
+        settlement_rule_status=UNVERIFIED_STATUS,
+        verified=False,
+        audit_status="unsafe",
+        reason_codes=reason_codes,
+        complement_safe_for_paper_settlement=False,
+    )
 
 
 def _scope_display(scope: str) -> str:
@@ -620,6 +669,9 @@ def verify_spread_market(
     reason_codes: list[str] = []
     if family_key not in SPREAD_FAMILIES:
         reason_codes.append("unsupported_family")
+    ticker_family = recognized_spread_ticker_family(str(payload.get("ticker") or ""))
+    if family_key in SPREAD_FAMILIES and ticker_family is not None and ticker_family != family_key:
+        reason_codes.append("spread_family_ticker_conflict")
     if not payload.get("ticker") and market is None:
         reason_codes.append("missing_market_data")
     if family_key == FULL_GAME_SPREAD and rules_text and rules_condition is None:
@@ -769,12 +821,16 @@ def spread_verification_from_mapping(
     cached = spread_verification_from_cached_metadata(mapping=mapping, market=market)
     if cached is not None and cached.verified:
         return cached
-    return verify_spread_market(
-        game=game,
-        family_key=family_key,
-        market=market,
-        line_value=mapping.line_value or market.line_value,
-        selection_code=mapping.selection_code or market.selection_code,
+    return enforce_spread_family_consistency(
+        verify_spread_market(
+            game=game,
+            family_key=family_key,
+            market=market,
+            line_value=mapping.line_value or market.line_value,
+            selection_code=mapping.selection_code or market.selection_code,
+        ),
+        expected_family=family_key,
+        ticker=market.ticker,
     )
 
 
@@ -826,7 +882,7 @@ def spread_verification_from_cached_metadata(
             verified = False
         if "first_five_scope_unverified" in reason_codes or "first_five_official_result_source_unverified" in reason_codes:
             audit_status = "needs_review"
-    return SpreadVerification(
+    verification = SpreadVerification(
         family_key=family_key,
         parser_status=str(existing.get("parser_status") or VERIFIED_STATUS),
         settlement_rule_status=str(existing.get("settlement_rule_status") or VERIFIED_STATUS),
@@ -891,4 +947,9 @@ def spread_verification_from_cached_metadata(
             if isinstance(existing.get("ticker_suffix_line_raw"), str)
             else None
         ),
+    )
+    return enforce_spread_family_consistency(
+        verification,
+        expected_family=family_key,
+        ticker=market.ticker if market is not None else None,
     )

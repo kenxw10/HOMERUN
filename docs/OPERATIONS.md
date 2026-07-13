@@ -1469,8 +1469,25 @@ $Key = Read-Host -Prompt "PASTE YOUR HOMERUN API KEY HERE AND PRESS ENTER"
 if ([string]::IsNullOrWhiteSpace($Key)) { throw "No API key was entered." }
 $Headers = @{ "X-API-Key" = $Key }
 try {
-    $audit = Invoke-RestMethod -Method Post -Headers $Headers "$Base/v1/jobs/run/first-five-spread-audit?target_date=today_et&min_time_to_start_minutes=45&max_time_to_start_minutes=360"
-    $audit.result | Select-Object status, target_date, checked, verified, needs_review_count, trusted_audit_only_count, audit_only, read_only, paper_trades_created, candidate_mutations, mapping_mutations, settlement_rows_created | Format-List
+    $Response = Invoke-RestMethod -Method Post -Headers $Headers "$Base/v1/jobs/run/first-five-spread-audit?target_date=today_et&min_time_to_start_minutes=45&max_time_to_start_minutes=360"
+    $Run = $Response.result
+    $Audit = $null
+    if ($Run -and $Run.result -and $Run.result.first_five_spread_audit) {
+        $Audit = $Run.result.first_five_spread_audit
+    } elseif ($Run -and $Run.first_five_spread_audit) {
+        $Audit = $Run.first_five_spread_audit
+    }
+    if (-not $Audit) {
+        [pscustomobject]@{
+            JobStatus = $Run.status
+            JobRunId = $Run.job_run_id
+            TargetDate = $Run.target_date
+            WarningCount = @($Run.warnings).Count
+            ErrorCount = @($Run.errors).Count
+        } | Format-List
+        throw "First-five spread audit payload was not present in the response."
+    }
+    $Audit | Select-Object status, target_date, checked, verified, needs_review_count, trusted_audit_only_count, audit_only, read_only, paper_trades_created, candidate_mutations, mapping_mutations, settlement_rows_created | Format-List
 } finally {
     Remove-Variable Key, Headers -ErrorAction SilentlyContinue
 }
@@ -1481,12 +1498,17 @@ The first-five audit is read-only and bounded. Confirm `audit_only=true`, `read_
 Preview historical adapter repair without writing changes:
 
 ```powershell
+$ErrorActionPreference = "Stop"
+$Base = "https://homerun-production-2551.up.railway.app"
+Write-Host ""
+Write-Host "HOMERUN API KEY REQUIRED" -ForegroundColor Yellow
 $Key = Read-Host -Prompt "PASTE YOUR HOMERUN API KEY HERE AND PRESS ENTER"
 if ([string]::IsNullOrWhiteSpace($Key)) { throw "No API key was entered." }
 $Headers = @{ "X-API-Key" = $Key }
 try {
-    $preview = Invoke-RestMethod -Headers $Headers "$Base/v1/model/first-five-spread-adapter-repair-preview?date=2026-07-04&limit=500"
-    $preview.result | Select-Object status, target_date, matching_rows_count, rows_seen, truncated, classification_counts, reason_counts, affected_target_date_range, affected_target_date_range_complete, preview_only, read_only, mutations_applied | Format-List
+    $Response = Invoke-RestMethod -Headers $Headers "$Base/v1/model/first-five-spread-adapter-repair-preview?date=2026-07-04&limit=500"
+    $Preview = $Response.result
+    $Preview | Select-Object status, target_date, matching_rows_count, rows_seen, truncated, classification_counts, reason_counts, affected_target_date_range, affected_target_date_range_complete, preview_only, read_only, mutations_applied | Format-List
 } finally {
     Remove-Variable Key, Headers -ErrorAction SilentlyContinue
 }

@@ -15,7 +15,12 @@ from app.services.probability_adapters import (
     PROBABILITY_ADAPTER_FEATURE_POLICY_VERSION,
     PROBABILITY_ADAPTER_POLICY_VERSION,
 )
-from app.services.spread_verification import SPREAD_AUDIT_STATUSES, SpreadVerification, spread_verification_from_mapping
+from app.services.spread_verification import (
+    SPREAD_AUDIT_STATUSES,
+    SpreadVerification,
+    enforce_spread_family_consistency,
+    spread_verification_from_mapping,
+)
 from app.time_utils import ensure_aware_utc, get_dashboard_zone, today_eastern, utc_now
 
 
@@ -248,7 +253,11 @@ def run_spread_audit(
 
         family = mapping.market_family or market.market_family or market.market_type or "unknown"
         family_counts = by_family.setdefault(family, {"checked": 0, "verified": 0, "unverified": 0})
-        result = spread_verification_from_mapping(game=game, mapping=mapping, market=market)
+        result = enforce_spread_family_consistency(
+            spread_verification_from_mapping(game=game, mapping=mapping, market=market),
+            expected_family=family_key,
+            ticker=market.ticker,
+        )
         metadata = result.as_metadata()
         settlement_preview = _settlement_preview(game, result)
 
