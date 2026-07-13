@@ -1461,8 +1461,12 @@ Keep `PAPER_FIRST_FIVE_SPREAD_TRADING_ENABLED=false`. The broad `PAPER_SPREAD_TR
 Run the dedicated first-five audit manually or from a separately reviewed short-lived service when evidence is needed:
 
 ```powershell
-python -m app.jobs.runner --job first-five-spread-audit --target-date today_et --min-time-to-start-minutes 45 --max-time-to-start-minutes 360
-Invoke-RestMethod -Method Post -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-RAILWAY-API/v1/jobs/run/first-five-spread-audit?target_date=today_et&min_time_to_start_minutes=45&max_time_to_start_minutes=360"
+$base = "https://homerun-production-2551.up.railway.app"
+$apiKeySecure = Read-Host -Prompt "Paste internal API key" -AsSecureString
+$apiKeyPtr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($apiKeySecure)
+try { $apiKey = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($apiKeyPtr).Trim() } finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($apiKeyPtr) }
+$headers = @{ "X-API-Key" = $apiKey }
+Invoke-RestMethod -Method Post -Headers $headers "$base/v1/jobs/run/first-five-spread-audit?target_date=today_et&min_time_to_start_minutes=45&max_time_to_start_minutes=360"
 ```
 
 The first-five audit is read-only and bounded. Confirm `audit_only=true`, `read_only=true`, `paper_trades_created=0`, `candidate_mutations=0`, `mapping_mutations=0`, and `settlement_rows_created=0`. Freshness and trusted counts appear separately under first-five dashboard/readiness fields; full-game spread audit freshness is unchanged.
@@ -1470,7 +1474,7 @@ The first-five audit is read-only and bounded. Confirm `audit_only=true`, `read_
 Preview historical adapter repair without writing changes:
 
 ```powershell
-Invoke-RestMethod -Headers @{"X-API-Key"="YOUR_KEY"} "https://YOUR-RAILWAY-API/v1/model/first-five-spread-adapter-repair-preview?date=2026-07-04&limit=500"
+Invoke-RestMethod -Headers $headers "$base/v1/model/first-five-spread-adapter-repair-preview?date=2026-07-04&limit=500"
 ```
 
 The preview must report `preview_only=true`, `read_only=true`, and `mutations_applied=0`. This PR requires no migration and does not add or configure a Railway service. First-five settlement revalidates cached trusted audit metadata and leaves untrusted rows unsettled with an explicit skip reason. `live_enabled=false` and `live_readiness_status=blocked_for_live` remain unchanged.

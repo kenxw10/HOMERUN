@@ -9,6 +9,7 @@ from app.models import KalshiMarket, MarketMapping, MlbGame
 from app.services.contracts import FIRST_FIVE_SPREAD, FULL_GAME_SPREAD
 
 SPREAD_FAMILIES = {FULL_GAME_SPREAD, FIRST_FIVE_SPREAD}
+FIRST_FIVE_SPREAD_TICKER_PREFIX = "KXMLBF5SPREAD-"
 SPREAD_AUDIT_STATUSES = {
     "trusted_audit_only",
     "needs_review",
@@ -395,6 +396,26 @@ def _binary_market_confirmed(payload: dict[str, Any], market: KalshiMarket | Non
     return ticker.startswith("KXMLBSPREAD-") or ticker.startswith("KXMLBF5SPREAD-")
 
 
+def _first_five_scope_evidence(payload: dict[str, Any], market: KalshiMarket | None = None) -> bool:
+    ticker = str(payload.get("ticker") or (market.ticker if market is not None else "") or "").upper()
+    if not ticker.startswith(FIRST_FIVE_SPREAD_TICKER_PREFIX):
+        return False
+    text = " ".join(
+        str(payload.get(field) or "")
+        for field in ("title", "subtitle", "yes_subtitle", "no_subtitle", "rules_primary", "rules_secondary", "rules")
+    )
+    tokens = _text_tokens(text)
+    return _contains_phrase(tokens, "first 5 innings") or _contains_phrase(tokens, "first five innings")
+
+
+def _first_five_official_result_source_evidence(payload: dict[str, Any]) -> bool:
+    rules_text = " ".join(str(payload.get(field) or "") for field in SPREAD_RULE_TEXT_FIELDS)
+    tokens = _text_tokens(rules_text)
+    first_five_rules = _contains_phrase(tokens, "first 5 innings") or _contains_phrase(tokens, "first five innings")
+    result_language = bool(set(tokens) & {"score", "scores", "runs", "result", "resolves", "settles", "settlement"})
+    return first_five_rules and result_language
+
+
 def _supporting_spread_conflicts(
     *,
     payload: dict[str, Any],
@@ -437,6 +458,7 @@ def _reason_status(reason_codes: list[str]) -> str:
         ("unsupported", "unsupported_family"),
         ("missing_market_data", "missing_market_data"),
         ("missing_game_mapping", "missing_game_mapping"),
+        ("parse_error", "first_five_contract_parse_error"),
         ("missing_line", "missing_line"),
         ("parse_error", "rules_text_unparseable"),
         ("unsafe", "explicit_no_text_conflicts_with_binary_complement"),
@@ -648,8 +670,16 @@ def verify_spread_market(
     if settlement_formula:
         reason_codes.append("settlement_formula_verified")
     if family_key == FIRST_FIVE_SPREAD:
-        reason_codes.append("first_five_scope_verified")
-        reason_codes.append("first_five_official_result_source_verified")
+        if _first_five_scope_evidence(payload, market):
+            reason_codes.append("first_five_scope_verified")
+        else:
+            reason_codes.append("first_five_scope_unverified")
+        if _first_five_official_result_source_evidence(payload):
+            reason_codes.append("first_five_official_result_source_verified")
+        else:
+            reason_codes.append("first_five_official_result_source_unverified")
+        if parsed_line is None or line_source is None or parsed_selection not in team_codes or selection_source is None:
+            reason_codes.append("first_five_contract_parse_error")
 
     audit_status = _reason_status(reason_codes)
     verified = audit_status == "trusted_audit_only"
@@ -761,11 +791,34 @@ def spread_verification_from_cached_metadata(
     market_line = market.line_value if market is not None else None
     market_selection = market.selection_code if market is not None else None
     market_scope = market.inning_scope if market is not None else None
+    raw_contract_text = existing.get("raw_contract_text") if isinstance(existing.get("raw_contract_text"), dict) else {}
+    reason_codes = list(existing.get("reason_codes") or []) if isinstance(existing.get("reason_codes"), list) else []
+    audit_status = str(existing.get("audit_status") or "trusted_audit_only")
+    verified = bool(existing.get("verified"))
+    if family_key == FIRST_FIVE_SPREAD:
+        cached_payload = {
+            "ticker": market.ticker if market is not None else None,
+            "yes_subtitle": raw_contract_text.get("yes"),
+            "no_subtitle": raw_contract_text.get("no"),
+            "rules": raw_contract_text.get("rules"),
+        }
+        if not _first_five_scope_evidence(cached_payload, market):
+            reason_codes = [code for code in reason_codes if code != "first_five_scope_verified"]
+            reason_codes.append("first_five_scope_unverified")
+            verified = False
+        if not _first_five_official_result_source_evidence(cached_payload):
+            reason_codes = [
+                code for code in reason_codes if code != "first_five_official_result_source_verified"
+            ]
+            reason_codes.append("first_five_official_result_source_unverified")
+            verified = False
+        if "first_five_scope_unverified" in reason_codes or "first_five_official_result_source_unverified" in reason_codes:
+            audit_status = "needs_review"
     return SpreadVerification(
         family_key=family_key,
         parser_status=str(existing.get("parser_status") or VERIFIED_STATUS),
         settlement_rule_status=str(existing.get("settlement_rule_status") or VERIFIED_STATUS),
-        verified=bool(existing.get("verified")),
+        verified=verified,
         selection_code=str(existing.get("selection_code") or mapping.selection_code or market_selection or "") or None,
         line_value=Decimal(str(line)).quantize(Decimal("0.0001")) if line is not None else mapping.line_value or market_line,
         inning_scope=str(existing.get("inning_scope") or mapping.inning_scope or market_scope or _scope(family_key)),
@@ -777,10 +830,10 @@ def spread_verification_from_cached_metadata(
             else None
         ),
         parse_source=str(existing.get("parse_source") or "metadata"),
-        raw_contract_text=existing.get("raw_contract_text") if isinstance(existing.get("raw_contract_text"), dict) else {},
+        raw_contract_text=raw_contract_text,
         warnings=list(existing.get("warnings") or []) if isinstance(existing.get("warnings"), list) else [],
-        audit_status=str(existing.get("audit_status") or "trusted_audit_only"),
-        reason_codes=list(existing.get("reason_codes") or []) if isinstance(existing.get("reason_codes"), list) else [],
+        audit_status=audit_status,
+        reason_codes=reason_codes,
         yes_interpretation=existing.get("yes_interpretation") if isinstance(existing.get("yes_interpretation"), str) else None,
         no_interpretation=existing.get("no_interpretation") if isinstance(existing.get("no_interpretation"), str) else None,
         no_is_true_complement=bool(existing.get("no_is_true_complement", True)),

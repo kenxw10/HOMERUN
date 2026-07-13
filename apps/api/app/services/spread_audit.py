@@ -440,6 +440,10 @@ def first_five_spread_adapter_repair_preview(
         "missing_source_evidence": 0,
     }
     examples: dict[str, list[dict[str, object]]] = {key: [] for key in counts}
+    reason_counts: dict[str, int] = {}
+    affected_dates = sorted(
+        {row.get("target_date") for row in rows if isinstance(row.get("target_date"), date)}
+    )
     required_fields = (
         "probability_adapter_version",
         "probability_adapter_policy_version",
@@ -454,22 +458,36 @@ def first_five_spread_adapter_repair_preview(
         diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
         adapter_metadata = row.get("probability_adapter_metadata")
         adapter_metadata = adapter_metadata if isinstance(adapter_metadata, dict) else {}
+        metadata_diagnostics = adapter_metadata.get("diagnostics")
+        metadata_diagnostics = metadata_diagnostics if isinstance(metadata_diagnostics, dict) else {}
         adapter_error = (
             diagnostics.get("probability_adapter_error")
             or diagnostics.get("adapter_error")
             or adapter_metadata.get("adapter_error")
+            or metadata_diagnostics.get("adapter_error")
         )
-        if row.get("probability_adapter_family") not in {None, "first_five_spread"}:
-            classification = "unsupported"
-        elif adapter_error:
+        if adapter_error:
+            error_reason = (
+                adapter_error.get("reason")
+                if isinstance(adapter_error, dict)
+                else str(adapter_error)
+            )
+            reason = f"adapter_error:{error_reason or 'unknown'}"
             classification = "ambiguous"
+        elif row.get("probability_adapter_family") not in {None, "first_five_spread"}:
+            reason = "unsupported_adapter_family"
+            classification = "unsupported"
         elif all(row.get(field) is not None for field in required_fields) and adapter_metadata:
+            reason = "complete_adapter_metadata"
             classification = "already_valid"
         elif diagnostics.get("gate_spread_parser_verified") or diagnostics.get("spread_verification"):
+            reason = "cached_spread_verification_evidence"
             classification = "deterministically_repairable"
         else:
+            reason = "missing_source_evidence"
             classification = "missing_source_evidence"
         counts[classification] += 1
+        reason_counts[reason] = reason_counts.get(reason, 0) + 1
         if len(examples[classification]) < 3:
             examples[classification].append(
                 {
@@ -490,5 +508,10 @@ def first_five_spread_adapter_repair_preview(
         "rows_seen": len(rows),
         "truncated": truncated,
         "classification_counts": counts,
+        "reason_counts": reason_counts,
+        "affected_target_date_range": {
+            "start": affected_dates[0].isoformat() if affected_dates else None,
+            "end": affected_dates[-1].isoformat() if affected_dates else None,
+        },
         "examples": examples,
     }

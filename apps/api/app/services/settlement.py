@@ -482,7 +482,7 @@ def _skip_reason(
         return "parse_uncertain"
     if first_five_market and _first_five_runs(game) is None:
         return "first_five_not_complete" if status_kind == "open" else "missing_f5_linescore"
-    if market_type == FIRST_FIVE_SPREAD and status_kind != "open":
+    if market_type == FIRST_FIVE_SPREAD:
         audit_reason = _first_five_spread_audit_skip_reason(first_five_spread_verification)
         if audit_reason is not None:
             return audit_reason
