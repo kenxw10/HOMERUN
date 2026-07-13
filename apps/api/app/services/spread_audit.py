@@ -3,11 +3,18 @@ from __future__ import annotations
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from app.models import KalshiMarket, MarketMapping, MlbGame, ModelCandidate
 from app.services.contracts import FIRST_FIVE_SPREAD, FULL_GAME_SPREAD
+from app.services.modeling import FAMILY_SCOPE_GOVERNANCE_POLICY
+from app.services.probability_adapters import (
+    ADAPTER_VERSION_BY_FAMILY,
+    CALIBRATION_HOOK_BY_FAMILY,
+    PROBABILITY_ADAPTER_FEATURE_POLICY_VERSION,
+    PROBABILITY_ADAPTER_POLICY_VERSION,
+)
 from app.services.spread_verification import SPREAD_AUDIT_STATUSES, SpreadVerification, spread_verification_from_mapping
 from app.time_utils import ensure_aware_utc, get_dashboard_zone, today_eastern, utc_now
 
@@ -407,12 +414,18 @@ def first_five_spread_adapter_repair_preview(
     limit: int = 500,
 ) -> dict[str, object]:
     bounded_limit = max(1, min(int(limit), 1000))
+    family_filter = or_(
+        ModelCandidate.market_family == FIRST_FIVE_SPREAD,
+        ModelCandidate.market_type == FIRST_FIVE_SPREAD,
+    )
     query = (
         select(
             ModelCandidate.id,
             ModelCandidate.target_date,
             ModelCandidate.market_family,
+            ModelCandidate.market_type,
             ModelCandidate.inning_scope,
+            ModelCandidate.probability_adapter_key,
             ModelCandidate.probability_adapter_family,
             ModelCandidate.probability_adapter_scope,
             ModelCandidate.probability_adapter_policy_version,
@@ -423,12 +436,21 @@ def first_five_spread_adapter_repair_preview(
             ModelCandidate.probability_adapter_metadata,
             ModelCandidate.gate_diagnostics,
         )
-        .where(ModelCandidate.market_family == FIRST_FIVE_SPREAD)
+        .where(family_filter)
         .order_by(ModelCandidate.id.asc())
         .limit(bounded_limit + 1)
     )
     if target_date is not None:
         query = query.where(ModelCandidate.target_date == target_date)
+
+    aggregate_query = select(
+        func.count(ModelCandidate.id).label("matching_rows_count"),
+        func.min(ModelCandidate.target_date).label("affected_start"),
+        func.max(ModelCandidate.target_date).label("affected_end"),
+    ).where(family_filter)
+    if target_date is not None:
+        aggregate_query = aggregate_query.where(ModelCandidate.target_date == target_date)
+    aggregate = session.execute(aggregate_query).mappings().one()
     rows = list(session.execute(query).mappings())
     truncated = len(rows) > bounded_limit
     rows = rows[:bounded_limit]
@@ -441,53 +463,183 @@ def first_five_spread_adapter_repair_preview(
     }
     examples: dict[str, list[dict[str, object]]] = {key: [] for key in counts}
     reason_counts: dict[str, int] = {}
-    affected_dates = sorted(
-        {row.get("target_date") for row in rows if isinstance(row.get("target_date"), date)}
+
+    def adapter_error_reasons(*values: object) -> list[str]:
+        found: list[str] = []
+
+        def walk(value: object) -> None:
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    if key in {"adapter_error", "probability_adapter_error"} and child is not None and child != "":
+                        if isinstance(child, dict):
+                            reason = next(
+                                (
+                                    str(child.get(name))
+                                    for name in ("reason", "code", "type", "message")
+                                    if child.get(name)
+                                ),
+                                None,
+                            ) or "unknown"
+                        else:
+                            reason = str(child)
+                        reason = reason.strip() or "unknown"
+                        if reason not in found:
+                            found.append(reason)
+                    elif key == "adapter_status" and str(child).lower() == "error":
+                        if "adapter_status_error" not in found:
+                            found.append("adapter_status_error")
+                    walk(child)
+            elif isinstance(value, list):
+                for child in value:
+                    walk(child)
+
+        for value in values:
+            walk(value)
+        return found
+
+    expected_scalars = {
+        "probability_adapter_key": f"{FIRST_FIVE_SPREAD}_probability_adapter",
+        "probability_adapter_version": ADAPTER_VERSION_BY_FAMILY[FIRST_FIVE_SPREAD],
+        "probability_adapter_policy_version": PROBABILITY_ADAPTER_POLICY_VERSION,
+        "probability_adapter_family": FIRST_FIVE_SPREAD,
+        "probability_adapter_scope": "first_five",
+        "probability_adapter_calibration_hook": CALIBRATION_HOOK_BY_FAMILY[FIRST_FIVE_SPREAD],
+        "probability_adapter_feature_policy_version": PROBABILITY_ADAPTER_FEATURE_POLICY_VERSION,
+    }
+    expected_metadata = {
+        "adapter_key": expected_scalars["probability_adapter_key"],
+        "adapter_version": expected_scalars["probability_adapter_version"],
+        "adapter_policy_version": expected_scalars["probability_adapter_policy_version"],
+        "adapter_family": expected_scalars["probability_adapter_family"],
+        "adapter_scope": expected_scalars["probability_adapter_scope"],
+        "calibration_hook": expected_scalars["probability_adapter_calibration_hook"],
+        "feature_policy_version": expected_scalars["probability_adapter_feature_policy_version"],
+    }
+    supported_hook_statuses = {"family_scope_active", "metadata_only_pending_pr3v"}
+    required_trust_reasons = {
+        "selected_team_verified",
+        "binary_yes_no_complement_verified",
+        "settlement_formula_verified",
+        "first_five_scope_verified",
+        "first_five_official_result_source_verified",
+    }
+    blocked_reason_tokens = (
+        "ambiguous",
+        "unsafe",
+        "parse",
+        "missing",
+        "unverified",
+        "conflict",
+        "uncertain",
+        "unsupported",
+        "error",
     )
-    required_fields = (
-        "probability_adapter_version",
-        "probability_adapter_policy_version",
-        "probability_adapter_family",
-        "probability_adapter_scope",
-        "probability_adapter_calibration_hook",
-        "probability_adapter_calibration_version",
-        "probability_adapter_feature_policy_version",
-    )
+
+    def family_reason(row: dict[str, object]) -> str | None:
+        values = {
+            str(value)
+            for value in (row.get("market_family"), row.get("market_type"))
+            if value not in {None, ""}
+        }
+        if not values:
+            return "missing_market_family"
+        if any(value != FIRST_FIVE_SPREAD for value in values):
+            return "conflicting_market_family"
+        if row.get("inning_scope") not in {None, "first_five"}:
+            return "conflicting_inning_scope"
+        return None
+
+    def strict_metadata(row: dict[str, object], metadata: dict[str, object]) -> bool:
+        if any(row.get(field) != expected for field, expected in expected_scalars.items()):
+            return False
+        if row.get("inning_scope") != "first_five":
+            return False
+        if any(metadata.get(field) != expected for field, expected in expected_metadata.items()):
+            return False
+        calibration_version = metadata.get("calibration_version")
+        if not isinstance(calibration_version, str) or not calibration_version.strip():
+            return False
+        if row.get("probability_adapter_calibration_version") != calibration_version:
+            return False
+        calibration_hook_status = metadata.get("calibration_hook_status")
+        if calibration_hook_status not in supported_hook_statuses:
+            return False
+        if calibration_hook_status == "metadata_only_pending_pr3v" and calibration_version != "shared_parameter_offsets_pre_pr3v":
+            return False
+        if calibration_hook_status == "family_scope_active" and not calibration_version.startswith(
+            f"{FAMILY_SCOPE_GOVERNANCE_POLICY}_{FIRST_FIVE_SPREAD}_"
+        ):
+            return False
+        metadata_diagnostics = metadata.get("diagnostics")
+        if not isinstance(metadata_diagnostics, dict):
+            return False
+        if adapter_error_reasons(row.get("gate_diagnostics"), metadata):
+            return False
+        return True
+
+    def strict_verification(diagnostics: dict[str, object]) -> bool:
+        verification = diagnostics.get("spread_verification")
+        if not isinstance(verification, dict):
+            return False
+        if verification.get("verified") is not True or verification.get("audit_status") != "trusted_audit_only":
+            return False
+        if verification.get("family_key") != FIRST_FIVE_SPREAD or verification.get("inning_scope") != "first_five":
+            return False
+        if not verification.get("selection_code") or not verification.get("settlement_formula"):
+            return False
+        try:
+            if Decimal(str(verification.get("line_value"))) == Decimal("0"):
+                return False
+        except (ArithmeticError, TypeError, ValueError):
+            return False
+        if verification.get("no_is_true_complement") is not True:
+            return False
+        if verification.get("complement_safe_for_paper_settlement") is not True:
+            return False
+        push_possible = verification.get("push_possible")
+        if push_possible is not False and verification.get("push_rule_verified") is not True:
+            return False
+        reason_codes = verification.get("reason_codes")
+        if not isinstance(reason_codes, list) or not required_trust_reasons.issubset(set(reason_codes)):
+            return False
+        if any(
+            any(token in str(reason).lower() for token in blocked_reason_tokens)
+            for reason in reason_codes
+        ):
+            return False
+        return True
+
     for row in rows:
         diagnostics = row.get("gate_diagnostics")
         diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
         adapter_metadata = row.get("probability_adapter_metadata")
         adapter_metadata = adapter_metadata if isinstance(adapter_metadata, dict) else {}
-        metadata_diagnostics = adapter_metadata.get("diagnostics")
-        metadata_diagnostics = metadata_diagnostics if isinstance(metadata_diagnostics, dict) else {}
-        adapter_error = (
-            diagnostics.get("probability_adapter_error")
-            or diagnostics.get("adapter_error")
-            or adapter_metadata.get("adapter_error")
-            or metadata_diagnostics.get("adapter_error")
-        )
-        if adapter_error:
-            error_reason = (
-                adapter_error.get("reason")
-                if isinstance(adapter_error, dict)
-                else str(adapter_error)
-            )
-            reason = f"adapter_error:{error_reason or 'unknown'}"
+        error_reasons = adapter_error_reasons(diagnostics, adapter_metadata)
+        if error_reasons:
+            for error_reason in error_reasons:
+                reason_counts[f"adapter_error:{error_reason}"] = reason_counts.get(
+                    f"adapter_error:{error_reason}", 0
+                ) + 1
+            reason = f"adapter_error:{error_reasons[0]}"
             classification = "ambiguous"
-        elif row.get("probability_adapter_family") not in {None, "first_five_spread"}:
-            reason = "unsupported_adapter_family"
+        elif family_reason(row) is not None:
+            reason = family_reason(row) or "unsupported_adapter_family"
             classification = "unsupported"
-        elif all(row.get(field) is not None for field in required_fields) and adapter_metadata:
+        elif strict_metadata(row, adapter_metadata):
             reason = "complete_adapter_metadata"
             classification = "already_valid"
-        elif diagnostics.get("gate_spread_parser_verified") or diagnostics.get("spread_verification"):
-            reason = "cached_spread_verification_evidence"
+        elif strict_verification(diagnostics):
+            reason = "deterministic_spread_verification_evidence"
             classification = "deterministically_repairable"
+        elif isinstance(diagnostics.get("spread_verification"), dict):
+            reason = "untrusted_spread_verification"
+            classification = "ambiguous"
         else:
             reason = "missing_source_evidence"
             classification = "missing_source_evidence"
         counts[classification] += 1
-        reason_counts[reason] = reason_counts.get(reason, 0) + 1
+        if not error_reasons:
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
         if len(examples[classification]) < 3:
             examples[classification].append(
                 {
@@ -506,12 +658,14 @@ def first_five_spread_adapter_repair_preview(
         "candidate_mutations": 0,
         "bounded_limit": bounded_limit,
         "rows_seen": len(rows),
+        "matching_rows_count": int(aggregate["matching_rows_count"] or 0),
         "truncated": truncated,
         "classification_counts": counts,
         "reason_counts": reason_counts,
         "affected_target_date_range": {
-            "start": affected_dates[0].isoformat() if affected_dates else None,
-            "end": affected_dates[-1].isoformat() if affected_dates else None,
+            "start": aggregate["affected_start"].isoformat() if aggregate["affected_start"] else None,
+            "end": aggregate["affected_end"].isoformat() if aggregate["affected_end"] else None,
         },
+        "affected_target_date_range_complete": True,
         "examples": examples,
     }

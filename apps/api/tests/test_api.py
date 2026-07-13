@@ -111,7 +111,11 @@ from app.services.spread_audit import (
     run_first_five_spread_audit,
     run_spread_audit,
 )
-from app.services.spread_verification import spread_verification_from_cached_metadata, verify_spread_market
+from app.services.spread_verification import (
+    _first_five_scope_evidence,
+    spread_verification_from_cached_metadata,
+    verify_spread_market,
+)
 from app.time_utils import classify_time_bucket, eastern_display, today_eastern
 from app.workers import kalshi_ws_paper
 
@@ -24580,20 +24584,33 @@ def test_first_five_spread_adapter_repair_preview_groups_nested_errors_and_date_
                 "adapter_key": "first_five_spread_probability_adapter",
                 "diagnostics": {"adapter_error": "missing_spread_team_or_line"},
             },
-            gate_diagnostics={"spread_verification": {"verified": True}},
+            gate_diagnostics={
+                "probability_adapter": {
+                    "diagnostics": {"adapter_error": "missing_spread_team_or_line"}
+                }
+            },
             features={},
         )
         second = ModelCandidate(
             evaluated_at=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
             target_date=date(2026, 7, 4),
             market_family="first_five_spread",
+            market_type="first_five_spread",
             inning_scope="first_five",
             features={},
         )
-        session.add_all([candidate, second])
+        third = ModelCandidate(
+            evaluated_at=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
+            target_date=date(2026, 7, 10),
+            market_family=None,
+            market_type="first_five_spread",
+            inning_scope="first_five",
+            features={},
+        )
+        session.add_all([candidate, second, third])
         session.commit()
 
-        result = first_five_spread_adapter_repair_preview(session, limit=10)
+        result = first_five_spread_adapter_repair_preview(session, limit=2)
 
     assert result["classification_counts"]["ambiguous"] == 1
     assert result["classification_counts"]["already_valid"] == 0
@@ -24602,7 +24619,141 @@ def test_first_five_spread_adapter_repair_preview_groups_nested_errors_and_date_
         "adapter_error:missing_spread_team_or_line": 1,
         "missing_source_evidence": 1,
     }
-    assert result["affected_target_date_range"] == {"start": "2026-07-02", "end": "2026-07-04"}
+    assert result["matching_rows_count"] == 3
+    assert result["rows_seen"] == 2
+    assert result["truncated"] is True
+    assert result["affected_target_date_range"] == {"start": "2026-07-02", "end": "2026-07-10"}
+    assert result["affected_target_date_range_complete"] is True
+
+
+def test_first_five_spread_adapter_repair_preview_requires_strict_metadata_and_trust() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    metadata = {
+        "adapter_key": "first_five_spread_probability_adapter",
+        "adapter_version": "first_five_spread_adapter_v1",
+        "adapter_policy_version": probability_adapters.PROBABILITY_ADAPTER_POLICY_VERSION,
+        "adapter_family": "first_five_spread",
+        "adapter_scope": "first_five",
+        "calibration_hook": "calibration_hook_first_five_spread",
+        "calibration_version": "shared_parameter_offsets_pre_pr3v",
+        "calibration_hook_status": "metadata_only_pending_pr3v",
+        "feature_policy_version": probability_adapters.PROBABILITY_ADAPTER_FEATURE_POLICY_VERSION,
+        "diagnostics": {},
+    }
+    verification = {
+        "family_key": "first_five_spread",
+        "inning_scope": "first_five",
+        "verified": True,
+        "audit_status": "trusted_audit_only",
+        "selection_code": "PIT",
+        "line_value": "-0.5000",
+        "settlement_formula": "first-five official linescore",
+        "no_is_true_complement": True,
+        "complement_safe_for_paper_settlement": True,
+        "push_possible": False,
+        "push_rule_verified": False,
+        "reason_codes": [
+            "selected_team_verified",
+            "binary_yes_no_complement_verified",
+            "settlement_formula_verified",
+            "first_five_scope_verified",
+            "first_five_official_result_source_verified",
+        ],
+    }
+
+    with Session(engine) as session:
+        valid = ModelCandidate(
+            evaluated_at=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
+            target_date=date(2026, 7, 2),
+            market_family="first_five_spread",
+            market_type="first_five_spread",
+            inning_scope="first_five",
+            probability_adapter_key=metadata["adapter_key"],
+            probability_adapter_version=metadata["adapter_version"],
+            probability_adapter_policy_version=metadata["adapter_policy_version"],
+            probability_adapter_family=metadata["adapter_family"],
+            probability_adapter_scope=metadata["adapter_scope"],
+            probability_adapter_calibration_hook=metadata["calibration_hook"],
+            probability_adapter_calibration_version=metadata["calibration_version"],
+            probability_adapter_feature_policy_version=metadata["feature_policy_version"],
+            probability_adapter_metadata=metadata,
+            features={},
+        )
+        repairable = ModelCandidate(
+            evaluated_at=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
+            target_date=date(2026, 7, 3),
+            market_family="first_five_spread",
+            market_type="first_five_spread",
+            inning_scope="first_five",
+            gate_diagnostics={"spread_verification": verification},
+            features={},
+        )
+        untrusted = ModelCandidate(
+            evaluated_at=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
+            target_date=date(2026, 7, 4),
+            market_family="first_five_spread",
+            market_type="first_five_spread",
+            inning_scope="first_five",
+            gate_diagnostics={
+                "spread_verification": {**verification, "verified": False}
+            },
+            features={},
+        )
+        wrong_calibration_metadata = {**metadata, "calibration_version": "shared_v1"}
+        wrong_calibration = ModelCandidate(
+            evaluated_at=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
+            target_date=date(2026, 7, 5),
+            market_family="first_five_spread",
+            market_type="first_five_spread",
+            inning_scope="first_five",
+            probability_adapter_key=wrong_calibration_metadata["adapter_key"],
+            probability_adapter_version=wrong_calibration_metadata["adapter_version"],
+            probability_adapter_policy_version=wrong_calibration_metadata["adapter_policy_version"],
+            probability_adapter_family=wrong_calibration_metadata["adapter_family"],
+            probability_adapter_scope=wrong_calibration_metadata["adapter_scope"],
+            probability_adapter_calibration_hook=wrong_calibration_metadata["calibration_hook"],
+            probability_adapter_calibration_version=wrong_calibration_metadata["calibration_version"],
+            probability_adapter_feature_policy_version=wrong_calibration_metadata["feature_policy_version"],
+            probability_adapter_metadata=wrong_calibration_metadata,
+            features={},
+        )
+        session.add_all([valid, repairable, untrusted, wrong_calibration])
+        session.commit()
+
+        result = first_five_spread_adapter_repair_preview(session, limit=10)
+
+    assert result["classification_counts"] == {
+        "already_valid": 1,
+        "deterministically_repairable": 1,
+        "ambiguous": 1,
+        "unsupported": 0,
+        "missing_source_evidence": 1,
+    }
+    assert result["reason_counts"] == {
+        "complete_adapter_metadata": 1,
+        "deterministic_spread_verification_evidence": 1,
+        "untrusted_spread_verification": 1,
+        "missing_source_evidence": 1,
+    }
+
+
+def test_first_five_scope_evidence_accepts_supported_contract_field_spellings() -> None:
+    ticker = "KXMLBF5SPREAD-26JUL011900SEAPIT-PIT+0.5"
+    for field in (
+        "yes_sub_title",
+        "yes_subtitle",
+        "yes_title",
+        "no_sub_title",
+        "no_subtitle",
+        "no_title",
+        "title",
+        "subtitle",
+        "rules_primary",
+        "rules_secondary",
+        "rules",
+    ):
+        assert _first_five_scope_evidence({"ticker": ticker, field: "first 5 innings"}) is True
 
 
 def test_spread_audit_reports_out_of_window_mapping_coverage(monkeypatch) -> None:

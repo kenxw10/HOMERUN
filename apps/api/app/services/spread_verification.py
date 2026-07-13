@@ -402,7 +402,19 @@ def _first_five_scope_evidence(payload: dict[str, Any], market: KalshiMarket | N
         return False
     text = " ".join(
         str(payload.get(field) or "")
-        for field in ("title", "subtitle", "yes_subtitle", "no_subtitle", "rules_primary", "rules_secondary", "rules")
+        for field in (
+            "title",
+            "subtitle",
+            "yes_title",
+            "yes_sub_title",
+            "yes_subtitle",
+            "no_title",
+            "no_sub_title",
+            "no_subtitle",
+            "rules_primary",
+            "rules_secondary",
+            "rules",
+        )
     )
     tokens = _text_tokens(text)
     return _contains_phrase(tokens, "first 5 innings") or _contains_phrase(tokens, "first five innings")
