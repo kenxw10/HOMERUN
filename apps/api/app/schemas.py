@@ -351,6 +351,10 @@ class ConfigStatus(BaseModel):
     kalshi_credentials: Literal["not_set", "set_redacted"]
     feature_sync_enable_network_sources: bool = False
     public_sources_enabled: bool = False
+    paper_spread_trading_enabled: bool = False
+    paper_full_game_spread_trading_enabled: bool = False
+    paper_first_five_spread_trading_enabled: bool = False
+    first_five_spread_activation_warning: str | None = None
     source_status: dict[str, object] = Field(default_factory=dict)
 
 

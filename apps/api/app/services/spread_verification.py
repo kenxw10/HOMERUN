@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
 import re
 from typing import Any
@@ -9,7 +9,13 @@ from app.models import KalshiMarket, MarketMapping, MlbGame
 from app.services.contracts import FIRST_FIVE_SPREAD, FULL_GAME_SPREAD
 
 SPREAD_FAMILIES = {FULL_GAME_SPREAD, FIRST_FIVE_SPREAD}
-FULL_GAME_SPREAD_AUDIT_STATUSES = {
+FULL_GAME_SPREAD_TICKER_PREFIX = "KXMLBSPREAD-"
+FIRST_FIVE_SPREAD_TICKER_PREFIX = "KXMLBF5SPREAD-"
+SPREAD_TICKER_PREFIX_BY_FAMILY = {
+    FULL_GAME_SPREAD: FULL_GAME_SPREAD_TICKER_PREFIX,
+    FIRST_FIVE_SPREAD: FIRST_FIVE_SPREAD_TICKER_PREFIX,
+}
+SPREAD_AUDIT_STATUSES = {
     "trusted_audit_only",
     "needs_review",
     "unsafe",
@@ -24,6 +30,8 @@ FULL_GAME_SPREAD_AUDIT_STATUSES = {
     "settlement_text_unverified",
     "push_behavior_uncertain",
 }
+FULL_GAME_SPREAD_AUDIT_STATUSES = SPREAD_AUDIT_STATUSES
+FIRST_FIVE_SPREAD_AUDIT_STATUSES = SPREAD_AUDIT_STATUSES
 SPREAD_TEXT_FIELDS = (
     "yes_sub_title",
     "yes_subtitle",
@@ -47,6 +55,8 @@ TRUST_EVIDENCE_REASON_CODES = {
     "binary_yes_no_complement_verified",
     "half_run_no_push_verified",
     "settlement_formula_verified",
+    "first_five_scope_verified",
+    "first_five_official_result_source_verified",
 }
 CURRENT_AUDIT_METADATA_KEYS = {
     "audit_status",
@@ -383,12 +393,51 @@ def _no_text_source(no_text: str | None, yes_text: str | None, rules_text: str |
 
 
 def _binary_market_confirmed(payload: dict[str, Any], market: KalshiMarket | None, family_key: str) -> bool:
-    if family_key not in SPREAD_FAMILIES:
+    expected_prefix = SPREAD_TICKER_PREFIX_BY_FAMILY.get(family_key)
+    if expected_prefix is None:
         return False
     ticker = str(payload.get("ticker") or (market.ticker if market is not None else "") or "").upper()
-    if not ticker:
-        return market is not None
-    return ticker.startswith("KXMLBSPREAD-") or ticker.startswith("KXMLBF5SPREAD-")
+    return bool(ticker) and ticker.startswith(expected_prefix)
+
+
+def recognized_spread_ticker_family(ticker: str | None) -> str | None:
+    normalized = str(ticker or "").upper()
+    for family_key, prefix in SPREAD_TICKER_PREFIX_BY_FAMILY.items():
+        if normalized.startswith(prefix):
+            return family_key
+    return None
+
+
+def _first_five_scope_evidence(payload: dict[str, Any], market: KalshiMarket | None = None) -> bool:
+    ticker = str(payload.get("ticker") or (market.ticker if market is not None else "") or "").upper()
+    if not ticker.startswith(FIRST_FIVE_SPREAD_TICKER_PREFIX):
+        return False
+    text = " ".join(
+        str(payload.get(field) or "")
+        for field in (
+            "title",
+            "subtitle",
+            "yes_title",
+            "yes_sub_title",
+            "yes_subtitle",
+            "no_title",
+            "no_sub_title",
+            "no_subtitle",
+            "rules_primary",
+            "rules_secondary",
+            "rules",
+        )
+    )
+    tokens = _text_tokens(text)
+    return _contains_phrase(tokens, "first 5 innings") or _contains_phrase(tokens, "first five innings")
+
+
+def _first_five_official_result_source_evidence(payload: dict[str, Any]) -> bool:
+    rules_text = " ".join(str(payload.get(field) or "") for field in SPREAD_RULE_TEXT_FIELDS)
+    tokens = _text_tokens(rules_text)
+    first_five_rules = _contains_phrase(tokens, "first 5 innings") or _contains_phrase(tokens, "first five innings")
+    result_language = bool(set(tokens) & {"score", "scores", "runs", "result", "resolves", "settles", "settlement"})
+    return first_five_rules and result_language
 
 
 def _supporting_spread_conflicts(
@@ -433,8 +482,11 @@ def _reason_status(reason_codes: list[str]) -> str:
         ("unsupported", "unsupported_family"),
         ("missing_market_data", "missing_market_data"),
         ("missing_game_mapping", "missing_game_mapping"),
+        ("parse_error", "first_five_contract_parse_error"),
         ("missing_line", "missing_line"),
         ("parse_error", "rules_text_unparseable"),
+        ("unsafe", "spread_family_ticker_conflict"),
+        ("unsafe", "spread_family_metadata_conflict"),
         ("unsafe", "explicit_no_text_conflicts_with_binary_complement"),
         ("unsafe", "title_rules_team_conflict"),
         ("ambiguous_team_selection", "team_selection_not_verified"),
@@ -478,6 +530,41 @@ def _scope(family_key: str) -> str:
     return "first_five" if family_key == FIRST_FIVE_SPREAD else "full_game"
 
 
+def enforce_spread_family_consistency(
+    verification: SpreadVerification,
+    *,
+    expected_family: str,
+    ticker: str | None,
+) -> SpreadVerification:
+    """Prevent a recognized canonical ticker from being trusted for another family."""
+    if expected_family not in SPREAD_FAMILIES:
+        return verification
+
+    reason_codes = list(verification.reason_codes or [])
+    recognized_family = recognized_spread_ticker_family(ticker)
+    conflicts: list[str] = []
+    if recognized_family is not None and recognized_family != expected_family:
+        conflicts.append("spread_family_ticker_conflict")
+    if verification.family_key != expected_family or verification.inning_scope != _scope(expected_family):
+        conflicts.append("spread_family_metadata_conflict")
+    if not conflicts:
+        return verification
+
+    for reason in conflicts:
+        if reason not in reason_codes:
+            reason_codes.append(reason)
+    return replace(
+        verification,
+        family_key=expected_family,
+        parser_status=UNVERIFIED_STATUS,
+        settlement_rule_status=UNVERIFIED_STATUS,
+        verified=False,
+        audit_status="unsafe",
+        reason_codes=reason_codes,
+        complement_safe_for_paper_settlement=False,
+    )
+
+
 def _scope_display(scope: str) -> str:
     return "first 5 innings" if scope == "first_five" else "full game"
 
@@ -500,7 +587,7 @@ def verify_spread_market(
     rule_entries = _all_text(payload, SPREAD_RULE_TEXT_FIELDS)
     rules_text = _combined_text(rule_entries)
     rules_condition = None
-    if family_key == FULL_GAME_SPREAD:
+    if family_key in SPREAD_FAMILIES:
         for rules_source, candidate_rules_text in rule_entries:
             rules_condition = _parse_rules_spread_condition(candidate_rules_text, game, rules_source)
             if rules_condition is not None:
@@ -562,7 +649,9 @@ def verify_spread_market(
     binary_confirmed = _binary_market_confirmed(payload, market, family_key)
     no_complement_source = None
     no_complement_confidence = None
-    if yes_rule_verified and binary_confirmed and not no_explicit_conflict:
+    if yes_rule_verified and binary_confirmed and (
+        family_key == FULL_GAME_SPREAD or no_text is None
+    ) and not no_explicit_conflict:
         no_complement_source = "binary_market_complement"
         no_complement_confidence = "high"
     elif explicit_no_text_mentions_expected:
@@ -580,6 +669,9 @@ def verify_spread_market(
     reason_codes: list[str] = []
     if family_key not in SPREAD_FAMILIES:
         reason_codes.append("unsupported_family")
+    ticker_family = recognized_spread_ticker_family(str(payload.get("ticker") or ""))
+    if family_key in SPREAD_FAMILIES and ticker_family is not None and ticker_family != family_key:
+        reason_codes.append("spread_family_ticker_conflict")
     if not payload.get("ticker") and market is None:
         reason_codes.append("missing_market_data")
     if family_key == FULL_GAME_SPREAD and rules_text and rules_condition is None:
@@ -605,7 +697,7 @@ def verify_spread_market(
     elif parsed_line is not None and line_source is None:
         reason_codes.append("line_direction_not_verified_from_text")
         warnings.append("SPREAD_LINE_NOT_VERIFIED_FROM_KALSHI_TEXT")
-    if family_key == FULL_GAME_SPREAD and rules_condition is not None:
+    if family_key in SPREAD_FAMILIES and rules_condition is not None:
         reason_codes.extend(
             _supporting_spread_conflicts(
                 payload=payload,
@@ -621,9 +713,9 @@ def verify_spread_market(
         if not no_complement_source:
             reason_codes.append("binary_complement_unverified")
     else:
-        if no_text is None:
+        if not no_complement_source and no_text is None:
             reason_codes.append("no_contract_text_missing")
-        elif not explicit_no_text_mentions_expected:
+        elif not no_complement_source and not explicit_no_text_mentions_expected:
             reason_codes.append("no_contract_text_conflicts_with_expected_complement")
     if rules_text is None:
         reason_codes.append("settlement_text_missing")
@@ -641,6 +733,17 @@ def verify_spread_market(
         reason_codes.append("half_run_no_push_verified")
     if settlement_formula:
         reason_codes.append("settlement_formula_verified")
+    if family_key == FIRST_FIVE_SPREAD:
+        if _first_five_scope_evidence(payload, market):
+            reason_codes.append("first_five_scope_verified")
+        else:
+            reason_codes.append("first_five_scope_unverified")
+        if _first_five_official_result_source_evidence(payload):
+            reason_codes.append("first_five_official_result_source_verified")
+        else:
+            reason_codes.append("first_five_official_result_source_unverified")
+        if parsed_line is None or line_source is None or parsed_selection not in team_codes or selection_source is None:
+            reason_codes.append("first_five_contract_parse_error")
 
     audit_status = _reason_status(reason_codes)
     verified = audit_status == "trusted_audit_only"
@@ -718,12 +821,16 @@ def spread_verification_from_mapping(
     cached = spread_verification_from_cached_metadata(mapping=mapping, market=market)
     if cached is not None and cached.verified:
         return cached
-    return verify_spread_market(
-        game=game,
-        family_key=family_key,
-        market=market,
-        line_value=mapping.line_value or market.line_value,
-        selection_code=mapping.selection_code or market.selection_code,
+    return enforce_spread_family_consistency(
+        verify_spread_market(
+            game=game,
+            family_key=family_key,
+            market=market,
+            line_value=mapping.line_value or market.line_value,
+            selection_code=mapping.selection_code or market.selection_code,
+        ),
+        expected_family=family_key,
+        ticker=market.ticker,
     )
 
 
@@ -740,18 +847,46 @@ def spread_verification_from_cached_metadata(
     if not (
         isinstance(existing, dict)
         and CURRENT_AUDIT_METADATA_KEYS.issubset(existing.keys())
-        and existing.get("audit_status") in FULL_GAME_SPREAD_AUDIT_STATUSES
+        and existing.get("audit_status") in SPREAD_AUDIT_STATUSES
     ):
+        return None
+    if existing.get("family_key") not in {None, family_key}:
+        return None
+    expected_scope = _scope(family_key)
+    if existing.get("inning_scope") not in {None, expected_scope}:
         return None
     line = existing.get("line_value")
     market_line = market.line_value if market is not None else None
     market_selection = market.selection_code if market is not None else None
     market_scope = market.inning_scope if market is not None else None
-    return SpreadVerification(
+    raw_contract_text = existing.get("raw_contract_text") if isinstance(existing.get("raw_contract_text"), dict) else {}
+    reason_codes = list(existing.get("reason_codes") or []) if isinstance(existing.get("reason_codes"), list) else []
+    audit_status = str(existing.get("audit_status") or "trusted_audit_only")
+    verified = bool(existing.get("verified"))
+    if family_key == FIRST_FIVE_SPREAD:
+        cached_payload = {
+            "ticker": market.ticker if market is not None else None,
+            "yes_subtitle": raw_contract_text.get("yes"),
+            "no_subtitle": raw_contract_text.get("no"),
+            "rules": raw_contract_text.get("rules"),
+        }
+        if not _first_five_scope_evidence(cached_payload, market):
+            reason_codes = [code for code in reason_codes if code != "first_five_scope_verified"]
+            reason_codes.append("first_five_scope_unverified")
+            verified = False
+        if not _first_five_official_result_source_evidence(cached_payload):
+            reason_codes = [
+                code for code in reason_codes if code != "first_five_official_result_source_verified"
+            ]
+            reason_codes.append("first_five_official_result_source_unverified")
+            verified = False
+        if "first_five_scope_unverified" in reason_codes or "first_five_official_result_source_unverified" in reason_codes:
+            audit_status = "needs_review"
+    verification = SpreadVerification(
         family_key=family_key,
         parser_status=str(existing.get("parser_status") or VERIFIED_STATUS),
         settlement_rule_status=str(existing.get("settlement_rule_status") or VERIFIED_STATUS),
-        verified=bool(existing.get("verified")),
+        verified=verified,
         selection_code=str(existing.get("selection_code") or mapping.selection_code or market_selection or "") or None,
         line_value=Decimal(str(line)).quantize(Decimal("0.0001")) if line is not None else mapping.line_value or market_line,
         inning_scope=str(existing.get("inning_scope") or mapping.inning_scope or market_scope or _scope(family_key)),
@@ -763,10 +898,10 @@ def spread_verification_from_cached_metadata(
             else None
         ),
         parse_source=str(existing.get("parse_source") or "metadata"),
-        raw_contract_text=existing.get("raw_contract_text") if isinstance(existing.get("raw_contract_text"), dict) else {},
+        raw_contract_text=raw_contract_text,
         warnings=list(existing.get("warnings") or []) if isinstance(existing.get("warnings"), list) else [],
-        audit_status=str(existing.get("audit_status") or "trusted_audit_only"),
-        reason_codes=list(existing.get("reason_codes") or []) if isinstance(existing.get("reason_codes"), list) else [],
+        audit_status=audit_status,
+        reason_codes=reason_codes,
         yes_interpretation=existing.get("yes_interpretation") if isinstance(existing.get("yes_interpretation"), str) else None,
         no_interpretation=existing.get("no_interpretation") if isinstance(existing.get("no_interpretation"), str) else None,
         no_is_true_complement=bool(existing.get("no_is_true_complement", True)),
@@ -812,4 +947,9 @@ def spread_verification_from_cached_metadata(
             if isinstance(existing.get("ticker_suffix_line_raw"), str)
             else None
         ),
+    )
+    return enforce_spread_family_consistency(
+        verification,
+        expected_family=family_key,
+        ticker=market.ticker if market is not None else None,
     )

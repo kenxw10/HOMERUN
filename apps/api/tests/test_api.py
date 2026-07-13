@@ -106,8 +106,16 @@ from app.services.paper_epoch import (
 )
 from app.services.portfolio import calculate_paper_portfolio, create_balance_snapshot
 from app.services.settlement import settle_paper_trades
-from app.services.spread_audit import run_spread_audit
-from app.services.spread_verification import verify_spread_market
+from app.services.spread_audit import (
+    first_five_spread_adapter_repair_preview,
+    run_first_five_spread_audit,
+    run_spread_audit,
+)
+from app.services.spread_verification import (
+    _first_five_scope_evidence,
+    spread_verification_from_cached_metadata,
+    verify_spread_market,
+)
 from app.time_utils import classify_time_bucket, eastern_display, today_eastern
 from app.workers import kalshi_ws_paper
 
@@ -580,6 +588,46 @@ def test_probability_adapters_do_not_invent_ambiguous_spread_complements() -> No
     assert ambiguous_no.probability_raw == Decimal("0.500000")
     assert ambiguous_no.diagnostics["adapter_error"] == "ambiguous_spread_complement"
     assert ambiguous_no.diagnostics["ambiguous_spread_complement"] is True
+
+
+@pytest.mark.parametrize(
+    ("contract_side", "selection", "line", "exposure_team", "exposure_line"),
+    [
+        ("yes", "PIT", "-1.5", "PIT", "-1.5"),
+        ("no", "PIT", "-1.5", "SEA", "+1.5"),
+        ("yes", "SEA", "+1.5", "SEA", "+1.5"),
+        ("no", "SEA", "+1.5", "PIT", "-1.5"),
+        ("yes", "PIT", "-1", "PIT", "-1"),
+        ("no", "PIT", "-1", "SEA", "+1"),
+        ("yes", "SEA", "-1.5", "SEA", "-1.5"),
+        ("no", "SEA", "-1.5", "PIT", "+1.5"),
+    ],
+)
+def test_first_five_spread_adapter_contract_matrix(
+    contract_side: str,
+    selection: str,
+    line: str,
+    exposure_team: str,
+    exposure_line: str,
+) -> None:
+    result = probability_adapters.score_probability_adapter(
+        _adapter_context(
+            "first_five_spread",
+            contract_side=contract_side,
+            selection_code=selection,
+            line_value=line,
+            exposure_direction="cover",
+            exposure_team=exposure_team,
+            exposure_line=exposure_line,
+        )
+    )
+
+    assert "adapter_error" not in result.diagnostics
+    assert result.diagnostics["spread_team"] == exposure_team
+    assert result.diagnostics["spread_line"] == float(Decimal(exposure_line))
+    assert result.diagnostics["actual_contract_probability"] == float(result.probability_calibrated)
+    if Decimal(line) == Decimal("-1"):
+        assert result.push_probability > Decimal("0")
 
 
 def test_compact_dashboard_preserves_nested_probability_adapter_summary() -> None:
@@ -1653,6 +1701,7 @@ def test_pr3e_feature_hardening_preserves_paper_safety_defaults(monkeypatch) -> 
         "WEBSOCKET_MARKET_DATA_ENABLED",
         "PAPER_SPREAD_TRADING_ENABLED",
         "PAPER_FULL_GAME_SPREAD_TRADING_ENABLED",
+        "PAPER_FIRST_FIVE_SPREAD_TRADING_ENABLED",
         "PAPER_MIN_DATA_QUALITY",
         "PAPER_OBSERVATION_MIN_DATA_QUALITY",
         "LIVE_MIN_DATA_QUALITY",
@@ -1669,6 +1718,7 @@ def test_pr3e_feature_hardening_preserves_paper_safety_defaults(monkeypatch) -> 
         assert settings.websocket_market_data_enabled is False
         assert settings.paper_spread_trading_enabled is False
         assert settings.paper_full_game_spread_trading_enabled is False
+        assert settings.paper_first_five_spread_trading_enabled is False
         assert settings.paper_min_data_quality == Decimal("0.60")
         assert settings.paper_observation_min_data_quality == Decimal("0.55")
         assert settings.live_min_data_quality == Decimal("0.60")
@@ -2743,6 +2793,79 @@ def test_spread_audit_freshness_keeps_current_day_covered_evidence(monkeypatch) 
     assert latest_audit["spread_audit_stale_warning"] is False
     assert pack["spread_audit"]["freshness_status"] == "fresh_covered"
     assert pack["spread_audit"]["latest_run_coverage_status"] == "no_mappings_in_window"
+
+
+def test_first_five_spread_freshness_isolated_and_preserves_covered_evidence(monkeypatch) -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    now = datetime(2026, 7, 5, 16, 0, tzinfo=UTC)
+    monkeypatch.setattr(spread_audit_freshness, "utc_now", lambda: now)
+
+    def add_run(session: Session, job_name: str, result_key: str, completed_at: datetime, checked: int, coverage: str) -> None:
+        session.add(
+            JobRun(
+                job_name=job_name,
+                job_type="paper_ops",
+                paper_trading_epoch_id=active.id,
+                status="succeeded",
+                started_at=completed_at - timedelta(minutes=1),
+                completed_at=completed_at,
+                target_date=date(2026, 7, 5),
+                result={
+                    result_key: {
+                        "checked": checked,
+                        "coverage_status": coverage,
+                        "zero_checked_reason": "not_applicable" if checked else "all_target_date_mappings_outside_window",
+                        "target_date_mapping_count": checked or 4,
+                        "in_window_mapping_count": checked,
+                    }
+                },
+            )
+        )
+
+    with Session(engine) as session:
+        active = get_or_create_active_paper_epoch(session, starting_balance=Decimal("500.00"))
+        add_run(
+            session,
+            "spread-audit",
+            "spread_audit",
+            now - timedelta(minutes=30),
+            8,
+            "covered",
+        )
+        add_run(
+            session,
+            "first-five-spread-audit",
+            "first_five_spread_audit",
+            now - timedelta(hours=2),
+            4,
+            "covered",
+        )
+        add_run(
+            session,
+            "first-five-spread-audit",
+            "first_five_spread_audit",
+            now - timedelta(minutes=10),
+            0,
+            "no_mappings_in_window",
+        )
+        session.commit()
+
+        payload = spread_audit_freshness.first_five_spread_audit_freshness_payload(
+            session,
+            active,
+            job_status=None,
+            started_at=None,
+            completed_at=None,
+            target_date=date(2026, 7, 5),
+            now=now,
+        )
+
+    assert payload["freshness_policy_version"] == "pr4f_first_five_spread_audit_freshness_v1"
+    assert payload["freshness_status"] == "fresh_covered"
+    assert payload["latest_run_checked"] == 0
+    assert payload["latest_run_coverage_status"] == "no_mappings_in_window"
+    assert payload["latest_covered_target_date"] == "2026-07-05"
 
 
 def test_pr4e1_freshness_reports_true_no_target_mappings_as_fresh(monkeypatch) -> None:
@@ -10920,6 +11043,13 @@ def _add_settlement_trade(
         inning_scope=inning_scope,
         settlement_rule_status="paper_supported",
     )
+    if family == "first_five_spread" and selection and line is not None:
+        opponent = game.away_abbreviation if selection == game.home_abbreviation else game.home_abbreviation
+        market.title = f"{selection} first five spread"
+        signed_line = f"+{float(line):g}" if line > 0 else f"{float(line):g}"
+        market.yes_subtitle = f"{selection} {signed_line} first 5 innings"
+        market.no_subtitle = f"{opponent} {float(-line):g} first 5 innings"
+        market.rules = "The market is based on the score after the first 5 innings. Push if the line is exact."
     session.add(market)
     session.flush()
     mapping = _add_candidate_mapping(
@@ -10935,6 +11065,16 @@ def _add_settlement_trade(
         inning_scope=inning_scope,
         settlement_rule_status="paper_supported",
     )
+    if family == "first_five_spread" and selection and line is not None:
+        verification = verify_spread_market(
+            game=game,
+            family_key=family,
+            market=market,
+            line_value=line,
+            selection_code=selection,
+        )
+        assert verification.audit_status == "trusted_audit_only", verification.reason_codes
+        mapping.mapping_metadata = {"spread_verification": verification.as_metadata()}
     session.flush()
     candidate = ModelCandidate(
         paper_trading_epoch_id=epoch_id,
@@ -11566,6 +11706,57 @@ def test_first_five_winner_and_spread_settle_before_full_game_final() -> None:
     assert spread_trade.status == "settled"
     assert spread_trade.outcome == "push"
     assert spread_trade.current_price == spread_trade.entry_price
+
+
+def test_first_five_spread_open_game_revalidates_cached_trust_after_innings_complete() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        epoch_id = _active_epoch_id(session)
+        game = MlbGame(
+            external_game_id="settle-f5-spread-audit-revalidation",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+            status="In Progress",
+            raw_payload=_linescore_payload([(1, 0), (0, 0), (0, 1), (1, 0), (0, 0)]),
+        )
+        session.add(game)
+        session.flush()
+        trade, _candidate, market, _position = _add_settlement_trade(
+            session,
+            epoch_id=epoch_id,
+            game=game,
+            ticker="KXMLBF5SPREAD-26JUL011900SEAPIT-PIT+1",
+            family="first_five_spread",
+            line=Decimal("1.0000"),
+            selection="PIT",
+            inning_scope="first_five",
+        )
+        mapping = session.scalar(
+            select(MarketMapping)
+            .where(MarketMapping.mlb_game_id == game.id)
+            .where(MarketMapping.kalshi_market_id == market.id)
+        )
+        assert mapping is not None
+        metadata = dict(mapping.mapping_metadata or {})
+        verification = dict(metadata["spread_verification"])
+        verification["verified"] = False
+        metadata["spread_verification"] = verification
+        mapping.mapping_metadata = metadata
+        session.commit()
+
+        result = settle_paper_trades(session, date(2026, 7, 1), now=datetime(2026, 7, 2, 1, 0, tzinfo=UTC))
+        session.refresh(trade)
+
+    assert result["settled"] == 0
+    assert result["skipped_first_five_spread_audit_not_trusted"] == 1
+    assert result["skip_reasons"]["first_five_spread_audit_not_trusted"] == 1
+    assert trade.status == "open"
+    assert trade.outcome is None
 
 
 def test_paper_settlement_handles_spread_total_and_first_five_families() -> None:
@@ -23126,6 +23317,437 @@ def test_market_family_mapping_preserves_first_five_spread_verification() -> Non
     assert mapping.mapping_metadata["spread_verification"]["inning_scope"] == "first_five"
 
 
+def test_first_five_spread_trust_requires_canonical_scope_and_result_evidence() -> None:
+    game = MlbGame(
+        external_game_id="first-five-evidence",
+        home_team="Pittsburgh Pirates",
+        away_team="Seattle Mariners",
+        home_abbreviation="PIT",
+        away_abbreviation="SEA",
+        scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+        status="scheduled",
+    )
+    raw = {
+        "ticker": "KXMLBF5SPREAD-26JUL011900SEAPIT-PIT+0.5",
+        "yes_subtitle": "Pittsburgh -0.5 first 5 innings",
+        "no_subtitle": "Seattle +0.5 first 5 innings",
+        "rules": "The market is based on the score after the first 5 innings.",
+    }
+
+    trusted = verify_spread_market(game=game, family_key="first_five_spread", raw=raw)
+    assert trusted.verified is True
+    assert "first_five_scope_verified" in trusted.reason_codes
+    assert "first_five_official_result_source_verified" in trusted.reason_codes
+
+    wrong_scope = verify_spread_market(
+        game=game,
+        family_key="first_five_spread",
+        raw={**raw, "ticker": "KXMLBSPREAD-26JUL011900SEAPIT-PIT+0.5"},
+    )
+    assert wrong_scope.verified is False
+    assert "first_five_scope_unverified" in wrong_scope.reason_codes
+
+    missing_result_source = verify_spread_market(
+        game=game,
+        family_key="first_five_spread",
+        raw={**raw, "rules": "Pittsburgh -0.5 first 5 innings"},
+    )
+    assert missing_result_source.verified is False
+    assert "first_five_official_result_source_unverified" in missing_result_source.reason_codes
+
+
+def test_first_five_spread_cached_trust_revalidates_canonical_scope() -> None:
+    game = MlbGame(
+        external_game_id="first-five-cached-scope",
+        home_team="Pittsburgh Pirates",
+        away_team="Seattle Mariners",
+        home_abbreviation="PIT",
+        away_abbreviation="SEA",
+        scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+        status="scheduled",
+    )
+    raw = {
+        "ticker": "KXMLBF5SPREAD-26JUL011900SEAPIT-PIT+0.5",
+        "yes_subtitle": "Pittsburgh -0.5 first 5 innings",
+        "no_subtitle": "Seattle +0.5 first 5 innings",
+        "rules": "The market is based on the score after the first 5 innings.",
+    }
+    verification = verify_spread_market(game=game, family_key="first_five_spread", raw=raw)
+    mapping = MarketMapping(
+        mapping_status="confirmed",
+        market_family="first_five_spread",
+        market_type="first_five_spread",
+        line_value=Decimal("-0.5000"),
+        selection_code="PIT",
+        inning_scope="first_five",
+        mapping_metadata={"spread_verification": verification.as_metadata()},
+    )
+    market = KalshiMarket(
+        kalshi_market_id="first-five-cached-scope",
+        ticker=raw["ticker"],
+        title="Pittsburgh vs Seattle first 5 innings",
+        rules=raw["rules"],
+        yes_subtitle=raw["yes_subtitle"],
+        no_subtitle=raw["no_subtitle"],
+    )
+
+    cached = spread_verification_from_cached_metadata(mapping=mapping, market=market)
+    assert cached is not None
+    assert cached.verified is True
+
+    market.ticker = "KXMLBSPREAD-26JUL011900SEAPIT-PIT+0.5"
+    revalidated = spread_verification_from_cached_metadata(mapping=mapping, market=market)
+    assert revalidated is not None
+    assert revalidated.verified is False
+    assert revalidated.audit_status == "unsafe"
+    assert "spread_family_ticker_conflict" in revalidated.reason_codes
+    assert "first_five_scope_unverified" in revalidated.reason_codes
+
+
+@pytest.mark.parametrize(
+    ("family_key", "ticker"),
+    [
+        ("full_game_spread", "KXMLBF5SPREAD-26JUL011900SEAPIT-PIT+0.5"),
+        ("first_five_spread", "KXMLBSPREAD-26JUL011900SEAPIT-PIT-1.5"),
+    ],
+)
+def test_spread_family_ticker_conflicts_are_unsafe(
+    family_key: str,
+    ticker: str,
+) -> None:
+    game = MlbGame(
+        external_game_id=f"spread-family-conflict-{family_key}",
+        home_team="Pittsburgh Pirates",
+        away_team="Seattle Mariners",
+        home_abbreviation="PIT",
+        away_abbreviation="SEA",
+        scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+        status="scheduled",
+    )
+    raw = {
+        "ticker": ticker,
+        "yes_subtitle": "Pittsburgh -1.5 first 5 innings" if family_key == "first_five_spread" else "Pittsburgh -1.5",
+        "no_subtitle": "Seattle +1.5 first 5 innings" if family_key == "first_five_spread" else "Seattle +1.5",
+        "rules": (
+            "The market is based on the score after the first 5 innings."
+            if family_key == "first_five_spread"
+            else "If Pittsburgh wins by more than 1.5 runs, this market resolves to Yes."
+        ),
+    }
+
+    result = verify_spread_market(game=game, family_key=family_key, raw=raw)
+
+    assert result.verified is False
+    assert result.audit_status == "unsafe"
+    assert "spread_family_ticker_conflict" in result.reason_codes
+
+
+@pytest.mark.parametrize("family_key", ["full_game_spread", "first_five_spread"])
+def test_cached_spread_trust_cannot_bypass_ticker_family_conflict(family_key: str) -> None:
+    game = MlbGame(
+        external_game_id=f"cached-spread-family-conflict-{family_key}",
+        home_team="Pittsburgh Pirates",
+        away_team="Seattle Mariners",
+        home_abbreviation="PIT",
+        away_abbreviation="SEA",
+        scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+        status="scheduled",
+    )
+    good_ticker = (
+        "KXMLBF5SPREAD-26JUL011900SEAPIT-PIT+0.5"
+        if family_key == "first_five_spread"
+        else "KXMLBSPREAD-26JUL011900SEAPIT-PIT-1.5"
+    )
+    conflicting_ticker = (
+        "KXMLBSPREAD-26JUL011900SEAPIT-PIT-1.5"
+        if family_key == "first_five_spread"
+        else "KXMLBF5SPREAD-26JUL011900SEAPIT-PIT+0.5"
+    )
+    raw = {
+        "ticker": good_ticker,
+        "yes_subtitle": "Pittsburgh -1.5 first 5 innings" if family_key == "first_five_spread" else "Pittsburgh -1.5",
+        "no_subtitle": "Seattle +1.5 first 5 innings" if family_key == "first_five_spread" else "Seattle +1.5",
+        "rules": (
+            "The market is based on the score after the first 5 innings."
+            if family_key == "first_five_spread"
+            else "If Pittsburgh wins by more than 1.5 runs, this market resolves to Yes."
+        ),
+    }
+    verification = verify_spread_market(game=game, family_key=family_key, raw=raw)
+    assert verification.verified is True
+    mapping = MarketMapping(
+        mapping_status="confirmed",
+        market_family=family_key,
+        market_type=family_key,
+        line_value=Decimal("-1.5000"),
+        selection_code="PIT",
+        inning_scope="first_five" if family_key == "first_five_spread" else "full_game",
+        mapping_metadata={"spread_verification": verification.as_metadata()},
+    )
+    market = KalshiMarket(
+        kalshi_market_id=f"cached-conflict-{family_key}",
+        ticker=conflicting_ticker,
+        market_family=family_key,
+        market_type=family_key,
+        title="Pittsburgh vs Seattle spread",
+    )
+
+    cached = spread_verification_from_cached_metadata(mapping=mapping, market=market)
+
+    assert cached is not None
+    assert cached.verified is False
+    assert cached.audit_status == "unsafe"
+    assert "spread_family_ticker_conflict" in cached.reason_codes
+    if family_key == "first_five_spread":
+        assert settlement._first_five_spread_audit_skip_reason(cached) == "first_five_spread_audit_unsafe"
+
+
+def test_spread_family_ticker_conflict_blocks_candidate_gate(monkeypatch) -> None:
+    monkeypatch.setattr(
+        candidates,
+        "get_settings",
+        lambda: SimpleNamespace(
+            paper_full_game_spread_trading_enabled=True,
+            paper_first_five_spread_trading_enabled=True,
+        ),
+    )
+    game = MlbGame(
+        external_game_id="candidate-spread-family-conflict",
+        home_team="Pittsburgh Pirates",
+        away_team="Seattle Mariners",
+        home_abbreviation="PIT",
+        away_abbreviation="SEA",
+        scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+        status="scheduled",
+    )
+    raw = {
+        "ticker": "KXMLBSPREAD-26JUL011900SEAPIT-PIT-1.5",
+        "yes_subtitle": "Pittsburgh -1.5 first 5 innings",
+        "no_subtitle": "Seattle +1.5 first 5 innings",
+        "rules": "The market is based on the score after the first 5 innings.",
+    }
+    trusted = verify_spread_market(game=game, family_key="first_five_spread", raw={**raw, "ticker": "KXMLBF5SPREAD-26JUL011900SEAPIT-PIT+0.5"})
+    mapping = MarketMapping(
+        mapping_status="confirmed",
+        confidence=Decimal("0.9500"),
+        market_family="first_five_spread",
+        market_type="first_five_spread",
+        line_value=Decimal("-1.5000"),
+        selection_code="PIT",
+        inning_scope="first_five",
+        settlement_rule_status="paper_supported",
+        mapping_metadata={"spread_verification": trusted.as_metadata()},
+    )
+    market = KalshiMarket(
+        kalshi_market_id="candidate-spread-family-conflict",
+        ticker=raw["ticker"],
+        title="Pittsburgh vs Seattle first five spread",
+        market_family="first_five_spread",
+        market_type="first_five_spread",
+        settlement_rule_status="paper_supported",
+        status="open",
+    )
+
+    decision = candidates._base_decision(
+        mapping,
+        game,
+        market,
+        "first_five_spread",
+        date(2026, 7, 1),
+        60,
+        candidates.PriceContext(None, None, None, None, None, "missing", "yes"),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+
+    assert decision == "no_trade_first_five_spread_unsafe"
+
+
+def test_first_five_audit_documented_response_shapes() -> None:
+    audit = {"status": "completed", "checked": 1, "read_only": True}
+
+    def extract(response: dict[str, object]) -> dict[str, object] | None:
+        run = response.get("result")
+        if not isinstance(run, dict):
+            return None
+        nested = run.get("result")
+        if isinstance(nested, dict) and isinstance(nested.get("first_five_spread_audit"), dict):
+            return nested["first_five_spread_audit"]
+        direct = run.get("first_five_spread_audit")
+        return direct if isinstance(direct, dict) else None
+
+    assert extract({"result": {"result": {"first_five_spread_audit": audit}}}) == audit
+    assert extract({"result": {"first_five_spread_audit": audit}}) == audit
+
+
+def test_first_five_spread_audit_marks_conflicting_ticker_unsafe_and_read_only(monkeypatch) -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+
+    with Session(engine) as session:
+        game = MlbGame(
+            external_game_id="audit-spread-family-conflict",
+            home_team="Pittsburgh Pirates",
+            away_team="Seattle Mariners",
+            home_abbreviation="PIT",
+            away_abbreviation="SEA",
+            scheduled_start=datetime(2026, 7, 1, 17, 30, tzinfo=UTC),
+            status="scheduled",
+        )
+        market = KalshiMarket(
+            kalshi_market_id="audit-spread-family-conflict",
+            ticker="KXMLBSPREAD-26JUL011900SEAPIT-PIT-1.5",
+            title="Pittsburgh vs Seattle first five spread",
+            yes_subtitle="Pittsburgh -1.5 first 5 innings",
+            no_subtitle="Seattle +1.5 first 5 innings",
+            rules="The market is based on the score after the first 5 innings.",
+            market_family="first_five_spread",
+            market_type="first_five_spread",
+            status="open",
+            settlement_rule_status="paper_supported",
+            line_value=Decimal("-1.5000"),
+            selection_code="PIT",
+            inning_scope="first_five",
+        )
+        session.add_all([game, market])
+        session.flush()
+        mapping = MarketMapping(
+            mlb_game_id=game.id,
+            kalshi_market_id=market.id,
+            mapping_status="confirmed",
+            market_family="first_five_spread",
+            market_type="first_five_spread",
+            settlement_rule_status="paper_supported",
+            line_value=Decimal("-1.5000"),
+            selection_code="PIT",
+            inning_scope="first_five",
+        )
+        session.add(mapping)
+        session.commit()
+        monkeypatch.setattr("app.services.spread_audit.utc_now", lambda: now)
+
+        result = run_first_five_spread_audit(
+            session,
+            date(2026, 7, 1),
+            min_time_to_start_minutes=0,
+            max_time_to_start_minutes=180,
+        )
+
+        session.expire_all()
+        persisted_mapping = session.get(MarketMapping, mapping.id)
+
+    assert result["checked"] == 1
+    assert result["verified"] == 0
+    assert result["unsafe_count"] == 1
+    assert "spread_family_ticker_conflict" in result["items"][0]["reason_codes"]
+    assert result["read_only"] is True
+    assert result["mapping_mutations"] == 0
+    assert result["candidate_mutations"] == 0
+    assert result["paper_trades_created"] == 0
+    assert persisted_mapping is not None
+    assert persisted_mapping.mapping_metadata is None
+
+
+def test_first_five_spread_broad_flag_cannot_bypass_dedicated_activation(monkeypatch) -> None:
+    monkeypatch.setattr(
+        candidates,
+        "get_settings",
+        lambda: SimpleNamespace(
+            paper_spread_trading_enabled=True,
+            paper_first_five_spread_trading_enabled=False,
+        ),
+    )
+    mapping = MarketMapping(
+        mapping_status="confirmed",
+        confidence=Decimal("0.9500"),
+        market_family="first_five_spread",
+        market_type="first_five_spread",
+        line_value=Decimal("-0.5000"),
+        selection_code="PIT",
+        settlement_rule_status="paper_supported",
+    )
+    game = MlbGame(
+        home_abbreviation="PIT",
+        away_abbreviation="SEA",
+        scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+        status="scheduled",
+    )
+    market = KalshiMarket(
+        kalshi_market_id="first-five-broad-flag",
+        ticker="KXMLBF5SPREAD-26JUL011900SEAPIT-PIT+0.5",
+        title="Pittsburgh vs Seattle first 5 innings",
+        market_family="first_five_spread",
+        settlement_rule_status="paper_supported",
+    )
+
+    decision = candidates._base_decision(
+        mapping,
+        game,
+        market,
+        "first_five_spread",
+        date(2026, 7, 1),
+        60,
+        candidates.PriceContext(None, None, None, None, None, "missing", "yes"),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    assert decision == "no_trade_first_five_spread_trading_disabled"
+
+
+def test_first_five_spread_contract_text_conflicts_remain_untrusted() -> None:
+    game = MlbGame(
+        external_game_id="first-five-contract-conflicts",
+        home_team="Pittsburgh Pirates",
+        away_team="Seattle Mariners",
+        home_abbreviation="PIT",
+        away_abbreviation="SEA",
+        scheduled_start=datetime(2026, 7, 1, 23, 0, tzinfo=UTC),
+        status="scheduled",
+    )
+    base = {
+        "ticker": "KXMLBF5SPREAD-26JUL011900SEAPIT-PIT+0.5",
+        "yes_subtitle": "Pittsburgh -0.5 first 5 innings",
+        "no_subtitle": "Seattle +0.5 first 5 innings",
+        "rules": "The market is based on the score after the first 5 innings.",
+    }
+
+    duplicate_no = verify_spread_market(game=game, family_key="first_five_spread", raw={**base, "no_subtitle": base["yes_subtitle"]})
+    contradictory_no = verify_spread_market(
+        game=game,
+        family_key="first_five_spread",
+        raw={**base, "no_subtitle": "Pittsburgh -0.5 first 5 innings"},
+    )
+    missing_team = verify_spread_market(
+        game=game,
+        family_key="first_five_spread",
+        raw={**base, "yes_subtitle": "-0.5 first 5 innings", "no_subtitle": "Seattle +0.5 first 5 innings"},
+    )
+    missing_line = verify_spread_market(
+        game=game,
+        family_key="first_five_spread",
+        raw={**base, "yes_subtitle": "Pittsburgh first 5 innings", "no_subtitle": "Seattle first 5 innings"},
+    )
+
+    assert duplicate_no.verified is False
+    assert contradictory_no.verified is False
+    assert "no_contract_text_conflicts_with_expected_complement" in contradictory_no.reason_codes
+    assert missing_team.audit_status == "parse_error"
+    assert missing_line.audit_status == "parse_error"
+
+
 def test_market_family_mapping_keeps_spread_without_rules_needs_review() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
@@ -24132,6 +24754,258 @@ def test_spread_audit_reports_no_target_date_mapping_coverage(monkeypatch) -> No
     assert result["paper_trades_created"] == 0
     assert result["mapping_mutations"] == 0
     assert result["settlement_rows_created"] == 0
+
+
+def test_first_five_spread_audit_is_bounded_and_read_only_when_empty(monkeypatch) -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+
+    with Session(engine) as session:
+        monkeypatch.setattr("app.services.spread_audit.utc_now", lambda: now)
+        result = run_first_five_spread_audit(
+            session,
+            date(2026, 7, 1),
+            min_time_to_start_minutes=45,
+            max_time_to_start_minutes=360,
+        )
+
+    assert result["audit_scope"] == "first_five_spread"
+    assert result["total_first_five_spread_markets_seen"] == 0
+    assert result["coverage_status"] == "no_target_date_mappings"
+    assert result["read_only"] is True
+    assert result["audit_only"] is True
+    assert result["candidate_mutations"] == 0
+    assert result["paper_trades_created"] == 0
+
+
+def test_first_five_spread_adapter_repair_preview_does_not_mutate_candidates() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        candidate = ModelCandidate(
+            evaluated_at=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
+            target_date=date(2026, 7, 1),
+            market_family="first_five_spread",
+            inning_scope="first_five",
+            features={},
+        )
+        session.add(candidate)
+        session.commit()
+        candidate_id = candidate.id
+
+        result = first_five_spread_adapter_repair_preview(
+            session,
+            target_date=date(2026, 7, 1),
+            limit=1,
+        )
+
+        session.expire_all()
+        persisted = session.get(ModelCandidate, candidate_id)
+
+    assert result["preview_only"] is True
+    assert result["read_only"] is True
+    assert result["mutations_applied"] == 0
+    assert result["candidate_mutations"] == 0
+    assert result["rows_seen"] == 1
+    assert result["classification_counts"]["missing_source_evidence"] == 1
+    assert persisted is not None
+    assert persisted.probability_adapter_family is None
+    assert persisted.probability_adapter_metadata is None
+
+
+def test_first_five_spread_adapter_repair_preview_groups_nested_errors_and_date_range() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        candidate = ModelCandidate(
+            evaluated_at=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
+            target_date=date(2026, 7, 2),
+            market_family="first_five_spread",
+            inning_scope="first_five",
+            probability_adapter_family="first_five_spread",
+            probability_adapter_scope="first_five",
+            probability_adapter_policy_version="pr3u_probability_adapter_v1",
+            probability_adapter_version="first_five_spread_adapter_v1",
+            probability_adapter_calibration_hook="calibration_hook_first_five_spread",
+            probability_adapter_calibration_version="shared_v1",
+            probability_adapter_feature_policy_version="pr3u_probability_adapter_features_v1",
+            probability_adapter_metadata={
+                "adapter_key": "first_five_spread_probability_adapter",
+                "diagnostics": {"adapter_error": "missing_spread_team_or_line"},
+            },
+            gate_diagnostics={
+                "probability_adapter": {
+                    "diagnostics": {"adapter_error": "missing_spread_team_or_line"}
+                }
+            },
+            features={},
+        )
+        second = ModelCandidate(
+            evaluated_at=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
+            target_date=date(2026, 7, 4),
+            market_family="first_five_spread",
+            market_type="first_five_spread",
+            inning_scope="first_five",
+            features={},
+        )
+        third = ModelCandidate(
+            evaluated_at=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
+            target_date=date(2026, 7, 10),
+            market_family=None,
+            market_type="first_five_spread",
+            inning_scope="first_five",
+            features={},
+        )
+        session.add_all([candidate, second, third])
+        session.commit()
+
+        result = first_five_spread_adapter_repair_preview(session, limit=2)
+
+    assert result["classification_counts"]["ambiguous"] == 1
+    assert result["classification_counts"]["already_valid"] == 0
+    assert result["classification_counts"]["deterministically_repairable"] == 0
+    assert result["reason_counts"] == {
+        "adapter_error:missing_spread_team_or_line": 1,
+        "missing_source_evidence": 1,
+    }
+    assert result["matching_rows_count"] == 3
+    assert result["rows_seen"] == 2
+    assert result["truncated"] is True
+    assert result["affected_target_date_range"] == {"start": "2026-07-02", "end": "2026-07-10"}
+    assert result["affected_target_date_range_complete"] is True
+
+
+def test_first_five_spread_adapter_repair_preview_requires_strict_metadata_and_trust() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    metadata = {
+        "adapter_key": "first_five_spread_probability_adapter",
+        "adapter_version": "first_five_spread_adapter_v1",
+        "adapter_policy_version": probability_adapters.PROBABILITY_ADAPTER_POLICY_VERSION,
+        "adapter_family": "first_five_spread",
+        "adapter_scope": "first_five",
+        "calibration_hook": "calibration_hook_first_five_spread",
+        "calibration_version": "shared_parameter_offsets_pre_pr3v",
+        "calibration_hook_status": "metadata_only_pending_pr3v",
+        "feature_policy_version": probability_adapters.PROBABILITY_ADAPTER_FEATURE_POLICY_VERSION,
+        "diagnostics": {},
+    }
+    verification = {
+        "family_key": "first_five_spread",
+        "inning_scope": "first_five",
+        "verified": True,
+        "audit_status": "trusted_audit_only",
+        "selection_code": "PIT",
+        "line_value": "-0.5000",
+        "settlement_formula": "first-five official linescore",
+        "no_is_true_complement": True,
+        "complement_safe_for_paper_settlement": True,
+        "push_possible": False,
+        "push_rule_verified": False,
+        "reason_codes": [
+            "selected_team_verified",
+            "binary_yes_no_complement_verified",
+            "settlement_formula_verified",
+            "first_five_scope_verified",
+            "first_five_official_result_source_verified",
+        ],
+    }
+
+    with Session(engine) as session:
+        valid = ModelCandidate(
+            evaluated_at=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
+            target_date=date(2026, 7, 2),
+            market_family="first_five_spread",
+            market_type="first_five_spread",
+            inning_scope="first_five",
+            probability_adapter_key=metadata["adapter_key"],
+            probability_adapter_version=metadata["adapter_version"],
+            probability_adapter_policy_version=metadata["adapter_policy_version"],
+            probability_adapter_family=metadata["adapter_family"],
+            probability_adapter_scope=metadata["adapter_scope"],
+            probability_adapter_calibration_hook=metadata["calibration_hook"],
+            probability_adapter_calibration_version=metadata["calibration_version"],
+            probability_adapter_feature_policy_version=metadata["feature_policy_version"],
+            probability_adapter_metadata=metadata,
+            features={},
+        )
+        repairable = ModelCandidate(
+            evaluated_at=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
+            target_date=date(2026, 7, 3),
+            market_family="first_five_spread",
+            market_type="first_five_spread",
+            inning_scope="first_five",
+            gate_diagnostics={"spread_verification": verification},
+            features={},
+        )
+        untrusted = ModelCandidate(
+            evaluated_at=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
+            target_date=date(2026, 7, 4),
+            market_family="first_five_spread",
+            market_type="first_five_spread",
+            inning_scope="first_five",
+            gate_diagnostics={
+                "spread_verification": {**verification, "verified": False}
+            },
+            features={},
+        )
+        wrong_calibration_metadata = {**metadata, "calibration_version": "shared_v1"}
+        wrong_calibration = ModelCandidate(
+            evaluated_at=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
+            target_date=date(2026, 7, 5),
+            market_family="first_five_spread",
+            market_type="first_five_spread",
+            inning_scope="first_five",
+            probability_adapter_key=wrong_calibration_metadata["adapter_key"],
+            probability_adapter_version=wrong_calibration_metadata["adapter_version"],
+            probability_adapter_policy_version=wrong_calibration_metadata["adapter_policy_version"],
+            probability_adapter_family=wrong_calibration_metadata["adapter_family"],
+            probability_adapter_scope=wrong_calibration_metadata["adapter_scope"],
+            probability_adapter_calibration_hook=wrong_calibration_metadata["calibration_hook"],
+            probability_adapter_calibration_version=wrong_calibration_metadata["calibration_version"],
+            probability_adapter_feature_policy_version=wrong_calibration_metadata["feature_policy_version"],
+            probability_adapter_metadata=wrong_calibration_metadata,
+            features={},
+        )
+        session.add_all([valid, repairable, untrusted, wrong_calibration])
+        session.commit()
+
+        result = first_five_spread_adapter_repair_preview(session, limit=10)
+
+    assert result["classification_counts"] == {
+        "already_valid": 1,
+        "deterministically_repairable": 1,
+        "ambiguous": 1,
+        "unsupported": 0,
+        "missing_source_evidence": 1,
+    }
+    assert result["reason_counts"] == {
+        "complete_adapter_metadata": 1,
+        "deterministic_spread_verification_evidence": 1,
+        "untrusted_spread_verification": 1,
+        "missing_source_evidence": 1,
+    }
+
+
+def test_first_five_scope_evidence_accepts_supported_contract_field_spellings() -> None:
+    ticker = "KXMLBF5SPREAD-26JUL011900SEAPIT-PIT+0.5"
+    for field in (
+        "yes_sub_title",
+        "yes_subtitle",
+        "yes_title",
+        "no_sub_title",
+        "no_subtitle",
+        "no_title",
+        "title",
+        "subtitle",
+        "rules_primary",
+        "rules_secondary",
+        "rules",
+    ):
+        assert _first_five_scope_evidence({"ticker": ticker, field: "first 5 innings"}) is True
 
 
 def test_spread_audit_reports_out_of_window_mapping_coverage(monkeypatch) -> None:

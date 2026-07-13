@@ -184,6 +184,7 @@ def probability_adapter_candidate_payload(result: ProbabilityAdapterResult) -> d
         "probability_adapter_rationale": result.adapter_rationale,
         "probability_adapter_calibration_hook": result.calibration_hook,
         "probability_adapter_calibration_version": result.calibration_version,
+        "probability_adapter_calibration_hook_status": result.calibration_hook_status,
         "probability_adapter_feature_policy_version": result.feature_policy_version,
         "probability_adapter_metadata": result.compact_metadata(),
     }
@@ -198,7 +199,7 @@ def _score_family_adapter(
     expectations = expected_runs(context.features, parameters)
     data_quality = _decimal(context.features.get("data_quality"), Decimal("0.10")).quantize(Decimal("0.0001"))
     raw_probability, push_probability, diagnostics = _raw_probability(context, expectations)
-    if context.base_model_score is not None and not diagnostics.get("ambiguous_spread_complement"):
+    if context.base_model_score is not None and not diagnostics.get("adapter_error"):
         raw_probability, calibrated_probability, calibration_status = _probabilities_from_base_score(context.base_model_score, context.contract_side)
         push_probability = context.base_model_score.push_probability or push_probability
         diagnostics["legacy_model_score_input"] = True
@@ -234,9 +235,13 @@ def _score_family_adapter(
         context.market_type,
         context.settlement_status,
     )
-    if context.base_model_score is not None and not diagnostics.get("ambiguous_spread_complement"):
+    if context.base_model_score is not None and not diagnostics.get("adapter_error"):
         training_eligible = context.base_model_score.training_eligible
         training_exclusion_reason = context.base_model_score.training_exclusion_reason
+    adapter_error = diagnostics.get("adapter_error")
+    if adapter_error:
+        training_eligible = False
+        training_exclusion_reason = f"probability_adapter_{adapter_error}"
     family_kind = FAMILY_KIND_BY_MARKET_FAMILY.get(context.market_type, context.market_type)
     scope_policy = (
         "full_game_bullpen_aware"
@@ -250,6 +255,8 @@ def _score_family_adapter(
             "run_mean_source": scope_policy,
             "contract_side": context.contract_side.lower(),
             "calibration_hook": CALIBRATION_HOOK_BY_FAMILY[context.market_type],
+            "adapter_status": "error" if adapter_error else "ok",
+            "actual_contract_probability": float(calibrated_probability),
         }
     )
     model_policy_metadata = {

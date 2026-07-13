@@ -274,7 +274,7 @@ Interpretation:
 - `trusted_audit_only_count` is the only full-game spread audit bucket eligible for PR3q paper trading when the separate full-game spread flag is enabled.
 - Any `needs_review`, ambiguous, missing, or push-uncertain status must remain blocked.
 - Candidate sweeps should show full-game spread candidates as `no_trade_full_game_spread_trading_disabled` while `PAPER_FULL_GAME_SPREAD_TRADING_ENABLED=false`. When that flag is true, only cached `trusted_audit_only` rows can pass; untrusted rows must return explicit full-game spread audit rejection reasons.
-- The broad `PAPER_SPREAD_TRADING_ENABLED` flag still controls first-five spread diagnostics. It does not enable full-game spread paper trading.
+- The broad `PAPER_SPREAD_TRADING_ENABLED` flag is not sufficient to activate first-five spreads. First-five paper trading also requires `PAPER_FIRST_FIVE_SPREAD_TRADING_ENABLED=true` and cached trusted first-five audit metadata. Keep the dedicated flag false during observation.
 
 After deployment, validate:
 
@@ -1453,6 +1453,68 @@ Expected:
 - No migration is required, and safety remains paper trading true, live trading false, kill switch true, demo Kalshi.
 
 After PR4e.1 deploy, do not enable or declare the separate Railway spread-audit cron production-validated until the zero-window checks above pass. The recurring command and 10 AM / 2 PM / 6 PM ET cadence stay unchanged.
+
+## PR4f First-Five Spread Integrity and Audit Readiness
+
+Keep `PAPER_FIRST_FIVE_SPREAD_TRADING_ENABLED=false`. The broad `PAPER_SPREAD_TRADING_ENABLED` flag alone never activates first-five spreads. Candidate sweeps remain cache-only and do not run full feature sync, spread audits, or other heavy source ingestion.
+
+Run the dedicated first-five audit manually or from a separately reviewed short-lived service when evidence is needed:
+
+```powershell
+$ErrorActionPreference = "Stop"
+$Base = "https://homerun-production-2551.up.railway.app"
+Write-Host ""
+Write-Host "HOMERUN API KEY REQUIRED" -ForegroundColor Yellow
+$Key = Read-Host -Prompt "PASTE YOUR HOMERUN API KEY HERE AND PRESS ENTER"
+if ([string]::IsNullOrWhiteSpace($Key)) { throw "No API key was entered." }
+$Headers = @{ "X-API-Key" = $Key }
+try {
+    $Response = Invoke-RestMethod -Method Post -Headers $Headers "$Base/v1/jobs/run/first-five-spread-audit?target_date=today_et&min_time_to_start_minutes=45&max_time_to_start_minutes=360"
+    $Run = $Response.result
+    $Audit = $null
+    if ($Run -and $Run.result -and $Run.result.first_five_spread_audit) {
+        $Audit = $Run.result.first_five_spread_audit
+    } elseif ($Run -and $Run.first_five_spread_audit) {
+        $Audit = $Run.first_five_spread_audit
+    }
+    if (-not $Audit) {
+        [pscustomobject]@{
+            JobStatus = $Run.status
+            JobRunId = $Run.job_run_id
+            TargetDate = $Run.target_date
+            WarningCount = @($Run.warnings).Count
+            ErrorCount = @($Run.errors).Count
+        } | Format-List
+        throw "First-five spread audit payload was not present in the response."
+    }
+    $Audit | Select-Object status, target_date, checked, verified, needs_review_count, trusted_audit_only_count, audit_only, read_only, paper_trades_created, candidate_mutations, mapping_mutations, settlement_rows_created | Format-List
+} finally {
+    Remove-Variable Key, Headers -ErrorAction SilentlyContinue
+}
+```
+
+The first-five audit is read-only and bounded. Confirm `audit_only=true`, `read_only=true`, `paper_trades_created=0`, `candidate_mutations=0`, `mapping_mutations=0`, and `settlement_rows_created=0`. Freshness and trusted counts appear separately under first-five dashboard/readiness fields; full-game spread audit freshness is unchanged.
+
+Preview historical adapter repair without writing changes:
+
+```powershell
+$ErrorActionPreference = "Stop"
+$Base = "https://homerun-production-2551.up.railway.app"
+Write-Host ""
+Write-Host "HOMERUN API KEY REQUIRED" -ForegroundColor Yellow
+$Key = Read-Host -Prompt "PASTE YOUR HOMERUN API KEY HERE AND PRESS ENTER"
+if ([string]::IsNullOrWhiteSpace($Key)) { throw "No API key was entered." }
+$Headers = @{ "X-API-Key" = $Key }
+try {
+    $Response = Invoke-RestMethod -Headers $Headers "$Base/v1/model/first-five-spread-adapter-repair-preview?date=2026-07-04&limit=500"
+    $Preview = $Response.result
+    $Preview | Select-Object status, target_date, matching_rows_count, rows_seen, truncated, classification_counts, reason_counts, affected_target_date_range, affected_target_date_range_complete, preview_only, read_only, mutations_applied | Format-List
+} finally {
+    Remove-Variable Key, Headers -ErrorAction SilentlyContinue
+}
+```
+
+The preview must report `preview_only=true`, `read_only=true`, and `mutations_applied=0`. This PR requires no migration and does not add or configure a Railway service. First-five settlement revalidates cached trusted audit metadata and leaves untrusted rows unsettled with an explicit skip reason. `live_enabled=false` and `live_readiness_status=blocked_for_live` remain unchanged.
 
 ## Required Context Updates
 

@@ -7,6 +7,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from app.models import JobRun, PaperTrade, PaperTradingEpoch
+from app.services.contracts import FIRST_FIVE_SPREAD, FULL_GAME_SPREAD
 from app.time_utils import ensure_aware_utc, utc_now
 
 SPREAD_AUDIT_FRESHNESS_POLICY_VERSION = "pr4e1_spread_audit_coverage_freshness_v1"
@@ -14,6 +15,7 @@ SPREAD_AUDIT_FRESHNESS_MAX_AGE_HOURS = 36
 SPREAD_AUDIT_RECENT_ACTIVITY_DAYS = 7
 SPREAD_AUDIT_CURRENT_RUN_LIMIT = 25
 SPREAD_AUDIT_TIME_ZONE = ZoneInfo("America/New_York")
+FIRST_FIVE_SPREAD_AUDIT_FRESHNESS_POLICY_VERSION = "pr4f_first_five_spread_audit_freshness_v1"
 
 
 def _recent_full_game_spread_activity_count(
@@ -21,6 +23,7 @@ def _recent_full_game_spread_activity_count(
     epoch: PaperTradingEpoch,
     *,
     now: datetime | None = None,
+    family_key: str = FULL_GAME_SPREAD,
 ) -> int:
     captured_at = ensure_aware_utc(now or utc_now())
     cutoff = captured_at - timedelta(days=SPREAD_AUDIT_RECENT_ACTIVITY_DAYS)
@@ -28,7 +31,7 @@ def _recent_full_game_spread_activity_count(
         session.scalar(
             select(func.count(PaperTrade.id))
             .where(PaperTrade.paper_trading_epoch_id == epoch.id)
-            .where(PaperTrade.market_family == "full_game_spread")
+            .where(PaperTrade.market_family == family_key)
             .where(
                 or_(
                     PaperTrade.status == "open",
@@ -80,8 +83,10 @@ def _spread_audit_rows(
     *,
     target_date: date | None,
     limit: int,
+    job_name: str = "spread-audit",
+    result_key: str = "spread_audit",
 ) -> list[object]:
-    spread_result = JobRun.result["spread_audit"]
+    spread_result = JobRun.result[result_key]
     statement = (
         select(
             JobRun.status.label("job_status"),
@@ -94,7 +99,7 @@ def _spread_audit_rows(
             spread_result["target_date_mapping_count"].label("target_date_mapping_count"),
             spread_result["in_window_mapping_count"].label("in_window_mapping_count"),
         )
-        .where(JobRun.job_name == "spread-audit")
+        .where(JobRun.job_name == job_name)
         .where(JobRun.paper_trading_epoch_id == epoch.id)
         .order_by(JobRun.started_at.desc(), JobRun.id.desc())
         .limit(limit)
@@ -127,17 +132,35 @@ def spread_audit_freshness_payload(
     completed_at: datetime | None,
     target_date: date | None,
     now: datetime | None = None,
+    job_name: str = "spread-audit",
+    result_key: str = "spread_audit",
+    family_key: str = FULL_GAME_SPREAD,
+    policy_version: str = SPREAD_AUDIT_FRESHNESS_POLICY_VERSION,
 ) -> dict[str, object]:
     captured_at = ensure_aware_utc(now or utc_now())
     today_et = captured_at.astimezone(SPREAD_AUDIT_TIME_ZONE).date()
-    recent_activity_count = _recent_full_game_spread_activity_count(session, epoch, now=captured_at)
+    recent_activity_count = _recent_full_game_spread_activity_count(
+        session,
+        epoch,
+        now=captured_at,
+        family_key=family_key,
+    )
     current_day_rows = _spread_audit_rows(
         session,
         epoch,
         target_date=today_et,
         limit=SPREAD_AUDIT_CURRENT_RUN_LIMIT,
+        job_name=job_name,
+        result_key=result_key,
     )
-    latest_rows = _spread_audit_rows(session, epoch, target_date=None, limit=1)
+    latest_rows = _spread_audit_rows(
+        session,
+        epoch,
+        target_date=None,
+        limit=1,
+        job_name=job_name,
+        result_key=result_key,
+    )
     latest_row = latest_rows[0] if latest_rows else None
     current_day_successful_rows = [row for row in current_day_rows if row["job_status"] == "succeeded"]  # type: ignore[index]
     current_day_covered_rows = [row for row in current_day_successful_rows if _run_is_covered(row)]
@@ -205,7 +228,7 @@ def spread_audit_freshness_payload(
     latest_covered_reference = _reference_time(latest_covered_row) if latest_covered_row is not None else None
 
     return {
-        "freshness_policy_version": SPREAD_AUDIT_FRESHNESS_POLICY_VERSION,
+        "freshness_policy_version": policy_version,
         "freshness_max_age_hours": SPREAD_AUDIT_FRESHNESS_MAX_AGE_HOURS,
         "recent_activity_window_days": SPREAD_AUDIT_RECENT_ACTIVITY_DAYS,
         "today_et": today_et.isoformat(),
@@ -230,5 +253,30 @@ def spread_audit_freshness_payload(
         ),
         "spread_audit_coverage_warning": spread_audit_coverage_warning,
         "spread_audit_stale_warning": stale_warning,
-        "recent_full_game_spread_activity_count": recent_activity_count,
+        f"recent_{family_key}_activity_count": recent_activity_count,
     }
+
+
+def first_five_spread_audit_freshness_payload(
+    session: Session,
+    epoch: PaperTradingEpoch,
+    *,
+    job_status: str | None,
+    started_at: datetime | None,
+    completed_at: datetime | None,
+    target_date: date | None,
+    now: datetime | None = None,
+) -> dict[str, object]:
+    return spread_audit_freshness_payload(
+        session,
+        epoch,
+        job_status=job_status,
+        started_at=started_at,
+        completed_at=completed_at,
+        target_date=target_date,
+        now=now,
+        job_name="first-five-spread-audit",
+        result_key="first_five_spread_audit",
+        family_key=FIRST_FIVE_SPREAD,
+        policy_version=FIRST_FIVE_SPREAD_AUDIT_FRESHNESS_POLICY_VERSION,
+    )

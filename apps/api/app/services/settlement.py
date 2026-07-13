@@ -45,6 +45,15 @@ SPREAD_SKIP_REASON_BY_AUDIT_STATUS = {
     "missing_line": "spread_audit_missing",
     "push_behavior_uncertain": "spread_push_uncertain",
 }
+FIRST_FIVE_SPREAD_SKIP_REASON_BY_AUDIT_STATUS = {
+    "parse_error": "first_five_spread_audit_parse_error",
+    "unsafe": "first_five_spread_audit_unsafe",
+    "needs_review": "first_five_spread_audit_needs_review",
+    "missing_market_data": "first_five_spread_audit_missing",
+    "missing_game_mapping": "first_five_spread_audit_missing",
+    "missing_line": "first_five_spread_audit_missing",
+    "push_behavior_uncertain": "first_five_spread_push_uncertain",
+}
 
 
 def _line_text(value: Decimal | None) -> str:
@@ -371,6 +380,48 @@ def _full_game_spread_audit_skip_reason(verification: SpreadVerification | None)
     return SPREAD_SKIP_REASON_BY_AUDIT_STATUS.get(verification.audit_status or "", "spread_audit_not_trusted")
 
 
+def _trusted_first_five_spread_audit(verification: SpreadVerification | None) -> bool:
+    if verification is None:
+        return False
+    reason_codes = set(verification.reason_codes or [])
+    return (
+        verification.family_key == FIRST_FIVE_SPREAD
+        and verification.inning_scope == "first_five"
+        and verification.audit_status == FULL_GAME_SPREAD_TRUSTED_AUDIT_STATUS
+        and verification.verified
+        and verification.selection_code is not None
+        and verification.threshold_runs is not None
+        and verification.line_direction is not None
+        and "selected_team_verified" in reason_codes
+        and verification.no_is_true_complement
+        and verification.complement_safe_for_paper_settlement
+        and "binary_yes_no_complement_verified" in reason_codes
+        and bool(verification.settlement_formula)
+        and "settlement_formula_verified" in reason_codes
+        and (not verification.push_possible or verification.push_rule_verified)
+        and "first_five_scope_verified" in reason_codes
+        and "first_five_official_result_source_verified" in reason_codes
+    )
+
+
+def _first_five_spread_audit_skip_reason(verification: SpreadVerification | None) -> str | None:
+    if _trusted_first_five_spread_audit(verification):
+        return None
+    if verification is None:
+        return "first_five_spread_audit_missing"
+    if verification.audit_status == FULL_GAME_SPREAD_TRUSTED_AUDIT_STATUS and (
+        verification.selection_code is None
+        or verification.threshold_runs is None
+        or not verification.settlement_formula
+        or not verification.no_is_true_complement
+    ):
+        return "first_five_spread_settlement_metadata_missing"
+    return FIRST_FIVE_SPREAD_SKIP_REASON_BY_AUDIT_STATUS.get(
+        verification.audit_status or "",
+        "first_five_spread_audit_not_trusted",
+    )
+
+
 def _full_game_spread_contract_outcome(
     game: MlbGame,
     *,
@@ -415,6 +466,7 @@ def _skip_reason(
     inning_scope: str | None = None,
     settlement_rule_status: str | None = None,
     full_game_spread_verification: SpreadVerification | None = None,
+    first_five_spread_verification: SpreadVerification | None = None,
 ) -> str:
     if market_type not in PAPER_SUPPORTED_MARKET_FAMILIES:
         return "unsupported"
@@ -430,7 +482,11 @@ def _skip_reason(
         return "parse_uncertain"
     if first_five_market and _first_five_runs(game) is None:
         return "first_five_not_complete" if status_kind == "open" else "missing_f5_linescore"
-    if status_kind == "open":
+    if market_type == FIRST_FIVE_SPREAD:
+        audit_reason = _first_five_spread_audit_skip_reason(first_five_spread_verification)
+        if audit_reason is not None:
+            return audit_reason
+    if status_kind == "open" and not first_five_market:
         return "not_final_full_game"
     if market_type in {FULL_GAME_SPREAD, FIRST_FIVE_SPREAD} and line_value is None:
         return "missing_line"
@@ -546,6 +602,10 @@ def _trade_outcome(
             contract_side=trade.contract_side,
             verification=spread_verification_from_cached_metadata(mapping=mapping, market=market),
         )
+    if market_type == FIRST_FIVE_SPREAD:
+        verification = spread_verification_from_cached_metadata(mapping=mapping, market=market)
+        if not _trusted_first_five_spread_audit(verification):
+            return None
     return _contract_outcome(
         game,
         market_ticker=trade.market_ticker,
@@ -576,6 +636,10 @@ def _candidate_outcome(
             contract_side=candidate.contract_side,
             verification=spread_verification_from_cached_metadata(mapping=mapping, market=market),
         )
+    if market_type == FIRST_FIVE_SPREAD:
+        verification = spread_verification_from_cached_metadata(mapping=mapping, market=market)
+        if not _trusted_first_five_spread_audit(verification):
+            return None
     return _contract_outcome(
         game,
         market_ticker=market.ticker,
@@ -829,6 +893,13 @@ def settle_paper_trades(
         "skipped_spread_parse_error": 0,
         "skipped_spread_push_uncertain": 0,
         "skipped_spread_settlement_metadata_missing": 0,
+        "skipped_first_five_spread_audit_missing": 0,
+        "skipped_first_five_spread_audit_not_trusted": 0,
+        "skipped_first_five_spread_audit_needs_review": 0,
+        "skipped_first_five_spread_audit_unsafe": 0,
+        "skipped_first_five_spread_audit_parse_error": 0,
+        "skipped_first_five_spread_push_uncertain": 0,
+        "skipped_first_five_spread_settlement_metadata_missing": 0,
         "skip_reasons": {},
         "already_settled": already_settled_count,
         "already_settled_audit_backfilled": 0,
@@ -856,6 +927,13 @@ def settle_paper_trades(
         "candidate_labels_skipped_spread_parse_error": 0,
         "candidate_labels_skipped_spread_push_uncertain": 0,
         "candidate_labels_skipped_spread_settlement_metadata_missing": 0,
+        "candidate_labels_skipped_first_five_spread_audit_missing": 0,
+        "candidate_labels_skipped_first_five_spread_audit_not_trusted": 0,
+        "candidate_labels_skipped_first_five_spread_audit_needs_review": 0,
+        "candidate_labels_skipped_first_five_spread_audit_unsafe": 0,
+        "candidate_labels_skipped_first_five_spread_audit_parse_error": 0,
+        "candidate_labels_skipped_first_five_spread_push_uncertain": 0,
+        "candidate_labels_skipped_first_five_spread_settlement_metadata_missing": 0,
         "candidate_label_skip_reasons": {},
         "snapshot_id": None,
     }
@@ -868,7 +946,7 @@ def settle_paper_trades(
         inning_scope = _first_text(trade.inning_scope, _mapping.inning_scope, market.inning_scope)
         verification = (
             spread_verification_from_cached_metadata(mapping=_mapping, market=market)
-            if market_type == FULL_GAME_SPREAD
+            if market_type in {FULL_GAME_SPREAD, FIRST_FIVE_SPREAD}
             else None
         )
         formula = _settlement_formula(
@@ -928,6 +1006,11 @@ def settle_paper_trades(
                     if market_type == FULL_GAME_SPREAD
                     else None
                 ),
+                first_five_spread_verification=(
+                    spread_verification_from_cached_metadata(mapping=_mapping, market=market)
+                    if market_type == FIRST_FIVE_SPREAD
+                    else None
+                ),
             )
             _record_skip(result, reason, prefix="candidate_labels_skipped")
             continue
@@ -955,7 +1038,7 @@ def settle_paper_trades(
         )
         verification = (
             spread_verification_from_cached_metadata(mapping=_mapping, market=market)
-            if market_type == FULL_GAME_SPREAD
+            if market_type in {FULL_GAME_SPREAD, FIRST_FIVE_SPREAD}
             else None
         )
         formula = _settlement_formula(
@@ -995,6 +1078,7 @@ def settle_paper_trades(
                 inning_scope=inning_scope,
                 settlement_rule_status=settlement_rule_status,
                 full_game_spread_verification=verification,
+                first_five_spread_verification=verification,
             )
             _apply_trade_settlement_audit(
                 trade,
