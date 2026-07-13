@@ -106,7 +106,11 @@ from app.services.paper_epoch import (
 )
 from app.services.portfolio import calculate_paper_portfolio, create_balance_snapshot
 from app.services.settlement import settle_paper_trades
-from app.services.spread_audit import run_spread_audit
+from app.services.spread_audit import (
+    first_five_spread_adapter_repair_preview,
+    run_first_five_spread_audit,
+    run_spread_audit,
+)
 from app.services.spread_verification import verify_spread_market
 from app.time_utils import classify_time_bucket, eastern_display, today_eastern
 from app.workers import kalshi_ws_paper
@@ -1653,6 +1657,7 @@ def test_pr3e_feature_hardening_preserves_paper_safety_defaults(monkeypatch) -> 
         "WEBSOCKET_MARKET_DATA_ENABLED",
         "PAPER_SPREAD_TRADING_ENABLED",
         "PAPER_FULL_GAME_SPREAD_TRADING_ENABLED",
+        "PAPER_FIRST_FIVE_SPREAD_TRADING_ENABLED",
         "PAPER_MIN_DATA_QUALITY",
         "PAPER_OBSERVATION_MIN_DATA_QUALITY",
         "LIVE_MIN_DATA_QUALITY",
@@ -1669,6 +1674,7 @@ def test_pr3e_feature_hardening_preserves_paper_safety_defaults(monkeypatch) -> 
         assert settings.websocket_market_data_enabled is False
         assert settings.paper_spread_trading_enabled is False
         assert settings.paper_full_game_spread_trading_enabled is False
+        assert settings.paper_first_five_spread_trading_enabled is False
         assert settings.paper_min_data_quality == Decimal("0.60")
         assert settings.paper_observation_min_data_quality == Decimal("0.55")
         assert settings.live_min_data_quality == Decimal("0.60")
@@ -10920,6 +10926,13 @@ def _add_settlement_trade(
         inning_scope=inning_scope,
         settlement_rule_status="paper_supported",
     )
+    if family == "first_five_spread" and selection and line is not None:
+        opponent = game.away_abbreviation if selection == game.home_abbreviation else game.home_abbreviation
+        market.title = f"{selection} first five spread"
+        signed_line = f"+{float(line):g}" if line > 0 else f"{float(line):g}"
+        market.yes_subtitle = f"{selection} {signed_line} first 5 innings"
+        market.no_subtitle = f"{opponent} {float(-line):g} first 5 innings"
+        market.rules = "The market is based on the score after the first 5 innings. Push if the line is exact."
     session.add(market)
     session.flush()
     mapping = _add_candidate_mapping(
@@ -10935,6 +10948,16 @@ def _add_settlement_trade(
         inning_scope=inning_scope,
         settlement_rule_status="paper_supported",
     )
+    if family == "first_five_spread" and selection and line is not None:
+        verification = verify_spread_market(
+            game=game,
+            family_key=family,
+            market=market,
+            line_value=line,
+            selection_code=selection,
+        )
+        assert verification.audit_status == "trusted_audit_only", verification.reason_codes
+        mapping.mapping_metadata = {"spread_verification": verification.as_metadata()}
     session.flush()
     candidate = ModelCandidate(
         paper_trading_epoch_id=epoch_id,
@@ -24132,6 +24155,65 @@ def test_spread_audit_reports_no_target_date_mapping_coverage(monkeypatch) -> No
     assert result["paper_trades_created"] == 0
     assert result["mapping_mutations"] == 0
     assert result["settlement_rows_created"] == 0
+
+
+def test_first_five_spread_audit_is_bounded_and_read_only_when_empty(monkeypatch) -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    now = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
+
+    with Session(engine) as session:
+        monkeypatch.setattr("app.services.spread_audit.utc_now", lambda: now)
+        result = run_first_five_spread_audit(
+            session,
+            date(2026, 7, 1),
+            min_time_to_start_minutes=45,
+            max_time_to_start_minutes=360,
+        )
+
+    assert result["audit_scope"] == "first_five_spread"
+    assert result["total_first_five_spread_markets_seen"] == 0
+    assert result["coverage_status"] == "no_target_date_mappings"
+    assert result["read_only"] is True
+    assert result["audit_only"] is True
+    assert result["candidate_mutations"] == 0
+    assert result["paper_trades_created"] == 0
+
+
+def test_first_five_spread_adapter_repair_preview_does_not_mutate_candidates() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        candidate = ModelCandidate(
+            evaluated_at=datetime(2026, 7, 1, 16, 0, tzinfo=UTC),
+            target_date=date(2026, 7, 1),
+            market_family="first_five_spread",
+            inning_scope="first_five",
+            features={},
+        )
+        session.add(candidate)
+        session.commit()
+        candidate_id = candidate.id
+
+        result = first_five_spread_adapter_repair_preview(
+            session,
+            target_date=date(2026, 7, 1),
+            limit=1,
+        )
+
+        session.expire_all()
+        persisted = session.get(ModelCandidate, candidate_id)
+
+    assert result["preview_only"] is True
+    assert result["read_only"] is True
+    assert result["mutations_applied"] == 0
+    assert result["candidate_mutations"] == 0
+    assert result["rows_seen"] == 1
+    assert result["classification_counts"]["missing_source_evidence"] == 1
+    assert persisted is not None
+    assert persisted.probability_adapter_family is None
+    assert persisted.probability_adapter_metadata is None
 
 
 def test_spread_audit_reports_out_of_window_mapping_coverage(monkeypatch) -> None:

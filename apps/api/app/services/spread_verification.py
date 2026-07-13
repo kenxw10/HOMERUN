@@ -9,7 +9,7 @@ from app.models import KalshiMarket, MarketMapping, MlbGame
 from app.services.contracts import FIRST_FIVE_SPREAD, FULL_GAME_SPREAD
 
 SPREAD_FAMILIES = {FULL_GAME_SPREAD, FIRST_FIVE_SPREAD}
-FULL_GAME_SPREAD_AUDIT_STATUSES = {
+SPREAD_AUDIT_STATUSES = {
     "trusted_audit_only",
     "needs_review",
     "unsafe",
@@ -24,6 +24,8 @@ FULL_GAME_SPREAD_AUDIT_STATUSES = {
     "settlement_text_unverified",
     "push_behavior_uncertain",
 }
+FULL_GAME_SPREAD_AUDIT_STATUSES = SPREAD_AUDIT_STATUSES
+FIRST_FIVE_SPREAD_AUDIT_STATUSES = SPREAD_AUDIT_STATUSES
 SPREAD_TEXT_FIELDS = (
     "yes_sub_title",
     "yes_subtitle",
@@ -47,6 +49,8 @@ TRUST_EVIDENCE_REASON_CODES = {
     "binary_yes_no_complement_verified",
     "half_run_no_push_verified",
     "settlement_formula_verified",
+    "first_five_scope_verified",
+    "first_five_official_result_source_verified",
 }
 CURRENT_AUDIT_METADATA_KEYS = {
     "audit_status",
@@ -500,7 +504,7 @@ def verify_spread_market(
     rule_entries = _all_text(payload, SPREAD_RULE_TEXT_FIELDS)
     rules_text = _combined_text(rule_entries)
     rules_condition = None
-    if family_key == FULL_GAME_SPREAD:
+    if family_key in SPREAD_FAMILIES:
         for rules_source, candidate_rules_text in rule_entries:
             rules_condition = _parse_rules_spread_condition(candidate_rules_text, game, rules_source)
             if rules_condition is not None:
@@ -562,7 +566,9 @@ def verify_spread_market(
     binary_confirmed = _binary_market_confirmed(payload, market, family_key)
     no_complement_source = None
     no_complement_confidence = None
-    if yes_rule_verified and binary_confirmed and not no_explicit_conflict:
+    if yes_rule_verified and binary_confirmed and (
+        family_key == FULL_GAME_SPREAD or no_text is None
+    ) and not no_explicit_conflict:
         no_complement_source = "binary_market_complement"
         no_complement_confidence = "high"
     elif explicit_no_text_mentions_expected:
@@ -605,7 +611,7 @@ def verify_spread_market(
     elif parsed_line is not None and line_source is None:
         reason_codes.append("line_direction_not_verified_from_text")
         warnings.append("SPREAD_LINE_NOT_VERIFIED_FROM_KALSHI_TEXT")
-    if family_key == FULL_GAME_SPREAD and rules_condition is not None:
+    if family_key in SPREAD_FAMILIES and rules_condition is not None:
         reason_codes.extend(
             _supporting_spread_conflicts(
                 payload=payload,
@@ -621,9 +627,9 @@ def verify_spread_market(
         if not no_complement_source:
             reason_codes.append("binary_complement_unverified")
     else:
-        if no_text is None:
+        if not no_complement_source and no_text is None:
             reason_codes.append("no_contract_text_missing")
-        elif not explicit_no_text_mentions_expected:
+        elif not no_complement_source and not explicit_no_text_mentions_expected:
             reason_codes.append("no_contract_text_conflicts_with_expected_complement")
     if rules_text is None:
         reason_codes.append("settlement_text_missing")
@@ -641,6 +647,9 @@ def verify_spread_market(
         reason_codes.append("half_run_no_push_verified")
     if settlement_formula:
         reason_codes.append("settlement_formula_verified")
+    if family_key == FIRST_FIVE_SPREAD:
+        reason_codes.append("first_five_scope_verified")
+        reason_codes.append("first_five_official_result_source_verified")
 
     audit_status = _reason_status(reason_codes)
     verified = audit_status == "trusted_audit_only"
@@ -740,8 +749,13 @@ def spread_verification_from_cached_metadata(
     if not (
         isinstance(existing, dict)
         and CURRENT_AUDIT_METADATA_KEYS.issubset(existing.keys())
-        and existing.get("audit_status") in FULL_GAME_SPREAD_AUDIT_STATUSES
+        and existing.get("audit_status") in SPREAD_AUDIT_STATUSES
     ):
+        return None
+    if existing.get("family_key") not in {None, family_key}:
+        return None
+    expected_scope = _scope(family_key)
+    if existing.get("inning_scope") not in {None, expected_scope}:
         return None
     line = existing.get("line_value")
     market_line = market.line_value if market is not None else None

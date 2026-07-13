@@ -77,6 +77,7 @@ from app.services.position_refresh import refresh_open_position_prices
 from app.services.portfolio import create_balance_snapshot
 from app.services.paper_epoch import get_or_create_active_paper_epoch, reset_paper_trading_epoch
 from app.services.settlement import settle_paper_trades
+from app.services.spread_audit import first_five_spread_adapter_repair_preview
 from app.services.ws_market_data import ws_status_payload
 from app.time_utils import eastern_display, today_eastern, to_eastern_iso
 
@@ -237,6 +238,14 @@ def system_status() -> SystemStatus:
         "open_meteo_base_url": settings.open_meteo_base_url,
         "paper_probability_hardening_enabled": settings.paper_probability_hardening_enabled,
         "paper_probability_hardening_policy_version": settings.paper_probability_hardening_policy_version,
+        "paper_spread_trading_enabled": settings.paper_spread_trading_enabled,
+        "paper_full_game_spread_trading_enabled": settings.paper_full_game_spread_trading_enabled,
+        "paper_first_five_spread_trading_enabled": settings.paper_first_five_spread_trading_enabled,
+        "first_five_spread_activation_warning": (
+            "legacy_spread_flag_not_sufficient_for_first_five_activation"
+            if settings.paper_spread_trading_enabled and not settings.paper_first_five_spread_trading_enabled
+            else None
+        ),
         "paper_total_tail_max_raw_adapter_lift_abs": float(settings.paper_total_tail_max_raw_adapter_lift_abs),
         "paper_total_deep_alt_max_raw_adapter_lift_abs": float(settings.paper_total_deep_alt_max_raw_adapter_lift_abs),
         "paper_total_tail_max_raw_adapter_multiplier": float(settings.paper_total_tail_max_raw_adapter_multiplier),
@@ -282,7 +291,11 @@ def system_status() -> SystemStatus:
                         "optional_weather_provider_configured",
                         "paper_risk_governance_enabled",
                         "paper_risk_governance_policy_version",
-                    "paper_drawdown_halt_enabled",
+                        "paper_spread_trading_enabled",
+                        "paper_full_game_spread_trading_enabled",
+                        "paper_first_five_spread_trading_enabled",
+                        "first_five_spread_activation_warning",
+                        "paper_drawdown_halt_enabled",
                     "paper_drawdown_halt_threshold_abs",
                     "paper_drawdown_halt_threshold_pct",
                     "drawdown_policy_version",
@@ -331,7 +344,19 @@ def system_status() -> SystemStatus:
                     "drawdown_live_halt_threshold_abs": float(DRAWDOWN_LIVE_HALT_THRESHOLD_ABS),
                     "drawdown_live_halt_basis": "starting_bankroll_minus_150",
                 }
-                source_status = {**compact_source_status, **config_fields, **risk_config_fields}
+                source_status = {
+                    **compact_source_status,
+                    **config_fields,
+                    **risk_config_fields,
+                    "paper_spread_trading_enabled": settings.paper_spread_trading_enabled,
+                    "paper_full_game_spread_trading_enabled": settings.paper_full_game_spread_trading_enabled,
+                    "paper_first_five_spread_trading_enabled": settings.paper_first_five_spread_trading_enabled,
+                    "first_five_spread_activation_warning": (
+                        "legacy_spread_flag_not_sufficient_for_first_five_activation"
+                        if settings.paper_spread_trading_enabled and not settings.paper_first_five_spread_trading_enabled
+                        else None
+                    ),
+                }
         except Exception:
             source_status["last_error"] = "source status unavailable"
 
@@ -353,6 +378,14 @@ def system_status() -> SystemStatus:
             kalshi_credentials=credentials_state,
             feature_sync_enable_network_sources=settings.feature_sync_enable_network_sources,
             public_sources_enabled=settings.feature_sync_enable_network_sources,
+            paper_spread_trading_enabled=settings.paper_spread_trading_enabled,
+            paper_full_game_spread_trading_enabled=settings.paper_full_game_spread_trading_enabled,
+            paper_first_five_spread_trading_enabled=settings.paper_first_five_spread_trading_enabled,
+            first_five_spread_activation_warning=(
+                "legacy_spread_flag_not_sufficient_for_first_five_activation"
+                if settings.paper_spread_trading_enabled and not settings.paper_first_five_spread_trading_enabled
+                else None
+            ),
             source_status=source_status,
         ),
         readiness=readiness,
@@ -743,6 +776,21 @@ def run_spread_audit_job(
     )
 
 
+@app.post("/v1/jobs/run/first-five-spread-audit", response_model=RunResponse)
+def run_first_five_spread_audit_job(
+    target_date: str | None = Query(default=None),
+    min_time_to_start_minutes: int | None = Query(default=45),
+    max_time_to_start_minutes: int | None = Query(default=360),
+    _: None = Depends(require_internal_api_key),
+) -> RunResponse:
+    return _run_named_job(
+        "first-five-spread-audit",
+        target_date,
+        min_time_to_start_minutes=min_time_to_start_minutes,
+        max_time_to_start_minutes=max_time_to_start_minutes,
+    )
+
+
 @app.post("/v1/run/model-governance", response_model=RunResponse)
 def run_model_governance_endpoint(_: None = Depends(require_internal_api_key)) -> RunResponse:
     with _db_session_or_503() as session:
@@ -800,6 +848,17 @@ def model_sources_status(_: None = Depends(require_internal_api_key)) -> RunResp
     response = RunResponse(ok=True, action="model_sources_status", result=result)
     _log_endpoint_metrics("/v1/model/sources/status", started_at, response, rss_before=rss_before)
     return response
+
+
+@app.get("/v1/model/first-five-spread-adapter-repair-preview", response_model=RunResponse)
+def first_five_spread_adapter_repair_preview_endpoint(
+    target_date: date | None = Query(default=None, alias="date"),
+    limit: int = Query(default=500, ge=1, le=1000),
+    _: None = Depends(require_internal_api_key),
+) -> RunResponse:
+    with _db_session_or_503() as session:
+        result = first_five_spread_adapter_repair_preview(session, target_date=target_date, limit=limit)
+    return RunResponse(ok=True, action="first_five_spread_adapter_repair_preview", result=result)
 
 
 @app.get("/v1/model/parameters/active", response_model=RunResponse)

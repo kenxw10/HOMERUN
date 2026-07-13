@@ -23,7 +23,7 @@ This is not a sportsbook app. It does not use DraftKings, FanDuel, Odds API, or 
 - PR 3c scores validated MLB market-family rows with `mature_mlb_run_distribution_v2` and `mature_mlb_features_v2`.
 - Team totals, multivariate/MVE markets, sportsbook data, and guessed/retired prefixes remain out of scope.
 - Paper candidates are explicitly target-date scoped and side-aware: YES uses executable YES asks/orderbook-implied YES asks, and NO uses executable NO asks/orderbook-implied NO asks. The engine must not price a NO candidate from a YES ask.
-- Spread paper trading is disabled by default with `PAPER_SPREAD_TRADING_ENABLED=false`. First-five spreads use that broad spread flag. Full-game spreads use the separate `PAPER_FULL_GAME_SPREAD_TRADING_ENABLED=false` flag and can paper trade only when cached PR3o.1 audit metadata is `trusted_audit_only`.
+- Spread paper trading is disabled by default with `PAPER_SPREAD_TRADING_ENABLED=false`. First-five spreads also require the separate `PAPER_FIRST_FIVE_SPREAD_TRADING_ENABLED=false` flag and cached PR4f trusted audit metadata. Full-game spreads use `PAPER_FULL_GAME_SPREAD_TRADING_ENABLED=false` and cached PR3o.1 audit metadata. The broad spread flag alone never activates either spread family.
 - Paper trade caps default to `PAPER_MAX_TRADES_PER_SLATE=8`, `PAPER_MAX_TRADES_PER_MARKET_FAMILY=4`, and `PAPER_MAX_OPEN_POSITIONS=12`, plus aggregate bankroll caps for daily new risk, open risk, market-family risk, scope risk, and sub-20c low-price risk.
 - PR3k blocks first-five `TIE` paper trades, blocks sub-10c entries, requires stronger EV/edge for 10c-under-20c entries, caps low-price entries per slate and sweep, caps new trades per sweep, reserves later-day trade slots, and rejects post-cap positions that shrink below minimum size.
 - Same-game same-scope correlation defaults to `PAPER_MAX_TRADES_PER_GAME_SCOPE=1`, so first-five total and first-five winner exposure cannot both trade for the same MLB game by default. One first-five and one full-game position remain separate scopes.
@@ -421,3 +421,9 @@ Existing open paper positions are not rewritten. PR4c adds no migration and does
 - Operating rules and validation checklists: see `docs/OPERATIONS.md`.
 
 Every future PR must update `PROJECT_CONTEXT.md`.
+
+## PR4f First-Five Spread Integrity and Audit Readiness
+
+PR4f gives first-five spreads their own disabled-by-default paper flag, cached trusted-audit gate, adapter integrity diagnostics, first-five-only read-only audit job, freshness policy, settlement revalidation, and compact dashboard/readiness/governance status. The audit job is `first-five-spread-audit` and the protected endpoint is `POST /v1/jobs/run/first-five-spread-audit`; both are read-only and report `paper_trades_created=0`, `candidate_mutations=0`, and `settlement_rows_created=0`. Historical adapter repair is preview-only through `GET /v1/model/first-five-spread-adapter-repair-preview`.
+
+Candidate-sweep remains cache-only and does not run either spread audit or heavy feature ingestion. No migration, Railway configuration, live execution, credential, settlement formula, selector threshold, EV/model math, risk-cap, WebSocket, sportsbook, team-total, umpire, or MVE change is included. `PAPER_FIRST_FIVE_SPREAD_TRADING_ENABLED` must remain `false`; full-game spread behavior remains on its existing dedicated flag and audit gate.

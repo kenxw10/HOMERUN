@@ -32,7 +32,10 @@ from app.services.risk_governance import (
     risk_governance_policy_version,
 )
 from app.services.settlement import SETTLEMENT_FORMULA_VERSION
-from app.services.spread_audit_freshness import spread_audit_freshness_payload
+from app.services.spread_audit_freshness import (
+    first_five_spread_audit_freshness_payload,
+    spread_audit_freshness_payload,
+)
 from app.time_utils import to_eastern_iso, utc_now
 
 READINESS_POLICY_VERSION = "pr4b_final_readiness_audit_pack_v1"
@@ -195,6 +198,14 @@ def _candidate_pipeline(session: Session | None, epoch: PaperTradingEpoch | None
         or PROBABILITY_HARDENING_POLICY_VERSION,
         "risk_governance_policy_version": risk_governance_policy_version(settings),
         "risk_governance_enabled": settings.paper_risk_governance_enabled,
+        "paper_spread_trading_enabled": settings.paper_spread_trading_enabled,
+        "paper_full_game_spread_trading_enabled": settings.paper_full_game_spread_trading_enabled,
+        "paper_first_five_spread_trading_enabled": settings.paper_first_five_spread_trading_enabled,
+        "first_five_spread_activation_warning": (
+            "legacy_spread_flag_not_sufficient_for_first_five_activation"
+            if settings.paper_spread_trading_enabled and not settings.paper_first_five_spread_trading_enabled
+            else None
+        ),
         "exposure_taxonomy_version": EXPOSURE_TAXONOMY_VERSION,
         "line_classification_policy_version": LINE_CLASSIFICATION_POLICY_VERSION,
     }
@@ -302,6 +313,7 @@ def _model_governance(session: Session | None, epoch: PaperTradingEpoch | None) 
             "governance_policy_version": FAMILY_SCOPE_GOVERNANCE_POLICY,
         }
     summary = governance_status(session, epoch.id, include_details=False)
+    family_units = summary.get("family_scope_units") if isinstance(summary.get("family_scope_units"), dict) else {}
     return {
         "status": str(summary.get("last_governance_status") or "not_run"),
         "governance_policy_version": summary.get("governance_policy_version") or FAMILY_SCOPE_GOVERNANCE_POLICY,
@@ -322,6 +334,7 @@ def _model_governance(session: Session | None, epoch: PaperTradingEpoch | None) 
         "adapter_errors_excluded_from_training": summary.get("adapter_errors_excluded_from_training", True),
         "last_training_run": summary.get("last_training_run"),
         "last_calibration_run": summary.get("last_calibration_run"),
+        "first_five_spread_governance": family_units.get("first_five_spread", {}),
     }
 
 
@@ -419,10 +432,18 @@ def _bool_json(value: Any) -> bool | None:
     return None
 
 
-def _spread_audit(session: Session | None, epoch: PaperTradingEpoch | None) -> dict[str, object]:
+def _spread_audit(
+    session: Session | None,
+    epoch: PaperTradingEpoch | None,
+    *,
+    job_name: str = "spread-audit",
+    result_key: str = "spread_audit",
+    audit_label: str = "spread_audit",
+    freshness_payload_fn=spread_audit_freshness_payload,
+) -> dict[str, object]:
     if session is None or epoch is None:
         return {"status": UNKNOWN_EVIDENCE}
-    spread_result = JobRun.result["spread_audit"]
+    spread_result = JobRun.result[result_key]
     row = session.execute(
         select(
             JobRun.status.label("job_status"),
@@ -453,15 +474,15 @@ def _spread_audit(session: Session | None, epoch: PaperTradingEpoch | None) -> d
             spread_result["settlement_rows_created"].label("settlement_rows_created"),
         )
         .where(JobRun.paper_trading_epoch_id == epoch.id)
-        .where(JobRun.job_name == "spread-audit")
+        .where(JobRun.job_name == job_name)
         .order_by(JobRun.started_at.desc(), JobRun.id.desc())
         .limit(1)
     ).mappings().first()
     if row is None:
         return {
             "status": UNKNOWN_EVIDENCE,
-            "latest_spread_audit_job": {"status": "not_run"},
-            **spread_audit_freshness_payload(
+            f"latest_{audit_label}_job": {"status": "not_run"},
+            **freshness_payload_fn(
                 session,
                 epoch,
                 job_status=None,
@@ -472,13 +493,13 @@ def _spread_audit(session: Session | None, epoch: PaperTradingEpoch | None) -> d
         }
     result: dict[str, object] = {
         "status": row["job_status"],
-        "latest_spread_audit_job": {
+        f"latest_{audit_label}_job": {
             "status": row["job_status"],
             "started_at": _iso(row["started_at"]),
             "completed_at": _iso(row["completed_at"]),
             "target_date": row["target_date"].isoformat() if row["target_date"] else None,
         },
-        **spread_audit_freshness_payload(
+        **freshness_payload_fn(
             session,
             epoch,
             job_status=row["job_status"],
@@ -528,6 +549,17 @@ def _spread_audit(session: Session | None, epoch: PaperTradingEpoch | None) -> d
     return result
 
 
+def _first_five_spread_audit(session: Session | None, epoch: PaperTradingEpoch | None) -> dict[str, object]:
+    return _spread_audit(
+        session,
+        epoch,
+        job_name="first-five-spread-audit",
+        result_key="first_five_spread_audit",
+        audit_label="first_five_spread_audit",
+        freshness_payload_fn=first_five_spread_audit_freshness_payload,
+    )
+
+
 def _component(name: str, status: str, evidence: dict[str, object]) -> dict[str, object]:
     return {"component": name, "status": status, "evidence": evidence}
 
@@ -547,6 +579,7 @@ def _validated_components(
     candidate_pipeline: dict[str, object],
     settlement_audit: dict[str, object],
     spread_audit: dict[str, object],
+    first_five_spread_audit: dict[str, object],
     governance: dict[str, object],
     safety_ok: bool,
 ) -> list[dict[str, object]]:
@@ -636,6 +669,22 @@ def _validated_components(
                 ),
             },
         ),
+        _component(
+            "first_five_spread_trusted_audit_gate",
+            "available"
+            if first_five_spread_audit.get("freshness_status") in {"fresh_covered", "fresh_no_eligible_markets"}
+            and int(first_five_spread_audit.get("trusted_audit_only_count") or 0) > 0
+            else UNKNOWN_EVIDENCE,
+            {
+                "checked": first_five_spread_audit.get("checked", 0),
+                "coverage_status": first_five_spread_audit.get("coverage_status"),
+                "trusted_audit_only_count": first_five_spread_audit.get("trusted_audit_only_count", 0),
+                "read_only": first_five_spread_audit.get("read_only"),
+                "freshness_policy_version": first_five_spread_audit.get("freshness_policy_version"),
+                "freshness_status": first_five_spread_audit.get("freshness_status"),
+                "age_hours": first_five_spread_audit.get("age_hours"),
+            },
+        ),
     ]
 
 
@@ -712,6 +761,7 @@ def readiness_audit_pack(session: Session | None = None) -> dict[str, object]:
     candidate_pipeline = _candidate_pipeline(session, epoch)
     settlement_audit = _settlement_audit(session, epoch)
     spread_audit = _spread_audit(session, epoch)
+    first_five_spread_audit = _first_five_spread_audit(session, epoch)
     blockers = _blockers_for_live()
     checklist = _operator_checklist()
     paper_status = PAPER_OBSERVATION_READY if safety_ok else PAPER_OBSERVATION_BLOCKED
@@ -719,6 +769,7 @@ def readiness_audit_pack(session: Session | None = None) -> dict[str, object]:
         candidate_pipeline,
         settlement_audit,
         spread_audit,
+        first_five_spread_audit,
         governance,
         safety_ok,
     )
@@ -762,8 +813,14 @@ def readiness_audit_pack(session: Session | None = None) -> dict[str, object]:
                 else None
             ),
             "spread_audit_age_hours": spread_audit.get("age_hours"),
+            "first_five_spread_audit_stale_warning": first_five_spread_audit.get("spread_audit_stale_warning"),
+            "first_five_spread_audit_coverage_warning": first_five_spread_audit.get("spread_audit_coverage_warning"),
+            "first_five_spread_audit_freshness_status": first_five_spread_audit.get("freshness_status"),
+            "first_five_spread_audit_coverage_status": first_five_spread_audit.get("coverage_status"),
+            "first_five_spread_audit_age_hours": first_five_spread_audit.get("age_hours"),
         },
         "spread_audit": spread_audit,
+        "first_five_spread_audit": first_five_spread_audit,
         "blockers_for_live": blockers,
         "operator_checklist": checklist,
         "readiness_decision": {
@@ -791,6 +848,9 @@ def compact_readiness_summary(pack: dict[str, object]) -> dict[str, object]:
     blocker_count = len(pack.get("blockers_for_live") or []) if isinstance(pack.get("blockers_for_live"), list) else 0
     model_governance = pack.get("model_governance") if isinstance(pack.get("model_governance"), dict) else {}
     spread_audit = pack.get("spread_audit") if isinstance(pack.get("spread_audit"), dict) else {}
+    first_five_spread_audit = (
+        pack.get("first_five_spread_audit") if isinstance(pack.get("first_five_spread_audit"), dict) else {}
+    )
     calibration_coverage = (
         model_governance.get("calibration_coverage_summary")
         if isinstance(model_governance.get("calibration_coverage_summary"), dict)
@@ -863,4 +923,37 @@ def compact_readiness_summary(pack: dict[str, object]) -> dict[str, object]:
         "spread_audit_age_hours": (pack.get("operational_warnings") or {}).get("spread_audit_age_hours")
         if isinstance(pack.get("operational_warnings"), dict)
         else None,
+        "first_five_spread_audit_freshness_policy_version": first_five_spread_audit.get(
+            "freshness_policy_version"
+        ),
+        "first_five_spread_audit_stale_warning": (pack.get("operational_warnings") or {}).get(
+            "first_five_spread_audit_stale_warning"
+        )
+        if isinstance(pack.get("operational_warnings"), dict)
+        else False,
+        "first_five_spread_audit_coverage_warning": (pack.get("operational_warnings") or {}).get(
+            "first_five_spread_audit_coverage_warning"
+        )
+        if isinstance(pack.get("operational_warnings"), dict)
+        else False,
+        "first_five_spread_audit_freshness_status": (pack.get("operational_warnings") or {}).get(
+            "first_five_spread_audit_freshness_status"
+        )
+        if isinstance(pack.get("operational_warnings"), dict)
+        else None,
+        "first_five_spread_audit_coverage_status": (pack.get("operational_warnings") or {}).get(
+            "first_five_spread_audit_coverage_status"
+        )
+        if isinstance(pack.get("operational_warnings"), dict)
+        else None,
+        "first_five_spread_audit_age_hours": (pack.get("operational_warnings") or {}).get(
+            "first_five_spread_audit_age_hours"
+        )
+        if isinstance(pack.get("operational_warnings"), dict)
+        else None,
+        "first_five_spread_governance": (
+            (pack.get("model_governance") or {}).get("first_five_spread_governance", {})
+            if isinstance(pack.get("model_governance"), dict)
+            else {}
+        ),
     }

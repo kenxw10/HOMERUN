@@ -52,7 +52,10 @@ from app.services.risk_governance import (
     drawdown_summary,
 )
 from app.services.readiness import compact_readiness_summary, readiness_audit_pack
-from app.services.spread_audit_freshness import spread_audit_freshness_payload
+from app.services.spread_audit_freshness import (
+    first_five_spread_audit_freshness_payload,
+    spread_audit_freshness_payload,
+)
 from app.services.ws_market_data import ws_status_running_is_fresh
 from app.time_utils import eastern_display, ensure_aware_utc, get_dashboard_zone, to_eastern_iso, today_eastern, utc_now
 
@@ -1549,6 +1552,7 @@ def _latest_job_status(
         "governance",
         "full-paper-cycle",
         "spread-audit",
+        "first-five-spread-audit",
     ]
     ranked = (
         select(
@@ -1659,8 +1663,15 @@ def _latest_job_status(
     return latest
 
 
-def _latest_spread_audit_counts(session: Session, epoch: PaperTradingEpoch) -> dict[str, object]:
-    spread_audit_result = JobRun.result["spread_audit"]
+def _latest_spread_audit_counts(
+    session: Session,
+    epoch: PaperTradingEpoch,
+    *,
+    job_name: str = "spread-audit",
+    result_key: str = "spread_audit",
+    freshness_payload_fn=spread_audit_freshness_payload,
+) -> dict[str, object]:
+    spread_audit_result = JobRun.result[result_key]
     row = session.execute(
         select(
             JobRun.status.label("job_status"),
@@ -1690,13 +1701,13 @@ def _latest_spread_audit_counts(session: Session, epoch: PaperTradingEpoch) -> d
             spread_audit_result["mapping_mutations"].label("mapping_mutations"),
             spread_audit_result["settlement_rows_created"].label("settlement_rows_created"),
         )
-        .where(JobRun.job_name == "spread-audit")
+        .where(JobRun.job_name == job_name)
         .where(JobRun.paper_trading_epoch_id == epoch.id)
         .order_by(JobRun.started_at.desc(), JobRun.id.desc())
         .limit(1)
     ).mappings().first()
     if not row:
-        return spread_audit_freshness_payload(
+        return freshness_payload_fn(
             session,
             epoch,
             job_status=None,
@@ -1709,7 +1720,7 @@ def _latest_spread_audit_counts(session: Session, epoch: PaperTradingEpoch) -> d
         "started_at": to_eastern_iso(row["started_at"]),
         "completed_at": to_eastern_iso(row["completed_at"]),
         "target_date": row["target_date"].isoformat() if row["target_date"] else None,
-        **spread_audit_freshness_payload(
+        **freshness_payload_fn(
             session,
             epoch,
             job_status=row["job_status"],
@@ -1765,6 +1776,16 @@ def _latest_spread_audit_counts(session: Session, epoch: PaperTradingEpoch) -> d
     elif isinstance(read_only, str):
         compact["read_only"] = read_only.strip('"').lower() == "true"
     return compact
+
+
+def _latest_first_five_spread_audit_counts(session: Session, epoch: PaperTradingEpoch) -> dict[str, object]:
+    return _latest_spread_audit_counts(
+        session,
+        epoch,
+        job_name="first-five-spread-audit",
+        result_key="first_five_spread_audit",
+        freshness_payload_fn=first_five_spread_audit_freshness_payload,
+    )
 
 
 def _websocket_status(session: Session) -> WebSocketStatusSummary:
@@ -2206,7 +2227,7 @@ def dashboard_summary_from_db(
         session,
         active_epoch,
         include_job_results=include_diagnostics or include_job_results,
-        detailed_job_names={"spread-audit"} if include_spread_audit_details else None,
+        detailed_job_names={"spread-audit", "first-five-spread-audit"} if include_spread_audit_details else None,
     )
     summary.websocket_status = _websocket_status(session)
     feature_avg_data_quality = (
@@ -2244,6 +2265,15 @@ def dashboard_summary_from_db(
             "full_game_spread_audit_gate_enabled": True,
             "full_game_spread_requires_trusted_audit": True,
             "full_game_spread_latest_audit": _latest_spread_audit_counts(session, active_epoch),
+            "paper_first_five_spread_trading_enabled": settings.paper_first_five_spread_trading_enabled,
+            "first_five_spread_activation_warning": (
+                "legacy_spread_flag_not_sufficient_for_first_five_activation"
+                if settings.paper_spread_trading_enabled and not settings.paper_first_five_spread_trading_enabled
+                else None
+            ),
+            "first_five_spread_audit_gate_enabled": True,
+            "first_five_spread_requires_trusted_audit": True,
+            "first_five_spread_latest_audit": _latest_first_five_spread_audit_counts(session, active_epoch),
             "paper_risk_governance_enabled": settings.paper_risk_governance_enabled,
             "paper_risk_governance_policy_version": settings.paper_risk_governance_policy_version,
             "paper_drawdown_halt_enabled": settings.paper_drawdown_halt_enabled,
@@ -2294,6 +2324,11 @@ def dashboard_summary_from_db(
             "enabled": bool(governance_summary.get("family_scope_governance_enabled")),
             "unit_count": governance_summary.get("family_scope_unit_count"),
             "units": governance_summary.get("family_scope_units", {}),
+            "first_five_spread": (
+                (governance_summary.get("family_scope_units") or {}).get("first_five_spread", {})
+                if isinstance(governance_summary.get("family_scope_units"), dict)
+                else {}
+            ),
             "adapter_error_count": governance_summary.get("adapter_error_count", 0),
             "adapter_error_reason_counts": governance_summary.get("adapter_error_reason_counts", {}),
             "adapter_errors_excluded_from_training": governance_summary.get(

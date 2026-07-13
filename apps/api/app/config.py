@@ -73,6 +73,10 @@ class Settings(BaseSettings):
     paper_selector_mode: Literal["legacy", "live_like"] = Field(default="live_like", alias="PAPER_SELECTOR_MODE")
     paper_max_open_positions: int = Field(default=12, alias="PAPER_MAX_OPEN_POSITIONS")
     paper_spread_trading_enabled: bool = Field(default=False, alias="PAPER_SPREAD_TRADING_ENABLED")
+    paper_first_five_spread_trading_enabled: bool = Field(
+        default=False,
+        alias="PAPER_FIRST_FIVE_SPREAD_TRADING_ENABLED",
+    )
     paper_full_game_spread_trading_enabled: bool = Field(
         default=False,
         alias="PAPER_FULL_GAME_SPREAD_TRADING_ENABLED",

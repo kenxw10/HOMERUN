@@ -25,7 +25,7 @@ from app.services.paper_epoch import get_or_create_active_paper_epoch
 from app.services.portfolio import create_balance_snapshot
 from app.services.position_refresh import refresh_open_position_prices
 from app.services.settlement import settle_paper_trades
-from app.services.spread_audit import run_spread_audit
+from app.services.spread_audit import run_first_five_spread_audit, run_spread_audit
 from app.time_utils import ensure_aware_utc, today_eastern, to_eastern_iso, utc_now
 
 JOB_NAMES = {
@@ -36,9 +36,17 @@ JOB_NAMES = {
     "governance",
     "full-paper-cycle",
     "spread-audit",
+    "first-five-spread-audit",
 }
 DATE_INSENSITIVE_LOCK_JOBS = {"price-refresh"}
-TODAY_DEFAULT_LOCK_JOBS = {"daily-setup", "candidate-sweep", "settlement", "full-paper-cycle", "spread-audit"}
+TODAY_DEFAULT_LOCK_JOBS = {
+    "daily-setup",
+    "candidate-sweep",
+    "settlement",
+    "full-paper-cycle",
+    "spread-audit",
+    "first-five-spread-audit",
+}
 SETTLEMENT_JOB_STATUS_POLICY_VERSION = "pr4b1_settlement_job_status_hardening_v1"
 SETTLEMENT_STALE_RUNNING_THRESHOLD_MINUTES = 30
 SETTLEMENT_RUNNING_STATUS_RECOVERY_ENABLED = True
@@ -766,6 +774,19 @@ def _execute_job_steps(
                     target,
                     min_time_to_start_minutes=min_time_to_start_minutes,
                     max_time_to_start_minutes=max_time_to_start_minutes,
+                ),
+            ),
+        }
+    if job_name == "first-five-spread-audit":
+        return {
+            "first_five_spread_audit": _run_step(
+                run,
+                "first_five_spread_audit",
+                lambda: run_first_five_spread_audit(
+                    session,
+                    target,
+                    min_time_to_start_minutes=(45 if min_time_to_start_minutes is None else min_time_to_start_minutes),
+                    max_time_to_start_minutes=(360 if max_time_to_start_minutes is None else max_time_to_start_minutes),
                 ),
             ),
         }

@@ -6,9 +6,9 @@ from decimal import Decimal
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models import KalshiMarket, MarketMapping, MlbGame
-from app.services.contracts import FULL_GAME_SPREAD
-from app.services.spread_verification import FULL_GAME_SPREAD_AUDIT_STATUSES, SpreadVerification, spread_verification_from_mapping
+from app.models import KalshiMarket, MarketMapping, MlbGame, ModelCandidate
+from app.services.contracts import FIRST_FIVE_SPREAD, FULL_GAME_SPREAD
+from app.services.spread_verification import SPREAD_AUDIT_STATUSES, SpreadVerification, spread_verification_from_mapping
 from app.time_utils import ensure_aware_utc, get_dashboard_zone, today_eastern, utc_now
 
 
@@ -79,6 +79,8 @@ def _settlement_preview(game: MlbGame, verification: SpreadVerification) -> dict
     selection_code = verification.selection_code
     line_value = verification.line_value
     formula_fields = _preview_formula_fields(game, verification)
+    if verification.inning_scope == "first_five":
+        return {"preview_status": "first_five_requires_official_linescore", **formula_fields}
     if _status_kind(game.status) == "void":
         return {"preview_status": "void_game", **formula_fields}
     if _status_kind(game.status) != "final":
@@ -132,7 +134,7 @@ def _settlement_preview(game: MlbGame, verification: SpreadVerification) -> dict
 
 
 def _status_counter_template() -> dict[str, int]:
-    return {status: 0 for status in sorted(FULL_GAME_SPREAD_AUDIT_STATUSES)}
+    return {status: 0 for status in sorted(SPREAD_AUDIT_STATUSES)}
 
 
 def _coverage_status(
@@ -189,10 +191,14 @@ def run_spread_audit(
     *,
     min_time_to_start_minutes: int | None = 45,
     max_time_to_start_minutes: int | None = 180,
+    family_key: str = FULL_GAME_SPREAD,
 ) -> dict[str, object]:
+    if family_key not in {FULL_GAME_SPREAD, FIRST_FIVE_SPREAD}:
+        raise ValueError(f"Unsupported spread audit family: {family_key}")
     day = target_date or today_eastern()
     start, end = _day_bounds(day)
     now = utc_now()
+    ticker_prefix = "KXMLBF5SPREAD-%" if family_key == FIRST_FIVE_SPREAD else "KXMLBSPREAD-%"
     rows = list(
         session.execute(
             select(MarketMapping, MlbGame, KalshiMarket)
@@ -201,11 +207,11 @@ def run_spread_audit(
             .where(MlbGame.scheduled_start >= start)
             .where(MlbGame.scheduled_start < end)
             .where(
-                (MarketMapping.market_family == FULL_GAME_SPREAD)
-                | (MarketMapping.market_type == FULL_GAME_SPREAD)
-                | (KalshiMarket.market_family == FULL_GAME_SPREAD)
-                | (KalshiMarket.market_type == FULL_GAME_SPREAD)
-                | (KalshiMarket.ticker.ilike("KXMLBSPREAD-%"))
+                (MarketMapping.market_family == family_key)
+                | (MarketMapping.market_type == family_key)
+                | (KalshiMarket.market_family == family_key)
+                | (KalshiMarket.market_type == family_key)
+                | (KalshiMarket.ticker.ilike(ticker_prefix))
             )
             .order_by(MlbGame.scheduled_start.asc(), KalshiMarket.ticker.asc())
         )
@@ -269,7 +275,7 @@ def run_spread_audit(
             "scheduled_start": ensure_aware_utc(game.scheduled_start).isoformat(),
             "minutes_to_start": minutes_to_start,
             "family": family,
-            "market_family": FULL_GAME_SPREAD,
+            "market_family": family_key,
             "inning_scope": result.inning_scope,
             "audit_status": result.audit_status,
             "reason_codes": list(result.reason_codes or []),
@@ -353,12 +359,13 @@ def run_spread_audit(
         "coverage_status": coverage_status,
         "zero_checked_reason": zero_checked_reason,
         "by_family": by_family,
-        "audit_scope": "full_game_spread",
+        "audit_scope": family_key,
         "audit_only": True,
         "read_only": True,
         "mapping_mutations": 0,
+        "candidate_mutations": 0,
         "settlement_rows_created": 0,
-        "total_full_game_spread_markets_seen": checked,
+        f"total_{family_key}_markets_seen": checked,
         "mapped_to_games": checked,
         "status_counts": status_counts,
         "trusted_audit_only_count": status_counts.get("trusted_audit_only", 0),
@@ -374,4 +381,114 @@ def run_spread_audit(
         "examples_by_reason": examples_by_reason,
         "items": items[:100],
         "paper_trades_created": 0,
+    }
+
+
+def run_first_five_spread_audit(
+    session: Session,
+    target_date: date | None = None,
+    *,
+    min_time_to_start_minutes: int | None = 45,
+    max_time_to_start_minutes: int | None = 360,
+) -> dict[str, object]:
+    return run_spread_audit(
+        session,
+        target_date,
+        min_time_to_start_minutes=min_time_to_start_minutes,
+        max_time_to_start_minutes=max_time_to_start_minutes,
+        family_key=FIRST_FIVE_SPREAD,
+    )
+
+
+def first_five_spread_adapter_repair_preview(
+    session: Session,
+    *,
+    target_date: date | None = None,
+    limit: int = 500,
+) -> dict[str, object]:
+    bounded_limit = max(1, min(int(limit), 1000))
+    query = (
+        select(
+            ModelCandidate.id,
+            ModelCandidate.target_date,
+            ModelCandidate.market_family,
+            ModelCandidate.inning_scope,
+            ModelCandidate.probability_adapter_family,
+            ModelCandidate.probability_adapter_scope,
+            ModelCandidate.probability_adapter_policy_version,
+            ModelCandidate.probability_adapter_version,
+            ModelCandidate.probability_adapter_calibration_hook,
+            ModelCandidate.probability_adapter_calibration_version,
+            ModelCandidate.probability_adapter_feature_policy_version,
+            ModelCandidate.probability_adapter_metadata,
+            ModelCandidate.gate_diagnostics,
+        )
+        .where(ModelCandidate.market_family == FIRST_FIVE_SPREAD)
+        .order_by(ModelCandidate.id.asc())
+        .limit(bounded_limit + 1)
+    )
+    if target_date is not None:
+        query = query.where(ModelCandidate.target_date == target_date)
+    rows = list(session.execute(query).mappings())
+    truncated = len(rows) > bounded_limit
+    rows = rows[:bounded_limit]
+    counts = {
+        "already_valid": 0,
+        "deterministically_repairable": 0,
+        "ambiguous": 0,
+        "unsupported": 0,
+        "missing_source_evidence": 0,
+    }
+    examples: dict[str, list[dict[str, object]]] = {key: [] for key in counts}
+    required_fields = (
+        "probability_adapter_version",
+        "probability_adapter_policy_version",
+        "probability_adapter_family",
+        "probability_adapter_scope",
+        "probability_adapter_calibration_hook",
+        "probability_adapter_calibration_version",
+        "probability_adapter_feature_policy_version",
+    )
+    for row in rows:
+        diagnostics = row.get("gate_diagnostics")
+        diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
+        adapter_metadata = row.get("probability_adapter_metadata")
+        adapter_metadata = adapter_metadata if isinstance(adapter_metadata, dict) else {}
+        adapter_error = (
+            diagnostics.get("probability_adapter_error")
+            or diagnostics.get("adapter_error")
+            or adapter_metadata.get("adapter_error")
+        )
+        if row.get("probability_adapter_family") not in {None, "first_five_spread"}:
+            classification = "unsupported"
+        elif adapter_error:
+            classification = "ambiguous"
+        elif all(row.get(field) is not None for field in required_fields) and adapter_metadata:
+            classification = "already_valid"
+        elif diagnostics.get("gate_spread_parser_verified") or diagnostics.get("spread_verification"):
+            classification = "deterministically_repairable"
+        else:
+            classification = "missing_source_evidence"
+        counts[classification] += 1
+        if len(examples[classification]) < 3:
+            examples[classification].append(
+                {
+                    "candidate_id": row.get("id"),
+                    "target_date": row.get("target_date").isoformat() if row.get("target_date") else None,
+                    "adapter_family": row.get("probability_adapter_family"),
+                    "adapter_scope": row.get("probability_adapter_scope"),
+                }
+            )
+    return {
+        "status": "completed",
+        "target_date": target_date.isoformat() if target_date else None,
+        "preview_only": True,
+        "read_only": True,
+        "mutations_applied": 0,
+        "candidate_mutations": 0,
+        "bounded_limit": bounded_limit,
+        "rows_seen": len(rows),
+        "truncated": truncated,
+        "classification_counts": counts,
+        "examples": examples,
     }

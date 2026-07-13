@@ -148,9 +148,10 @@ def main() -> None:
             job=args.job,
             snapshot_id=balance_snapshot.get("snapshot_id"),
         )
-    if args.job == "spread-audit":
+    if args.job in {"spread-audit", "first-five-spread-audit"}:
         run_result = result.get("result") if isinstance(result.get("result"), dict) else {}
-        spread_result = run_result.get("spread_audit") if isinstance(run_result.get("spread_audit"), dict) else {}
+        audit_result_key = "first_five_spread_audit" if args.job == "first-five-spread-audit" else "spread_audit"
+        spread_result = run_result.get(audit_result_key) if isinstance(run_result.get(audit_result_key), dict) else {}
         _log_event(
             "spread_audit_window",
             job=args.job,
@@ -183,6 +184,7 @@ def main() -> None:
             parse_error_count=spread_result.get("parse_error_count"),
             paper_trades_created=spread_result.get("paper_trades_created"),
             mapping_mutations=spread_result.get("mapping_mutations"),
+            candidate_mutations=spread_result.get("candidate_mutations"),
             settlement_rows_created=spread_result.get("settlement_rows_created"),
             audit_only=spread_result.get("audit_only"),
             read_only=spread_result.get("read_only"),

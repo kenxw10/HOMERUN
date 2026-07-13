@@ -65,6 +65,7 @@ PAPER_ALLOW_MULTIPLE_LINES_PER_GAME_FAMILY=false
 PAPER_ALLOW_MULTIPLE_F5_WINNER_OUTCOMES=false
 PAPER_MAX_OPEN_POSITIONS=12
 PAPER_SPREAD_TRADING_ENABLED=false
+PAPER_FIRST_FIVE_SPREAD_TRADING_ENABLED=false
 PAPER_MAX_DAILY_NEW_RISK_PCT=0.20
 PAPER_MAX_OPEN_RISK_PCT=0.25
 PAPER_MAX_MARKET_FAMILY_RISK_PCT=0.10
@@ -149,6 +150,7 @@ Run these from the Railway backend service shell after migrations succeed:
 python -m app.jobs.runner --job daily-setup --target-date today_et
 python -m app.jobs.runner --job candidate-sweep --target-date today_et --min-time-to-start-minutes 45 --max-time-to-start-minutes 180 --sweep-label rolling_pregame_window
 python -m app.jobs.runner --job spread-audit --target-date today_et --min-time-to-start-minutes 45 --max-time-to-start-minutes 360
+python -m app.jobs.runner --job first-five-spread-audit --target-date today_et --min-time-to-start-minutes 45 --max-time-to-start-minutes 360
 python -m app.jobs.runner --job price-refresh --target-date today_et
 python -m app.jobs.runner --job settlement --target-date yesterday_et
 python -m app.jobs.runner --job governance
@@ -158,6 +160,8 @@ python -m app.jobs.runner --job full-paper-cycle --target-date today_et
 These commands create database records for the dashboard and paper engine. They do not place live orders.
 
 The spread-audit command verifies spread parsing and settlement metadata from Kalshi raw text fields. It is audit-only/read-only and does not create paper trades, mutate mappings, or write settlement rows. PR4e allows this as a separate short-lived Railway cron service so coverage/freshness evidence stays current, but it does not enable `PAPER_SPREAD_TRADING_ENABLED`, first-five spread trading, or any live execution service. Do not enable or declare the recurring spread-audit service production-validated until the PR4e.1 zero-window freshness checks in `docs/OPERATIONS.md` pass after deployment.
+
+PR4f adds `first-five-spread-audit` as a separate bounded read-only command. It reports first-five scope/trust/freshness evidence and must remain distinct from the full-game audit. It does not enable first-five paper trading, and no recurring Railway service is configured by this PR. Keep `PAPER_FIRST_FIVE_SPREAD_TRADING_ENABLED=false`.
 
 Recommended Railway cron services should be separate short-lived services, not the main web server. Times below show the intended ET cadence and the equivalent UTC cron during EDT:
 
